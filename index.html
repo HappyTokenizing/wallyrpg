@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12141c">
+<meta name="description" content="WALLY RPG — a cel-shaded island city, an elephant in sunglasses, and sixty-nine things worth owning.">
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23141414"/><path d="M10 38 h7 l8-11 h7" fill="none" stroke="%23fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M32 38 h7 l8-11 h7" fill="none" stroke="%23fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>'>
+<link rel="apple-touch-icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="%23141414"/><path d="M10 38 h7 l8-11 h7" fill="none" stroke="%23fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M32 38 h7 l8-11 h7" fill="none" stroke="%23fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>'>
+<title>WALLY RPG</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0a0d16}
+  body{font-family:'Nunito',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:#f3eee5}
+  #gl{position:fixed;inset:0;width:100%;height:100%;display:block}
+
+  /* ui layers are stacked above the canvas; each owns its own root */
+  #ui{position:fixed;inset:0;pointer-events:none;z-index:10}
+  #overlay{position:fixed;inset:0;pointer-events:none;z-index:20}
+
+  #boot{
+    position:fixed;inset:0;z-index:100;display:grid;place-items:center;
+    background:#0a0d16;transition:opacity .5s ease;
+  }
+  #boot.gone{opacity:0;pointer-events:none}
+  #bootInner{text-align:center}
+  #bootMark{
+    font:700 clamp(30px,7vw,64px)/1 'Baloo 2',system-ui,sans-serif;
+    letter-spacing:.14em;color:#f5913c;
+    text-shadow:0 0 44px rgba(245,145,60,.45);
+  }
+  #bootStatus{
+    margin-top:16px;font:500 11px/1 ui-monospace,Menlo,monospace;
+    letter-spacing:.32em;text-transform:uppercase;color:#5d6580;
+  }
+  #bootBar{
+    margin:18px auto 0;width:190px;height:2px;border-radius:2px;
+    background:rgba(255,255,255,.08);overflow:hidden;
+  }
+  #bootBar::after{
+    content:'';display:block;height:100%;width:38%;border-radius:2px;
+    background:linear-gradient(90deg,transparent,#f5913c,transparent);
+    animation:sweep 1.25s ease-in-out infinite;
+  }
+  @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(360%)}}
+  @media (prefers-reduced-motion:reduce){#bootBar::after{animation:none;width:100%}}
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <div id="ui"></div>
+  <div id="overlay"></div>
+
+  <div id="boot">
+    <div id="bootInner">
+      <div id="bootMark">WALLY</div>
+      <div id="bootStatus">booting</div>
+      <div id="bootBar"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
