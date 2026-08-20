@@ -31,6 +31,10 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { extname, join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/* NOTE: do NOT add --disable-frame-rate-limit to the Chrome args below.
+   It starves page.screenshot() and every capture times out. Learned
+   the hard way; the symptom is 'waiting for fonts to load' then a
+   30s timeout with no other clue. */
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const MIME = {

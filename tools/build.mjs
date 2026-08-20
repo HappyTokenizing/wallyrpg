@@ -33,11 +33,12 @@ const result = await build({
   bundle: true,
   format: 'esm',
   target: ['chrome110', 'firefox110', 'safari16'],
-  // Granular rather than `minify: true`. Identifier renaming is safe, but
-  // esbuild's syntax pass merges adjacent template-literal concatenations,
-  // and the SVG builders in src/ui and src/intro concatenate dozens of them —
-  // the merge mangles `${...}` into literal text and the page dies with
-  // "Expected length, ${p}". Whitespace + identifiers get most of the win.
+  // Granular rather than `minify: true`. esbuild's SYNTAX pass merges
+  // adjacent template-literal concatenations, and the SVG builders in
+  // src/ui and src/intro concatenate dozens of them — the merge mangles
+  // ${...} into literal text and the page dies with "Expected length, ${p}".
+  // Identifier renaming breaks it the same way. Whitespace-only is safe
+  // and still gets most of the size win.
   minifyWhitespace: !DEV,
   minifyIdentifiers: false,
   minifySyntax: false,
