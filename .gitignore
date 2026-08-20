@@ -1,0 +1,32 @@
+# ---------------------------------------------------------------
+# Dependencies — restore with `npm install`, never commit.
+# This is what was breaking the commit: three.js ships thousands of
+# files under examples/jsm, and indexing them times out.
+# ---------------------------------------------------------------
+node_modules/
+
+# ---------------------------------------------------------------
+# Generated artifacts. All of these are reproducible from source,
+# and together they are ~385 MB — they would bloat history badly.
+#   shots/  debug + verification screenshots   (368 MB)
+#   ab*/    blind A/B comparison sheets, and the sidecar .json keys
+#           that must never be shared with a judging agent
+# ---------------------------------------------------------------
+shots/
+ab/
+ab2/
+ab3/
+
+# NOTE: WALLY-RPG.html (the single-file build) is deliberately TRACKED.
+# It is the downloadable, double-clickable game — worth having in the
+# repo. Regenerate it with `npm run build` before each release commit.
+
+# ---------------------------------------------------------------
+# OS / editor / deploy noise
+# ---------------------------------------------------------------
+.DS_Store
+*.swp
+.vercel
+
+# Local backups
+*.tgz

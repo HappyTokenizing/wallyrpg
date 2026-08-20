@@ -1,0 +1,931 @@
+/* ============================================================
+   menus.js — every panel that is not the phone.
+
+     pause          resume / phone / desk / settings / save / load
+     settings       audio, quality, accessibility, persistence
+     travel         the fare board for a destination
+     place          "what you can do here" + the people standing there
+     desk           orders, arrivals, tokenizing, office, team
+     market         a venue's order book
+     school, bank, pawn, homes, farm, mine, dev lab, listings,
+     the Stampede questline
+
+   Every one of these is a thin skin over ctx.game.actions — this
+   module contains no game rules, only the reading of results.
+   ============================================================ */
+
+import { BRAND, CATEGORY, BUILD, SEA, LAND, css } from '../core/palette.js';
+import { QUALITY_TIERS, clamp } from '../core/contracts.js';
+import {
+  h, clear, icon, money, money2, pad2, portrait, wallyMark, rgba, mix, C,
+} from './style.js';
+
+export function createMenus(ctx, ui) {
+  const g = () => ctx.game;
+
+  /* ============================================================
+     sheet scaffolding
+     ============================================================ */
+  function sheet(spec, build) {
+    const titleEl = h('h2', { text: spec.title });
+    const subEl = h('div.hs', { text: spec.sub || '' });
+    const head = h('div.w-sheet-head', null,
+      spec.glyph
+        ? h('div.ic', {
+            style: {
+              width: '38px', height: '38px', borderRadius: '12px', display: 'grid',
+              placeItems: 'center', fontSize: '19px', flex: 'none',
+              background: rgba(spec.tint ?? BRAND.token, 0.16),
+            },
+            text: spec.glyph,
+          })
+        : null,
+      h('div.w-grow', null, titleEl, subEl),
+      h('button.w-btn.sm.ghost.w-pe', {
+        type: 'button', 'aria-label': 'Close',
+        style: { minWidth: '34px', padding: '0 8px' },
+        onclick: () => { ui.sfx('ui.close'); ui.popSheet(); },
+      }, icon('close', 16)));
+
+    const body = h('div.w-sheet-body');
+    const el = h('div.w-sheet.w-paper.w-pe', { role: 'dialog' }, head, body);
+    el._rebuild = () => {
+      clear(body);
+      try { build(body, el); } catch (e) { console.error('[ui] sheet failed', e); }
+    };
+    el._setTitle = (t, s) => { titleEl.textContent = t; subEl.textContent = s || ''; };
+    el._rebuild();
+    return el;
+  }
+
+  /* result of a game action → toast + sound + repaint */
+  function res(r, okMsg) {
+    if (r && r.ok) {
+      ui.sfx(okMsg === 'money' ? 'coin' : 'ui.select');
+      if (typeof okMsg === 'string' && okMsg !== 'money') ui.toast(okMsg, 'good');
+    } else {
+      ui.sfx('ui.error');
+      ui.toast((r && r.why) || 'Not right now', 'bad');
+    }
+    ui.refresh();
+    return r;
+  }
+
+  function card(o) {
+    const btn = h('button.w-card' + (o.onclick ? '.w-pe' : ''), {
+      type: 'button',
+      disabled: o.disabled,
+      onclick: o.onclick ? () => { ui.click(); o.onclick(); } : null,
+    },
+      o.node || h('div.ic', {
+        style: o.glyph ? { fontSize: '17px' } : null,
+      }, o.glyph ? document.createTextNode(o.glyph) : icon(o.ic || 'info', 17)),
+      h('div.w-grow', null,
+        h('div.t', { text: o.t }),
+        o.d ? h('div.d', { text: o.d }) : null),
+      o.m ? h('div.m', { style: o.mColor ? { color: C(o.mColor) } : null, text: o.m },
+        o.ms ? h('small', { text: o.ms }) : null) : null);
+    if (!o.onclick) btn.style.cursor = 'default';
+    return btn;
+  }
+  const label = (t) => h('div.w-label', { text: t });
+  const kv = (k, v) => h('div.w-kv', null, h('span', { text: k }), h('b', { text: v }));
+  /* Element.append() stringifies null — always go through this. */
+  const put = (parent, ...nodes) => { for (const n of nodes) if (n) parent.append(n); return parent; };
+  const hoursLine = (loc, open) => (
+    loc.hours[0] === 0 && loc.hours[1] === 24 ? 'always open'
+      : open ? 'open until ' + pad2(loc.hours[1]) + ':00'
+        : 'closed · ' + pad2(loc.hours[0]) + ':00–' + pad2(loc.hours[1]) + ':00');
+
+  /* ============================================================
+     PAUSE
+     ============================================================ */
+  function pause() {
+    const el = h('div.w-pause.w-chrome.w-pe', { role: 'dialog', 'aria-label': 'Paused' });
+    const mark = wallyMark(62);
+    mark.style.filter = `drop-shadow(0 6px 18px ${rgba(0x05070c, 0.5)})`;
+    el.append(h('div.brand', null, mark,
+      h('div.wm', { text: 'WALLY' }),
+      h('div.sm', { text: 'Bull Bear City' })));
+
+    const d = g().hud();
+    el.append(h('div', {
+      style: {
+        display: 'flex', justifyContent: 'center', gap: '14px', margin: '2px 0 12px',
+        fontSize: 'calc(11px * var(--w-ts))', fontWeight: '700', color: 'var(--w-dim)',
+      },
+    },
+      h('span', { text: 'Day ' + d.day }),
+      h('span', { text: money(d.money) }),
+      h('span', { text: Math.round(d.rep) + ' rep' }),
+      h('span', { text: d.cityPct + '% city' })));
+
+    const b = (txt, ic, fn, cls = 'dark') => h('button.w-btn.' + cls + '.w-pe', {
+      type: 'button', onclick: () => { ui.click(); fn(); },
+    }, icon(ic, 16), txt);
+
+    put(el,
+      b('Resume', 'play', () => ui.hide('pause'), 'prim'),
+      b('Phone', 'phone', () => { ui.hide('pause'); ui.openPhone(); }),
+      b('Your desk', 'door', () => { ui.hide('pause'); ui.openDesk(); }),
+      b('Settings', 'gear', () => ui.pushSheet(settings())),
+      b('Save', 'save', () => { const ok = g().save(); ui.toast(ok ? 'Progress saved' : 'Could not save', ok ? 'good' : 'bad'); }),
+      g().hasSave() ? b('Load last save', 'book', () => {
+        if (g().load()) { ui.toast('Save loaded', 'good'); ui.closeAll(); ui.refresh(); }
+        else ui.toast('No save found', 'bad');
+      }) : null,
+    );
+    return el;
+  }
+
+  /* ============================================================
+     SETTINGS  (shared by the pause menu and the phone app)
+     ============================================================ */
+  function settings() {
+    return sheet({ title: 'Settings', sub: 'Sound, picture, comfort, saves', glyph: '⚙️', tint: BUILD.metal },
+      (body) => renderSettings(body));
+  }
+
+  function renderSettings(body) {
+    const st = g().state;
+    const S = st.settings;
+
+    /* ---- sound ---- */
+    body.append(label('Sound'));
+    body.append(slider('Music', ctx.audio?.musicVolume ?? S.music, (v) => {
+      S.music = v;
+      if (ctx.audio) ctx.audio.musicVolume = v;
+    }));
+    body.append(slider('Effects', ctx.audio?.sfxVolume ?? S.sfx, (v) => {
+      S.sfx = v;
+      if (ctx.audio) ctx.audio.sfxVolume = v;
+      ui.sfx('ui.click');
+    }));
+
+    /* ---- picture ---- */
+    body.append(label('Picture'));
+    const tiers = ['low', 'med', 'high', 'ultra'];
+    body.append(chips('Quality', tiers, tierName(ctx.quality?.name), (v) => {
+      try {
+        ctx.render?.setQuality(QUALITY_TIERS[v]);
+        ui.toast('Quality: ' + v, 'info');
+      } catch (e) { ui.toast('Could not change quality', 'bad'); }
+    }, tiers.map((t) => t.toUpperCase())));
+
+    /* ---- comfort ---- */
+    body.append(label('Comfort'));
+    const sizes = ['0.9', '1', '1.15', '1.3'];
+    body.append(chips('Text size', sizes, String(S.textSize || 1), (v) => {
+      S.textSize = +v;
+      ui.setTextSize(+v);
+    }, ['S', 'M', 'L', 'XL']));
+    body.append(toggle('Reduced motion', !!S.reduced, (on) => { S.reduced = on; ui.setReducedMotion(on); }));
+    body.append(toggle('High contrast', !!S.contrast, (on) => { S.contrast = on; ui.setHighContrast(on); }));
+    body.append(toggle('Relaxed pace', !!S.relaxed, (on) => {
+      S.relaxed = on;
+      ui.toast(on ? 'Everything takes 30% less time' : 'Normal pace', 'info');
+    }));
+
+    /* ---- saves ---- */
+    body.append(label('Your game'));
+    body.append(h('div.w-row', null,
+      h('button.w-btn.prim.w-pe', { type: 'button', onclick: () => {
+        const ok = g().save();
+        ui.toast(ok ? 'Progress saved' : 'Could not save', ok ? 'good' : 'bad');
+      } }, icon('save', 15), 'Save'),
+      h('button.w-btn.ghost.w-pe', { type: 'button', disabled: !g().hasSave(), onclick: () => {
+        if (g().load()) { ui.toast('Save loaded', 'good'); ui.closeAll(); ui.refresh(); }
+        else ui.toast('No save found', 'bad');
+      } }, icon('book', 15), 'Load'),
+      h('button.w-btn.ghost.w-pe', { type: 'button', onclick: () => {
+        const r = g().downloadSave();
+        if (r && r.ok) ui.toast('Save file downloaded', 'good');
+        else showExport();
+      } }, icon('save', 15), 'Export'),
+      h('button.w-btn.ghost.w-pe', { type: 'button', onclick: () => showImport() }, icon('info', 15), 'Import'),
+    ));
+
+    const io = h('div');
+    body.append(io);
+
+    function showExport() {
+      clear(io);
+      const ta = h('textarea.w-ta.w-pe', { readonly: true });
+      ta.value = g().exportSave();
+      io.append(label('Save data'), ta,
+        h('button.w-btn.sm.ghost.w-pe', { type: 'button', onclick: () => { ta.select(); document.execCommand?.('copy'); ui.toast('Copied', 'good'); } }, 'Copy'));
+    }
+    function showImport() {
+      clear(io);
+      const ta = h('textarea.w-ta.w-pe', { placeholder: 'Paste a WALLY save file here…' });
+      io.append(label('Import a save'), ta,
+        h('button.w-btn.sm.prim.w-pe', { type: 'button', onclick: () => {
+          const d = g().importSave(ta.value.trim());
+          if (d) { ui.toast('Save imported', 'good'); ui.closeAll(); ui.refresh(); }
+          else { ui.toast('That is not a WALLY save', 'bad'); ui.sfx('ui.error'); }
+        } }, 'Import'));
+    }
+
+    body.append(label('Danger'));
+    let armed = false;
+    const nb = h('button.w-btn.ghost.w-pe', {
+      type: 'button',
+      style: { width: '100%', color: C(BRAND.bad), boxShadow: `inset 0 0 0 1.5px ${rgba(BRAND.bad, 0.4)}` },
+      onclick: () => {
+        if (!armed) { armed = true; nb.textContent = 'Tap again to erase everything'; ui.sfx('ui.error'); return; }
+        g().wipeSave();
+        g().newGame();
+        ui.closeAll();
+        ui.refresh();
+        ui.banner('DAY 1', 'A folding table and a poster');
+      },
+    }, 'Start a new game');
+    body.append(nb);
+
+    body.append(h('div', {
+      style: { textAlign: 'center', opacity: '.4', fontSize: '10px', marginTop: '16px', letterSpacing: '.1em' },
+      text: 'WALLY RPG · save v' + g().data.config.version,
+    }));
+  }
+
+  function tierName(n) {
+    if (!n) return 'high';
+    const s = String(n).replace(/\(.*\)/, '');
+    return QUALITY_TIERS[s] ? s : 'high';
+  }
+
+  function slider(name, value, onInput) {
+    const val = h('b', { text: Math.round(value * 100) + '%' });
+    const inp = h('input.w-slider.w-pe', {
+      type: 'range', min: '0', max: '1', step: '0.02', value: String(value),
+      oninput: (e) => { const v = +e.target.value; val.textContent = Math.round(v * 100) + '%'; onInput(v); },
+    });
+    return h('div', { style: { marginBottom: '12px' } },
+      h('div.w-kv', { style: { borderBottom: '0', paddingBottom: '4px' } }, h('span', { text: name }), val), inp);
+  }
+  function toggle(name, on, onChange) {
+    const sw = h('button.w-switch.w-pe' + (on ? '.on' : ''), { type: 'button', role: 'switch' });
+    sw.addEventListener('click', () => {
+      const next = !sw.classList.contains('on');
+      sw.classList.toggle('on', next);
+      ui.click();
+      onChange(next);
+    });
+    return h('div.w-kv', null, h('span', { text: name }), sw);
+  }
+  function chips(name, values, active, onPick, labels) {
+    const bar = h('div.w-chipbar');
+    values.forEach((v, i) => {
+      const c = h('button.w-chip.w-pe' + (String(v) === String(active) ? '.on' : ''), {
+        type: 'button',
+        text: (labels && labels[i]) || v,
+        onclick: () => {
+          for (const k of bar.children) k.classList.remove('on');
+          c.classList.add('on');
+          ui.click();
+          onPick(v);
+        },
+      });
+      bar.append(c);
+    });
+    return h('div', { style: { marginBottom: '10px' } },
+      h('div.w-kv', { style: { borderBottom: '0', paddingBottom: '5px' } }, h('span', { text: name })), bar);
+  }
+
+  /* ============================================================
+     TRAVEL
+     ============================================================ */
+  function travel(locId, why) {
+    const game = g();
+    const loc = game.data.locationById[locId];
+    if (!loc) return null;
+    return sheet({
+      title: loc.n,
+      sub: why || (game.data.zones[loc.z].n + ' · ' + (game.isOpen(locId) ? 'open now' : 'closed')),
+      glyph: loc.ico, tint: BRAND.info,
+    }, (body) => {
+      const st = game.state;
+      if (st.loc === locId) {
+        body.append(h('div.w-empty', { text: 'You are already here.' }));
+        body.append(h('button.w-btn.prim.w-pe', {
+          type: 'button', style: { width: '100%' },
+          onclick: () => { ui.popSheet(); ui.openPlace(locId); },
+        }, 'Look around'));
+        return;
+      }
+      body.append(h('div', { style: { fontSize: '12px', opacity: '.7', marginBottom: '4px' }, text: loc.desc }));
+      body.append(label('How do you want to get there'));
+      const modeIcon = { walk: 'foot', bike: 'bike', train: 'train', trunk: 'car' };
+      for (const f of game.fares(locId)) {
+        body.append(card({
+          ic: modeIcon[f.mode] || 'foot',
+          t: f.n,
+          d: f.ok ? (f.mins + ' min' + (f.energy ? ' · ' + f.energy + ' energy' : '') + (f.metres ? ' · ' + f.metres + ' m' : '')) : f.why,
+          m: f.cost ? money(f.cost) : 'Free',
+          mColor: f.ok ? (f.cost ? BRAND.ink : BRAND.good) : BRAND.bad,
+          disabled: !f.ok,
+          onclick: () => {
+            const r = game.travel(locId, f.mode);
+            if (!r.ok) { res(r); return; }
+            ui.sfx(f.mode === 'walk' ? 'step.dirt' : f.mode === 'train' ? 'train.horn' : 'ui.select');
+            ui.placeWally(locId);
+            ui.popSheet();
+            ui.refresh();
+            ui.toast('Arrived at ' + loc.n, 'token');
+            ui.openPlace(locId);
+          },
+        }));
+      }
+      body.append(h('div', {
+        style: { fontSize: '11px', opacity: '.55', marginTop: '10px', lineHeight: '1.5' },
+        text: 'Or close this and walk there yourself — the island is one continuous place, and the door will prompt you when you reach it.',
+      }));
+    });
+  }
+
+  /* ============================================================
+     PLACE — "what you can do here"
+     ============================================================ */
+  function place(locId) {
+    const game = g();
+    const loc = game.data.locationById[locId];
+    if (!loc) return null;
+    return sheet({
+      title: loc.n,
+      sub: game.data.zones[loc.z].n + ' · ' + hoursLine(loc, game.isOpen(locId)),
+      glyph: loc.ico, tint: BRAND.token,
+    }, (body, el) => {
+      body.append(h('div', { style: { fontSize: '12.5px', opacity: '.72', lineHeight: '1.5' }, text: loc.desc }));
+
+      const q = game.quests.questAt(locId);
+      if (q) {
+        body.append(h('div', {
+          style: {
+            marginTop: '12px', padding: '11px 13px', borderRadius: '13px',
+            background: rgba(BRAND.token, 0.14), boxShadow: `inset 0 0 0 1.4px ${rgba(BRAND.token, 0.34)}`,
+          },
+        },
+          h('div', { style: { fontWeight: '800', fontSize: '13px' }, text: q.t }),
+          h('div', { style: { fontSize: '11.5px', opacity: '.7', marginTop: '2px' }, text: q.d })));
+      }
+
+      body.append(label('What you can do here'));
+      const acts = actionsFor(loc);
+      if (!acts.length) body.append(h('div.w-empty', { text: 'Nothing to do here today.' }));
+      for (const a of acts) body.append(card(a));
+
+      /* people */
+      const here = game.clients.at(locId);
+      if (here.length) {
+        body.append(label('People here'));
+        for (const c of here) {
+          const cs = game.state.clients[c.id];
+          body.append(card({
+            node: portrait(c, 34),
+            t: c.n,
+            d: cs.met ? c.role : c.role + ' · you have not met',
+            m: cs.met ? 'trust ' + cs.trust : 'Say hello',
+            mColor: cs.met ? BRAND.ink : BRAND.token2,
+            onclick: () => talkTo(c),
+          }));
+        }
+      }
+    });
+  }
+
+  function talkTo(c) {
+    const game = g();
+    const first = !game.state.clients[c.id].met;
+    if (first) game.clients.meet(c.id);
+    const order = game.state.arrivals.find((o) => o.client === c.id);
+    ui.dialogue({
+      speaker: c.n, role: c.role, portrait: c.id,
+      text: first ? [c.intro] : [c.intro],
+      choices: order ? [
+        { label: 'What do you need?', value: 'order', kind: 'prim', onPick: () => ui.showOrder(order) },
+        { label: 'Another time', value: null, kind: 'ghost' },
+      ] : [{ label: 'Good to see you', value: null, kind: 'prim' }],
+    });
+    ui.refresh();
+  }
+
+  /* map an `act` string from data.js onto a card */
+  function actionsFor(loc) {
+    const game = g();
+    const st = game.state;
+    const out = [];
+    for (const act of loc.acts) {
+      const [kind, a, b] = act.split(':');
+      switch (kind) {
+        case 'sleep':
+          out.push({ ic: 'bed', t: 'Sleep until morning', d: 'Ends the day, restores energy, saves the game.',
+            onclick: () => {
+              const r = game.actions.sleep();
+              ui.closeAll();
+              ui.sfx('ui.close');
+              ui.refresh();
+            } });
+          break;
+        case 'desk': case 'hub':
+          out.push({ ic: 'door', t: 'Work at the desk', d: 'Orders, clients, tokenizing, your office.',
+            m: st.arrivals.length ? st.arrivals.length + ' waiting' : null, mColor: BRAND.token2,
+            onclick: () => { ui.popSheet(); ui.openDesk(); } });
+          break;
+        case 'poster':
+          out.push({ glyph: '🖼️', t: 'Look at the poster', d: 'The Bull Bear Stampede, some year they would rather forget.',
+            onclick: () => ui.dialogue({
+              speaker: 'Wally', portrait: 'wally',
+              text: ['Row F, seat 12. Someone in that photograph is looking straight at the camera and grinning like the season is going to end differently.',
+                     'It did not. It has not, for a while.'],
+            }) });
+          break;
+        case 'wardrobe':
+          out.push({ glyph: '🧥', t: 'Get changed', d: 'Same jacket. Cleaner, at least.',
+            onclick: () => ui.dialogue({ speaker: 'Wally', portrait: 'wally', text: 'Same jacket. It is a good jacket. It has three pockets and one opinion.' }) });
+          break;
+        case 'job': {
+          const j = game.data.jobs[a];
+          if (!j) break;
+          out.push({ glyph: j.ico, t: j.t, d: j.d, m: '~' + money(j.base + j.mult * 0.5), ms: j.en + ' energy',
+            onclick: () => runShift(a) });
+          break;
+        }
+        case 'food':
+          out.push({ glyph: '🍜', t: 'Eat · ' + money(+a), d: 'Fills ' + b + ' points of appetite.',
+            m: money(+a), mColor: BRAND.good,
+            onclick: () => {
+              const r = game.actions.eat(+a, +b);
+              if (r.ok) { ui.sfx('coin'); ui.toast('That is better', 'good'); }
+              else res(r);
+              ui.refresh(); ui.rebuildTop();
+            } });
+          break;
+        case 'market': {
+          const v = game.data.venues[a];
+          out.push({ ic: 'bag', t: v.name, d: game.economy.venueOpen(a) ? 'Buy and sell here.' : 'You do not have access yet.',
+            disabled: !game.economy.venueOpen(a),
+            onclick: () => ui.pushSheet(market(a)) });
+          break;
+        }
+        case 'bank':  out.push({ ic: 'cash', t: 'Bull Bear Mutual', d: 'Borrow against your reputation, repay when you can.', onclick: () => ui.pushSheet(bank()) }); break;
+        case 'pawn':  out.push({ ic: 'bag', t: "Vic's stock", d: 'Four things a day, 14% under market.', onclick: () => ui.pushSheet(pawn()) }); break;
+        case 'school':out.push({ ic: 'book', t: 'Enrol in a course', d: 'Ten courses. Each ends in an exam you can fail.', onclick: () => ui.pushSheet(school()) }); break;
+        case 'study': out.push({ ic: 'book', t: 'Read for two hours', d: '+1 reputation, 12 energy.', onclick: () => { res(game.actions.study(), 'Two quiet hours well spent'); ui.rebuildTop(); } }); break;
+        case 'archive': out.push({ ic: 'book', t: 'File the bond archive', d: 'Unlocks City Treasury access.', onclick: () => { res(game.actions.archive()); ui.rebuildTop(); } }); break;
+        case 'homes': out.push({ ic: 'key', t: 'View apartments', d: 'Somewhere better to sleep.', onclick: () => ui.pushSheet(homes()) }); break;
+        case 'farm':  out.push({ ic: 'tools', t: "Maple's Farm", d: 'Irrigation, partnership, harvest.', onclick: () => ui.pushSheet(farm()) }); break;
+        case 'mine':  out.push({ ic: 'tools', t: 'The old mine', d: 'Records, the elevator, the seam.', onclick: () => ui.pushSheet(mine()) }); break;
+        case 'devlab':out.push({ ic: 'spark', t: 'Trunk Technologies Lab', d: 'Wallet, remote orders, Wally Swap.', onclick: () => ui.pushSheet(devlab()) }); break;
+        case 'ipo':   out.push({ ic: 'chart', t: 'Listings', d: 'Four companies want to go public.', onclick: () => ui.pushSheet(ipos()) }); break;
+        case 'stampede': out.push({ ic: 'trophy', t: 'The Stampede', d: 'Ten steps to give a team back to a city.', onclick: () => ui.pushSheet(stadium()) }); break;
+        case 'vance': out.push({ ic: 'star', t: 'Ask Vance for a mandate', d: 'Institutional money, if he takes the meeting.',
+          onclick: () => { const r = game.actions.vanceMandate(); if (r.ok) { ui.toast('A mandate is on your desk', 'token'); ui.sfx('unlock'); } else res(r); } }); break;
+        default: break;
+      }
+    }
+    return out;
+  }
+
+  function runShift(key) {
+    const game = g();
+    const j = game.data.jobs[key];
+    const r = game.actions.work(key);
+    if (!r.ok) { res(r); return; }
+    ui.sfx('cash');
+    ui.refresh();
+    ui.rebuildTop();
+    const pages = ['That is ' + money2(r.pay) + ' for ' + j.hrs + ' hours. ' +
+      (r.score > 0.72 ? 'Nobody had to tell you twice.' : r.score > 0.5 ? 'Steady work.' : 'Long hours, slow clock.')];
+    if (r.extra) pages.push(r.extra.text);
+    ui.dialogue({ speaker: 'Wally', portrait: 'wally', text: pages });
+  }
+
+  /* ============================================================
+     DESK
+     ============================================================ */
+  function desk() {
+    const game = g();
+    return sheet({ title: 'Your desk', sub: '', glyph: '🗂️', tint: BRAND.token }, (body, el) => {
+      const st = game.state;
+      const E = game.economy;
+      const stage = game.data.offices[st.office];
+      el._setTitle('Your desk', stage.n + ' · ' + st.orders.length + '/' + E.orderSlots() + ' orders');
+
+      if (st.arrivals.length) {
+        body.append(label('Waiting for you'));
+        for (const o of st.arrivals) {
+          const c = game.data.clientById[o.client];
+          body.append(card({
+            node: portrait(c, 34), t: c.n, d: describeOrder(o),
+            m: money(o.budget + o.fee), mColor: BRAND.good, ms: 'day ' + o.deadline,
+            onclick: () => ui.showOrder(o),
+          }));
+        }
+      }
+
+      body.append(label('Open orders'));
+      if (!st.orders.length) body.append(h('div.w-empty', { text: 'No orders. Meet people; they will find you.' }));
+      for (const o of st.orders) {
+        const c = game.data.clientById[o.client];
+        const ready = E.canComplete(o);
+        const missing = o.items.filter((it) => E.free(it.a) + 1e-4 < it.q)
+          .map((it) => game.data.assetById[it.a].n);
+        body.append(card({
+          node: portrait(c, 34), t: c.n + ' · ' + describeOrder(o),
+          d: ready ? 'Everything is in hand. Deliver it.' : 'Still need: ' + missing.join(', '),
+          m: ready ? 'Deliver' : money(o.budget + o.fee),
+          mColor: ready ? BRAND.good : BRAND.warn,
+          disabled: !ready,
+          onclick: ready ? () => {
+            const r = game.actions.deliver(o);
+            if (r.ok) {
+              ui.sfx('cash');
+              ui.refresh();
+              el._rebuild();
+              ui.dialogue({
+                speaker: c.n, role: c.role, portrait: c.id,
+                text: r.late ? 'Late. But you came. That counts for something.'
+                             : 'Exactly what I asked for. I will tell people.',
+              });
+            } else res(r);
+          } : null,
+        }));
+      }
+
+      body.append(label('Your office'));
+      const nx = game.actions.nextOffice();
+      body.append(kv('Stage', stage.n));
+      body.append(kv('Inventory', E.invCount() + ' / ' + E.invCap()));
+      body.append(kv('Order slots', st.orders.length + ' / ' + E.orderSlots()));
+      if (nx) {
+        body.append(card({
+          ic: 'door', t: 'Upgrade to ' + nx.n, d: nx.desc,
+          m: money(nx.cost), ms: nx.rep + ' rep',
+          onclick: () => { const r = game.actions.upgradeOffice(); if (r.ok) { ui.sfx('levelup'); el._rebuild(); ui.refresh(); } else res(r); },
+        }));
+      }
+
+      body.append(label('Team · ' + st.employees.length + '/' + (st.office + 1)));
+      for (const e of game.data.employees) {
+        const hired = st.employees.includes(e.id);
+        body.append(card({
+          ic: 'people', t: e.n + ' · ' + e.role, d: hired ? '"' + e.line + '"' : e.skill,
+          m: hired ? 'On the team' : money(e.salary) + '/d',
+          mColor: hired ? BRAND.good : BRAND.ink,
+          onclick: () => {
+            const r = hired ? game.actions.fire(e.id) : game.actions.hire(e.id);
+            if (r.ok) { ui.sfx(hired ? 'ui.back' : 'levelup'); el._rebuild(); ui.refresh(); } else res(r);
+          },
+        }));
+      }
+
+      if (st.funds.length) {
+        body.append(label('Funds'));
+        for (const f of st.funds) {
+          body.append(card({ ic: 'chart', t: f.name, d: game.data.clientById[f.client].n + ' · satisfaction ' + Math.round(f.satisfaction) + '%',
+            m: money(f.value), ms: money(f.weekly) + '/wk' }));
+        }
+      }
+    });
+  }
+  function describeOrder(o) {
+    const game = g();
+    const items = o.items.map((it) => (it.q > 1 ? it.q + '× ' : '') + game.data.assetById[it.a].n).join(', ');
+    return (o.type === 'fund' ? 'Fund: ' : '') + items;
+  }
+
+  /* the accept/decline card for a single arrival */
+  function showOrder(o) {
+    const game = g();
+    const c = game.data.clientById[o.client];
+    ui.dialogue({
+      speaker: c.n, role: c.role, portrait: c.id,
+      text: [o.line, (o.type === 'fund' ? 'I want a basket, not a thing: ' : 'What I need is ') +
+        describeOrder(o) + '. My budget is ' + money2(o.budget) + ', and there is ' +
+        money2(o.fee) + ' in it for you. Day ' + o.deadline + ' at the latest.'],
+      choices: [
+        { label: 'I will take it', value: 'accept', kind: 'prim', onPick: () => {
+          const r = game.actions.accept(o);
+          if (r.ok) { ui.sfx('quest.start'); ui.toast('Order accepted', 'good'); ui.refresh(); ui.rebuildTop(); }
+          else res(r);
+        } },
+        { label: 'Not this time', value: null, kind: 'ghost' },
+      ],
+    });
+  }
+
+  /* ============================================================
+     MARKET
+     ============================================================ */
+  function market(venue) {
+    const game = g();
+    const v = game.data.venues[venue];
+    return sheet({
+      title: v.name,
+      sub: game.economy.venueOpenNow(venue) ? 'Open · spread ' + Math.round(v.spread * 100) + '%'
+                                            : 'Closed · ' + pad2(v.hours[0]) + ':00–' + pad2(v.hours[1]) + ':00',
+      glyph: '🧾', tint: CATEGORY.Stocks,
+    }, (body, el) => {
+      const E = game.economy;
+      const st = game.state;
+      body.append(kv('Cash', money2(st.money)));
+      body.append(kv('Inventory', E.invCount() + ' / ' + E.invCap()));
+      const list = game.data.assets.filter((a) => a.ven === venue);
+      body.append(label(list.length + ' listed'));
+      for (const a of list) {
+        const owned = E.owned(a.id);
+        const bp = E.buyPrice(a.id, venue), sp = E.sellPrice(a.id, venue);
+        const tr = E.trend(a.id);
+        const row = h('div.w-card', null,
+          h('div.ic', { style: { fontSize: '17px', background: rgba(CATEGORY[a.cat] ?? BRAND.info, 0.16) }, text: a.ico }),
+          h('div.w-grow', null,
+            h('div.t', { text: a.n }),
+            h('div.d', { text: (a.tick ? a.tick + ' · ' : '') + a.cat + (owned ? ' · you hold ' + owned : '') })),
+          h('div.m', {
+            text: money2(E.price(a.id)),
+            style: { color: C(tr > 0.004 ? BRAND.good : tr < -0.004 ? BRAND.bad : BRAND.ink) },
+          }, h('small', { text: (tr > 0 ? '▲' : tr < 0 ? '▼' : '·') + ' ' + a.q + '/5 liq' })));
+        const buttons = h('div', { style: { display: 'flex', gap: '6px', marginLeft: '8px' } },
+          h('button.w-btn.sm.prim.w-pe', {
+            type: 'button',
+            onclick: () => {
+              const r = E.buy(a.id, 1, venue);
+              if (r.ok) { ui.sfx('buy'); ui.refresh(); el._rebuild(); } else res(r);
+            },
+          }, money(bp)),
+          h('button.w-btn.sm.ghost.w-pe', {
+            type: 'button', disabled: E.free(a.id) < 1,
+            onclick: () => {
+              const r = E.sell(a.id, 1, venue);
+              if (r.ok) { ui.sfx('sell'); ui.refresh(); el._rebuild(); } else res(r);
+            },
+          }, money(sp)));
+        row.append(buttons);
+        body.append(row);
+      }
+    });
+  }
+
+  /* ============================================================
+     SCHOOL
+     ============================================================ */
+  function school() {
+    const game = g();
+    return sheet({ title: 'Bull Bear Business School', sub: 'Ten courses, ten exams', glyph: '🎓', tint: LAND.grassLit },
+      (body, el) => {
+        const st = game.state;
+        body.append(kv('Cash', money2(st.money)));
+        body.append(kv('Energy', Math.round(st.energy) + '%'));
+        body.append(label('Courses'));
+        for (const c of game.data.courses) {
+          const passed = !!st.skills[c.id];
+          const chk = game.actions.courseAvailable(c.id);
+          body.append(card({
+            ic: 'book', t: c.n, d: passed ? 'Passed' : (chk.ok ? c.desc : chk.why),
+            m: passed ? '✔' : money(c.cost), ms: passed ? null : c.hours + ' h · ' + c.energy + ' en',
+            mColor: passed ? BRAND.good : chk.ok ? BRAND.ink : BRAND.bad,
+            disabled: passed || !chk.ok,
+            onclick: () => {
+              const r = game.actions.enrol(c.id);
+              ui.refresh(); ui.rebuildTop(); el._rebuild();
+              if (r.ok) { ui.sfx('levelup'); }
+              else if (r.failed) ui.dialogue({ speaker: 'The Examiner', text: r.why });
+              else res(r);
+            },
+          }));
+        }
+      });
+  }
+
+  /* ============================================================
+     BANK / PAWN / HOMES
+     ============================================================ */
+  function bank() {
+    const game = g();
+    return sheet({ title: 'Bull Bear Mutual', sub: 'Marble floors, slow queue', glyph: '🏦', tint: BUILD.metal },
+      (body, el) => {
+        const st = game.state;
+        const cap = 500 + st.rep * 120;
+        body.append(kv('Cash', money2(st.money)));
+        body.append(kv('Outstanding loan', money2(st.loan)));
+        body.append(kv('Credit line', money(cap)));
+        body.append(kv('Daily interest', '2% of the balance'));
+        body.append(label('Borrow'));
+        body.append(h('div.w-row', null, ...[200, 500, 1000, 2500].map((n) =>
+          h('button.w-btn.prim.w-pe', {
+            type: 'button',
+            onclick: () => { const r = game.actions.borrow(n); if (r.ok) { ui.sfx('cash'); el._rebuild(); ui.refresh(); } else res(r); },
+          }, money(n)))));
+        body.append(label('Repay'));
+        body.append(h('div.w-row', null, ...[100, 500, Math.min(st.loan, st.money) || 0].map((n, i) =>
+          h('button.w-btn.ghost.w-pe', {
+            type: 'button', disabled: !n || st.loan <= 0,
+            onclick: () => { const r = game.actions.repay(n); if (r.ok) { ui.sfx('coin'); el._rebuild(); ui.refresh(); } else res(r); },
+          }, i === 2 ? 'All · ' + money(n) : money(n)))));
+      });
+  }
+
+  function pawn() {
+    const game = g();
+    return sheet({ title: "Vic's Pawn & Trade", sub: 'Assets with a past', glyph: '🏷️', tint: BRAND.gem },
+      (body, el) => {
+        const E = game.economy;
+        body.append(label("Today's stock"));
+        const stock = game.actions.pawnStock();
+        if (!stock.length) body.append(h('div.w-empty', { text: 'Vic has nothing today.' }));
+        for (const s of stock) {
+          const a = game.data.assetById[s.id];
+          body.append(card({
+            glyph: a.ico, t: a.n, d: a.cat + ' · 14% under market', m: money(s.price), mColor: BRAND.good,
+            onclick: () => { const r = game.actions.pawnBuy(s.id); if (r.ok) { ui.sfx('buy'); el._rebuild(); ui.refresh(); } else res(r); },
+          }));
+        }
+        const mine = Object.keys(game.state.inv).filter((k) => E.free(k) >= 1);
+        body.append(label('Sell to Vic · 22% under market'));
+        if (!mine.length) body.append(h('div.w-empty', { text: 'Nothing spare to sell.' }));
+        for (const id of mine) {
+          const a = game.data.assetById[id];
+          body.append(card({
+            glyph: a.ico, t: a.n, d: E.free(id) + ' free', m: money(Math.round(E.price(id) * 0.78)),
+            onclick: () => { const r = game.actions.pawnSell(id, 1); if (r.ok) { ui.sfx('sell'); el._rebuild(); ui.refresh(); } else res(r); },
+          }));
+        }
+      });
+  }
+
+  function homes() {
+    const game = g();
+    return sheet({ title: 'Somewhere to live', sub: 'Rest, storage, standing', glyph: '🔑', tint: BUILD.roof },
+      (body, el) => {
+        const st = game.state;
+        for (const hm of game.data.homes) {
+          const cur = st.home === hm.id;
+          body.append(card({
+            ic: 'key', t: hm.n, d: hm.desc + ' · rest ' + hm.rest + ' · +' + hm.store + ' storage',
+            m: cur ? 'Home' : money(hm.cost), ms: money(hm.rent) + '/wk',
+            mColor: cur ? BRAND.good : BRAND.ink, disabled: cur,
+            onclick: () => { const r = game.actions.moveHome(hm.id); if (r.ok) { ui.sfx('unlock'); el._rebuild(); ui.refresh(); } else res(r); },
+          }));
+        }
+      });
+  }
+
+  /* ============================================================
+     FARM / MINE / DEV LAB / IPO / STADIUM
+     ============================================================ */
+  function farm() {
+    const game = g();
+    return sheet({ title: "Maple's Farm", sub: 'Good soil, bad paperwork', glyph: '🌾', tint: LAND.grassLit },
+      (body, el) => {
+        const f = game.state.farm;
+        const A = game.actions;
+        const step = (t, d, m, on, done) => body.append(card({
+          ic: 'tools', t, d, m: done ? '✔' : m, mColor: done ? BRAND.good : BRAND.ink, disabled: done,
+          onclick: done ? null : () => { const r = on(); if (r.ok) { ui.sfx('ui.select'); el._rebuild(); ui.refresh(); ui.rebuildTop(); } else res(r); },
+        }));
+        body.append(label('The farm'));
+        step('Fix the irrigation', 'Two hours, 14 energy. Maple watches.', 'Do it', () => A.farmFixIrrigation(), f.irrigation);
+        step('Buy into the partnership', 'A third of the farm and the co-op unlocked.', money(2400), () => A.farmBuyIn(), f.owned);
+        if (f.owned) {
+          step('Build the barn', 'One extra crate every harvest.', money(3200), () => A.farmBuild('barn'), f.barn);
+          step('Build cold storage', 'Nothing spoils on the way to market.', money(6500), () => A.farmBuild('cold'), f.cold);
+          body.append(card({ ic: 'tools', t: 'Upgrade the farm', d: 'Level ' + f.lvl + ' → ' + (f.lvl + 1) + '. Better crops appear.',
+            m: money(2000 * (f.lvl + 1)),
+            onclick: () => { const r = A.farmUpgrade(); if (r.ok) { ui.sfx('levelup'); el._rebuild(); ui.refresh(); } else res(r); } }));
+          body.append(card({ ic: 'spark', t: 'Harvest', d: 'Three hours, 16 energy.', m: 'Go',
+            onclick: () => {
+              const r = A.farmHarvest();
+              if (r.ok) { ui.sfx('coin'); ui.toast('Harvested ' + r.qty + '× ' + game.data.assetById[r.asset].n, 'good'); ui.refresh(); ui.rebuildTop(); }
+              else res(r);
+            } }));
+        }
+      });
+  }
+
+  function mine() {
+    const game = g();
+    return sheet({ title: 'Old Bull Bear Mine', sub: 'Closed eleven years', glyph: '⛏️', tint: BRAND.gem },
+      (body, el) => {
+        const m = game.state.mine;
+        const A = game.actions;
+        const step = (t, d, mm, on, done) => body.append(card({
+          ic: 'tools', t, d, m: done ? '✔' : mm, mColor: done ? BRAND.good : BRAND.ink, disabled: done,
+          onclick: done ? null : () => { const r = on(); if (r.ok) { ui.sfx('ui.select'); el._rebuild(); ui.refresh(); ui.rebuildTop(); } else res(r); },
+        }));
+        step('Get the records from Goldie', 'Needs the Mining and Safety class.', 'Ask', () => A.mineRights(), m.rights);
+        step('Certify the elevator', 'The inspector has opinions.', money(2600), () => A.mineCertifyLift(), m.elevator);
+        step('Reopen the mine', 'Two and a half hours, 16 energy.', 'Open it', () => A.mineOpen(), m.owned);
+        if (m.owned) {
+          body.append(card({ ic: 'tools', t: 'Upgrade the mine', d: 'Level ' + m.lvl + ' → ' + (m.lvl + 1) + '. Deeper seams.',
+            m: money(3600 * (m.lvl + 1)),
+            onclick: () => { const r = A.mineUpgrade(); if (r.ok) { ui.sfx('levelup'); el._rebuild(); ui.refresh(); } else res(r); } }));
+          body.append(card({ ic: 'spark', t: 'Work a seam', d: 'Three hours, 20 energy.', m: 'Dig',
+            onclick: () => {
+              const r = A.mineDig();
+              if (r.ok) { ui.sfx('coin'); ui.toast('Brought up ' + r.qty + '× ' + game.data.assetById[r.asset].n, 'good'); ui.refresh(); ui.rebuildTop(); }
+              else res(r);
+            } }));
+        }
+      });
+  }
+
+  function devlab() {
+    const game = g();
+    return sheet({ title: 'Trunk Technologies Lab', sub: 'Where your phone learns to hold assets', glyph: '🧪', tint: BRAND.info },
+      (body, el) => {
+        const st = game.state;
+        const A = game.actions;
+        body.append(card({ ic: 'wallet', t: 'Asset Wallet', d: 'Hold tokenized assets on the phone.',
+          m: st.unlocks.wallet ? '✔' : money(900), mColor: st.unlocks.wallet ? BRAND.good : BRAND.ink,
+          disabled: !!st.unlocks.wallet,
+          onclick: () => { const r = A.buyWallet(); if (r.ok) { ui.sfx('unlock'); el._rebuild(); ui.refresh(); } else res(r); } }));
+        body.append(card({ ic: 'net', t: 'Remote order acceptance', d: 'Take client orders without walking back.',
+          m: st.unlocks.remote ? '✔' : money(2400), mColor: st.unlocks.remote ? BRAND.good : BRAND.ink,
+          disabled: !!st.unlocks.remote,
+          onclick: () => { const r = A.buyRemote(); if (r.ok) { ui.sfx('unlock'); el._rebuild(); ui.refresh(); } else res(r); } }));
+        body.append(card({ ic: 'spark', t: 'Build Wally Swap', d: 'Automated pools for every tokenized asset.',
+          m: st.swap.unlocked ? '✔' : money(45000), mColor: st.swap.unlocked ? BRAND.good : BRAND.ink,
+          disabled: !!st.swap.unlocked,
+          onclick: () => { const r = A.buildSwap(); if (r.ok) { ui.sfx('fanfare'); el._rebuild(); ui.refresh(); } else res(r); } }));
+        if (st.swap.unlocked) {
+          body.append(label('Liquidity pools'));
+          for (const id of Object.keys(st.tokenized)) {
+            const a = game.data.assetById[id];
+            if (!a) continue;
+            const has = !!st.swap.pools[id];
+            body.append(card({ glyph: a.ico, t: a.n, d: has ? 'Pool live' : 'Seed a pool with half its value',
+              m: has ? '✔' : money(Math.round(game.economy.price(id) * 0.5)),
+              mColor: has ? BRAND.good : BRAND.ink, disabled: has,
+              onclick: () => { const r = A.addPool(id); if (r.ok) { ui.sfx('token'); el._rebuild(); ui.refresh(); } else res(r); } }));
+          }
+        }
+      });
+  }
+
+  function ipos() {
+    const game = g();
+    return sheet({ title: 'Listings Office', sub: 'Four companies, all nervous', glyph: '📈', tint: CATEGORY.Stocks },
+      (body, el) => {
+        for (const ip of game.data.ipos) {
+          const step = game.actions.ipoStep(ip.id);
+          const total = game.data.ipoSteps.length;
+          const listed = step >= total;
+          const gate = game.actions.ipoGate(ip.id);
+          body.append(label(ip.n + ' · ' + (listed ? 'listed' : step + '/' + total)));
+          body.append(h('div', { style: { fontSize: '11.5px', opacity: '.65', marginBottom: '6px' }, text: ip.story }));
+          if (listed) { body.append(h('div.w-empty', { text: 'It rang the bell. It trades on the Exchange now.' })); continue; }
+          const s = game.data.ipoSteps[step];
+          body.append(card({
+            ic: 'chart', t: s.t, d: gate.ok ? s.d : gate.why,
+            m: step === 0 ? money(ip.cost) : 'Go', disabled: !gate.ok,
+            onclick: () => {
+              const r = game.actions.ipoAdvance(ip.id);
+              ui.refresh(); ui.rebuildTop(); el._rebuild();
+              if (r.ok) ui.sfx(r.listed ? 'fanfare' : 'quest.done');
+              else if (r.failed) ui.dialogue({ speaker: game.data.clientById[ip.client].n, portrait: ip.client, text: r.why });
+              else res(r);
+            },
+          }));
+        }
+      });
+  }
+
+  function stadium() {
+    const game = g();
+    return sheet({ title: 'Bull Bear Stampede', sub: 'Twelve thousand seats', glyph: '🏟️', tint: CATEGORY.Sports },
+      (body, el) => {
+        const st = game.state;
+        const steps = game.data.stadiumSteps;
+        const gate = game.actions.stadiumGate();
+        for (let i = 0; i < steps.length; i++) {
+          const s = steps[i];
+          const done = st.stadium.step > i;
+          const active = st.stadium.step === i;
+          body.append(card({
+            ic: done ? 'check' : active ? 'trophy' : 'info',
+            t: (i + 1) + '. ' + s.t,
+            d: done ? 'Complete' : active ? (gate.ok ? s.d : gate.why) : s.d,
+            m: done ? '✔' : active ? (s.cost ? money(s.cost) : 'Go') : null,
+            mColor: done ? BRAND.good : BRAND.ink,
+            disabled: !active || !gate.ok,
+            onclick: active && gate.ok ? () => {
+              const r = game.actions.stadiumAdvance();
+              ui.refresh(); ui.rebuildTop(); el._rebuild();
+              if (r.ok) ui.sfx('quest.done');
+              else if (r.failed) ui.dialogue({ speaker: 'Coach Thunder', portrait: 'thunder', text: r.why });
+              else res(r);
+            } : null,
+          }));
+        }
+      });
+  }
+
+  /* ============================================================
+     public
+     ============================================================ */
+  return {
+    pause, settings, renderSettings, travel, place, desk, market,
+    school, bank, pawn, homes, farm, mine, devlab, ipos, stadium,
+    showOrder, talkTo, sheet, card, label,
+  };
+}

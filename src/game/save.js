@@ -1,0 +1,199 @@
+/* ============================================================
+   save.js — versioned persistence, export/import, migration and
+   corrupt-save recovery.
+
+   Storage is abstracted behind a tiny driver so the same code runs
+   in the browser (localStorage) and in plain node (a Map). Nothing
+   here touches `document` or `window` at import time.
+
+   Save format: the state object verbatim, plus `version`.
+     v4  the original "Wally: City of Assets" save
+     v5  WALLY RPG — adds stats.spent/trips/metres, seen.apartment,
+         pawnDay/pawnStock, msgs entries carry `read`
+   migrate() forward-fills any field a newer version added, so a v4
+   file loads straight into v5 without losing a single asset.
+   ============================================================ */
+
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID } from './data.js';
+import { newState, clamp, round2 } from './state.js';
+
+/* ---------- storage driver ---------- */
+function makeStore() {
+  let ls = null;
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage) {
+      localStorage.setItem('__wally_probe__', '1');
+      localStorage.removeItem('__wally_probe__');
+      ls = localStorage;
+    }
+  } catch (e) { ls = null; }
+
+  if (ls) {
+    return {
+      kind: 'localStorage',
+      get: (k) => { try { return ls.getItem(k); } catch (e) { return null; } },
+      set: (k, v) => { try { ls.setItem(k, v); return true; } catch (e) { return false; } },
+      del: (k) => { try { ls.removeItem(k); } catch (e) { /* ignore */ } },
+    };
+  }
+  const mem = new Map();
+  return {
+    kind: 'memory',
+    get: (k) => (mem.has(k) ? mem.get(k) : null),
+    set: (k, v) => { mem.set(k, v); return true; },
+    del: (k) => { mem.delete(k); },
+  };
+}
+
+export function createSave(env) {
+  const store = makeStore();
+  const bus = env.bus;
+  const KEY = CONFIG.saveKey;
+
+  /* ---------- migration ---------- */
+  function migrate(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
+    if (typeof data.version !== 'number') return null;
+    if (data.version > CONFIG.version) return null;      // from the future: refuse
+
+    if (data.version < CONFIG.version) {
+      const fresh = newState(env.makeRng('migrate'));
+      for (const k of Object.keys(fresh)) if (!(k in data)) data[k] = fresh[k];
+      for (const k of ['settings', 'stats', 'farm', 'mine', 'stadium', 'swap']) {
+        if (!data[k] || typeof data[k] !== 'object') data[k] = fresh[k];
+        else for (const kk of Object.keys(fresh[k])) if (!(kk in data[k])) data[k][kk] = fresh[k][kk];
+      }
+      if (!data.prices) data.prices = {};
+      if (!data.hist) data.hist = {};
+      if (!data.trend) data.trend = {};
+      for (const a of ASSETS) {
+        if (data.prices[a.id] == null) {
+          data.prices[a.id] = a.v;
+          data.hist[a.id] = [a.v];
+          data.trend[a.id] = 0;
+        }
+      }
+      if (!data.clients) data.clients = {};
+      for (const c of CLIENTS) {
+        if (!data.clients[c.id]) data.clients[c.id] = { met: false, trust: 0, done: 0, failed: 0, step: 0, lastDay: 0 };
+      }
+      data.version = CONFIG.version;
+    }
+    return sanitize(data);
+  }
+
+  /* Never let a bad file produce NaN money or a negative holding. */
+  function sanitize(m) {
+    if (!Number.isFinite(m.money)) m.money = 0;
+    m.money = Math.max(0, round2(m.money));
+    m.energy = clamp(Number(m.energy) || 0, 0, 100);
+    m.hunger = clamp(Number(m.hunger) || 0, 0, 100);
+    m.rep = Math.max(0, Number(m.rep) || 0);
+    m.day = Math.max(1, Math.floor(Number(m.day) || 1));
+    m.time = Number.isFinite(m.time) ? m.time : CONFIG.dayStartMin;
+    m.office = clamp(Math.floor(Number(m.office) || 0), 0, 5);
+
+    if (!m.inv || typeof m.inv !== 'object') m.inv = {};
+    for (const id of Object.keys(m.inv)) {
+      const e = m.inv[id];
+      if (!ASSET_BY_ID[id] || !e || !Number.isFinite(e.qty) || e.qty <= 0) { delete m.inv[id]; continue; }
+      e.qty = round2(e.qty);
+      e.cost = Number.isFinite(e.cost) ? round2(e.cost) : 0;
+      e.locked = Number.isFinite(e.locked) ? Math.max(0, Math.min(e.qty, e.locked)) : 0;
+    }
+    for (const id of Object.keys(m.prices || {})) {
+      if (!ASSET_BY_ID[id]) { delete m.prices[id]; continue; }
+      if (!Number.isFinite(m.prices[id]) || m.prices[id] <= 0) m.prices[id] = ASSET_BY_ID[id].v;
+    }
+    for (const id of Object.keys(m.tokenized || {})) if (!ASSET_BY_ID[id]) delete m.tokenized[id];
+
+    if (!LOC_BY_ID[m.loc]) m.loc = 'apartment';
+    if (!Array.isArray(m.arrivals)) m.arrivals = [];
+    if (!Array.isArray(m.orders)) m.orders = [];
+    if (!Array.isArray(m.funds)) m.funds = [];
+    if (!Array.isArray(m.employees)) m.employees = [];
+    if (!Array.isArray(m.msgs)) m.msgs = [];
+    if (!Array.isArray(m.news)) m.news = [];
+    if (!Array.isArray(m.wallynet)) m.wallynet = [];
+    if (!m.seen) m.seen = {};
+    if (!m.known) m.known = {};
+    if (!m.visited) m.visited = {};
+    if (!m.flags) m.flags = {};
+    if (!m.skills) m.skills = {};
+    if (!m.unlocks) m.unlocks = {};
+    if (!m.quests) m.quests = {};
+    if (!m.ipo) m.ipo = {};
+    return m;
+  }
+
+  /* ---------- persistence ---------- */
+  function save(state, quiet) {
+    const s = state || env.state;
+    let text;
+    try { text = JSON.stringify(s); }
+    catch (e) { bus.emit('save', { ok: false, why: 'state is not serialisable' }); return false; }
+    const ok = store.set(KEY, text);
+    bus.emit('save', { ok, quiet: !!quiet, bytes: text.length });
+    if (!ok) env.mutate.note('bad', 'Could not save: storage is full');
+    else if (!quiet) env.mutate.note('good', 'Progress saved');
+    return ok;
+  }
+
+  function load() {
+    let raw = store.get(KEY);
+    if (!raw) {
+      for (const legacy of CONFIG.legacyKeys) {          // adopt a v4 save
+        raw = store.get(legacy);
+        if (raw) break;
+      }
+    }
+    if (!raw) return null;
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (e) {
+      store.set(KEY + '_corrupt', raw);
+      store.del(KEY);
+      bus.emit('save', { ok: false, why: 'corrupt' });
+      return null;
+    }
+    const m = migrate(data);
+    if (!m) { store.del(KEY); return null; }
+    return m;
+  }
+
+  const has = () => !!store.get(KEY) || CONFIG.legacyKeys.some((k) => !!store.get(k));
+  function wipe() { store.del(KEY); bus.emit('save', { ok: true, wiped: true }); }
+
+  /* ---------- export / import ----------
+     exportJSON returns the TEXT. Handing it to the user (a Blob and
+     an <a download>) is the UI's job — this module never touches the
+     DOM. `download` is a convenience that no-ops outside a browser. */
+  function exportJSON(state) {
+    return JSON.stringify(state || env.state, null, 1);
+  }
+  function filename(state) {
+    const s = state || env.state;
+    return 'wally-rpg-save-day' + s.day + '.json';
+  }
+  function download(state) {
+    const s = state || env.state;
+    if (typeof document === 'undefined' || typeof URL === 'undefined' || !URL.createObjectURL) {
+      return { ok: false, why: 'no browser', text: exportJSON(s) };
+    }
+    const blob = new Blob([exportJSON(s)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename(s);
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    return { ok: true };
+  }
+  function importJSON(text) {
+    let data;
+    try { data = typeof text === 'string' ? JSON.parse(text) : text; }
+    catch (e) { return null; }
+    return migrate(data);
+  }
+
+  return { save, load, has, wipe, migrate, sanitize, exportJSON, importJSON, download, filename, driver: store.kind };
+}
