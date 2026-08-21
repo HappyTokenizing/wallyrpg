@@ -73,9 +73,61 @@ async function boot() {
   const ctx = createContext({ canvas, renderer, scene, camera });
   window.WALLY = { ctx, THREE, debug: {} };   // debug + screenshot handle
 
-  const status = document.getElementById('bootStatus');
+  /* ---- boot progress ------------------------------------------------
+     Weights are MEASURED, not guessed — timed over a full cold boot at
+     1280x720. Boot is ~13 s and one stage is nearly two thirds of it:
+
+       npc 63.5% · wally 17.3% · city 10.5% · world 4.7% · audio 1.7%
+       render 1.0% · everything else under 0.5% each
+
+     An evenly-weighted 16-stage bar would therefore sit frozen around
+     50% for eight seconds, which is worse than no bar at all. Stages not
+     listed here get MIN_W so they still nudge the bar visibly. */
+  const STAGE_W = {
+    render: 1.0, mat: 0.5, wind: 0.1, sky: 0.2, world: 4.7, city: 10.5,
+    foliage: 0.3, water: 0.5, phys: 0.6, wally: 17.3, npc: 63.5,
+    cam: 0.1, game: 0.2, ui: 0.4, audio: 1.7, intro: 0.5,
+  };
+  const MIN_W = 0.1;
+  const totalW = STAGES.reduce((a, [n]) => a + (STAGE_W[n] ?? MIN_W), 0);
+
+  const elStage = document.getElementById('bootStage');
+  const elPct = document.getElementById('bootPct');
+  const elFill = document.getElementById('bootFill');
+
+  let doneW = 0;            // weight of fully-completed stages
+  let curW = 0;             // weight of the stage in flight
+  let shown = -1;
+
+  function paint(frac) {
+    const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+    if (pct === shown) return;
+    shown = pct;
+    if (elFill) elFill.style.width = pct + '%';
+    if (elPct) elPct.textContent = pct + '%';
+  }
+
+  /* Stages may report progress WITHIN themselves. ctx.boot.sub(f) moves the
+     bar across the current stage's slice; ctx.boot.tick(f) does that and
+     also yields a frame, which is the only way the bar can actually repaint
+     during a long synchronous build. */
+  ctx.boot = {
+    sub(f) {
+      paint((doneW + curW * Math.max(0, Math.min(1, f))) / totalW);
+    },
+    async tick(f) {
+      ctx.boot.sub(f);
+      await new Promise((r) => requestAnimationFrame(() => r()));
+    },
+    label(text) { if (elStage) elStage.textContent = text; },
+  };
+
   for (const [name, init] of STAGES) {
-    if (status) status.textContent = name;
+    curW = STAGE_W[name] ?? MIN_W;
+    ctx.boot.label(name);
+    ctx.boot.sub(0);
+    // Let the label and bar paint before a stage blocks the main thread.
+    await new Promise((r) => requestAnimationFrame(() => r()));
     try {
       const handle = await init(ctx);
       if (handle) {
@@ -86,7 +138,12 @@ async function boot() {
       console.error(`[boot] stage "${name}" failed:`, e);
       ctx.bus.emit('boot:error', { name, error: e });
     }
+    doneW += curW;
+    curW = 0;
+    paint(doneW / totalW);
   }
+  ctx.boot.label('ready');
+  paint(1);
 
   /* ---- frame loop ---- */
   const perf = { fps: 0, ms: 0, frames: 0, acc: 0, calls: 0, tris: 0 };
@@ -148,7 +205,7 @@ async function boot() {
 
 boot().catch(e => {
   console.error('[boot] fatal', e);
-  const el = document.getElementById('bootStatus');
+  const el = document.getElementById('bootStage') || document.getElementById('bootStatus');
   if (el) el.textContent = 'boot failed: ' + e.message;
   window.__WALLY_READY__ = true;   // let the harness capture the failure state
 });

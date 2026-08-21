@@ -29,21 +29,48 @@
     letter-spacing:.14em;color:#f5913c;
     text-shadow:0 0 44px rgba(245,145,60,.45);
   }
-  #bootStatus{
-    margin-top:16px;font:500 11px/1 ui-monospace,Menlo,monospace;
-    letter-spacing:.32em;text-transform:uppercase;color:#5d6580;
-  }
+  /* DETERMINATE progress. The old bar was an indeterminate sweep, which
+     said nothing — and boot is ~13 s, most of it in one stage, so "it is
+     doing something" is not enough information. main.js drives #bootFill
+     from measured per-stage weights. */
   #bootBar{
-    margin:18px auto 0;width:190px;height:2px;border-radius:2px;
-    background:rgba(255,255,255,.08);overflow:hidden;
+    margin:20px auto 0;width:240px;height:3px;border-radius:3px;
+    background:rgba(255,255,255,.09);overflow:hidden;
+    box-shadow:0 0 0 1px rgba(255,255,255,.04);
   }
-  #bootBar::after{
-    content:'';display:block;height:100%;width:38%;border-radius:2px;
-    background:linear-gradient(90deg,transparent,#f5913c,transparent);
-    animation:sweep 1.25s ease-in-out infinite;
+  #bootFill{
+    display:block;height:100%;width:0;border-radius:3px;
+    background:linear-gradient(90deg,#d97a26,#f5913c 60%,#ffb567);
+    box-shadow:0 0 12px rgba(245,145,60,.55);
+    /* eased so the bar glides between stage boundaries instead of
+       snapping; the duration is longer than a frame so a burst of quick
+       stages still reads as motion */
+    transition:width .45s cubic-bezier(.32,.72,.3,1);
+    position:relative;
   }
-  @keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(360%)}}
-  @media (prefers-reduced-motion:reduce){#bootBar::after{animation:none;width:100%}}
+  /* a travelling highlight, so a long stage still looks alive while the
+     width is momentarily static */
+  #bootFill::after{
+    content:'';position:absolute;inset:0;border-radius:3px;
+    background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);
+    animation:shimmer 1.4s ease-in-out infinite;
+  }
+  #bootStatus{
+    margin-top:14px;display:flex;gap:12px;justify-content:center;
+    align-items:baseline;width:240px;margin-left:auto;margin-right:auto;
+    font:500 11px/1 ui-monospace,Menlo,monospace;
+    letter-spacing:.28em;text-transform:uppercase;color:#5d6580;
+  }
+  #bootStage{flex:1;text-align:left;overflow:hidden;white-space:nowrap}
+  #bootPct{color:#f5913c;font-variant-numeric:tabular-nums;letter-spacing:.1em}
+  @keyframes shimmer{
+    from{transform:translateX(-100%)}
+    to{transform:translateX(100%)}
+  }
+  @media (prefers-reduced-motion:reduce){
+    #bootFill::after{animation:none;opacity:0}
+    #bootFill{transition:none}
+  }
 </style>
 </head>
 <body>
@@ -54,8 +81,8 @@
   <div id="boot">
     <div id="bootInner">
       <div id="bootMark">WALLY</div>
-      <div id="bootStatus">booting</div>
-      <div id="bootBar"></div>
+      <div id="bootBar"><i id="bootFill"></i></div>
+      <div id="bootStatus"><span id="bootStage">starting</span><span id="bootPct">0%</span></div>
     </div>
   </div>
 

@@ -547,7 +547,22 @@ export async function init(ctx) {
   /* ------------------------------------------------------------
      Boot: everyone in place
      ------------------------------------------------------------ */
-  for (const c of CLIENTS) spawnClient(c.id);
+  /* PROGRESS + YIELD. This module is 63% of a ~13 s boot, and building
+     24 named clients plus a few hundred crowd figures in one synchronous
+     run means the browser cannot repaint for eight seconds — so a loading
+     bar would sit frozen no matter how it was weighted, and the tab looks
+     hung. Yield a frame every few characters and report the fraction, so
+     the bar actually moves and the page stays responsive. The yield costs
+     one frame each, not per character. */
+  const boot = ctx.boot;
+  const YIELD_EVERY = 4;
+  for (let i = 0; i < CLIENTS.length; i++) {
+    spawnClient(CLIENTS[i].id);
+    if (boot && (i % YIELD_EVERY === YIELD_EVERY - 1 || i === CLIENTS.length - 1)) {
+      /* named clients are the first ~35% of this stage's work */
+      await boot.tick(0.35 * ((i + 1) / CLIENTS.length));
+    }
+  }
 
   /* HOW MANY PEOPLE IS A TOWN. 153 spread over a 900 m island put ONE
      figure in the default 78 m framing of the market square and four at
@@ -558,8 +573,11 @@ export async function init(ctx) {
      cost by distance, and everything past FAR is hidden outright — so
      the honest limit is boot time, and 350 people is half a second. */
   const baseCrowd = Math.round(clamp(40 + (q.particles ?? 1) * 140, 24, 180));
+  if (boot) await boot.tick(0.40);
   spawnCrowd(baseCrowd);
+  if (boot) await boot.tick(0.80);
   spawnResidents(q.particles >= 0.9 ? 12 : q.particles >= 0.5 ? 7 : 3);
+  if (boot) await boot.tick(0.95);
 
   /* mode variety across the standing clients so a district is not a
      row of statues in the same pose */

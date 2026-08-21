@@ -39,6 +39,7 @@ import {
 import {
   buildBodyGeometry, buildTuskGeometry, buildFrameGeometry,
   buildLensGeometry, buildLensTexture, buildGrooveStrokeGeometry,
+  ARM_SEAM,
 } from './model.js';
 import { Animator, CLIPS, CLIP_NAMES } from './anim.js';
 import { Expression, EXPRESSION_NAMES } from './expression.js';
@@ -692,6 +693,11 @@ export async function init(ctx) {
   root.add(body);
   root.updateMatrixWorld(true);
   body.bind(rig.skeleton);
+  /* The runtime half of the arm/flank crease — see the block at the
+     bottom of this file. Installed here because it needs the bound
+     skeleton's boneInverses and the mesh's bindMatrix, and because the
+     shader edit has to land before the first compile. */
+  const contact = installContactCrease(clayMat, body, rig);
 
   const attach = (geo, material, boneName, name) => {
     const m = new THREE.Mesh(geo, material);
@@ -794,34 +800,49 @@ export async function init(ctx) {
     addEventListener('keydown', (e) => { keys[e.code] = true; }, { passive: true });
     addEventListener('keyup', (e) => { keys[e.code] = false; }, { passive: true });
   }
-  function defaultInput() {
+  /* THE ONE PLACE THE CAMERA BASIS IS APPLIED.
+
+     (x, z) arrives as stick-space: +z is "away from the camera", +x is
+     "to the camera's right". Every input source — the keyboard below,
+     the touch thumbstick in ui/touch.js — goes through here, so there
+     is exactly one copy of this maths to get wrong.
+
+     CAMERA RIGHT = forward x up. For Y-up right-handed with forward
+     f = (fx, 0, fz) that is (-fz, 0, fx). This was once (fz, 0, -fx) —
+     the exact negation — so A and D drove the wrong way whenever the
+     camera basis was applied. Do not "simplify" the signs. */
+  function camRelative(x, z, out) {
+    const o = out || { x: 0, z: 0 };
+    o.x = x; o.z = z;
+    if (!x && !z) return o;
+    const cam = ctx.camera;
+    if (!cam) return o;                       // world-relative before the rig exists
+    cam.getWorldDirection(_v);
+    _v.y = 0;
+    if (_v.lengthSq() <= 1e-6) return o;
+    _v.normalize();
+    const rx = -_v.z, rz = _v.x;              // camera right
+    o.x = _v.x * z + rx * x;
+    o.z = _v.z * z + rz * x;
+    return o;
+  }
+
+  const _kbIn = { x: 0, z: 0, jump: false, jumpHeld: false, run: false };
+  /** The built-in WASD read, camera-relative. Public so an alternative
+      input source (touch) can fall back to it instead of replacing it. */
+  function keyboardInput(out) {
     let x = 0, z = 0;
     if (keys.KeyW || keys.ArrowUp) z += 1;
     if (keys.KeyS || keys.ArrowDown) z -= 1;
     if (keys.KeyA || keys.ArrowLeft) x -= 1;
     if (keys.KeyD || keys.ArrowRight) x += 1;
-    /* camera-relative once a camera rig exists; world-relative before */
-    if (x || z) {
-      const cam = ctx.camera;
-      if (cam) {
-        cam.getWorldDirection(_v);
-        _v.y = 0;
-        if (_v.lengthSq() > 1e-6) {
-          _v.normalize();
-          const rx = _v.z, rz = -_v.x;          // camera right
-          const nx = _v.x * z + rx * x;
-          const nz = _v.z * z + rz * x;
-          x = nx; z = nz;
-        }
-      }
-    }
-    return {
-      x, z,
-      jump: !!keys.Space,
-      jumpHeld: !!keys.Space,
-      run: !!(keys.ShiftLeft || keys.ShiftRight),
-    };
+    const o = camRelative(x, z, out || _kbIn);
+    o.jump = !!keys.Space;
+    o.jumpHeld = !!keys.Space;
+    o.run = !!(keys.ShiftLeft || keys.ShiftRight);
+    return o;
   }
+  function defaultInput() { return keyboardInput(_kbIn); }
   if (controller) controller.setInputFn((dt, c) => (inputFn ? inputFn(dt, c) : (ownInput ? defaultInput() : null)));
 
   /* ================================================================
@@ -985,6 +1006,7 @@ export async function init(ctx) {
     else if (dt > 0.05) dt = 0.05;
     secondary.lateUpdate(dt, { grounded: controller ? controller.grounded : true });
     root.updateMatrixWorld(true);
+    contact.update();
     if (dbgCam) applyDebugCam();
     if (studioOn) studioHold();
     /* The ground shadow reads the frame's own depth prepass and the live
@@ -1137,6 +1159,13 @@ export async function init(ctx) {
     },
     /** Replace the input source. null restores the built-in WASD. */
     setInput(fn) { inputFn = fn || null; ownInput = !fn; return api; },
+    /** The WASD read, already camera-relative. An input source that
+        wants to ADD to the keyboard rather than silence it (touch on a
+        device with a keyboard attached) composes with this. */
+    keyboardInput,
+    /** Stick space (+z away from camera, +x camera-right) -> world XZ.
+        The single source of truth for the camera basis. */
+    camRelative,
 
     /* --- secondary --- */
     /** Kick every spring chain. Explosions, big landings, story beats. */
@@ -1841,6 +1870,28 @@ export async function init(ctx) {
     return k;
   };
 
+  /* Dial the RUNTIME contact crease (see installContactCrease) between
+     0 and 1 in a live frame. It is a third term alongside wallySculpt's
+     rgb and wallyAO's alpha, it is the only one that tracks the pose,
+     and creasetest --extra needs to be able to switch it off to say how
+     much of a crease is this and how much is the studio key. */
+  dbg.wallyContact2 = (k = 1) => { contact.uniforms.uContactY.value.z = k; return k; };
+  dbg.wallyContactInfo = () => ({
+    strength: contact.uniforms.uContactY.value.z,
+    params: contact.uniforms.uContact.value.toArray(),
+    ramp: contact.uniforms.uContactY.value.toArray(),
+    drops: contact.uniforms.uContactK.value.toArray(),
+    arm: contact.uniforms.uCArmA.value.map((v, i) => [
+      v.toArray().map((q) => +q.toFixed(3)),
+      contact.uniforms.uCArmB.value[i].toArray().map((q) => +q.toFixed(3))]),
+    body: contact.uniforms.uCBodyA.value.map((v, i) => [
+      v.toArray().map((q) => +q.toFixed(3)),
+      contact.uniforms.uCBodyB.value[i].toArray().map((q) => +q.toFixed(3))]),
+    patched: clayMat.vertexShader.indexOf('wContactCaps') > -1
+      && clayMat.fragmentShader.indexOf('vContact') > -1,
+    progErr: clayMat.userData.progErr || null,
+  });
+
   /* Sweep the idle's trunk hint without a rebuild — the trunk IS §1.6
      pose 1 and its side/curl have to be judged against the live gameplay
      camera, which means several values per boot. */
@@ -1974,6 +2025,212 @@ export async function init(ctx) {
   api.stats.buildMs = +(performance.now() - t0).toFixed(1);
   console.log(`[wally] cell=${bodyGeo.userData.cell} tier=${tier} ${api.stats.triangles} tris, ${api.stats.vertices} verts, ${nb} bones, ${api.stats.buildMs} ms`);
 
+  return api;
+}
+
+/* ================================================================
+   THE RUNTIME ARM/HAND CONTACT CREASE (§1.2 "armpits") — the half of
+   the arm/flank crease that A BAKE CANNOT DO.
+
+   model.js armSeam() paints this crease from y 0.76 up, per vertex, in
+   BIND space, off the arm blobs against the TORSO and BELLY only. Its
+   own block explains why the leg is not in that min: bind space is
+   where the mitten hangs beside the thigh, so a leg-derived band leaves
+   its body-side half stranded on the hip the instant a pose opens the
+   arm — measured once at 23 000 stranded pixels across the two hip rows
+   in `welcome`. The band therefore had to stop at the wrist, and the
+   scan says exactly what that costs: at f 0.68 of figure height — the
+   forearm-and-mitten-against-hip stretch the user photographed — the
+   luminance ran monotonically 209 -> 103 across 130 mm with no minimum
+   anywhere, against a reference that plunges to 62 in a 14 mm hairline
+   between two lit forms.
+
+   SO THE SAME MEASURE IS EVALUATED IN THE POSE INSTEAD. Ten capsules —
+   forearm, mitten and knuckle per arm, both thighs, two hip columns —
+   are pushed to the vertex shader each frame in the space the skinning
+   chunk leaves `transformed` in, and the shader computes what armSeam()
+   computes:  s = max(0,dArm) + max(0,dBody), skewed by which wall the
+   vertex is on, through the same smoothstep and the same ARM_SEAM_W /
+   _A drops IMPORTED from model.js. Nothing is re-typed — drift between
+   the two halves would show up as a step across y 0.76.
+
+   WHY THIS IS SAFE WHERE THE BAKE WAS NOT. It is a proximity fact
+   recomputed from the current bone matrices, so when `welcome` swings
+   the mitten off the hip the hip's half of the band leaves with it,
+   which is the whole of the failure the bake could not avoid. It also
+   cannot gash the armpit: it is gated to bind y < 0.76, well under the
+   shoulder, and above that the baked band is in charge.
+
+   COST. A vertex-stage term (the bake it continues is per-vertex too),
+   ten capsules of vector maths over 31 k vertices; on the CPU one
+   matrix per contributing bone and 20 point transforms per frame.
+   ================================================================ */
+const CONTACT_ARM = 6, CONTACT_BODY = 4;
+
+/* The proxies, in BIND space, each carried by the bone that owns that
+   skin. RADII ARE READ OFF PROP AND SHADED DOWN, never authored: a proxy
+   that pokes out through the sculpted surface reads dArm = 0 on the
+   WRONG side of the slot and shades the whole limb. The hip pair are
+   round capsules against an elliptical lathe, so they take the lathe's
+   HALF-WIDTH and sit inside it in z — the safe direction. */
+function contactCapsules() {
+  const A = PROP.arm, HD = PROP.hand, L = PROP.leg, T = PROP.torso;
+  const fore = A[3], wrist = A[4];
+  const arm = (side) => {
+    const el = side > 0 ? 'armL1' : 'armR1';
+    const hn = side > 0 ? 'handL' : 'handR';
+    const S = (p) => [p[0] * side, p[1], p[2]];
+    return [
+      [el, S(fore), fore[3] * 0.96, S(wrist), wrist[3] * 0.96],
+      [hn, S(wrist), wrist[3] * 0.96, S(HD.knuckle), HD.knuckle[3] * 0.94],
+      [hn, S(HD.knuckle), HD.knuckle[3] * 0.94, S(HD.tip), HD.tip[3] * 0.94],
+    ];
+  };
+  const leg = (side) => [side > 0 ? 'legL0' : 'legR0',
+    [L[0][0] * side, L[0][1], L[0][2]], L[0][3] * 0.94,
+    [L[1][0] * side, L[1][1], L[1][2]], L[1][3] * 0.94];
+  const hip = (a, b) => ['hips',
+    [0, T[a][0], T[a][2]], T[a][1] * 0.96,
+    [0, T[b][0], T[b][2]], T[b][1] * 0.96];
+  return { arm: [...arm(1), ...arm(-1)], body: [leg(1), leg(-1), hip(0, 2), hip(2, 3)] };
+}
+
+function installContactCrease(material, skinned, rigRef) {
+  const caps = contactCapsules();
+  const armA = [], armB = [], bodyA = [], bodyB = [];
+  for (let i = 0; i < CONTACT_ARM; i++) { armA.push(new THREE.Vector4()); armB.push(new THREE.Vector4()); }
+  for (let i = 0; i < CONTACT_BODY; i++) { bodyA.push(new THREE.Vector4()); bodyB.push(new THREE.Vector4()); }
+
+  /* §1.2's crease is dark-WARM, never grey. Same construction as
+     bakeTint's rCrease: a hue direction normalised to unit luminance, so
+     the value drop is applied once (by W and A) and not twice. */
+  const lin = (h) => {
+    const f = (v) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+    return [f(((h >> 16) & 255) / 255), f(((h >> 8) & 255) / 255), f((h & 255) / 255)];
+  };
+  const lum = (c) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  const cr = lin(SHADOW.ao), bs = lin(CLAY.body);
+  const crL = lum(cr), bsL = lum(bs);
+  const hue = new THREE.Vector3(
+    (cr[0] / crL) / (bs[0] / bsL),
+    (cr[1] / crL) / (bs[1] / bsL),
+    (cr[2] / crL) / (bs[2] / bsL));
+
+  const u = material.uniforms;
+  u.uCArmA = { value: armA };
+  u.uCArmB = { value: armB };
+  u.uCBodyA = { value: bodyA };
+  u.uCBodyB = { value: bodyB };
+  /* x = R, y = C, z = skew on the arm wall, w = skew on the body wall.
+     THE BODY WALL IS SLACKER HERE THAN IN THE BAKE (1.8 against 3.20).
+     The bake's flank wall answers to the 30-57 mm slot beside the ribs;
+     this one answers to a 47 mm proxy clearance at the mitten, and at
+     3.20 the hip side of the contact fell off the end of the band
+     altogether — one lit wall and one dark one is a terminator, not a
+     crease, which is the note armSeam() opens with. */
+  u.uContact = { value: new THREE.Vector4(ARM_SEAM.R, ARM_SEAM.C, ARM_SEAM.skewArm, ARM_SEAM.skewFlank) };
+  /* x,y = the handover ramp, taken from model.js so the baked half and
+     this one meet at exactly one place; z = master strength (debug). */
+  u.uContactY = { value: new THREE.Vector3(ARM_SEAM.y0, ARM_SEAM.y1, 1) };
+  u.uContactK = { value: new THREE.Vector4(ARM_SEAM.W, ARM_SEAM.A, ARM_SEAM.flankP, 0) };
+  u.uCreaseHue = { value: hue };
+
+  /* A ShaderMaterial owns its source strings outright, so this is a
+     plain edit of THIS material. toon.js is untouched and every other
+     clay surface in the game compiles the shader it always did. */
+  const VDECL = `
+uniform vec4 uCArmA[${CONTACT_ARM}];
+uniform vec4 uCArmB[${CONTACT_ARM}];
+uniform vec4 uCBodyA[${CONTACT_BODY}];
+uniform vec4 uCBodyB[${CONTACT_BODY}];
+uniform vec4 uContact;
+uniform vec3 uContactY;
+uniform vec4 uContactK;
+varying float vContact;
+/* tapered capsule — the measure model.js primDist uses for CONE */
+float wContactCaps( vec3 p, vec4 a, vec4 b ) {
+  vec3 pa = p - a.xyz, ba = b.xyz - a.xyz;
+  float h = clamp( dot( pa, ba ) / max( dot( ba, ba ), 1e-8 ), 0.0, 1.0 );
+  return length( pa - ba * h ) - mix( a.w, b.w, h );
+}
+void main() {`;
+  if (material.vertexShader.indexOf('void main() {') < 0) throw new Error('toon VERT moved');
+  material.vertexShader = material.vertexShader.replace('void main() {', VDECL);
+
+  const SKIN = '  #include <skinning_vertex>';
+  if (material.vertexShader.indexOf(SKIN) < 0) throw new Error('toon skinning hook moved');
+  material.vertexShader = material.vertexShader.replace(SKIN, `${SKIN}
+
+  /* ---- the runtime half of the arm/flank crease ---- */
+  {
+    float dA = 1e3, dB = 1e3;
+    for ( int i = 0; i < ${CONTACT_ARM}; i++ ) dA = min( dA, wContactCaps( transformed, uCArmA[ i ], uCArmB[ i ] ) );
+    for ( int i = 0; i < ${CONTACT_BODY}; i++ ) dB = min( dB, wContactCaps( transformed, uCBodyA[ i ], uCBodyB[ i ] ) );
+    float s = max( dA, 0.0 ) + max( dB, 0.0 );
+    float ad = s * ( dA < dB ? uContact.z : uContact.w );
+    float c = clamp( ( uContact.x - ad ) / ( uContact.x - uContact.y ), 0.0, 1.0 );
+    c = c * c * ( 3.0 - 2.0 * c );
+    if ( dA >= dB ) c = pow( c, uContactK.z );   // the body wall recovers on a curve
+    vContact = c * ( 1.0 - smoothstep( uContactY.x, uContactY.y, position.y ) ) * uContactY.z;
+  }`);
+
+  const FDECL = `
+uniform vec4 uContactK;
+uniform vec3 uCreaseHue;
+varying float vContact;
+void main() {`;
+  material.fragmentShader = material.fragmentShader.replace('void main() {', FDECL);
+
+  const AOLINE = '    col *= mix( vec3( 0.62, 0.575, 0.565 ), vec3( 1.0 ), mix( 1.0, vColor.a, uAO ) );';
+  if (material.fragmentShader.indexOf(AOLINE) < 0) throw new Error('toon AO line moved');
+  material.fragmentShader = material.fragmentShader.replace(AOLINE, `${AOLINE}
+
+  /* the runtime crease, applied the way bakeTint applies the baked one:
+     a value drop, a value-neutral warm hue rotation, and a share of the
+     same warm AO multiplier the alpha channel rides. */
+  {
+    float cc = vContact;
+    float av = 1.0 - uContactK.y * cc;
+    col *= ( 1.0 - uContactK.x * cc )
+         * mix( vec3( 1.0 ), uCreaseHue, cc * 0.85 )
+         * mix( vec3( 0.62, 0.575, 0.565 ), vec3( 1.0 ), mix( 1.0, av, uAO ) );
+  }`);
+  material.needsUpdate = true;
+
+  /* Bind-space capsule -> the space `transformed` is in, built from the
+     mesh's OWN bindMatrix / bindMatrixInverse and the skeleton's
+     boneInverses rather than from an assumption about where the root
+     is. That assumption is the one that breaks silently the moment the
+     character walks away from the origin. */
+  const _p = new THREE.Vector3();
+  const perBone = new Map();
+  const boneMat = (name) => {
+    let M = perBone.get(name);
+    if (M !== undefined) return M;
+    const bone = rigRef.byName[name];
+    const i = bone ? skinned.skeleton.bones.indexOf(bone) : -1;
+    M = i < 0 ? null : new THREE.Matrix4()
+      .multiplyMatrices(bone.matrixWorld, skinned.skeleton.boneInverses[i])
+      .premultiply(skinned.bindMatrixInverse)
+      .multiply(skinned.bindMatrix);
+    perBone.set(name, M);
+    return M;
+  };
+  const write = (spec, A, B, i) => {
+    const M = boneMat(spec[0]);
+    if (!M) return;
+    _p.fromArray(spec[1]).applyMatrix4(M); A[i].set(_p.x, _p.y, _p.z, spec[2]);
+    _p.fromArray(spec[3]).applyMatrix4(M); B[i].set(_p.x, _p.y, _p.z, spec[4]);
+  };
+  const api = {
+    uniforms: u,
+    update() {
+      perBone.clear();
+      for (let i = 0; i < CONTACT_ARM; i++) write(caps.arm[i], armA, armB, i);
+      for (let i = 0; i < CONTACT_BODY; i++) write(caps.body[i], bodyA, bodyB, i);
+    },
+  };
+  api.update();
   return api;
 }
 

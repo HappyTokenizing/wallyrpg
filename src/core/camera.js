@@ -626,20 +626,86 @@ export async function init(ctx) {
      ================================================================ */
   let dragging = false, lastX = 0, lastY = 0;
   const keys = Object.create(null);
+
+  /* --- look, by finger ------------------------------------------------
+     A one-finger drag anywhere on the canvas orbits. (The touch UI's
+     stick zone is a DOM element ON TOP of the canvas, so a thumb that
+     lands there never reaches these listeners — "outside the stick
+     zone" costs nothing to enforce.)
+
+     Two differences from the mouse: only the FIRST pointer down steers,
+     so a second finger cannot teleport the boom by moving lastX/lastY
+     to itself; and a flick keeps going after release. The momentum is
+     spent through api.steer(), which is what refreshes `steerT` — so
+     the glide suppresses the auto-orbit exactly as a held drag does and
+     the follow rig takes the yaw back when it has died, instead of the
+     two fighting over the same frame. */
+  const SW = -0.0055, SP = -0.0035;   // px -> rad, yaw and pitch
+  let dragId = null, dragTouch = false;
+  let velYaw = 0, velPit = 0;         // rad/s, sampled while dragging
+  let flyYaw = 0, flyPit = 0;         // rad/s, spent after release
+  let lastT = 0;
+  const FLING_DECAY = 5.2;            // e-folds per second
+  const FLING_MAX = 3.4;              // rad/s, both axes
+  let pinchId = null, pinchD0 = 0, pinchZ0 = 0;
+
+  function pointerSteer(dx, dy, dt) {
+    api.steer(dx * SW, dy * SP);
+    if (dragTouch && dt > 1e-4) {
+      /* smooth the per-event rate so one jittery sample cannot fling */
+      velYaw = damp(velYaw, (dx * SW) / dt, 18, dt);
+      velPit = damp(velPit, (dy * SP) / dt, 18, dt);
+    }
+  }
+
   if (typeof window !== 'undefined' && !ctx.flags?.shot) {
     const el = ctx.canvas || window;
     el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 && e.button !== 2) return;
-      dragging = true; lastX = e.clientX; lastY = e.clientY;
+      if (e.pointerType === 'mouse' && e.button !== 0 && e.button !== 2) return;
+      if (dragId !== null) {
+        /* second finger: stop orbiting, start pinching to zoom */
+        if (e.pointerType !== 'mouse' && pinchId === null) {
+          pinchId = e.pointerId;
+          pinchD0 = Math.hypot(e.clientX - lastX, e.clientY - lastY);
+          pinchZ0 = zoomBias;
+          dragging = false;
+          velYaw = velPit = 0;
+        }
+        return;
+      }
+      dragId = e.pointerId;
+      dragTouch = e.pointerType !== 'mouse';
+      dragging = true;
+      lastX = e.clientX; lastY = e.clientY;
+      lastT = e.timeStamp || performance.now();
+      velYaw = velPit = flyYaw = flyPit = 0;
       el.setPointerCapture?.(e.pointerId);
     });
-    const end = () => { dragging = false; };
+    const end = (e) => {
+      if (e && e.pointerId === pinchId) { pinchId = null; return; }
+      if (e && dragId !== null && e.pointerId !== dragId) return;
+      if (dragging && dragTouch) {
+        flyYaw = clamp(velYaw, -FLING_MAX, FLING_MAX);
+        flyPit = clamp(velPit, -FLING_MAX, FLING_MAX);
+      }
+      dragging = false; dragId = null; dragTouch = false;
+      velYaw = velPit = 0;
+      if (pinchId !== null) pinchId = null;
+    };
     el.addEventListener('pointerup', end);
     el.addEventListener('pointercancel', end);
+    el.addEventListener('pointerleave', (e) => { if (e.pointerType !== 'mouse') end(e); });
     el.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      api.steer((e.clientX - lastX) * -0.0055, (e.clientY - lastY) * -0.0035);
-      lastX = e.clientX; lastY = e.clientY;
+      if (pinchId !== null) {
+        if (e.pointerId !== pinchId) { lastX = e.clientX; lastY = e.clientY; return; }
+        const d = Math.hypot(e.clientX - lastX, e.clientY - lastY);
+        if (pinchD0 > 8 && d > 8) zoomBias = clamp(pinchZ0 + (pinchD0 - d) * 0.012, -1.6, 4.5);
+        return;
+      }
+      if (!dragging || e.pointerId !== dragId) return;
+      const now = e.timeStamp || performance.now();
+      pointerSteer(e.clientX - lastX, e.clientY - lastY, (now - lastT) / 1000);
+      lastX = e.clientX; lastY = e.clientY; lastT = now;
     });
     el.addEventListener('wheel', (e) => {
       zoomBias = clamp(zoomBias + e.deltaY * 0.0022, -1.6, 4.5);
@@ -655,6 +721,33 @@ export async function init(ctx) {
     if (keys.KeyR) pit += 1;
     if (keys.KeyF) pit -= 1;
     if (yaw || pit) api.steer(yaw * 1.9 * dt, pit * 1.1 * dt);
+
+    /* spend the flick */
+    if (flyYaw || flyPit) {
+      api.steer(flyYaw * dt, flyPit * dt);
+      const k = Math.exp(-FLING_DECAY * dt);
+      flyYaw *= k; flyPit *= k;
+      if (Math.abs(flyYaw) < 0.004) flyYaw = 0;
+      if (Math.abs(flyPit) < 0.004) flyPit = 0;
+    }
+  }
+
+  /* ---- framing on a phone held upright ----
+     The lateral bias that takes him off the centre line (§6) is a
+     distance in METRES, and the NDC offset it buys is
+
+         shoulder / (d * tan(hfov/2)),   tan(hfov/2) = tan(vfov/2)*aspect
+
+     Every number in RIG was tuned at 16:9. At 390x844 the aspect is
+     0.46, so the same metre offset buys 3.8x the screen offset and
+     walks him half out of the LEFT of the frame — which is precisely
+     where the touch thumbstick lives. Scaling the bias by the aspect
+     against the design frame holds his screen position at the same
+     fraction of the width on both. 16:9 and wider are untouched: the
+     ratio clamps to 1. */
+  const DESIGN_ASPECT = 16 / 9;
+  function portraitScale() {
+    return clamp((cam.aspect || DESIGN_ASPECT) / DESIGN_ASPECT, 0.34, 1);
   }
 
   /* ================================================================
@@ -1268,7 +1361,7 @@ export async function init(ctx) {
        shoulderSign is which third he stands in, and it is chosen with
        the azimuth, not independently of it: it always puts him in the
        third his own facing points AWAY from. See pickPortraitYaw. */
-    const shoulderBase = (preset.shoulder ?? RIG.shoulder) * (1 - vb) * shoulderSign;
+    const shoulderBase = (preset.shoulder ?? RIG.shoulder) * (1 - vb) * shoulderSign * portraitScale();
 
     /* --- desired camera, in world --- */
     _wantPos.copy(anchor).addScaledVector(UP, height).addScaledVector(_fwd, -dist)
@@ -1312,6 +1405,9 @@ export async function init(ctx) {
        screen position still while the camera closes in. */
     const boomWant = Math.max(0.5, want);
     const frameScale = clamp(collDist / boomWant, 0.22, 1);
+
+    /* (the phone-aspect term is already inside shoulderBase — see
+       portraitScale()) */
     const shoulder = shoulderBase * frameScale;
 
     /* Aim: tilt the boom; at 3.15 m and +2.1 deg that is 0.12 m ABOVE the
@@ -1599,7 +1695,7 @@ export async function init(ctx) {
        slides sideways into frame while the screenshot is being taken. */
     const pitchDeg = lerp(preset.pitch ?? -9, preset.vistaPitch ?? RIG.vistaPitch, vb);
     const pitch = pitchDeg * DEG + pitchOffset;
-    const shoulderBase = (preset.shoulder ?? RIG.shoulder) * (1 - vb) * shoulderSign;
+    const shoulderBase = (preset.shoulder ?? RIG.shoulder) * (1 - vb) * shoulderSign * portraitScale();
     _fwd.set(Math.sin(boomYaw), 0, Math.cos(boomYaw));
     _right.set(-_fwd.z, 0, _fwd.x);
 

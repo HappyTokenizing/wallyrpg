@@ -663,6 +663,138 @@ export function stylesheet() {
   display:grid;place-items:center;padding:0 3px;box-shadow:0 0 0 2px ${rgba(BRAND.ink, 0.7)};
 }
 
+/* ============================================================
+   TOUCH CONTROLS — ui/touch.js
+
+   Only ever in the document when the device is actually touched;
+   see touch.js for the detection. Everything here is sized in raw
+   px, deliberately NOT scaled by --w-ts: a thumb is the same size
+   whatever the player set the text to, and 44 px is the smallest
+   target anyone should have to hit while an elephant is running.
+
+   The two clusters own the bottom two corners, so the HUD gets out
+   of their way: the key-hint row is replaced by the action pad, and
+   the toasts move from bottom-left (under the thumb) to under the
+   objective strip, top-left.
+   ============================================================ */
+.w-touch{position:absolute;inset:0;pointer-events:none;z-index:2;
+  transition:opacity .28s var(--w-ease)}
+.w-touch.hidden{display:none}
+.w-touch.muted{opacity:.22;pointer-events:none}
+
+/* the capture area. Invisible, bottom-left, thumb-sized — a drag that
+   starts here works the stick, a drag anywhere else reaches the canvas
+   underneath and orbits the camera. */
+.w-stickzone{
+  position:absolute;left:0;bottom:0;
+  width:min(46vw,250px);height:min(56vh,320px);
+  padding:0 0 max(12px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
+  pointer-events:auto;touch-action:none;-webkit-user-select:none;user-select:none;
+}
+.w-stick{
+  position:absolute;left:0;top:0;width:var(--w-sk);height:var(--w-sk);
+  margin-left:calc(var(--w-sk) * -.5);margin-top:calc(var(--w-sk) * -.5);
+  border-radius:50%;opacity:.78;
+  transition:opacity .22s var(--w-ease);
+  will-change:transform,opacity;
+}
+.w-stick.live{opacity:1}
+/* Same chrome as every other surface in the game — one chrome, no
+   second colour (see the key-hint note). It matters more here than
+   anywhere else: a ring made of a hairline and a wash disappears the
+   moment a grey elephant walks through it, and this is the one control
+   the player has to be able to find without looking down. */
+.w-stick .ring{
+  position:absolute;inset:0;border-radius:50%;
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1.5px solid ${rgba(BRAND.paper, 0.34)};
+  box-shadow:var(--w-shadow),inset 0 1px 0 ${rgba(BRAND.paper, 0.16)},
+    inset 0 0 30px ${rgba(0x05070c, 0.30)};
+}
+/* the four bearings, so the ring reads as a control and not a smudge */
+.w-stick .tick{position:absolute;left:50%;top:50%;width:2px;height:7px;margin:-3.5px 0 0 -1px;
+  border-radius:2px;background:${rgba(BRAND.paper, 0.42)};transform-origin:50% 50%}
+.w-stick .knob{
+  position:absolute;left:50%;top:50%;width:var(--w-kn);height:var(--w-kn);
+  margin-left:calc(var(--w-kn) * -.5);margin-top:calc(var(--w-kn) * -.5);
+  border-radius:50%;
+  background:linear-gradient(178deg,${rgba(BRAND.paper, 0.94)},${C(mix(BRAND.paper, BRAND.token, 0.22))});
+  border:1px solid ${rgba(BRAND.ink, 0.18)};
+  box-shadow:0 3px 0 ${rgba(BRAND.token2, 0.55)},0 8px 20px ${rgba(0x05070c, 0.45)},inset 0 1px 0 ${rgba(0xffffff, 0.7)};
+  will-change:transform;
+}
+.w-stick.run .knob{background:linear-gradient(178deg,${C(mix(BRAND.token, 0xffffff, 0.35))},var(--w-token));
+  box-shadow:0 3px 0 ${rgba(BRAND.token2, 0.8)},0 0 22px ${rgba(BRAND.token, 0.5)},inset 0 1px 0 ${rgba(0xffffff, 0.5)}}
+/* the caption goes ABOVE the ring: below it is off the bottom of the
+   screen, which is where a thumb-height control by definition sits */
+.w-stick .lbl{
+  position:absolute;left:50%;top:-15px;transform:translateX(-50%);
+  font-size:9.5px;font-weight:800;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--w-dim2);white-space:nowrap;transition:opacity .2s var(--w-ease);
+}
+.w-stick.live .lbl{opacity:0}
+
+/* ---------- the action pad ---------- */
+/* the +15 is headroom for the captions, which hang below the buttons
+   and would otherwise be cropped by the bottom edge of the screen */
+.w-acts{
+  position:absolute;right:max(12px,env(safe-area-inset-right));
+  bottom:calc(max(10px,env(safe-area-inset-bottom)) + 15px);
+  display:flex;flex-direction:column;align-items:flex-end;gap:10px;
+  pointer-events:none;
+}
+.w-acts .shortcuts{display:flex;gap:8px;pointer-events:none}
+.w-acts .pad{display:flex;align-items:flex-end;gap:11px;pointer-events:none}
+.w-abtn{
+  position:relative;display:grid;place-items:center;
+  width:46px;height:46px;border-radius:50%;padding:0;
+  pointer-events:auto;touch-action:manipulation;-webkit-user-select:none;user-select:none;
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid var(--w-line);box-shadow:var(--w-shadow),var(--w-inset);
+  color:var(--w-text);font-family:var(--w-font);font-weight:800;cursor:pointer;
+  transition:transform .12s var(--w-ease),opacity .2s var(--w-ease),border-color .2s;
+}
+.w-abtn .cap{position:absolute;left:50%;bottom:-13px;transform:translateX(-50%);
+  font-size:8.5px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
+  color:var(--w-dim2);white-space:nowrap;pointer-events:none}
+.w-abtn:active,.w-abtn.down{transform:scale(.9);border-color:${rgba(BRAND.token, 0.75)}}
+.w-abtn.big{width:66px;height:66px}
+.w-abtn.mid{width:57px;height:57px;margin-bottom:26px}
+.w-abtn.jump{background-image:var(--w-grain),linear-gradient(178deg,${rgba(BRAND.token, 0.92)},${rgba(BRAND.token2, 0.92)});
+  color:${C(BRAND.ink)};border-color:${rgba(BRAND.paper, 0.4)};
+  box-shadow:0 4px 0 ${rgba(BRAND.token2, 0.85)},var(--w-shadow)}
+.w-abtn.jump .cap{color:${rgba(BRAND.text, 0.66)}}
+.w-abtn .w-up{transform:rotate(90deg);transform-origin:50% 50%}
+.w-abtn.act{border-color:${rgba(BRAND.token, 0.5)}}
+.w-abtn.act.on{background-image:var(--w-grain),linear-gradient(178deg,${rgba(BRAND.good, 0.9)},${rgba(BRAND.good, 0.72)});
+  color:${C(BRAND.paper)};animation:wActPulse 1.9s ease-in-out infinite}
+.w-abtn.act.off{opacity:.46}
+@keyframes wActPulse{0%,100%{box-shadow:var(--w-shadow),0 0 0 0 ${rgba(BRAND.good, 0.45)}}
+  55%{box-shadow:var(--w-shadow),0 0 0 9px ${rgba(BRAND.good, 0)}}}
+.w-abtn .badge{
+  position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;border-radius:99px;
+  background:var(--w-bad);color:#fff;font-size:9px;font-weight:800;
+  display:grid;place-items:center;padding:0 3px;box-shadow:0 0 0 2px ${rgba(BRAND.ink, 0.75)};
+}
+
+/* ---------- the HUD steps aside for two thumbs ---------- */
+.w-touch-on .w-hints{display:none}
+/* Toasts live bottom-left — under the thumb. On touch they move to
+   just below the objective strip, whose height touch.js measures
+   (it grows to two lines whenever the quest name is long). */
+.w-touch-on .w-toasts{
+  bottom:auto;top:var(--w-toasty,calc(max(12px,env(safe-area-inset-top)) + 96px));
+  flex-direction:column;max-width:min(320px,60vw);
+}
+.w-touch-on .w-toast{animation-name:wToastIn}
+/* the world prompt would sit under the pad on a short screen */
+@media (max-height:460px){
+  .w-touch .w-abtn.mid{margin-bottom:16px}
+  .w-acts{gap:7px}
+}
+
 /* ---------- dialogue takes the frame ----------
    Nine live pills shouting around a cream slab is nobody's idea of
    a reading experience. While someone is speaking the HUD steps
@@ -937,6 +1069,22 @@ export function stylesheet() {
   .w-obj{max-width:min(340px,66vw)}
   .w-hints{max-width:44vw}
   .w-dlg-tx{font-size:calc(14px * var(--w-ts))}
+}
+/* ---------- phone ----------
+   At 390 px the two stat clusters are 62 vw each and interleave across
+   the top of the frame. Shrink the pills, shorten the meters and give
+   each side under half the width, so the left column reads as a column,
+   the right one as a column, and there is a gutter between them. */
+@media (max-width:480px){
+  .w-bar{max-width:49vw;gap:calc(5px * var(--w-ts))}
+  .w-bar.right{flex-direction:column;align-items:flex-end}
+  .w-bar.right .w-pills{justify-content:flex-end}
+  .w-pill{height:calc(27px * var(--w-ts));padding:0 calc(8px * var(--w-ts));
+    gap:calc(5px * var(--w-ts));font-size:calc(11.5px * var(--w-ts))}
+  .w-meter{width:calc(42px * var(--w-ts))}
+  .w-obj{max-width:min(300px,76vw);padding:calc(7px * var(--w-ts)) calc(11px * var(--w-ts))}
+  .w-obj .t{font-size:calc(12px * var(--w-ts))}
+  .w-toasts{max-width:74vw}
 }
 @media (max-height:560px){
   .w-banner{top:8vh}

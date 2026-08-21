@@ -185,6 +185,12 @@ export function createMenus(ctx, ui) {
       S.relaxed = on;
       ui.toast(on ? 'Everything takes 30% less time' : 'Normal pace', 'info');
     }));
+    /* Auto-on for a phone; here so a touchscreen laptop, or anyone who
+       would rather thumb it than type, can have them on demand. */
+    body.append(toggle('Touch controls', !!ui.touch?.enabled, (on) => {
+      ui.setTouch(on);
+      ui.toast(on ? 'Thumbstick on' : 'Thumbstick off', 'info');
+    }));
 
     /* ---- saves ---- */
     body.append(label('Your game'));

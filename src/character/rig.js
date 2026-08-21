@@ -216,14 +216,68 @@ export const PROP = {
   torso: [
     [0.575, 0.1320,  0.020, 1.10],  // fork — cap bottoms ON the ref's crotch line
     [0.620, 0.2000,  0.026, 1.13],  // hips — full, barely tucked
-    [0.665, 0.2150,  0.030, 1.16],  // <- WIDEST, 0.430 dia, 0.42 H up
-    [0.730, 0.2080,  0.034, 1.17],
-    [0.800, 0.1980,  0.028, 1.14],
-    [0.870, 0.1800,  0.016, 1.08],
-    [0.940, 0.1580,  0.002, 1.00],
-    [1.020, 0.1370, -0.014, 0.94],
-    [1.090, 0.1220, -0.024, 0.92],
-    [1.162, 0.1020, -0.030, 0.94],  // narrow chest -> the head overhangs
+    /* ARM-WELD PASS: 0.2150 -> 0.2200. The belly ellipsoid below was
+       slimmed so it stops bulging the FLANK (see `belly`), and it was
+       contributing 11 mm of half-width to the widest row as well as to
+       the arm slot. The widest row has to stay where §1.1 puts it —
+       head ball / belly = 1.15 — so the 11 mm comes back here instead,
+       at y 0.665, which is 60 mm BELOW the bottom of the arm slot (the
+       arm's own skin runs out at the mitten, y 0.47-0.60, and clears
+       this station by 45 mm). Measured on the field: widest rendered
+       half-width 0.231 before, 0.228 after. */
+    /* ARM-SLOT PASS — THE CHEST WALL IS WHAT THE UPPER ARM WAS WELDED TO,
+       AND THE DEPTH COLUMN IS WHAT HID THE SLOT AT THE STUDIO ANGLE.
+       Two measured facts, both from tools/slotprobe.mjs, which meshes
+       this field at the real 13.6 mm cell and then rasterises the
+       silhouette along the CAMS.studio view axis instead of square-on:
+
+       1. SQUARE-ON the slot already opened at y 0.83 and measured
+          28-42 mm. At the studio's 29 degrees it measured ZERO on every
+          row. Not a blend, not the mesher: the arm's lateral offset is
+          multiplied by cos 29 = 0.875, so 324 mm of arm x arrives as
+          284, while this torso is very nearly CIRCULAR in section
+          (half-depth 0.92 x 1.17 = 1.076 of half-width) and its
+          projected half-width barely moves with angle at all. A 40 mm
+          square-on slot arrives as 5 mm. Every previous round measured
+          square-on and shipped a welded three-quarter — which is how
+          "42-51 mm both sides" and "fully welded" were both true at once.
+
+       2. ABOVE y 0.86 there was no slot in the FIELD either: the arm's
+          inner edge ran 7 mm INSIDE this wall at the armpit station and
+          19 mm outside it at y 0.89 — 1.4 mesher cells, which surface
+          nets bridges. So the whole upper arm meshed as one continuous
+          convex surface with the flank: no concave seam, nothing for the
+          AO bake to find, and the clay grain running unbroken across the
+          junction. That is the user's "textures get glued from body to
+          arms", exactly.
+
+       THE CHEST ROWS ARE THE FREE PART OF THE FIX, and round 7 above
+       already proved why: between f 0.49 and 0.71 the front silhouette
+       is set by the hands and forearms, never by the torso wall. So
+       0.1980/0.1800/0.1580/0.1370/0.1220 -> 0.1930/0.1720/0.1470/
+       0.1270/0.1160 changes no front row, deepens the pear
+       (belly-to-chest 1.57x -> 1.73x, which §1.1 asks for) and hands the
+       arm 15 mm of projected clearance a side through the band where it
+       was welded.
+
+       AND THE DEPTH COLUMN COMES DOWN WITH IT. depthMul 1.16/1.17/1.14
+       put the half-DEPTH 7% ABOVE the half-width through the arm band —
+       a barrel, and a barrel is exactly what a three-quarter lens sees
+       widest. At 1.06/1.06/1.03 the section is a shade flatter than
+       round (0.440 across against 0.429 deep at the belly), nowhere near
+       the 0.78 that once rendered as a plank, and the pot belly now
+       stands 30 mm proud of the lathe instead of 10 — §1.1's "protrudes
+       forward past the chest line" reads BETTER, not worse. The two fork
+       rows are untouched: the cap bottom is the crotch line and that is
+       not this pass's business. */
+    [0.665, 0.2200,  0.030, 1.06],  // <- WIDEST, 0.440 dia, 0.42 H up
+    [0.730, 0.2080,  0.034, 1.06],
+    [0.800, 0.1930,  0.028, 1.03],
+    [0.870, 0.1720,  0.016, 0.99],
+    [0.940, 0.1470,  0.002, 0.96],
+    [1.020, 0.1270, -0.014, 0.92],
+    [1.090, 0.1160, -0.024, 0.90],
+    [1.162, 0.1020, -0.030, 0.92],  // narrow chest -> the head overhangs
   ],
   /* DEPTH IS 0.92 OF WIDTH, NOT 0.78. At 0.78 the belly measured 0.343
      front-to-back against 0.440 across, and in profile he was a plank:
@@ -266,7 +320,30 @@ export const PROP = {
      has real curvature to glide over. Still narrower in x than the
      profile at every height it exists at (0.190 against 0.211), so it
      cannot creep sideways into the slot the arm hangs in. */
-  belly:     { c: [0, 0.690, 0.090], r: [0.190, 0.152, 0.185] },
+  /* ARM-WELD PASS — THE INVARIANT DIRECTLY ABOVE WAS TRUE OF THE
+     ELLIPSOID AND FALSE OF THE SURFACE, AND THAT IS WHAT WELDED THE ARM
+     TO THE FLANK. "Narrower in x than the profile at every height"
+     describes the primitive. What the mesher sees is the primitive
+     smooth-unioned into the torso at a join of 0.104, and smin pushes
+     the union OUT by up to k/4 = 26 mm wherever the two surfaces are
+     within k of each other. On the flank at y 0.72-0.83 they are 28-35
+     mm apart, so the join was adding 11-17 mm of half-width to exactly
+     the band the arm hangs in — the belly crept sideways into the slot
+     through the blend rather than through its own radius. Measured on
+     the field: flank at y 0.76 sat at 0.216 against a lathe wall of
+     0.2036.
+
+     THE FIX IS SHAPE, NOT k — the 0.104 join is doing real work on the
+     FRONT fillet (see the AO note above) and is left alone. The pot is
+     re-cut so its side and top walls fall outside the join's reach in
+     the arm band while its FRONT POLE does not move: c.z 0.090 -> 0.104
+     with r.z 0.185 -> 0.171 keeps the front face at z 0.275 to the
+     millimetre, r.x 0.190 -> 0.180 and r.y 0.152 -> 0.148 on a centre
+     4 mm lower pull the shoulders of the ellipsoid down and in.
+     Measured after: front pole unchanged at z 0.300 rendered, widest
+     rendered half-width 0.231 -> 0.228 (the 0.665 torso station above
+     puts that back), and the arm slot at y 0.76 goes 18 mm -> 34 mm. */
+  belly:     { c: [0, 0.688, 0.104], r: [0.150, 0.148, 0.171] },
 
   /* ears — span 0.78 H tip to tip, single ear 0.34 H tall x 0.22 H wide:
      a TALL leaf, not a disc. The inner edge sits just outside the cranium
@@ -817,13 +894,158 @@ export const PROP = {
      at the forearm and comes back to 0.298 at the wrist) and so does the
      forward set (z 0.020 -> 0.070), which is what keeps the mitten in
      FRONT of the thigh rather than fused into its outer face. */
+  /* ARM-WELD PASS — THE SLOT IS A MESHER PROBLEM AND IT IS MEASURED IN
+     CELLS, NOT IN MILLIMETRES. Surface nets can only open a hole where a
+     grid sample lands strictly inside the void with a positive field; at
+     the high tier the cell is 13.6 mm, so a void needs ~2.2 cells (30 mm)
+     before it opens on EVERY row instead of on a coin toss. Measured on
+     the field as shipped, the widest the slot ever got was 18-21 mm —
+     1.4 cells — which is why the arm rendered as a webbed membrane from
+     armpit to wrist however the join was tuned.
+
+     Two of that came back from the belly blend (see `belly`). The rest
+     comes from here: stations 2 and 3 move 8 and 6 mm OUTBOARD, radii
+     unchanged, so the inner edge gains all of it. This is a move toward
+     the reference, not away from it — the note below fixes the
+     reference's arm-outer / belly-half ratio at 1.74 and the shipped
+     build measured 1.66 (0.384 against 0.231) because both joins had
+     eaten the arm and fattened the belly. After: 0.391 against 0.228,
+     ratio 1.72. The wrist does NOT move, so PROP.hand still continues
+     the forearm's own direction and the 6.8-degree wrist break stands.
+     Slot after, measured on the field at the arm's own z: 27 mm at
+     y 0.83, 34 mm from y 0.81 to y 0.72, 46 mm beside the mitten. */
+  /* ARM-SLOT PASS — THE ARM HAS TO PEEL OFF THE FLANK 90 mm HIGHER, AND
+     THE MEASUREMENT THAT SAYS SO IS A SEAM HEIGHT, NOT A GAP WIDTH.
+
+     WHERE THE OLD TABLE ACTUALLY SEPARATED. Inner edge against the flank,
+     station by station: -24 mm at the deltoid (a shoulder, correct),
+     -7 mm at the armpit, +41 at the upper station. So the crossing sat
+     at y ~0.86 and the first 30 mm above it cleared by under two mesher
+     cells. Surface nets can only open a void where a grid sample lands
+     strictly inside it, so everything from y 0.86 to the deltoid meshed
+     SOLID — one convex surface from flank to arm, no concave seam
+     anywhere on it. A seam is what carries a crease, a crease is what
+     the AO bake darkens, and the dark line is the only thing that tells
+     a viewer the arm is a separate volume. Without it the flank ramps
+     smoothly into the arm and the fine clay grain runs straight across
+     the junction. Measured on the studio frame at f 0.44 our luminance
+     across the junction was a MONOTONIC ramp, 144 -> 210, no valley of
+     any kind; ref/wally-ref-cool.png at the same height dips to 135 and
+     holds a 145-155 band 30 mm wide between a 195 flank and a 200 arm.
+     That dark band is the whole difference, and it is a geometry fact.
+
+     SO THE ARMPIT STATION GOES OUTBOARD 28 mm AND THE UPPER STATION 2.
+     Against the narrowed chest (see `torso`) the inner edge now reads
+     -15 mm at the deltoid, +32 at the armpit, +50 at the upper station:
+     the crossing moves from y 0.86 to y ~0.95 and the clear-by-two-cells
+     line from y 0.89 to y 0.93 — which is where ref/wally-ref-cool.png
+     starts its own crease. The deltoid does NOT move: §1.1's ear-span
+     row fixes the shoulder at 0.364 H and 0.196 + 0.090 = 0.286 is that
+     number, so the arm still melts out of a soft narrow shoulder and
+     only then hangs clear. Outer edge at the armpit 0.335 against 0.393
+     at the forearm, so the limb still widens downward into the mitten
+     rather than flaring off the shoulder.
+
+     THE OUTER EDGE IS AT THE REFERENCE AND STAYS THERE. Both frames cut
+     to silhouettes, height-matched and anchored on the leg fork, the
+     hanging arm's outer edge measures +333 mm on the reference and
+     +357 on this build at f 0.54 — we are already 7% wide, so nothing
+     below moves the wrist or the forearm outboard. Everything this pass
+     gains, it gains from the flank and from the section, not from
+     holding his arms further out. */
   arm: [
     [0.196, 1.058, -0.002, 0.090],       // deltoid — soft, fused shoulder
-    [0.228, 0.950,  0.010, 0.078],       // armpit — BURIED in the flank, see note
-    [0.292, 0.840,  0.024, 0.071],       // upper — the slot opens here
-    [0.318, 0.720,  0.046, 0.066],       // forearm — full soft sausage
-    [0.314, 0.598,  0.074, 0.063],       // wrist — leads into the mitten
+    [0.256, 0.952,  0.008, 0.079],       // armpit — peels off the flank here
+    /* THE z COLUMN IS THE LEFT/RIGHT BALANCE, AND NOBODY HAD LOOKED AT
+       IT. At a three-quarter angle the two arms are NOT symmetric in
+       projection: near gap and far gap differ by exactly 2 sin29 (z_arm
+       - z_torso-centre), so an arm set forward of the torso's own
+       zCentre gives the NEAR side its clearance and takes the same
+       amount off the FAR side. Measured on shots/_slot1.png the near
+       slot ran 17-24 mm while the far ran 7-8 through the same rows.
+       Since the acceptance is two gaps and therefore a MINIMUM, the
+       balance is worth more than the total — which is fixed at
+       2(cos29.x - r - torso), whatever z does. 0.022/0.044 -> 0.030/
+       0.050 puts the mid-arm within a few mm of zCentre (0.022/0.033)
+       and splits the difference. The wrist does NOT move: PROP.hand
+       continues its direction and the mitten's clearance to the thigh
+       is already the tightest number on the model. */
+    [0.302, 0.845,  0.030, 0.073],       // upper — two clear cells by y 0.93
+    [0.326, 0.722,  0.050, 0.067],       // forearm — full soft sausage
+    [0.316, 0.600,  0.089, 0.063],       // wrist — leads into the mitten
   ],
+
+  /* THE ARMPIT FILLET — geometry where the old build used blend radius.
+     ------------------------------------------------------------------
+     History, because it is the whole argument. The arm's join to the
+     body went 0.016 -> 0.024 -> 0.030 over three rounds, each bump
+     chasing an armpit defect: first a sharp saddle, then a hard nub of
+     lit skin that everted once the welcome shoulder opened 26 degrees.
+     But a join of k closes any void narrower than about k, and the slot
+     is ~30 mm — so by 0.030 the cure had eaten the patient and the arm
+     welded to the flank for its whole length.
+
+     WHY THE SADDLE WAS THERE. At the armpit station the arm's own sphere
+     (inner edge 0.150) grazes the torso wall (0.155) — five millimetres
+     of overlap. Two nearly TANGENT surfaces meet along a long,
+     ill-conditioned crease, and no value of k rounds that without also
+     inflating everything for a hand's breadth around it. The deltoid
+     station above has no such problem precisely because it PLUNGES:
+     it sits 23 mm inside the wall and crosses it transversally, and the
+     fillet there is made of overlap, not of k.
+
+     So the armpit gets the same treatment as the deltoid — a short cone
+     seated deep in the flank and emerging through it at ~72 degrees. Its
+     far end is buried 30 mm inside the torso wall at y 1.00; its near end
+     is coincident with (and 6 mm smaller than) the arm's own armpit
+     sphere, so it adds nothing to the silhouette and nothing below
+     y 0.858. Between them its tube swallows the grazing seam — checked
+     point by point: the arm's surface at the seam sits 6 mm from this
+     cone's axis against a 76 mm radius, and the front and back armpit
+     flanks at z +/-0.07 sit 3-4 mm inside it. A convex tube crossing a
+     wall has no saddle to evert, which is why the nub cannot come back
+     when the shoulder opens. */
+  /* ARM-SLOT PASS — THE CONE TRACKS THE STATION IT IS SEATED IN, AND IF
+     IT DOES NOT IT BECOMES THE THING THAT FILLS THE SLOT. Its whole
+     licence is that its near end is INSIDE the arm's own armpit sphere
+     and therefore adds nothing to the silhouette. The armpit station
+     moved out 28 mm (see `arm`); left at x 0.222 this cone's near end
+     would have protruded 38 mm INBOARD of the arm at y 0.93 and bridged
+     the flank right where the new seam opens — the fix would have
+     rebuilt the membrane out of its own armpit fillet. b moves with the
+     station and slims to 0.066: checked at y 0.935 the arm runs
+     0.185-0.342 across and this cone runs 0.190-0.322, inside it on both
+     edges. Its far end is still buried 22 mm inside the narrowed chest
+     wall at y 1.00 and it still ends ABOVE the seam, so the crossing is
+     still transverse, the fillet is still made of overlap rather than of
+     k, and there is still no near-tangent saddle to evert when the
+     welcome pose opens the shoulder.
+
+     AND IT HAS TO RIDE ABOVE THE SEAM, WHICH IS A LOWER-ENVELOPE
+     MEASUREMENT AND NOT A CENTRE ONE. First cut of this pass moved b out
+     to the new station and left the cone where it was; the field scan
+     then showed the arm blob solid at x 0.150 all the way down to
+     y 0.89 — 45 mm INBOARD of the arm's own inner edge — and the new
+     slot never opened above y 0.86. The cause is that a round cone
+     hangs its own radius below its axis: at mid-length the axis sat at
+     y 0.961 with r 0.072, so the tube's underside reached y 0.889 and
+     filled the top 60 mm of the slot with the fillet it exists to make.
+     Raised to a y 1.070 -> b y 0.995 and slimmed to 0.084/0.060, the
+     underside bottoms at y 0.960 and the b-cap at 0.935, both above the
+     seam.
+     IT IS STILL SEATED ON THE GRAZE, because the graze moved too. With
+     the armpit station outboard the arm's inner edge now crosses the
+     flank at y ~1.02 (inner 0.1314 against a wall of 0.1270), not at
+     0.95 — so the cone is re-centred there: at y 1.020 it spans x 0.100
+     to 0.236, from 27 mm inside the wall to 72 mm inside the arm, a
+     transverse crossing with the fillet made of overlap exactly as
+     before. At y 0.952 it spans 0.200-0.284 against an arm running
+     0.177-0.335: inside on both edges, so it adds nothing to the
+     silhouette and nothing to the slot. */
+  armpit: {
+    a: [0.020, 1.070, 0.000], ra: 0.084,   // buried in the flank
+    b: [0.242, 0.995, 0.010], rb: 0.060,   // inside the arm's armpit sphere
+  },
   /* ==================================================================
      THE HAND — ONE TEARDROP MITTEN, MIRRORED. (§1.1's hand row, resolved
      against ref/wally-ref-cool.png at 3x on BOTH hands, which agree.)
@@ -845,12 +1067,45 @@ export const PROP = {
      hand-thigh gap. The thumb stays a blob of its own precisely BECAUSE
      it needs the join — its 0.016 is the width of that one crease.
 
-     MEASURED CLEARANCES (bind, both sides identical by mirror):
-       knuckle surface to thigh surface   26.8 mm  (~2.0 cells @ high)
-       thumb base   to thigh surface      32.6 mm
-       thumb tip    to thigh surface      40.1 mm
-     — every one of them over the two-cell floor the round-4 note fixed
-     as the weld threshold, so the welcome membrane cannot come back.
+     MEASURED CLEARANCES — AND THE OLD NUMBERS IN THIS COMMENT WERE
+     STALE, WHICH IS HOW THE WELD GOT BACK IN. The block used to claim
+     26.8 mm knuckle-to-thigh. That was true of the round-5 hand; the
+     LIKENESS FINAL pass below then grew the knuckle 0.057 -> 0.084 to
+     hit §1.1's 0.106 H mitten and nobody re-ran the number. Measured on
+     the actual tables it was 7.5 mm — 0.55 of a 13.6 mm cell — and the
+     mesher fused mitten to thigh over 100 mm of its length, from y 0.48
+     to 0.56. In the welcome pose smoothWeights had that fused skin at
+     ~0.36 handL against 0.64 hips+legL0+spine, so a third of every
+     vertex swung out with the arm and the rest stayed on the hip: the
+     hard-edged triangular web from hip to wrist, back for the third
+     time.
+
+     THE NUMBER THAT DECIDES IT IS THE FIELD, NOT THE TABLE, so it is
+     measured on buildBodyField() itself: the length of positive field
+     along the line from the thigh axis to the mitten axis, in mesher
+     cells. Surface nets needs ~2.2 clear cells to open a hole on every
+     row rather than on a coin toss.
+
+       row (y)     0.48  0.50  0.52  0.54  0.56
+       before      0.00  0.00  0.00  0.00  0.00   cells  — fused
+       after       3.41  2.77  2.52  2.52  2.88   cells
+
+     Bought with 42 mm of FORWARD and 8 mm of outboard on the mitten,
+     plus 19 mm of forward on the wrist so the hand still continues the
+     arm's own line. Forward is the cheap axis here and outboard is the
+     expensive one: the arm's projected outer edge already measures +357
+     mm against the reference's +333, so the 8 mm is all this pass is
+     willing to spend, and it lands on the mitten alone — the forearm
+     station that the +357 was measured at does not move. The hand's set
+     over the forearm goes from +10.4 to +15.5 degrees, still §1.1's
+     "gentle forward set" and not a break.
+
+     Authored surface clearances, for the record — but note the field row
+     above is the one that decides, because a table gap and a meshed gap
+     are not the same number:
+       mitten surface to thigh surface    33.9 mm  (2.49 cells)
+       thumb  surface to thigh surface    52.8 mm
+       forearm        to thigh surface    42.2 mm
 
      Hand bottom lands at y 0.459 = 0.286 H. Measured off the reference
      at 793 px/m the mitten's lowest point is 0.299 H; the 13 mm short
@@ -892,8 +1147,8 @@ export const PROP = {
        reach further down — the reference mitten bottoms at f 0.735
        (0.265 H above ground = 0.422 m) and the round-5 hand stopped at
        0.460. tip y 0.472 with a 0.050 cap lands the bottom at 0.422. */
-    knuckle: [0.3120, 0.5220, 0.0980, 0.0840],   // widest, two thirds up
-    tip:     [0.3100, 0.4700, 0.1150, 0.0530],   // rounds off
+    knuckle: [0.3200, 0.5220, 0.1400, 0.0840],   // widest, two thirds up
+    tip:     [0.3180, 0.4700, 0.1570, 0.0530],   // rounds off
     /* the thumb: inboard face, high, down-and-forward. Its own blob so
        the union carries a real crease (join 0.016 in model.js). */
     /* THE THUMB HAS TO CLEAR ITS OWN PALM BY MORE THAN IT IS THICK, or
@@ -912,8 +1167,8 @@ export const PROP = {
        1.386). The protrusion, the crease width and the clearance to the
        thigh all stay the ratios the last pass verified; only the scale
        changes with the hand. */
-    thumbA:  [0.2499, 0.5318, 0.1259, 0.0416],
-    thumbB:  [0.2312, 0.4647, 0.1446, 0.0333],
+    thumbA:  [0.2579, 0.5318, 0.1679, 0.0416],
+    thumbB:  [0.2392, 0.4647, 0.1866, 0.0333],
   },
   /* Compatibility view of the mitten as one ball — the AO proxy set and
      the handL capture volume both want a centre and a radius, and both
@@ -1080,11 +1335,37 @@ export const PROP = {
      is also §1.1's "occasionally peeks past a hip from the front
      three-quarter". _convergeChains holds bones ~within 3 degrees of
      bind at rest, so the authored drape survives the spring solver. */
+  /* ROUND 5 — IT IS A ROPE, AND A ROPE IS THIN AND HANGS FROM THE BACK.
+     The back view read it as a thick bulbous cord slung from very low,
+     almost between the legs, which is neither of the two things §1.1
+     asks for ("thin rope from the low-center back... ending in a 0.03 H
+     teardrop tuft"). Two measurements, both off the back frame:
+
+       rope diameter at the root   33 mm authored, 40 rendered (the
+                                   0.030 join adds k/4 = 7.5 mm at the
+                                   root, where it meets a wall)
+       root height                 y 0.640 = 0.40 H, which is the
+                                   BOTTOM of the rump — the rope left
+                                   the body level with the crotch cap
+                                   (y 0.443) and read as hanging out of
+                                   the fork rather than off the back
+
+     The rope slims to 26 mm at the root and 19 at the neck of the tuft —
+     0.016 H, a cord — and the root rises to y 0.700 (0.44 H, the lumbar
+     curve §1.1 names) and moves 12 mm further back to z -0.150, which is
+     26 mm inside the rear wall at that height, so it still emerges from
+     buried geometry rather than poking out of a hole. The tuft keeps its
+     §1.1 size (43 mm = 0.027 H) but stops being the widest thing on the
+     rope by a factor of two, which is what makes it read as a tuft
+     rather than as a bead on a string. Length is unchanged: the tuft
+     still bottoms at y ~0.31, i.e. the knee (y 0.297), and rounds 3-4's
+     +x drape survives so it still tucks behind the left leg from a
+     straight-on front camera. */
   tail: [
-    [0.000, 0.640, -0.138, 0.0165],
-    [0.020, 0.536, -0.178, 0.0145],
-    [0.052, 0.442, -0.196, 0.0130],
-    [0.076, 0.372, -0.196, 0.0120],
+    [0.000, 0.700, -0.150, 0.0130],
+    [0.022, 0.560, -0.182, 0.0118],
+    [0.052, 0.446, -0.196, 0.0106],
+    [0.076, 0.376, -0.196, 0.0097],
   ],
 };
 
@@ -1150,8 +1431,32 @@ const BASE_BONES = [
      top (leg wins by 11 mm), hip corner (hips spheres win), trunk (its
      own capture plus a 30 mm bias wins by 200 mm). Bottom station
      dropped 0.600 -> 0.585 so the hip band is covered continuously. */
+  /* ARMPIT PASS — THE TOP CAP MUST NOT REACH THE ARM'S INNER WALL, AND
+     AT 0.200 IT DID. A round cone's b-end is a sphere, so a 200 mm cap
+     at (0, 0.800, 0.034) reaches 222 mm out at y 0.88 — which is exactly
+     where the arm's own inboard face sits (x 0.205, 77 mm off the arm's
+     axis against a 77 mm sculpt radius). Sampled along that wall the
+     winner alternated spine / armL0 / armL1 / chest with margins of 1-5
+     mm, i.e. a shredded boundary running straight DOWN the arm rather
+     than across the armpit. Skin that a torso bone wins is torso by the
+     rule in bakeWeights, so the arm's own wall came out ~50% chest+spine
+     after the five smoothing passes, and in the welcome pose — where the
+     shoulder opens 26 degrees — half of every vertex swung with the arm
+     and half stayed on the chest. That is the rounded nub with a notch
+     above it that a judge marked NOT clean in both armpits; the cool
+     pose never showed it because a hanging arm never separates them.
+
+     0.174 puts the boundary where an armpit actually is: arm bones win
+     the inner wall continuously from y 0.84 to 0.92 and chest takes over
+     above it, one clean horizontal seam instead of a zigzag. Of 2606
+     surface samples over the whole body, 139 move spine -> chest (upper
+     flank, y ~0.9 — where the chest belongs anyway, and the two are one
+     hop apart so the smoothing pass hides the handover) and 14 move
+     spine -> hips. NOTHING moves out of the torso except the arm wall
+     this exists to release. The bottom radius does NOT change, so the
+     hip band that the 0.600 -> 0.585 note fixed is still covered. */
   { name: 'spine', parent: 'hips',  w: [0, 0.700, 0.022],
-    cap: [['c', 0, 0.575, 0.018, 0, 0.800, 0.034, 0.198, 0.200]] },
+    cap: [['c', 0, 0.575, 0.018, 0, 0.800, 0.034, 0.198, 0.174]] },
   { name: 'chest', parent: 'spine', w: [0, 0.965, 0.020],
     /* The second volume is a shoulder ball. Without it the arm capsule
        wins the whole shoulder fillet, and an arm that opens 45 degrees

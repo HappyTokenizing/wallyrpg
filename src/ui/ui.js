@@ -35,6 +35,7 @@ import { createHud } from './hud.js';
 import { createDialogue } from './dialogue.js';
 import { createPhone } from './phone.js';
 import { createMenus } from './menus.js';
+import { createTouch, shouldEnable } from './touch.js';
 
 /* which musical context each district wants */
 const ZONE_AUDIO = {
@@ -90,8 +91,10 @@ export async function init(ctx) {
   const dlg = createDialogue(ctx, uiRef);
   const phone = createPhone(ctx, uiRef);
   const menus = createMenus(ctx, uiRef);
+  const touch = createTouch(ctx, uiRef);
 
   uiRoot.append(hud.root);
+  uiRoot.append(touch.root);        // above the HUD, below the modal stack
   ovRoot.append(dlg.root);          // the dialogue always draws above the panels
 
   /* ------------------------------------------------------------
@@ -100,6 +103,18 @@ export async function init(ctx) {
   const stack = [];                 // [{name, el}]
   let inputGrabbed = false;
 
+  /* The input source to hand back when the last panel closes.
+     `null` means "the built-in WASD"; the touch layer parks its
+     thumbstick function here. Restoring null unconditionally — which
+     is what this used to do — silently uninstalled the touch controls
+     the first time anyone opened and closed the phone. */
+  let baseInput = null;
+  function applyInput(fn) { try { ctx.wally?.setInput(fn); } catch (e) {} }
+  function setBaseInput(fn) {
+    baseInput = fn || null;
+    if (!inputGrabbed) applyInput(baseInput);
+  }
+
   function syncModal() {
     const on = stack.length > 0;
     scrim.classList.toggle('on', on);
@@ -107,10 +122,10 @@ export async function init(ctx) {
     panels.style.pointerEvents = 'none';
     if (on && !inputGrabbed) {
       inputGrabbed = true;
-      try { ctx.wally?.setInput(() => ({ x: 0, z: 0, jump: false, jumpHeld: false, run: false })); } catch (e) {}
+      applyInput(() => ({ x: 0, z: 0, jump: false, jumpHeld: false, run: false }));
     } else if (!on && inputGrabbed) {
       inputGrabbed = false;
-      try { ctx.wally?.setInput(null); } catch (e) {}
+      applyInput(baseInput);
     }
   }
 
@@ -199,6 +214,15 @@ export async function init(ctx) {
     sfx('ui.open');
   }
 
+  /* The one "confirm" verb — E on a keyboard, the round button on a
+     phone. Advance the conversation if someone is talking, otherwise
+     use whatever door Wally is standing at. */
+  function interact() {
+    if (dlg.isOpen) { dlg.advance(); return true; }
+    if (stack.length) return false;
+    return hud.interact();
+  }
+
   function refresh() {
     hud.refresh(true);
     if (stack.some((s) => s.name === 'phone')) phone.refresh();
@@ -282,7 +306,7 @@ export async function init(ctx) {
     },
 
     /* --- navigation --- */
-    openPhone, openDesk, openPlace, goto, placeWally,
+    openPhone, openDesk, openPlace, goto, placeWally, interact,
     showOrder: (o) => menus.showOrder(o),
     talkTo: (c) => menus.talkTo(c),
     addPrompt: hud.addPrompt, removePrompt: hud.removePrompt,
@@ -292,6 +316,18 @@ export async function init(ctx) {
     /* --- accessibility --- */
     setTextSize, setReducedMotion, setHighContrast,
 
+    /* --- touch --- */
+    touch,
+    /** Show/hide the thumbstick + action pad. Persists in settings. */
+    setTouch(on) {
+      touch.setEnabled(on);
+      const s = ctx.game?.state?.settings;
+      if (s) s.touch = !!on;
+      return api;
+    },
+    /** Park an input source to restore whenever the modal stack empties. */
+    setBaseInput,
+
     /* --- small --- */
     sfx, click,
     /* the HUD steps back while someone is talking */
@@ -300,14 +336,15 @@ export async function init(ctx) {
 
     /* --- module contract --- */
     update(dt) {
+      touch.update(dt);            // runs while hidden: it owns the input fn
       if (!visible) return;
       hud.update(dt);
       dlg.update(dt);
     },
-    resize() {},
+    resize() { touch.measure(); },
     dispose() {
       closeAll();
-      hud.dispose(); dlg.dispose(); phone.dispose();
+      hud.dispose(); dlg.dispose(); phone.dispose(); touch.dispose();
       scrim.remove(); panels.remove(); film.remove(); vignette.remove();
       for (const off of subs) off();
       removeEventListener('keydown', onKey);
@@ -347,9 +384,8 @@ export async function init(ctx) {
         openDesk();
         break;
       case 'KeyE':
-        if (dlg.isOpen) { dlg.advance(); e.preventDefault(); return; }
-        if (stack.length) return;             // the camera keeps Q/E while a panel is open
-        if (hud.interact()) e.preventDefault();
+        /* the camera keeps Q/E while a panel is open — interact() says so */
+        if (interact()) e.preventDefault();
         break;
       case 'Escape':
         e.preventDefault();
@@ -410,6 +446,10 @@ export async function init(ctx) {
     setReducedMotion(!!S.reduced);
     setHighContrast(!!S.contrast);
   }
+  /* Thumbstick + action pad, on a phone only. touch.js also arms a
+     one-shot touchstart listener, so a hybrid laptop grows controls
+     the moment a finger lands on it and never before. */
+  if (shouldEnable(ctx)) touch.setEnabled(true);
   /* audio boots after us — apply the saved mix once it exists */
   on('ready', () => {
     if (!ctx.audio || !S) return;
@@ -492,6 +532,14 @@ export async function init(ctx) {
       api.dialogue(sampleDialogue());
       return 'hud + prompt + phone + dialogue';
     };
+    /* --- touch controls, for the phone screenshots --- */
+    d.touch = (on = true) => { api.setTouch(!!on); return touch.enabled; };
+    /** Pose the thumbstick without a thumb: nx/ny in -1..1, y up. */
+    d.stick = (nx, ny) => {
+      if (!touch.enabled) api.setTouch(true);
+      return touch.demo(nx, ny);
+    };
+    d.touchState = () => ({ enabled: touch.enabled, active: touch.active, ...touch.axes });
     d.uiToast = (t, k) => { toast(t || 'Toast', k || 'info'); return true; };
     d.uiBanner = (t, s) => { banner(t || 'TOKENIZED', s || '3% of the city is connected'); return true; };
     d.uiPrompt = (t) => { demoPrompt(t); return true; };

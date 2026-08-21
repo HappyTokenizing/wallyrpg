@@ -463,6 +463,9 @@ export function createHud(ctx, ui) {
     msgBadge.textContent = unread > 9 ? '9+' : String(unread);
     msgBadge.style.display = unread ? '' : 'none';
     hintByKey.KeyP?.classList.toggle('badged', unread > 0);
+    /* the touch pad stands in for this row on a phone and wants the
+       same count — one poll, two readouts */
+    ui.touch?.setBadge?.(unread);
   }
 
   /* ============================================================

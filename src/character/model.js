@@ -355,6 +355,28 @@ function primDist(p, x, y, z) {
  */
 const CHAIN_K = 0.006;
 
+/**
+ * THE ARM'S JOIN TO THE BODY. It is its own named constant because it is
+ * the one number on this model that can silently destroy a limb.
+ *
+ * smin subtracts h*h*k/4 and h is 1 at the midpoint of a gap, so a join
+ * of k closes any void narrower than about k and eats roughly k out of
+ * any void wider than that. The arm slot measures 27-46 mm on the field;
+ * the mesher's cell is 13.6 mm and surface nets needs ~2.2 cells of clear
+ * positive field to open a hole on every row rather than on a coin toss.
+ * There is no slack. At 0.030 — three rounds of chasing an armpit
+ * artifact with blend radius — the slot measured 18 mm before the mesher
+ * ever saw it and the arm rendered as a webbed membrane from armpit to
+ * wrist, against §1.1's "daylight between arm and body along most of its
+ * length".
+ *
+ * 0.016 costs about 4 mm and leaves the slot open from y 0.85 down. The
+ * armpit is NOT this number's job: it is solved by PROP.armpit, a cone
+ * that crosses the flank transversally instead of grazing it, and that
+ * table carries the argument.
+ */
+const ARM_JOIN = 0.016;
+
 /** Polynomial smooth minimum — C1, cheap, and it never spikes. */
 function smin(a, b, k) {
   if (k <= 0) return a < b ? a : b;
@@ -905,23 +927,34 @@ function armBlob(side) {
   for (let i = 0; i < chain.length - 1; i++) {
     prims.push(cone(s(i), s(i + 1), chain[i][3], chain[i + 1][3]));
   }
-  /* JOIN 0.016. smin adds k/4 of negative field at the midpoint of a gap,
-     so a join of k closes any void narrower than about k. The slot is
-     32 mm at its tightest and 0.024 was eating a quarter of it before the
-     mesher ever saw it; 0.016 costs 4 mm. The shoulder does not need the
-     blend anyway — the deltoid sphere sits 140 mm inside the flank, so
-     the fillet there is made of overlap, not of k. */
-  /* JOIN 0.024, NOT 0.016. The old note capped this at 0.016 because the
-     arm slot was 32 mm at its tightest and a join of k eats about k of
-     it. The slot is now 44 mm (the lower arm moved 12 mm outboard for the
-     hand's sake), so 0.024 costs 6 mm and buys the thing 0.016 could not:
-     a WIDE armpit fillet. At 0.016 the arm and the flank met in a sharp
-     saddle, and once the welcome shoulder opened 26 degrees that saddle
-     everted into a small hard nub of lit skin at each armpit — measured
-     at bind (+/-0.19, 0.87, 0.01), eight vertices, a 6 px white dot on
-     both sides of the chest in every welcome frame. A soft fillet has no
-     saddle to evert. */
-  return blob('body', prims, CHAIN_K, 0.030);
+  /* THE ARMPIT FILLET, AND WHY IT IS A PRIMITIVE AND NOT A BLEND RADIUS.
+     Rounds 1-3 fought the armpit with the join: 0.016 left a sharp
+     saddle, 0.024 was meant to widen it, 0.030 was meant to widen it
+     further, and by then the join was closing the entire 30 mm slot and
+     the arm had welded to the flank. The defect the blend was hiding had
+     become a worse defect than the one it was hiding.
+
+     The saddle exists because the armpit station GRAZES the torso — its
+     inner edge is 0.150 against a wall of 0.155, five millimetres of
+     overlap — and two near-tangent surfaces meet along a long crease
+     that no k rounds without inflating a hand's breadth of everything
+     around it. This cone is seated 30 mm inside the flank at y 1.00 and
+     emerges through the wall at about 72 degrees, ending coincident with
+     (and 6 mm inside) the arm's own armpit sphere. It is a transverse
+     crossing, so the fillet is made of OVERLAP, exactly as the deltoid's
+     is — and an overlap fillet has no saddle to evert when the welcome
+     pose opens the shoulder 26 degrees. See PROP.armpit for the
+     point-by-point check that it swallows the seam. It adds nothing to
+     the silhouette (its far end is buried, its near end is smaller than
+     the sphere it sits in) and nothing below y 0.858, where the slot
+     starts. */
+  const ap = P.armpit;
+  prims.push(cone(
+    [ap.a[0] * side, ap.a[1], ap.a[2]],
+    [ap.b[0] * side, ap.b[1], ap.b[2]],
+    ap.ra, ap.rb,
+  ));
+  return blob('body', prims, CHAIN_K, ARM_JOIN);
 }
 
 /**
@@ -1001,9 +1034,15 @@ function tailBlob() {
      into a sphere, so it reads as a drop rather than a bead on a string */
   const e = t[t.length - 1];
   prims.push(cone([e[0], e[1], e[2]], [e[0], e[1] - 0.030, e[2] + 0.004],
-    e[3], 0.0225));
-  prims.push(sphere([e[0], e[1] - 0.042, e[2] + 0.005], 0.0245));
-  return blob('body', prims, CHAIN_K, 0.030);
+    e[3], 0.0205));
+  prims.push(sphere([e[0], e[1] - 0.042, e[2] + 0.005], 0.0225));
+  /* JOIN 0.030 -> 0.018. The join radius IS the fillet where the rope
+     leaves the rump, and smin adds up to k/4 to the union: at 0.030 that
+     was 7.5 mm on a rope authored at 16.5 mm of radius, so the root
+     rendered 45% fatter than it was drawn — most of the back view's
+     "thick bulbous rope". On the 11.5 mm rope PROP.tail now carries,
+     0.018 still fillets the emergence and costs 4.5 mm. */
+  return blob('body', prims, CHAIN_K, 0.018);
 }
 
 /**
@@ -1086,14 +1125,18 @@ export function buildBodyField() {
   const headB = headBlob();
   const earBL = earBlob(1);
   const earBR = earBlob(-1);
+  const torsoB = torsoBlob();
+  const bellyB = bellyBlob();
+  const armBL = armBlob(1), armBR = armBlob(-1);
+  const legBL = legBlob(1), legBR = legBlob(-1);   // named for the blob list only
   const blobs = [
-    torsoBlob(),
-    bellyBlob(),
+    torsoB,
+    bellyB,
     headB,
     trunkBlob(),
-    armBlob(1), armBlob(-1),
+    armBL, armBR,
     handBlob(1), handBlob(-1),
-    legBlob(1), legBlob(-1),
+    legBL, legBR,
     footBlob(1), footBlob(-1),
     earBL, earBR,
     tailBlob(),
@@ -1266,6 +1309,92 @@ export function buildBodyField() {
     return v;
   }
 
+  /* Distance to the ARM/FLANK SEAM — the same measurement earSeam makes,
+     for the same reason, on the crease the user actually complained
+     about ("textures get glued from body to arms").
+
+     THE GEOMETRY FIX ALONE DOES NOT DRAW THE LINE. Moving the arm
+     outboard opens a real concave valley from y ~0.94 down (rig.js
+     `arm`), and that is the necessary half — you cannot shade a crease
+     that is not there. But both existing bakes are blind to it for
+     exactly the reasons the earSeam block sets out: the cone trace
+     leaves along the vertex normal, which on the arm's inner wall points
+     ACROSS the slot and out of it, and bakeFormOcclusion weights every
+     proxy sphere by dot(n, toSphere), which is negative for the flank
+     behind that normal. Measured on the studio frame at f 0.44 before
+     this pass the luminance across the junction was a monotonic ramp
+     144 -> 210 with no valley of any kind; ref/wally-ref-cool.png at the
+     same height dips to 135 and holds a 30 mm band between a 195 flank
+     and a 200 arm. That dark band is what tells the eye the arm is a
+     separate volume, and at a three-quarter camera it does far more of
+     that work than the 4-6 mm of true background the reference shows.
+
+     THE MEASURE IS dArm + dFlank, AND max(dArm, dFlank) — WHICH IS WHAT
+     THIS FUNCTION SHIPPED FIRST — CANNOT DO THIS JOB. bakeTint runs on
+     mesh vertices, and every mesh vertex lies ON the iso-surface: its
+     distance to the blob it belongs to is ~0 and its distance to the
+     other blob is the width of the slot between them. So the SUM reads
+     "how far is the other form from here", on both walls, symmetrically,
+     and it is exactly the quantity the occlusion depends on. The max
+     reads "how far is the FURTHER form", which on a wall equals the same
+     slot width — but only while the slot is narrower than the band. The
+     slot here runs 30 mm at the armpit and 57 mm by f 0.56, so a 42 mm
+     max-band went to zero over the whole lower half of the arm, and the
+     scan showed it: the arm's inboard wall came back at 175-189 against
+     a lit 215 while the reference's sat at 71-117. The sum keeps its
+     grip across a 57 mm slot and still cannot creep onto the outer arm
+     or the belly front, because from either of those the other form is
+     an arm's diameter away and the sum is 200 mm.
+
+     THE LEG IS DELIBERATELY NOT IN THE MIN, and that cost an A/B to
+     learn. The first cut included the thigh so the mitten would get the
+     same crease where it passes it. Rendered against an identical frame
+     with the band's strength zeroed, that version moved 3.1% of the
+     welcome pixels and 23 000 of the 36 000 sat in the two row bands
+     over the HIPS: this crease is baked per-vertex in BIND space, where
+     the mitten hangs beside the thigh, so opening the arms 26 degrees
+     carries the arm's half of the band away and leaves the thigh's half
+     behind as a dark patch on a hip with nothing near it. That is the
+     "broad low-frequency dirt band on the hips" this file has already
+     removed twice. Torso and belly only: those two never move relative
+     to each other, so the band they carry is a crease in every pose. */
+  function armSeam(x, y, z) {
+    if (y < ARM_SEAM_Y0 || y > 1.06) return 1;
+    const ax = x < 0 ? -x : x;
+    if (ax < 0.09 || ax > 0.46) return 1;
+    /* Both early-outs are the band radius itself, derived rather than
+       typed: a stale literal here silently clips the band the moment
+       ARM_SEAM_R moves, which is how the ear seam lost its back half
+       once (see the ROUND 7 note on grooveDist). Either term alone
+       already exceeds the sum's budget, so this is exact, not a guess. */
+    let da = blobDist(x > 0 ? armBL : armBR, x, y, z);
+    if (da > ARM_SEAM_R) return 1;
+    let dt = blobDist(torsoB, x, y, z);
+    const db = blobDist(bellyB, x, y, z);
+    if (db < dt) dt = db;
+    if (dt > ARM_SEAM_R) return 1;
+    if (da < 0) da = 0;
+    if (dt < 0) dt = 0;
+    /* THE TWO WALLS ARE NOT OCCLUDED EQUALLY AND MUST NOT BE SHADED
+       EQUALLY. From a point on the arm's inboard face the flank is a
+       wall that fills most of the hemisphere; from a point on the flank
+       the arm is a 150 mm sausage subtending a fraction of it. The
+       reference shows exactly that asymmetry — at f 0.56 its flank
+       recovers from 55 to 180 in 27 mm while its arm wall takes 67 mm to
+       climb from 71 to 179 — and a symmetric band cannot reproduce it.
+       So the sum is scaled by which side the vertex is on: the arm's
+       band reaches half again as far, the flank's lets go sooner and
+       gives the lit flank back. */
+    /* THE SIGN CARRIES THE SIDE. bakeTint has to SHAPE the two walls
+       differently as well as scale them (see ARM_SEAM_FLANK_P) and it
+       has no other way to know which one a vertex is on — it sees one
+       number. Negative = the flank wall. The 1 every early-out above
+       returns stays positive and above R, so it still reads as "no
+       band" without a second test. */
+    const s = da + dt;
+    return da < dt ? s * ARM_SEAM_SKEW_ARM : -s * ARM_SEAM_SKEW_FLANK;
+  }
+
   /* how deep inside the ear dish a point is, for the inner-plate tint */
   function dishDepth(x, y, z) {
     let v = 1e9;
@@ -1320,6 +1449,7 @@ export function buildBodyField() {
     tagAt,
     dishDepth,
     earSeam,
+    armSeam,
     grooveDist,
     nostrilDist,
     probe,
@@ -2250,6 +2380,175 @@ const EAR_SEAM_R = 0.064;
 const EAR_SEAM_W = 0.16;
 const EAR_SEAM_A = 0.13;
 
+/* Arm/flank seam — see armSeam() in buildBodyField for why this exists
+   and why neither existing bake can find it.
+
+   CREASE PASS — SIZED OFF A LUMINANCE SCAN OF BOTH IMAGES, NOT OFF A
+   SWATCH. tools/creasetest.mjs walks a horizontal row inward from the
+   silhouette edge on the hanging-arm side and reads arm -> crease ->
+   flank. Run against ref/wally-ref-cool.png and the shipped build at
+   f 0.44-0.60 of figure height, it says something the last three rounds
+   all got backwards:
+
+     the build's CREASE FLOOR was already as dark as the reference's
+     (85-95 against 57-99). What was missing was on the ARM.
+
+   Scanned across the slot at f 0.56 the reference runs, flank wall in:
+   166 -> 55, hole, 71 -> 179 out to the lit arm. BOTH walls of the slot
+   are dark; the arm's inboard face bottoms at 71. The shipped build ran
+   108 -> 85, hole, 175 -> 217: its flank wall was right and its arm wall
+   was never darkened at all, because that face points at the studio key
+   and nothing in the pipeline knew it was inside a slot. One lit wall
+   and one dark one is not a crease — it is a terminator, and a
+   terminator is exactly what "the texture smears from flank into arm"
+   describes.
+
+   So the measure changes (see armSeam) and the value drop roughly
+   trebles. Measured after, on the same rows, arm -> crease -> flank:
+
+     f      GAME before        GAME after         REFERENCE
+     0.44   215  85 133 .364   215  67 113 .402   213 147 204 .279
+     0.48   217  66 111 .313   216  67 115 .416   212  82 202 .594
+     0.52   218  89 141 .368   216  70 140 .501   211  77 203 .623
+     0.56   215  90 135 .334   214  73 135 .463   207  79 198 .599
+
+   THE RESIDUAL IS NOT THE CREASE, AND IT IS WORTH SAYING SO IN THE FILE
+   SO THE NEXT ROUND DOES NOT DEEPEN IT FURTHER. The build's crease FLOOR
+   (67-73) is now at or below the reference's (77-82). What is still 60
+   luma short is the FLANK BESIDE IT: 113-140 here against 198-204 there.
+   That gap is lighting, not shading — with wallySculpt(0) and wallyAO(0)
+   both off, the same flank still ramps 213 -> 117 across 130 mm, because
+   the studio key is rigged camera-upper-left and this is its terminator,
+   and because the reference's arm hangs closer in so only ~30 mm of its
+   flank is exposed against our 130. Neither of those lives in this file.
+
+   IT IS STILL WARM, WHICH IS THE ONE THING A DEEPER CREASE CAN QUIETLY
+   BREAK (§1.2: warm AO, never blue). Both halves of the drop carry
+   warmth by construction: the albedo half rotates toward SHADOW.ao with
+   the same value-neutral rCrease ratio the rest of bakeTint uses, and
+   the alpha half is multiplied in toon.js by vec3(0.62,0.575,0.565),
+   which is +10% red over blue. Measured in the deepened crease, R-B
+   comes back +9 to +12 — §1.2's own band, and warmer than the lit clay
+   beside it rather than cooler. */
+/* ROUND 2 OF THE CREASE PASS — THE VALLEY WAS RIGHT AND THE FLOOR WAS
+   NOT. The block above sized the drop against the reference's crease
+   FLOOR and stopped there. Re-run with the sweep carried down the arm
+   (creasetest --f 0.44,0.50,0.56,0.62,0.68) it says the drop overshot at
+   the top of the band and is still absent at the bottom:
+
+     f     GAME floor / w1/2      REF floor / w1/2
+     0.44   67 / 22 mm            147 / 40 mm     <- a gash in the armpit
+     0.50   67 / 28 mm             72 / 22 mm
+     0.56   73 / 42 mm             79 / 25 mm
+     0.62   69 / 44 mm             41 / 17 mm
+     0.68  143 / --                 62 / 14 mm     <- no valley at all
+
+   THE ARMPIT IS NOT A CONTACT LINE AND MUST NOT BE SHADED AS ONE. At
+   f 0.44 the reference is a 40 mm SOFT shade bottoming at 147 — the arm
+   is still merging into the shoulder there and no crease has formed.
+   Ours put a 22 mm oval at 67 in the same place, which is the "black
+   gash" failure in a different costume. The armpit fade therefore starts
+   lower (0.88 -> 0.82) and keeps an eighth rather than a third, and the
+   two drops come down across the whole band.
+
+   THE FLANK HALF WAS REACHING 77 mm INTO LIT CLAY (R/1.28 at 936 mm per
+   unit). The reference's flank is lit right up to the contact edge and
+   recovers inside 15-25 mm; the skew now lets go at 31 mm, and the
+   flat-bottom radius drops with it so the profile is an edge rather than
+   a basin. THE ARM HALF IS UNCHANGED at 150 mm — that asymmetry is
+   measured, documented in armSeam(), and correct.
+
+   WHAT THE FLANK LUMA GAP IS NOT. The 60-70 luma between our lit flank
+   (113-140) and the reference's (180-205) is NOT this band, and raising
+   the skew cannot buy it back. Measured on identical frames with
+   creasetest --extra:  band zeroed (W=A=0) moves the flank peak by 5
+   luma; the whole baked sculpt+AO off (wallySculpt(0) wallyAO(0)) moves
+   it by 25 and lands at 145-153 against the reference's 198-205. The
+   remaining ~50 is the studio key's terminator on the camera-right
+   flank plus how much further our arm hangs from the body, and neither
+   of those is in this file. Deepening the band to chase that number is
+   how the gash got here. */
+const ARM_SEAM_R = 0.105;    // scaled dArm+dFlank at which the band dies
+const ARM_SEAM_C = 0.024;    // ...and below which it is at full depth
+const ARM_SEAM_SKEW_ARM = 0.70;     // arm wall: reach 1/0.70 further
+const ARM_SEAM_SKEW_FLANK = 1.30;   // flank wall: let go sooner
+const ARM_SEAM_W = 0.34;
+const ARM_SEAM_A = 0.30;
+/* THE FLANK WALL IS SHARPENED, NOT SHORTENED, AND THE DIFFERENCE IS THE
+   WHOLE OF THIS FIX. The obvious move — raise SKEW_FLANK until the band
+   stops 25 mm inboard — was tried first and MEASURED: at 3.20 the band
+   dies at 31 mm of slot, this arm slot runs 30-57 mm, and the flank
+   then never gets the band at all. The crease floor went 67 -> 89
+   against a reference floor of 72: the band had switched itself off.
+   (Note which wall that floor is on. At f 0.50-0.56 the row crosses
+   arm, then 14-19 mm of TRUE BACKGROUND, then flank — the arm's inboard
+   face is not in the profile, and the number the ruler calls the crease
+   is the flank's own near-slot wall.)
+
+   The flank band is broad for a geometric reason no skew can touch:
+   dArm from a flank point 20 mm inboard of a 30 mm slot is only
+   sqrt(30^2+20^2) = 36 mm, so a band keyed on dArm decays as slowly as
+   the arm is big. What is wanted is full depth AT the slot and gone
+   soon after — a curve shape, not a range. So the flank keeps a skew
+   that actually fires and its smoothstep is raised to a power:
+   0.93 -> 0.85 at the slot edge, 0.46 -> 0.17 at 40 mm, ~0 by 60. */
+const ARM_SEAM_FLANK_P = 2.2;
+
+/* THE BAND HAS TO LET GO BEFORE THE ARMPIT, AND THAT IS NOT A DETAIL.
+   Above y ~0.88 the arm and the flank are FUSED — that is what an
+   armpit is — so max(dArm,dFlank) collapses to near zero over a broad
+   patch of shoulder rather than over two walls of a slot. At the old
+   0.14 that patch was a soft shoulder shade; at 0.34 it would be a
+   blotch, and because bakeTint is baked in BIND space it would travel
+   with the skin and swing straight into view when the welcome pose
+   opens the shoulder 26 degrees — the "black gash in welcome" this pass
+   was explicitly told not to ship. The gain therefore falls to a third
+   across y 0.88 -> 1.02, which is the old band's strength, and the low
+   end fades over 0.50 -> 0.57 so the band ends on a gradient instead of
+   a horizontal cut across the hip. */
+/* THE LOW END NOW HANDS OVER TO A RUNTIME TERM INSTEAD OF FADING TO
+   NOTHING (wally.js, installContactCrease). Below y ~0.62 the form the
+   arm is closing on is the HIP and the THIGH, and this bake cannot go
+   there: it runs per-vertex in BIND space, where the mitten hangs beside
+   the thigh, so any leg-derived band is left behind on the hip the
+   moment a pose swings the arm out — the hip-dirt failure the block
+   above records, and the reason the low fade was set at 0.50 in the
+   first place. Measured, that cut is exactly where the crease the user
+   photographed lives: at f 0.68 the scan ran monotonic 209 -> 103 with
+   NO minimum at all, against a reference that plunges to 62 in a 14 mm
+   hairline between two lit forms.
+   So the fade-in moves UP to 0.62 -> 0.76 and wally.js paints 1 - this
+   ramp with posed capsule distances evaluated in the vertex shader,
+   where the leg is legal because it is where the pose actually put it.
+   The two gains are exact complements, so the total is unchanged. */
+const ARM_SEAM_Y0 = 0.62, ARM_SEAM_Y1 = 0.76;   // low fade in / runtime handover
+const ARM_SEAM_Y2 = 0.82, ARM_SEAM_Y3 = 1.00;   // armpit fade out
+const ARM_SEAM_ARMPIT = 0.12;                   // gain retained at the armpit
+/* The crease constants, exported so the RUNTIME half of this crease
+   (wally.js installContactCrease) cannot drift from the baked half.
+   Never re-type these numbers anywhere else — a stale literal is how
+   the ear seam lost its back half. */
+export const ARM_SEAM = {
+  R: ARM_SEAM_R, C: ARM_SEAM_C,
+  skewArm: ARM_SEAM_SKEW_ARM, skewFlank: ARM_SEAM_SKEW_FLANK,
+  flankP: ARM_SEAM_FLANK_P,
+  W: ARM_SEAM_W, A: ARM_SEAM_A,
+  y0: ARM_SEAM_Y0, y1: ARM_SEAM_Y1,
+};
+
+function armSeamGain(y) {
+  let g = 1;
+  if (y < ARM_SEAM_Y1) {
+    const t = (y - ARM_SEAM_Y0) / (ARM_SEAM_Y1 - ARM_SEAM_Y0);
+    g = t <= 0 ? 0 : t * t * (3 - 2 * t);
+  }
+  if (y > ARM_SEAM_Y2) {
+    const t = Math.min(1, (y - ARM_SEAM_Y2) / (ARM_SEAM_Y3 - ARM_SEAM_Y2));
+    g *= 1 - (1 - ARM_SEAM_ARMPIT) * (t * t * (3 - 2 * t));
+  }
+  return g;
+}
+
 /* Trunk groove incision band (§1.5): a soft warm darkening hugging the
    three cut capsules. ROUND 5: this can NEVER be the carrier of the
    lines — it is baked per-vertex and the mesher cell (~15 mm) is wider
@@ -2299,6 +2598,7 @@ export function bakeTint(pos, nor, count, field, ao, form, sky) {
 
   const dish = field.dishDepth;
   const seam = field.earSeam;
+  const aSeam = field.armSeam;
   for (let i = 0; i < count; i++) {
     const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
     let r = 1, g = 1, b = 1;
@@ -2399,6 +2699,36 @@ export function bakeTint(pos, nor, count, field, ao, form, sky) {
         kb *= dk * (1 + (rCrease[2] - 1) * ht);
         sculptK[i] *= dk;
         creaseA = 1 - EAR_SEAM_A * c;
+      }
+    }
+
+    /* ---- THE ARM/FLANK CREASE (§1.2 "armpits") — see armSeam() ----
+       Same construction as the ear/skull crease above and for the same
+       blindness in the two bakes; the difference is that this one is the
+       defect the user reported, so it is measured against the reference
+       rather than judged. */
+    if (aSeam) {
+      const raw = aSeam(x, y, z);
+      const onFlank = raw < 0;
+      const ad = onFlank ? -raw : raw;
+      if (ad < ARM_SEAM_R) {
+        /* Flat-bottomed, not conical. Everything closer than ARM_SEAM_C
+           is a contact and gets the full drop; past that it falls off
+           over the rest of the band. A plain 1 - ad/R put the floor on a
+           single point and the reference's crease is a valley with a
+           bottom to it, ~25 mm wide at half depth. */
+        let c = (ARM_SEAM_R - ad) / (ARM_SEAM_R - ARM_SEAM_C);
+        if (c > 1) c = 1; else if (c < 0) c = 0;
+        c = c * c * (3 - 2 * c);
+        if (onFlank) c = Math.pow(c, ARM_SEAM_FLANK_P);
+        c *= armSeamGain(y);
+        const dk = 1 - ARM_SEAM_W * c;
+        const ht = c * 0.85;
+        kr *= dk * (1 + (rCrease[0] - 1) * ht);
+        kg *= dk * (1 + (rCrease[1] - 1) * ht);
+        kb *= dk * (1 + (rCrease[2] - 1) * ht);
+        sculptK[i] *= dk;
+        creaseA *= 1 - ARM_SEAM_A * c;
       }
     }
 
