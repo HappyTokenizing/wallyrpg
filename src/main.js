@@ -75,18 +75,24 @@ async function boot() {
 
   /* ---- boot progress ------------------------------------------------
      Weights are MEASURED, not guessed — timed over a full cold boot at
-     1280x720. Boot is ~13 s and one stage is nearly two thirds of it:
+     1280x720. An evenly-weighted 16-stage bar would sit visibly frozen
+     on whichever stage happens to dominate, which is worse than no bar.
 
-       npc 63.5% · wally 17.3% · city 10.5% · world 4.7% · audio 1.7%
-       render 1.0% · everything else under 0.5% each
+     These numbers are from AFTER the npc streaming rewrite. npc used to
+     be 63.5% of a 13.3 s boot; it now plans everyone at boot and meshes
+     the distant population lazily over the first seconds of play, so the
+     stage fell to 1.75 s and the shape of the boot changed completely:
 
-     An evenly-weighted 16-stage bar would therefore sit frozen around
-     50% for eight seconds, which is worse than no bar at all. Stages not
-     listed here get MIN_W so they still nudge the bar visibly. */
+       wally 35.9% · npc 27.3% · city 20.7% · world 9.3% · audio 3.1%
+       everything else under 1% each
+
+     RE-MEASURE THESE IF YOU CHANGE WHAT A STAGE DOES. A stale weight
+     table does not fail loudly — the bar just races and then crawls.
+     Stages not listed get MIN_W so they still nudge the bar visibly. */
   const STAGE_W = {
-    render: 1.0, mat: 0.5, wind: 0.1, sky: 0.2, world: 4.7, city: 10.5,
-    foliage: 0.3, water: 0.5, phys: 0.6, wally: 17.3, npc: 63.5,
-    cam: 0.1, game: 0.2, ui: 0.4, audio: 1.7, intro: 0.5,
+    render: 0.2, mat: 1.0, wind: 0.1, sky: 0.2, world: 9.3, city: 20.7,
+    foliage: 0.7, water: 0.9, phys: 0.2, wally: 35.9, npc: 27.3,
+    cam: 0.1, game: 0.2, ui: 0.5, audio: 3.1, intro: 0.2,
   };
   const MIN_W = 0.1;
   const totalW = STAGES.reduce((a, [n]) => a + (STAGE_W[n] ?? MIN_W), 0);
@@ -191,13 +197,131 @@ async function boot() {
   addEventListener('resize', onResize);
   onResize();
 
+  /* ================================================================
+     THE START BEAT
+     ----------------------------------------------------------------
+     An AudioContext is created `suspended` and only a real user
+     gesture may resume it. The opener therefore cannot simply roll:
+     notes scheduled into a suspended context are never heard, so the
+     score and the title sting play to nobody and the first thirty
+     seconds of the game are silent. The fix is the oldest convention
+     in the medium — one keystroke to start — which is also what the
+     2D original did with PRESS START.
+
+     Three paths, in order of preference:
+
+       1. flags.shot / flags.skipIntro — how every tool in tools/
+          boots. No prompt, no gesture, no intro, no waiting. Nothing
+          here may ever block those.
+       2. Audio already permitted (a returning player, a permissive
+          browser) or missing altogether — no prompt either. Asking
+          for a click the policy does not need is just a worse first
+          frame.
+       3. Otherwise, PRESS ANY KEY. On the gesture, in this order and
+          inside the gesture's own task: name the cinematic score,
+          resume the context, drop the boot screen, roll the opener.
+          music.js only snaps tempo to a new score while the
+          transport is stopped, so naming it first is what puts bar 0
+          at 54 bpm — and the title beat lands on bar 7 at 31.11 s
+          only because of that.
+
+     Audio never gates the game. If the context refuses to resume, or
+     Web Audio is missing entirely, the door opens anyway and WALLY
+     RPG plays in silence.
+     ================================================================ */
+  const bootEl = document.getElementById('boot');
+  const goEl = document.getElementById('bootGo');
+
+  function reveal() {
+    bootEl?.classList.remove('ask');
+    bootEl?.classList.add('gone');
+  }
+
+  let opened = false;
+  async function begin() {
+    if (opened) return;
+    opened = true;
+    ctx.audio?.setContext?.('cinematic', { immediate: true, fade: 0.6 });
+    /* Raced, never simply awaited. A blocked context's resume() can
+       return a promise that never settles at all, and the one thing
+       the start beat may not do is leave the player looking at the
+       loading screen. Worst case the opener rolls a beat late and
+       silent, which is still a game. */
+    try {
+      await Promise.race([
+        Promise.resolve(ctx.audio?.resume?.()).catch(() => false),
+        new Promise((r) => setTimeout(r, 1200)),
+      ]);
+    } catch { /* silence is allowed */ }
+    reveal();
+    ctx.intro?.play?.();
+  }
+
+  function ask() {
+    const coarse = typeof matchMedia === 'function'
+      && matchMedia('(hover: none) and (pointer: coarse)').matches;
+    if (goEl) goEl.textContent = coarse ? 'Tap to begin' : 'Press any key to begin';
+    bootEl?.classList.add('ask');
+    goEl?.focus?.({ preventScroll: true });
+
+    const go = (e) => {
+      /* Leave the browser's own chords alone: reloading or opening
+         dev tools must not be swallowed as the start beat. */
+      if (e && e.type === 'keydown'
+        && (e.key === 'F5' || e.key === 'F12' || e.metaKey || e.ctrlKey || e.altKey)) return;
+      if (opened) return;
+      removeEventListener('keydown', go, true);
+      removeEventListener('pointerdown', go, true);
+      removeEventListener('touchstart', go, true);
+      begin();
+    };
+    addEventListener('keydown', go, { capture: true });
+    addEventListener('pointerdown', go, { capture: true });
+    addEventListener('touchstart', go, { capture: true, passive: true });
+  }
+
+  async function openTheDoor() {
+    if (ctx.flags?.shot || ctx.flags?.skipIntro) { reveal(); opened = true; return; }
+
+    const a = ctx.audio;
+    let allowed = !a || !!a.unavailable || a.running === true;
+    if (!allowed) {
+      /* Outside a gesture, resume() either succeeds on a permitted
+         origin or never settles at all. Race it rather than bet on
+         which, and re-read the state afterwards. */
+      allowed = await Promise.race([
+        Promise.resolve(a.resume?.()).catch(() => false),
+        new Promise((r) => setTimeout(() => r(false), 400)),
+      ]).then(() => a.running === true).catch(() => false);
+    }
+    if (allowed) begin(); else ask();
+  }
+
   /* ---- ready signal for tools/shot.mjs ----
      Wait two frames so the first render (and any lazily-compiled
-     shaders) have actually landed before a screenshot is taken. */
+     shaders) have actually landed before a screenshot is taken.
+     __WALLY_READY__ is set here and NOT behind the start beat: a tool
+     that boots without ?shot / ?skipIntro must still be able to see
+     the page, and nothing in tools/ may ever hang on a keystroke. */
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    document.getElementById('boot')?.classList.add('gone');
     window.__WALLY_READY__ = true;
     ctx.bus.emit('ready');
+    window.WALLY.debug.begin = () => { begin(); return true; };
+    window.WALLY.debug.started = () => opened;
+    /* Pose the loading screen for a screenshot. The harness is only
+       allowed to look once boot has finished, by which point the
+       screen is already gone, so there is otherwise no way to see it.
+         bootScreen('load', 62)  the determinate bar, mid-boot
+         bootScreen('ask')       the start beat */
+    window.WALLY.debug.bootScreen = (mode = 'ask', pct = 62) => {
+      if (!bootEl) return null;
+      if (goEl && !goEl.textContent.trim()) goEl.textContent = 'Press any key to begin';
+      bootEl.classList.remove('gone');
+      bootEl.classList.toggle('ask', mode === 'ask');
+      if (mode !== 'ask') { ctx.boot.label('city'); paint(pct / 100); }
+      return mode;
+    };
+    openTheDoor();
   }));
 
   return ctx;

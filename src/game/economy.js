@@ -13,8 +13,9 @@
    ============================================================ */
 
 import {
-  CONFIG, ASSETS, ASSET_BY_ID, VENUES, CLIENT_BY_ID, OFFICE_STAGES,
+  CONFIG, ASSETS, ASSET_BY_ID, ASSET_BY_TICK, VENUES, CLIENT_BY_ID, OFFICE_STAGES,
   HOME_BY_ID, EMPLOYEE_BY_ID, NEWS_POOL, WALLYNET_GOOD, WALLYNET_BAD,
+  byTicker, assetIdOf, assetLabel, tickerQty, searchAssets, normTicker,
 } from './data.js';
 import { round2, clamp } from './state.js';
 
@@ -22,6 +23,36 @@ export function createEconomy(env) {
   const bus = env.bus;
   const M = () => env.mutate;          // state mutation layer
   const S = () => env.state;
+
+  /* ============================================================
+     TICKERS ARE FIRST-CLASS.
+
+     Every function below that takes an asset takes an id OR a ticker,
+     in any casing, with any spacing: price('GOLD'), buy('wheat', 3),
+     owned(' b5y ') all work, and so does the canonical id. idOf() is
+     the single funnel — it resolves EXACTLY (never fuzzily), and hands
+     an unrecognised string straight through, so the existing "no such
+     asset" refusals still fire with the string the caller passed.
+
+     Fuzzy matching is a separate, explicitly-named door: search().
+     ============================================================ */
+  const idOf = (x) => assetIdOf(x) || x;
+  const assetOf = (x) => byTicker(x);
+  const ticker = (x) => { const a = byTicker(x); return a ? a.tick : null; };
+  /* 'GOLD · Gold Seam Token'. Every place an asset is described to the
+     player should lead with this rather than concatenating by hand. */
+  const label = (x, sep) => assetLabel(x, sep);
+  const labelIco = (x, sep) => { const a = byTicker(x); return a ? a.ico + ' ' + a.tick + (sep || ' · ') + a.n : label(x, sep); };
+  /* Exact, case-insensitive, whitespace-tolerant. Null if unknown. */
+  const findByTicker = (x) => byTicker(x);
+  /* Fuzzy/prefix over ticker AND name: 'gol' -> GOLD, 'wheat' -> WHEAT. */
+  const search = (q, limit) => searchAssets(q, limit);
+  /* '2x WHEAT · GOLD' — an order rendered as a trade ticket. Takes an
+     order, a fund, or a bare [{a,q}] item list. */
+  function ticket(x, sep = ' · ') {
+    const items = Array.isArray(x) ? x : (x && Array.isArray(x.items) ? x.items : []);
+    return items.map((it) => tickerQty(it.a, it.q)).join(sep);
+  }
 
   /* ---------- formatting ---------- */
   function fmt(n) {
@@ -31,16 +62,19 @@ export function createEconomy(env) {
 
   /* ---------- prices ---------- */
   function price(id) {
+    id = idOf(id);
     const p = S().prices[id];
     return Number.isFinite(p) && p > 0 ? p : (ASSET_BY_ID[id] ? ASSET_BY_ID[id].v : 0);
   }
   function clampPrice(id, p) {
+    id = idOf(id);
     const a = ASSET_BY_ID[id];
     if (!a) return 0;
     if (!Number.isFinite(p) || p <= 0) p = a.v;
     return round2(clamp(p, a.v * 0.42, a.v * 2.7));
   }
   function liquidity(id) {
+    id = idOf(id);
     const a = ASSET_BY_ID[id];
     if (!a) return 1;
     return Math.min(5, a.q + (S().tokenized[id] ? 1 : 0) + (S().swap.pools[id] ? 1 : 0));
@@ -49,15 +83,17 @@ export function createEconomy(env) {
     const v = VENUES[venue];
     return v ? v.spread : 0.06;
   }
-  function buyPrice(id, venue) { return round2(price(id) * (1 + spread(venue))); }
+  function buyPrice(id, venue) { id = idOf(id); return round2(price(id) * (1 + spread(venue === undefined ? venueOf(id) : venue))); }
   function sellPrice(id, venue) {
+    id = idOf(id);
+    if (venue === undefined) venue = venueOf(id);
     const liqPenalty = (5 - liquidity(id)) * 0.035;
     const v = VENUES[venue];
     return round2(price(id) * (1 - (v ? v.spread : 0.10) - liqPenalty));
   }
-  function trend(id) { return S().trend[id] || 0; }
-  function history(id) { return (S().hist[id] || []).slice(); }
-  function venueOf(id) { return ASSET_BY_ID[id] ? ASSET_BY_ID[id].ven : null; }
+  function trend(id) { return S().trend[idOf(id)] || 0; }
+  function history(id) { return (S().hist[idOf(id)] || []).slice(); }
+  function venueOf(id) { const a = byTicker(id); return a ? a.ven : null; }
   function venueHours(v) { return VENUES[v] ? VENUES[v].hours : [0, 24]; }
   function venueOpenNow(v) {
     const h = venueHours(v);
@@ -66,18 +102,19 @@ export function createEconomy(env) {
   }
 
   /* ---------- inventory ---------- */
-  function owned(id) { const e = S().inv[id]; return e ? e.qty : 0; }
-  function free(id) { const e = S().inv[id]; return e ? Math.max(0, e.qty - (e.locked || 0)) : 0; }
+  function owned(id) { const e = S().inv[idOf(id)]; return e ? e.qty : 0; }
+  function free(id) { const e = S().inv[idOf(id)]; return e ? Math.max(0, e.qty - (e.locked || 0)) : 0; }
   function invCount() { let n = 0; for (const k in S().inv) n += S().inv[k].qty; return round2(n); }
   function invCap() {
     const home = HOME_BY_ID[S().home] || HOME_BY_ID.rusty;
     return OFFICE_STAGES[S().office].invCap + (home.store || 0);
   }
   function distinctOwned() { let n = 0; for (const k in S().inv) if (S().inv[k].qty > 0) n++; return n; }
-  function avgCost(id) { const e = S().inv[id]; return e && e.qty > 0 ? round2(e.cost / e.qty) : 0; }
+  function avgCost(id) { const e = S().inv[idOf(id)]; return e && e.qty > 0 ? round2(e.cost / e.qty) : 0; }
 
   function add(id, qty, cost) {
     const st = S();
+    id = idOf(id);
     if (!ASSET_BY_ID[id] || !Number.isFinite(qty) || qty <= 0) return false;
     if (!st.inv[id]) st.inv[id] = { qty: 0, cost: 0, locked: 0 };
     st.inv[id].qty = round2(st.inv[id].qty + qty);
@@ -88,6 +125,7 @@ export function createEconomy(env) {
   }
   function remove(id, qty) {
     const st = S();
+    id = idOf(id);
     const e = st.inv[id];
     if (!e) return false;
     if (free(id) + 1e-4 < qty) return false;
@@ -100,24 +138,28 @@ export function createEconomy(env) {
   }
 
   /* ---------- buy / sell ---------- */
-  function buy(id, qty = 1, venue = venueOf(id), unitOverride = null) {
+  function buy(id, qty = 1, venue = undefined, unitOverride = null) {
+    id = idOf(id);
     if (!ASSET_BY_ID[id]) return { ok: false, why: 'No such asset' };
+    if (venue === undefined) venue = venueOf(id);
     const unit = unitOverride != null ? unitOverride : buyPrice(id, venue);
     const total = round2(unit * qty);
     if (!M().afford(total)) return { ok: false, why: 'Not enough money' };
     if (invCount() + qty > invCap()) return { ok: false, why: 'No inventory space — upgrade your office' };
-    M().pay(-total, 'bought ' + ASSET_BY_ID[id].n);
+    M().pay(-total, 'bought ' + ASSET_BY_ID[id].tick);
     add(id, qty, total);
     bus.emit('trade', { kind: 'buy', id, qty, unit, total });
     return { ok: true, unit, total };
   }
-  function sell(id, qty = 1, venue = venueOf(id)) {
+  function sell(id, qty = 1, venue = undefined) {
+    id = idOf(id);
     if (!ASSET_BY_ID[id]) return { ok: false, why: 'No such asset' };
+    if (venue === undefined) venue = venueOf(id);
     if (free(id) + 1e-4 < qty) return { ok: false, why: 'Those units are locked in a client fund' };
     const unit = sellPrice(id, venue);
     const total = round2(unit * qty);
     remove(id, qty);
-    M().pay(total, 'sold ' + ASSET_BY_ID[id].n);
+    M().pay(total, 'sold ' + ASSET_BY_ID[id].tick);
     bus.emit('trade', { kind: 'sell', id, qty, unit, total });
     return { ok: true, unit, total };
   }
@@ -253,6 +295,7 @@ export function createEconomy(env) {
 
   /* ---------- tokenization (fee type 3) ---------- */
   function tokenizeCost(id) {
+    id = idOf(id);
     const a = ASSET_BY_ID[id];
     if (!a) return 0;
     let base = Math.max(60, price(id) * 0.13 * a.tq);
@@ -260,6 +303,7 @@ export function createEconomy(env) {
     return Math.round(base);
   }
   function canTokenize(id) {
+    id = idOf(id);
     const a = ASSET_BY_ID[id];
     if (!a) return { ok: false, why: 'No such asset' };
     if (S().tokenized[id]) return { ok: false, why: 'Already tokenized' };
@@ -270,6 +314,7 @@ export function createEconomy(env) {
     return { ok: true, cost: tokenizeCost(id) };
   }
   function tokenize(id) {
+    id = idOf(id);
     const chk = canTokenize(id);
     if (!chk.ok) return chk;
     const st = S();
@@ -279,7 +324,7 @@ export function createEconomy(env) {
     st.prices[id] = clampPrice(id, price(id) * 1.18);
     M().addRep(2 + a.tq * 2);
     st.stats.tokenized++;
-    M().banner('TOKENIZED', a.n + ' — ' + cityPct() + '% of the city is connected');
+    M().banner('TOKENIZED', label(id) + ' — ' + cityPct() + '% of the city is connected');
     bus.emit('tokenize', { id, pct: cityPct() });
     env.quests?.milestones();
     env.quests?.check();
@@ -395,6 +440,9 @@ export function createEconomy(env) {
   }
 
   return {
+    /* tickers — the primary handle for an asset (see the header) */
+    idOf, assetOf, ticker, label, labelIco, findByTicker, search, ticket,
+    tickerQty, normTicker, assetByTick: ASSET_BY_TICK,
     /* format + prices */
     fmt, price, prices: () => ({ ...S().prices }), clampPrice, liquidity, spread,
     buyPrice, sellPrice, trend, history, venueOf, venueHours, venueOpenNow,

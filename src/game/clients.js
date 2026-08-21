@@ -15,7 +15,7 @@
    minutes between 08:00 and 20:00.
    ============================================================ */
 
-import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID } from './data.js';
+import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID, tickerQty } from './data.js';
 
 const FUND_NAMES = {
   Stocks: 'Growth', Bonds: 'Safe City', Farm: 'Farm & Food', Minerals: 'Deep Earth',
@@ -100,7 +100,12 @@ export function createClients(env) {
       if (!pick || used[pick.id]) continue;
       used[pick.id] = 1;
       const q = E().price(pick.id) < 120 ? 1 + Math.floor(env.rng() * 3) : 1;
-      items.push({ a: pick.id, q });
+      /* `t` is the ticker, carried on the item so an order reads as a
+         trade ticket without a lookup. `a` remains the canonical id and
+         is what every economy call uses; `t` is presentation only, and
+         ticket() below re-derives it so orders in older saves still
+         render correctly. */
+      items.push({ a: pick.id, q, t: pick.tick });
     }
     if (!items.length) return null;
 
@@ -127,7 +132,20 @@ export function createClients(env) {
     return (FUND_NAMES[cat] || 'City Growth') + ' Fund';
   }
 
-  /* ---------- arrivals ---------- */
+  /* '2x WHEAT · GOLD' — an order as a trade ticket. Derived from `a`,
+     so it works for orders saved before items carried a ticker. */
+  function ticket(o, sep = ' · ') {
+    const items = Array.isArray(o) ? o : (o && Array.isArray(o.items) ? o.items : []);
+    return items.map((it) => tickerQty(it.a, it.q)).join(sep);
+  }
+
+  /* ---------- arrivals ----------
+     NOBODY BRINGS YOU WORK UNTIL YOU HAVE WORKED A SHIFT AT DISPATCH.
+     That is the third beat of the opening (see QUESTS in data.js): the
+     shift is what puts Wally's name about, and until flags.dispatchShift
+     is set there are no arrivals, no daily offers and no first order to
+     take. One gate, checked in the one place arrivals are created. */
+  const ordersUnlocked = () => !!S().flags.dispatchShift;
   const arrivals = () => S().arrivals;
   function hasArrival(cid) { return S().arrivals.some((o) => o.client === cid); }
   function addArrival(o) {
@@ -157,6 +175,7 @@ export function createClients(env) {
 
   function newArrival() {
     const st = S();
+    if (!ordersUnlocked()) return null;
     const pool = candidates();
     if (!pool.length || st.arrivals.length >= 4) return null;
     const c = pool[Math.floor(env.rng() * pool.length)];
@@ -171,6 +190,7 @@ export function createClients(env) {
 
   function seedArrivals() {
     const st = S();
+    if (!ordersUnlocked()) return;
     const n = 1 + (st.rep >= 15 ? 1 : 0) + (st.rep >= 40 ? 1 : 0);
     for (let i = 0; i < n; i++) newArrival();
   }
@@ -193,6 +213,7 @@ export function createClients(env) {
   /* fresh offers from met clients at the start of a day */
   function dailyOffers() {
     const st = S();
+    if (!ordersUnlocked()) return;
     const metIds = CLIENTS.filter((c) => st.clients[c.id].met || c.budget === 1).map((c) => c.id);
     const offers = 1 + Math.floor(st.rep / 28);
     for (let i = 0; i < offers; i++) {
@@ -208,8 +229,8 @@ export function createClients(env) {
 
   return {
     all, get, stateOf, trust, met, meet, addTrust, trustedCount, at,
-    likes, ceilingFor, makeOrder,
-    arrivals, hasArrival, addArrival, removeArrival, candidates,
+    likes, ceilingFor, makeOrder, ticket,
+    arrivals, hasArrival, addArrival, removeArrival, candidates, ordersUnlocked,
     newArrival, seedArrivals, dailyOffers, tick, resetClock,
   };
 }

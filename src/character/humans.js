@@ -394,22 +394,41 @@ export function makeField(blobs, carves = [], keeps = []) {
     b.bx = cx; b.by = cy; b.bz = cz; b.br = r + b.k * 0.5 + b.join * 0.5;
   }
   const nB = blobs.length;
+  const nC = carves.length;
+  /* A CARVE THAT CANNOT REACH THE POINT DOES NOT NEED EVALUATING.
+     This field is called about 280 000 times to mesh one head and it
+     used to evaluate every carve — eye sockets, mouth slit, nostrils,
+     the mento-labial shelf, a dozen of them — at every one of those
+     points, including points a whole head away from the mouth. Each
+     carve is a bounded primitive: `smax(acc, -p, k)` can only differ
+     from `acc` when `p < k - acc`, and `p >= dist - br` because the
+     primitive is inside its own bounding sphere. So the test below is
+     exact under the same bound the blob loop above has always used,
+     and it is the single largest saving in the mesher. */
+  const cPad = 0.02;
 
   function d(x, y, z) {
     let acc = 1e9;
     for (let i = 0; i < nB; i++) {
       const b = blobs[i];
-      const bd = Math.sqrt((x - b.bx) * (x - b.bx) + (y - b.by) * (y - b.by)
-        + (z - b.bz) * (z - b.bz)) - b.br;
-      if (bd > acc + b.join + 0.02) continue;
+      const dx = x - b.bx, dy = y - b.by, dz = z - b.bz;
+      /* the same cull as before, without the square root: skip when
+         dist - br > acc + join + 0.02 */
+      const lim = acc + b.join + cPad + b.br;
+      if (lim > 0 && dx * dx + dy * dy + dz * dz > lim * lim) continue;
       const ps = b.prims;
       let v = ps[0].d(x, y, z);
       for (let j = 1; j < ps.length; j++) v = smin(v, ps[j].d(x, y, z), b.k);
       acc = acc === 1e9 ? v : smin(acc, v, b.join);
     }
     if (acc === 1e9) acc = 1;
-    for (let i = 0; i < carves.length; i++) {
-      acc = smax(acc, -carves[i].p.d(x, y, z), carves[i].k);
+    for (let i = 0; i < nC; i++) {
+      const c = carves[i], p = c.p;
+      const lim = c.k + cPad - acc + p.br;
+      if (lim <= 0) continue;
+      const dx = x - p.bx, dy = y - p.by, dz = z - p.bz;
+      if (dx * dx + dy * dy + dz * dz > lim * lim) continue;
+      acc = smax(acc, -p.d(x, y, z), c.k);
     }
     for (let i = 0; i < keeps.length; i++) {
       const kp = keeps[i], ps = kp.prims;
@@ -425,9 +444,9 @@ export function makeField(blobs, carves = [], keeps = []) {
     let best = 1e9, part = blobs[0] ? blobs[0].part : 0, bone = null;
     for (let i = 0; i < nB; i++) {
       const b = blobs[i];
-      const bd = Math.sqrt((x - b.bx) * (x - b.bx) + (y - b.by) * (y - b.by)
-        + (z - b.bz) * (z - b.bz)) - b.br;
-      if (bd > best) continue;
+      const dx = x - b.bx, dy = y - b.by, dz = z - b.bz;
+      const lim = best + b.br;
+      if (lim > 0 && dx * dx + dy * dy + dz * dz > lim * lim) continue;
       let v = b.prims[0].d(x, y, z);
       for (let j = 1; j < b.prims.length; j++) v = smin(v, b.prims[j].d(x, y, z), b.k);
       if (v < best) { best = v; part = b.part; bone = b.bone; }
@@ -488,10 +507,27 @@ export function surfaceNets(field, bounds, cell, opts = {}) {
   const ny = Math.ceil((bounds.max[1] - oy) / cell) + 1;
   const nz = Math.ceil((bounds.max[2] - oz) / cell) + 1;
   const G = new Float32Array(nx * ny * nz).fill(1);
+  /* NEIGHBOURING BLOCKS SHARE A FACE, AND THAT FACE USED TO BE SAMPLED
+     TWICE. The block loop below walks [k*S, (k+1)*S] inclusive, so every
+     boundary plane belongs to two blocks: 125 samples per block of which
+     only 64 are its own. Measured on a head, that was 128 000 field
+     evaluations where 70 000 would do — nearly a quarter of the whole
+     mesher. One byte per grid point buys all of it back, exactly: the
+     values written are identical, only the duplicate work is gone. */
+  const done = new Uint8Array(nx * ny * nz);
   const gi = (i, j, k) => (k * ny + j) * nx + i;
 
   /* coarse block pass */
-  const S = 4;
+  /* Block stride for the coarse skip pass. 2, not 4: the reject band
+     scales with S but carries a fixed 10 mm of slack, so a smaller
+     block wastes proportionally less of the grid on shell it does not
+     need. Measured over a head, a body and a hair shell, S=2 costs 6-7 %
+     fewer field evaluations than S=4 and — verified by hashing position,
+     normal and index — produces a bit-identical mesh: a block can only
+     be skipped when every corner is further from the surface than the
+     block's own half-diagonal, so no cell that carries a sign change
+     ever touches a skipped corner. */
+  const S = opts.blockStride ?? 2;
   const bx = Math.ceil((nx - 1) / S), by = Math.ceil((ny - 1) / S), bz = Math.ceil((nz - 1) / S);
   const C = new Float32Array((bx + 1) * (by + 1) * (bz + 1));
   const ci = (i, j, k) => (k * (by + 1) + j) * (bx + 1) + i;
@@ -524,8 +560,12 @@ export function surfaceNets(field, bounds, cell, opts = {}) {
           const z = oz + kk * cell;
           for (let jj = j * S; jj <= Math.min((j + 1) * S, ny - 1); jj++) {
             const y = oy + jj * cell;
+            const row = (kk * ny + jj) * nx;
             for (let ii = i * S; ii <= Math.min((i + 1) * S, nx - 1); ii++) {
-              G[gi(ii, jj, kk)] = field(ox + ii * cell, y, z);
+              const g = row + ii;
+              if (done[g]) continue;
+              done[g] = 1;
+              G[g] = field(ox + ii * cell, y, z);
             }
           }
         }
@@ -2250,6 +2290,17 @@ export function randomSpec(rng, seedName = 'npc') {
  */
 export function createHumans(ctx) {
   const t0 = performance.now();
+  /* BOOT PROFILER. This module was 63 % of a 13.9 s cold boot and every
+     number in the rework below was read off this object, so it stays —
+     a boot budget you cannot re-measure is a boot budget that grows
+     back. It is a handful of performance.now() calls per character. */
+  const T = {
+    bodiesFine: 0, bodiesCoarse: 0, skin: 0,
+    cacheMiss: 0, skel: 0, bodyCol: 0, head: 0, mesh: 0, n: 0,
+    m: {},
+  };
+  const miss = (k, t) => { const e = T.m[k] || (T.m[k] = { n: 0, ms: 0 }); e.n++; e.ms += now() - t; };
+  const now = () => performance.now();
   const q = ctx.quality || {};
   const tier = String(q.name || 'high').replace(/\(.*/, '');
   const CELL_BODY = tier === 'low' ? 0.030 : tier === 'med' ? 0.025 : 0.0215;
@@ -2262,7 +2313,10 @@ export function createHumans(ctx) {
      characters one draw call each and — more importantly — makes the
      shading law identical to his. §1.2 forbids an outline on clay and
      asks for the warm-grey shade tint, both inherited from clay(). */
-  const material = ctx.mat.clay({
+  /* Kept as a named object, not written inline, so `fadeMaterial()`
+     below can build a twin that is identical by construction rather
+     than identical by somebody remembering to update both. */
+  const CLAY_PARAMS = {
     name: 'npc.clay',
     color: 0xffffff,
     vertexColors: true,
@@ -2305,7 +2359,8 @@ export function createHumans(ctx) {
     shadowStrength: 0.30,
     shadowTint: CLAY.bodyAO,
     ao: 1.0,
-  });
+  };
+  const material = ctx.mat.clay(CLAY_PARAMS);
 
   /* ---- bodies: one mesh per BODY_SHAPE, attributes shared by
      reference between every character that wears that shape.
@@ -2360,6 +2415,7 @@ export function createHumans(ctx) {
 
   /** capture-volume skin weights for one body's vertices */
   function skinFor(posArr, nvB) {
+    const _t = now();
     const skinIdx = new Uint16Array(nvB * 4);
     const skinW = new Float32Array(nvB * 4);
     for (let v = 0; v < nvB; v++) {
@@ -2387,6 +2443,7 @@ export function createHumans(ctx) {
       skinIdx[v * 4] = b0; skinW[v * 4] = 1 - w1;
       skinIdx[v * 4 + 1] = b1 >= 0 ? b1 : b0; skinW[v * 4 + 1] = w1;
     }
+    T.skin += now() - _t;
     return {
       i: new THREE.Uint16BufferAttribute(skinIdx, 4),
       w: new THREE.Float32BufferAttribute(skinW, 4),
@@ -2434,13 +2491,28 @@ export function createHumans(ctx) {
       skinI: sk.i, skinW: sk.w,
     };
   });
-  const BODIES = {
-    fine: buildBodies({ body: 1, hand: 1 }),
-    coarse: buildBodies({ body: COARSE.body, hand: COARSE.hand }),
-  };
+  /* THE BODY CACHE IS BUILT WHEN A BODY IS FIRST ASKED FOR, NOT AT
+     STARTUP. Six meshed bodies (three shapes, two detail tiers) were
+     900 ms of a boot that had not yet placed a single person, and the
+     tier a run actually needs depends on who it builds first: a boot
+     that only stands the nearby named clients up never needs the coarse
+     set at all until the crowd streams in, a second later, off the
+     critical path. */
+  const BODIES = {};
+  function bodySet(detail) {
+    let list = BODIES[detail];
+    if (!list) {
+      const _tb = now();
+      list = BODIES[detail] = detail === 'coarse'
+        ? buildBodies({ body: COARSE.body, hand: COARSE.hand })
+        : buildBodies({ body: 1, hand: 1 });
+      if (detail === 'coarse') T.bodiesCoarse = now() - _tb; else T.bodiesFine = now() - _tb;
+    }
+    return list;
+  }
   /** pick the cached body whose own girth is closest to this spec */
   function bodyFor(build, detail) {
-    const list = BODIES[detail] || BODIES.fine;
+    const list = bodySet(detail === 'coarse' ? 'coarse' : 'fine');
     let best = list[0], bd = 1e9;
     for (const b of list) {
       const d = Math.abs(b.S.g - build);
@@ -2455,9 +2527,22 @@ export function createHumans(ctx) {
   const built = [];
   const remember = (g) => { if (g) built.push(g); return g; };
 
+  /* EXPRESSION IS SUB-CELL ON A PEDESTRIAN. `mood` moves the mouth
+     slit's corners by 6-12 mm and tilts the brow roll by up to 9 mm;
+     `age` moves the lid and the nasolabial fold by less again. The
+     coarse tier samples the head on a 15.5 mm grid, so every one of
+     those offsets is under one cell and the mesh that comes back is the
+     same mesh. Keying the coarse caches on them meshed eighteen head
+     shells and fifty-four face sets to produce six and six distinct
+     results — 1.1 s of a boot spent on differences that cannot exist in
+     the output. The named clients are meshed fine and looked at from a
+     metre, and they keep every one of them. */
+  const moodFor = (mood, detail) => (detail === 'coarse' ? '' : (mood || ''));
+
   const headGeo = (face, mood, detail) => {
-    const key = face + '|' + (mood || '') + '|' + detail;
+    const key = face + '|' + moodFor(mood, detail) + '|' + detail;
     if (!cHead.has(key)) {
+      const _t = now();
       const cell = CELL_HEAD * (detail === 'coarse' ? COARSE.head : 1);
       /* The face is the one surface a player ever gets within a metre
          of, and a two-band ramp on a nearly-flat cheek breaks into a
@@ -2465,8 +2550,10 @@ export function createHumans(ctx) {
          millimetre of blend ripple. Two relaxation passes and five
          normal passes cost 40 ms per cached face shape and are the
          difference between clay and faceted plastic. */
-      cHead.set(key, remember(meshField(headField(HUMAN.face[face] || CANON, mood), cell, 1.22,
+      cHead.set(key, remember(meshField(
+        headField(HUMAN.face[face] || CANON, moodFor(mood, detail)), cell, 1.22,
         { relax: 2, normalPasses: 5 })));
+      T.cacheMiss += now() - _t; miss('head.' + detail, _t);
     }
     return cHead.get(key);
   };
@@ -2482,30 +2569,56 @@ export function createHumans(ctx) {
   const hairGeo = (style, detail) => {
     const key = style + '|' + detail;
     if (!cHair.has(key)) {
+      const _t = now();
       const f = hairField(style);
       const cell = CELL_HAIR * (detail === 'coarse' ? COARSE.hair : 1);
       cHair.set(key, f
         ? remember(meshField(f, cell, 1.20, { relax: 2, normalPasses: 4, aoField: shellAO(f) }))
         : null);
+      T.cacheMiss += now() - _t; miss('hair.' + detail, _t);
     }
     return cHair.get(key);
   };
   const beardGeo = (kind, detail) => {
     const key = kind + '|' + detail;
     if (!cBeard.has(key)) {
+      const _t = now();
       const f = beardField(kind);
       const cell = CELL_HAIR * (detail === 'coarse' ? COARSE.hair : 1);
       cBeard.set(key, f
         ? remember(meshField(f, cell, 1.32, { relax: 2, normalPasses: 4, aoField: shellAO(f) }))
         : null);
+      T.cacheMiss += now() - _t; miss('beard.' + detail, _t);
     }
     return cBeard.get(key);
   };
-  const specsGeoC = (k) => { if (!cSpecs.has(k)) cSpecs.set(k, remember(specsGeo(k))); return cSpecs.get(k); };
-  const hatGeoC = (k) => { if (!cHat.has(k)) cHat.set(k, remember(hatGeo(k))); return cHat.get(k); };
-  const faceGeoC = (face, mood, age) => {
-    const key = face + '|' + (mood || '') + '|' + age;
-    if (!cFace.has(key)) cFace.set(key, remember(faceGeo(HUMAN.face[face] || CANON, mood, age)));
+  const specsGeoC = (k) => {
+    if (!cSpecs.has(k)) { const _t = now(); cSpecs.set(k, remember(specsGeo(k))); T.cacheMiss += now() - _t; miss('specs', _t); }
+    return cSpecs.get(k);
+  };
+  const hatGeoC = (k) => {
+    if (!cHat.has(k)) { const _t = now(); cHat.set(k, remember(hatGeo(k))); T.cacheMiss += now() - _t; miss('hat', _t); }
+    return cHat.get(k);
+  };
+  /* `age` survives into the coarse tier and `mood` does not, and the
+     difference is not taste. Mood is a 3 mm push on a surface sampled
+     every 15.5 mm — measured, over three face shapes: mean 0.03 mm,
+     worst 4.7 mm, not one vertex moved by a whole cell. Age moves the
+     lid, the fold and the brow as separate pieces of geometry, at the
+     scale you can see across a street, and it is one of the eleven axes
+     the crowd's variety is made of. What must not happen is the two
+     disagreeing: these features are seated by bisection against the head
+     field, so faceGeo is handed exactly the mood its shell was meshed
+     with. */
+  const faceGeoC = (face, mood, age, detail) => {
+    const m = moodFor(mood, detail);
+    const a = age;
+    const key = face + '|' + m + '|' + a;
+    if (!cFace.has(key)) {
+      const _t = now();
+      cFace.set(key, remember(faceGeo(HUMAN.face[face] || CANON, m, a)));
+      T.cacheMiss += now() - _t; miss('face', _t);
+    }
     return cFace.get(key);
   };
 
@@ -2671,7 +2784,7 @@ export function createHumans(ctx) {
     const pieces = [];
     const add = (g, warp) => { if (g) pieces.push({ g, warp }); };
     add(headGeo(spec.face, spec.mood, detail), false);
-    add(faceGeoC(spec.face, spec.mood, spec.age | 0), false);
+    add(faceGeoC(spec.face, spec.mood, spec.age | 0, detail), false);
     add(hairGeo(spec.hair, detail), true);
     add(beardGeo(spec.beard, detail), true);
     add(specsGeoC(spec.specs), true);
@@ -2792,6 +2905,8 @@ export function createHumans(ctx) {
    * NPC module need; the caller adds `root` to the scene.
    */
   function build(spec, seed, detail = 'fine') {
+    T.n++;
+    let _t = now();
     const rng = ctx.makeRng(seed || ('human.' + (spec.id || 'x')));
     const pal = palette(spec, rng);
 
@@ -2799,6 +2914,7 @@ export function createHumans(ctx) {
     const root = new THREE.Group();
     root.name = 'npc.' + (spec.id || 'x');
     root.add(rig.rootBone);
+    T.skel += now() - _t; _t = now();
 
     const B = bodyFor(spec.build ?? 1, detail);
     const bodyGeo = new THREE.BufferGeometry();
@@ -2809,6 +2925,7 @@ export function createHumans(ctx) {
     bodyGeo.setAttribute('color', bodyColors(B, pal));
     bodyGeo.setIndex(B.idx);
     bodyGeo.boundingSphere = B.src.boundingSphere;
+    T.bodyCol += now() - _t; _t = now();
 
     const body = new THREE.SkinnedMesh(bodyGeo, material);
     body.name = root.name + '.body';
@@ -2821,8 +2938,10 @@ export function createHumans(ctx) {
     root.add(body);
     root.updateMatrixWorld(true);
     body.bind(rig.skeleton);
+    T.mesh += now() - _t; _t = now();
 
     const headG = buildHead(spec, pal, detail);
+    T.head += now() - _t;
     _tmpGeos.push(headG);
     const head = new THREE.Mesh(headG, material);
     head.name = root.name + '.head';
@@ -2855,22 +2974,72 @@ export function createHumans(ctx) {
     };
   }
 
+  /* ================================================================
+     THE FADE MATERIAL — one person dissolving, and nobody else.
+
+     A character who "leaves mysteriously" has to stop being there in a
+     way that reads as INTENDED. Hiding the object is a despawn and the
+     eye catches it every time; walking them past a wall needs a wall.
+     A dissolve is the honest answer, and the whole population shares a
+     single opaque clay material, so it needs a second one — identical
+     in every shading term, transparent, with the alpha on a uniform.
+
+     WHY NOT `opacity`. toon.js has one, but the population's geometry
+     carries a FOUR-component colour attribute (rgb = the palette,
+     alpha = the baked cone-traced AO), so three compiles the shader
+     with USE_COLOR_ALPHA and `tex *= vColor` multiplies the material
+     opacity by the AO. Fading through that path would make the creases
+     transparent first: a person dissolving from the inside out, which
+     is a special effect nobody asked for. So the final write takes
+     `uFade` directly and leaves tex.a alone.
+
+     The shading is otherwise bit-identical because the parameters are
+     the same object, and toon.js hands out the sun/ambient/shadow
+     uniforms BY REFERENCE from its globals — so the twin tracks the
+     time of day, the weather and the grade with no extra plumbing.
+
+     It is built on first use. Most sessions never need it.
+     ================================================================ */
+  let fadeMat = null;
+  function fadeMaterial() {
+    if (fadeMat) return fadeMat;
+    fadeMat = ctx.mat.clay({ ...CLAY_PARAMS, name: 'npc.clay.fade', transparent: true });
+    const MARK = 'gl_FragColor = vec4( col, tex.a );';
+    if (fadeMat.fragmentShader.indexOf(MARK) < 0) {
+      console.warn('[humans] toon.js output line moved; the fade will not fade');
+      return fadeMat;
+    }
+    fadeMat.uniforms.uFade = { value: 1 };
+    fadeMat.fragmentShader = 'uniform float uFade;\n'
+      + fadeMat.fragmentShader.replace(MARK, 'gl_FragColor = vec4( col, tex.a * uFade );');
+    fadeMat.needsUpdate = true;
+    return fadeMat;
+  }
+
   const buildMs = +(performance.now() - t0).toFixed(1);
 
   return {
     material, build, palette, randomSpec, PART, HUMAN, H, PROP, BONES, BONE_INDEX,
+    /** The transparent twin of `material`, for a character who has to
+        stop being there on purpose. Its alpha is uniforms.uFade. */
+    fadeMaterial,
     stats: {
-      bodyTriangles: BODIES.fine[0].src.userData.triangles,
-      bodyTrianglesCoarse: BODIES.coarse[0].src.userData.triangles,
-      bodyVertices: BODIES.fine[0].nv,
-      bodyShapes: BODIES.fine.length,
+      /* getters, because the body caches are lazy now — reading these
+         before anyone has been built would otherwise force the very
+         work the laziness exists to defer. */
+      get bodyTriangles() { return BODIES.fine ? BODIES.fine[0].src.userData.triangles : 0; },
+      get bodyTrianglesCoarse() { return BODIES.coarse ? BODIES.coarse[0].src.userData.triangles : 0; },
+      get bodyVertices() { return BODIES.fine ? BODIES.fine[0].nv : 0; },
+      get bodyShapes() { return (BODIES.fine || BODIES.coarse || []).length; },
       bones: BONES.length,
       buildMs,
     },
+    /** live boot profile — see the T declaration at the top of this fn */
+    perf: T,
     dispose() {
       material.dispose();
-      for (const b of BODIES.fine) b.src.dispose();
-      for (const b of BODIES.coarse) b.src.dispose();
+      fadeMat?.dispose();
+      for (const k of Object.keys(BODIES)) for (const b of BODIES[k]) b.src.dispose();
       for (const g of built) g?.dispose();
       for (const g of _tmpGeos) g.dispose();
     },

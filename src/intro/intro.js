@@ -295,12 +295,29 @@ export async function init(ctx) {
      Skip — any key, any tap, at any time
      ================================================================ */
   let skipOn = false;
+  let skipArmed = 0;              // when the listeners went on, ms
+
+  /* THE GESTURE THAT STARTS THE GAME MUST NOT ALSO SKIP IT.
+     main.js rolls the opener from the player's first press, and one
+     physical tap is several events: pointerdown, then touchstart, then
+     mousedown, then click. The start beat consumes the first of them
+     and play() attaches these listeners while that same tap is still
+     being delivered — so the next event in the sequence would arrive
+     here a millisecond later and cut a thirty-second cinematic to
+     black before its first frame. A short deaf window is the whole
+     fix, and it costs nothing: the skip hint does not appear until
+     t = 1.6 s. */
+  const SKIP_DEAF = 0.4;          // seconds
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
   function onSkip(e) {
     if (e && e.type === 'keydown' && (e.key === 'F5' || e.key === 'F12')) return;
+    if (now() - skipArmed < SKIP_DEAF * 1000) return;
     if (!running || outro) return;
     finish('skip');
   }
   function attachSkip() {
+    skipArmed = now();
     if (skipOn || typeof window === 'undefined') return;
     skipOn = true;
     addEventListener('keydown', onSkip, { capture: true });
@@ -478,9 +495,24 @@ export async function init(ctx) {
     dbg.intro = api;
   }
 
-  /* The harness always loads with ?shot=1, which sets both of these.
-     Nothing below this line may run in that case. */
-  if (!ctx.flags?.shot && !ctx.flags?.skipIntro) play();
+  /* NOTHING AUTO-PLAYS FROM HERE ANY MORE.
+
+     This module used to call play() at the end of its own init. That
+     meant the opener began while the AudioContext was still
+     suspended — browsers only resume one on a real user gesture, and
+     boot is not a gesture — so the score never started and the title
+     sting at 31.11 s was scheduled into a context that was not
+     running. The whole cinematic played silent.
+
+     main.js now rolls the opener from inside the player's first
+     gesture (see THE START BEAT there), once the context has actually
+     reached `running`, so the music and the picture begin on the same
+     instant and the title lands on bar 7 with the sting under it.
+
+     main.js calls ctx.intro.play() only when neither flags.shot nor
+     flags.skipIntro is set — the same condition that used to guard
+     this line. Every tool in tools/ boots with one of them and none
+     of them ever sees the cinematic. */
 
   return api;
 }

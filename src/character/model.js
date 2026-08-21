@@ -2521,9 +2521,54 @@ const ARM_SEAM_FLANK_P = 2.2;
    ramp with posed capsule distances evaluated in the vertex shader,
    where the leg is legal because it is where the pose actually put it.
    The two gains are exact complements, so the total is unchanged. */
+/* ROUND 8 — THE ARMPIT FADE OPENS EARLIER AND KEEPS LESS, AND THAT IS
+   THE ONLY CHANGE THIS ROUND MAKES TO THE BAND. It was ordered to lift
+   the crease FLOOR at f 0.50-0.68 from 55-60 to 140-170, because the
+   reference was believed to sit at 112-147 there. IT DOES NOT. That
+   reference column was BACKGROUND: ref/wally-ref-cool.png is cut on
+   black, the rows at f 0.50-0.68 cross the true slot between arm and
+   flank, and the old ruler sampled the hole and called it a crease.
+   tools/creasemeasure.mjs now masks both images (magenta frame for the
+   build, border-connected dark flood for the reference) and DROPS
+   background from the profile before taking any minimum. The reference
+   then reads, on the hanging-arm side:
+
+       f      GAME floor    REF floor
+       0.44       80          147     <- the one real defect
+       0.50       77           72
+       0.56       82           44
+       0.62       84           41
+       0.68      135           62
+
+   At f 0.50-0.62 this build is already ON the reference or LIGHTER than
+   it, and tools/creasetest.mjs — a different ruler, its own masks —
+   prints the same thing. Raising that floor to 140-170 would put it 60
+   to 100 luma ABOVE the reference and weld the arm back onto the flank,
+   which is the defect the user reported in the first place. W and A are
+   therefore UNCHANGED at 0.34 / 0.30.
+
+   f 0.44 IS a gash: 80 against the reference's 147, a 22 mm oval where
+   the reference has a 40 mm soft shade — the failure the ROUND 7 note
+   above opens with, that the armpit is not a contact line and must not
+   be shaded as one. MEASURED BY A/B on identical frames, the band owns
+   11 luma of that 67: zeroing W and A moves f 0.44 from 80 to 91 (and
+   f 0.50 from 77 to 91, which is why zeroing them is not the fix);
+   killing the whole baked sculpt+AO reaches 114; the last 33 is the
+   studio key's terminator and is not in this file. So the 11 that IS
+   ours comes out of the armpit and out of nothing else. The fade opens
+   at y 0.79 instead of 0.82 and keeps a sixteenth instead of an eighth,
+   which takes the gain at f 0.44 (y 0.896) from 0.66 to 0.20 while
+   f 0.50 (y 0.80) stays at 0.99 and every row below y 0.79 — the whole
+   stretch that already matches the reference — is untouched.
+
+   THE SKEWS ARE ALSO UNCHANGED, on the same evidence. The flank wall
+   was reported as recovering in ~100 mm against the reference's 15-25.
+   Masked, it recovers in 15 / 19 / 31 / 1 / 0 mm against the
+   reference's 12 / 12 / 16 / 18 / 10, and ARM_SEAM_SKEW_FLANK's own
+   note above records what raising it further did the last time. */
 const ARM_SEAM_Y0 = 0.62, ARM_SEAM_Y1 = 0.76;   // low fade in / runtime handover
-const ARM_SEAM_Y2 = 0.82, ARM_SEAM_Y3 = 1.00;   // armpit fade out
-const ARM_SEAM_ARMPIT = 0.12;                   // gain retained at the armpit
+const ARM_SEAM_Y2 = 0.79, ARM_SEAM_Y3 = 0.93;   // armpit fade out
+const ARM_SEAM_ARMPIT = 0.06;                   // gain retained at the armpit
 /* The crease constants, exported so the RUNTIME half of this crease
    (wally.js installContactCrease) cannot drift from the baked half.
    Never re-type these numbers anywhere else — a stale literal is how

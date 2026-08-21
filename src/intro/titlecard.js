@@ -130,8 +130,8 @@ function wordSVG(id, word, x, y, scale, fill, sheen) {
     `<g mask="url(#${id})">` +
     `<rect x="-40" y="-40" width="${m.w + 80}" height="180" fill="${fill}"/>` +
     (sheen
-      ? `<rect class="ic-sheen" x="-260" y="-60" width="120" height="230" ` +
-        `fill="url(#ic-sheen)" transform="skewX(-16)"/>`
+      ? `<rect class="${sheen.cls}" x="-260" y="-60" width="120" height="230" ` +
+        `fill="url(#${sheen.id})" transform="skewX(-16)"/>`
       : '') +
     `</g>`;
   return {
@@ -139,6 +139,81 @@ function wordSVG(id, word, x, y, scale, fill, sheen) {
     defs: mask,
     node: `<g transform="translate(${x},${y}) scale(${scale})">${body}</g>`,
   };
+}
+
+/* ------------------------------------------------------------------
+   THE LOCKUP — the product mark, WALLY RPG.
+
+   WALLY over a hard offset plate; RPG centred beneath it on the same
+   optical axis, between two rules that fade away from it. The small
+   word is what makes the mark read as a *title* rather than as a
+   name: at 0.30 scale its cap height lands near the big word's stem
+   weight, which is the ratio that makes a subtitle look set instead
+   of merely shrunk. The rules stop 26 units short of it on each side
+   so the eye finishes the line through the word.
+
+   Exported because the loading screen in index.html draws the SAME
+   mark. The first thing a player sees and the title they see thirty
+   seconds later have to be one designed object, not two drawings of
+   the same word.
+
+   `prefix` namespaces every id and class, so two lockups can share
+   one document without their masks and gradients colliding:
+     'ic' — the intro title card (this file)
+     'bm' — the boot mark (index.html)
+   ------------------------------------------------------------------ */
+export function wordmarkSVG({
+  prefix = 'ic',
+  paper = '#f7efe0', dawn = '#ffd0a0',
+  token = '#f5913c', token2 = '#d96f1e',
+  sheen = true, label = 'WALLY RPG',
+} = {}) {
+  const VW = 640, VH = 196;
+  const wallyX = (VW - setWord('WALLY').w) / 2;
+  const rpgScale = 0.30;
+  const rpgW = setWord('RPG').w * rpgScale;
+  const rpgX = (VW - rpgW) / 2;
+  const RULE_Y = 147;
+
+  const sh = sheen ? { id: `${prefix}-sheen`, cls: `${prefix}-sheen` } : null;
+  const big = wordSVG(`${prefix}-mw`, 'WALLY', wallyX, 6, 1, `url(#${prefix}-face)`, sh);
+  const plate = wordSVG(`${prefix}-mp`, 'WALLY', wallyX, 15, 1, token2, null);
+  const small = wordSVG(`${prefix}-mr`, 'RPG', rpgX, 132, rpgScale, token, null);
+
+  return (
+    `<svg class="${prefix}-mark" viewBox="0 0 ${VW} ${VH}" role="img" ` +
+    `aria-label="${label}" xmlns="http://www.w3.org/2000/svg">` +
+    `<defs>` +
+      `<linearGradient id="${prefix}-face" x1="0" y1="0" x2="0" y2="1">` +
+        `<stop offset="0" stop-color="${paper}"/>` +
+        `<stop offset="0.58" stop-color="${paper}"/>` +
+        `<stop offset="1" stop-color="${dawn}"/>` +
+      `</linearGradient>` +
+      (sheen
+        ? `<linearGradient id="${prefix}-sheen" x1="0" y1="0" x2="1" y2="0">` +
+            `<stop offset="0" stop-color="#fff" stop-opacity="0"/>` +
+            `<stop offset="0.5" stop-color="#fff" stop-opacity="0.62"/>` +
+            `<stop offset="1" stop-color="#fff" stop-opacity="0"/>` +
+          `</linearGradient>`
+        : '') +
+      `<linearGradient id="${prefix}-rule" x1="0" y1="0" x2="1" y2="0">` +
+        `<stop offset="0" stop-color="${token}" stop-opacity="0"/>` +
+        `<stop offset="1" stop-color="${token}" stop-opacity="0.95"/>` +
+      `</linearGradient>` +
+      `<linearGradient id="${prefix}-rule2" x1="0" y1="0" x2="1" y2="0">` +
+        `<stop offset="0" stop-color="${token}" stop-opacity="0.95"/>` +
+        `<stop offset="1" stop-color="${token}" stop-opacity="0"/>` +
+      `</linearGradient>` +
+      big.defs + plate.defs + small.defs +
+    `</defs>` +
+    plate.node + big.node +
+    `<rect class="${prefix}-rule" x="54" y="${RULE_Y}" ` +
+      `width="${rpgX - 54 - 26}" height="3" fill="url(#${prefix}-rule)"/>` +
+    `<rect class="${prefix}-rule" x="${rpgX + rpgW + 26}" y="${RULE_Y}" ` +
+      `width="${VW - 54 - (rpgX + rpgW + 26)}" height="3" fill="url(#${prefix}-rule2)"/>` +
+    small.node +
+    `</svg>`
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -152,50 +227,7 @@ export function createTitleCard(ctx) {
   const token2 = css(BRAND.token2);
   const ink = css(BRAND.ink);
 
-  /* --- layout, in the SVG's own units --------------------------- */
-  const VW = 640, VH = 196;
-  const wally = setWord('WALLY');
-  const wallyX = (VW - wally.w) / 2;
-  const rpgScale = 0.30;
-  const rpg = setWord('RPG');
-  const rpgW = rpg.w * rpgScale;
-  const rpgX = (VW - rpgW) / 2;
-  const RULE_Y = 147;
-
-  const big = wordSVG('ic-mw', 'WALLY', wallyX, 6, 1, 'url(#ic-face)', true);
-  const bigPlate = wordSVG('ic-mp', 'WALLY', wallyX, 15, 1, token2, false);
-  const small = wordSVG('ic-mr', 'RPG', rpgX, 132, rpgScale, token, false);
-
-  const svg =
-    `<svg class="ic-mark" viewBox="0 0 ${VW} ${VH}" role="img" ` +
-    `aria-label="WALLY RPG" xmlns="http://www.w3.org/2000/svg">` +
-    `<defs>` +
-      `<linearGradient id="ic-face" x1="0" y1="0" x2="0" y2="1">` +
-        `<stop offset="0" stop-color="${paper}"/>` +
-        `<stop offset="0.58" stop-color="${paper}"/>` +
-        `<stop offset="1" stop-color="${dawn}"/>` +
-      `</linearGradient>` +
-      `<linearGradient id="ic-sheen" x1="0" y1="0" x2="1" y2="0">` +
-        `<stop offset="0" stop-color="#fff" stop-opacity="0"/>` +
-        `<stop offset="0.5" stop-color="#fff" stop-opacity="0.62"/>` +
-        `<stop offset="1" stop-color="#fff" stop-opacity="0"/>` +
-      `</linearGradient>` +
-      `<linearGradient id="ic-rule" x1="0" y1="0" x2="1" y2="0">` +
-        `<stop offset="0" stop-color="${token}" stop-opacity="0"/>` +
-        `<stop offset="1" stop-color="${token}" stop-opacity="0.95"/>` +
-      `</linearGradient>` +
-      `<linearGradient id="ic-rule2" x1="0" y1="0" x2="1" y2="0">` +
-        `<stop offset="0" stop-color="${token}" stop-opacity="0.95"/>` +
-        `<stop offset="1" stop-color="${token}" stop-opacity="0"/>` +
-      `</linearGradient>` +
-      big.defs + bigPlate.defs + small.defs +
-    `</defs>` +
-    bigPlate.node + big.node +
-    `<rect class="ic-rule" x="54" y="${RULE_Y}" width="${rpgX - 54 - 26}" height="3" fill="url(#ic-rule)"/>` +
-    `<rect class="ic-rule" x="${rpgX + rpgW + 26}" y="${RULE_Y}" ` +
-      `width="${VW - 54 - (rpgX + rpgW + 26)}" height="3" fill="url(#ic-rule2)"/>` +
-    small.node +
-    `</svg>`;
+  const svg = wordmarkSVG({ prefix: 'ic', paper, dawn, token, token2, sheen: true });
 
   /* --- DOM ------------------------------------------------------- */
   const root = document.createElement('div');

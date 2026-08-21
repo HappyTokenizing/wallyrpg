@@ -41,9 +41,10 @@ import {
   buildLensGeometry, buildLensTexture, buildGrooveStrokeGeometry,
   ARM_SEAM,
 } from './model.js';
-import { Animator, CLIPS, CLIP_NAMES } from './anim.js';
+import { Animator, CLIPS, CLIP_NAMES, BIKE_SEAT } from './anim.js';
 import { Expression, EXPRESSION_NAMES } from './expression.js';
 import { Secondary } from './secondary.js';
+import { createBike } from './bike.js';
 
 const _e = new THREE.Euler(0, 0, 0, 'XYZ');
 const _v = new THREE.Vector3();
@@ -57,6 +58,38 @@ const _camPos = new THREE.Vector3();
 const _sc = new THREE.Vector3();
 const _fl = new THREE.Vector3();
 const _fr = new THREE.Vector3();
+
+/* Warp scratch. warpTo() runs the placement, the yaw solve and the
+   finite check in one call, so it cannot borrow _v / _v2 from face()
+   and headPosition() the way setPosition() safely does. */
+const _wp = new THREE.Vector3();
+const _wsafe = new THREE.Vector3();
+
+/* ------------------------------------------------------------------
+   THE NON-FINITE GUARD.
+
+   A position is only usable if every component is a real number, and
+   the cost of letting one that is not through is out of all proportion
+   to the cost of checking. The controller keeps THREE positions —
+   simPosition (end of the fixed step), _prevPosition (start of it) and
+   position (the render lerp between them) — and once any of them is
+   NaN the lerp is NaN for ever: there is no arithmetic that brings a
+   NaN back. Downstream of that, in order: root.position is NaN, so
+   Wally's bounding sphere is NaN and he is culled out of the frame;
+   the camera anchor damps toward NaN and the whole view disappears;
+   the spring chains integrate NaN and never recover; and the audio
+   panner is handed a NaN world position, at which point Web Audio
+   throws "setTargetAtTime: The provided float value is non-finite"
+   once per frame for the rest of the session.
+
+   So every entry point that can move him checks the destination BEFORE
+   the controller sees it, and update() re-checks the result of the
+   simulation once per frame. `Number.isFinite(x + y + z)` is one add
+   chain and one test: NaN and both infinities poison a sum, so the
+   single check covers all three components.
+   ------------------------------------------------------------------ */
+const finite3 = (x, y, z) => Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z);
+const vecFinite = (v) => !!v && Number.isFinite(v.x + v.y + v.z);
 
 /* A layer only the shadow projector's camera looks at, so the silhouette
    pass can draw Wally and nothing else without re-parenting him or
@@ -80,6 +113,14 @@ const CAMS = {
   side: { pos: [3.30, 0.90, 0.10], look: [0, 0.86, 0], fov: 33 },
   back: { pos: [0.00, 0.92, -3.30], look: [0, 0.86, 0], fov: 33 },
   ears: { pos: [0.00, 1.44, 2.10], look: [0, 1.36, 0], fov: 40 },
+  /* The bicycle needs a LOWER, WIDER lens than any of the above: the
+     interesting geometry (cranks, pedals, the fold at the hip, the bars
+     under his hands) lives between 0.2 and 1.0 m, and a lens at head
+     height looks straight down on to the top tube and photographs a
+     saddle. 0.86 m is level with the bars; 42 degrees keeps the wheels
+     inside the frame at 2.9 m without a fisheye on the near tyre. */
+  bike: { pos: [2.18, 1.02, 2.02], look: [0, 0.78, 0.06], fov: 41 },
+  bikeSide: { pos: [3.25, 0.74, 0.06], look: [0, 0.68, 0.03], fov: 38 },
 };
 
 /**
@@ -863,6 +904,53 @@ export async function init(ctx) {
   let silhouette = false;
   let silSaved = null;
 
+  /* --- the non-finite guard's memory (see finite3, top of file) ---
+     The last place everything downstream agreed was real. Seeded on the
+     first clean frame and refreshed on every clean frame after it, so
+     the recovery below always has somewhere legal to put him. */
+  let haveSafe = false;
+  let warnedNaN = false;
+
+  /** True if the character AND the controller are entirely finite. */
+  function positionFinite() {
+    if (!vecFinite(root.position)) return false;
+    const c = controller;
+    if (!c) return true;
+    /* All three of the controller's positions, because _post() lerps
+       _prevPosition -> simPosition into position every frame: one bad
+       endpoint contaminates the other two on the very next step. */
+    return vecFinite(c.simPosition) && vecFinite(c.position)
+      && vecFinite(c._prevPosition) && vecFinite(c.velocity);
+  }
+
+  /**
+   * Checkpoint or repair. Call after anything that writes a position.
+   * Returns true if the state was already clean.
+   *
+   * The repair goes back through controller.teleport() rather than
+   * assigning the fields here, because teleport() is the one path that
+   * resets simPosition, position and _prevPosition together and zeroes
+   * the velocity — which is exactly what a NaN recovery needs, and
+   * exactly what writing root.position behind the controller's back
+   * fails to do.
+   */
+  function guardFinite(where) {
+    if (positionFinite()) {
+      _wsafe.copy(root.position);
+      haveSafe = true;
+      warnedNaN = false;
+      return true;
+    }
+    if (!warnedNaN) {
+      warnedNaN = true;
+      console.warn(`[wally] non-finite position after ${where} — restoring last good`);
+    }
+    const p = haveSafe ? _wp.copy(_wsafe) : _wp.set(0, 0, 0);
+    if (controller) controller.teleport(p);
+    root.position.copy(p);
+    return false;
+  }
+
   if (ctx.bus) {
     ctx.bus.on('phys:jump', () => {
       if (!manual) { anim.play('jump-takeoff', { fade: 0.06, restart: true }); autoClip = 'jump-takeoff'; }
@@ -870,6 +958,247 @@ export async function init(ctx) {
     ctx.bus.on('phys:land', (e) => {
       landT = 0.34;
       if (!manual) { anim.play('jump-land', { fade: 0.05, restart: true }); autoClip = 'jump-land'; }
+    });
+  }
+
+  /* ================================================================
+     6b. THE BICYCLE
+
+     Ownership is the data agent's (state.bike.owned / .equipped, the
+     bus event 'bike', and ctx.game.actions.bike()). Everything from
+     "he has one" onward is here: when the prop exists, where it sits,
+     how he gets on and off it, how fast he goes and how far he leans.
+
+     THE PROP IS A CHILD OF `root`, WHICH IS THE WHOLE TRICK. root
+     already carries the controller's position and yaw, so the bicycle
+     inherits both for free and can never slide out from under him on a
+     turn — there is no second transform to keep in sync and therefore
+     no way for them to disagree. The lean into a corner is a roll on
+     root itself, so rider and machine bank together as one object,
+     which is what a bicycle does and what two separately-leaned
+     objects would never quite look like.
+
+     WHY THE SPEED LIVES HERE. The brief hands the ownership state to
+     the data agent and the LOOK to this file, but the two cannot be
+     separated for free-roam: the pedal cadence is driven by distance
+     travelled, so if the controller's top speed did not change, the
+     bicycle would be a man in a chair moving at walking pace. The
+     controller's own options are patched on equip and restored EXACTLY
+     on unequip, from a snapshot taken at the moment of the first
+     patch — never from a remembered literal, which is how these get
+     out of step with whoever last tuned the walk.
+
+     WHY strideLength GOES TO 1e6. It is metres-per-footstep-event, and
+     the audio layer turns each one into a footfall. A bicycle with
+     footsteps is a worse defect than a bicycle with no sound at all.
+     ================================================================ */
+  const BIKE = {
+    walkSpeed: 5.10,      // no shift — a relaxed cruise, 2.1x his walk
+    runSpeed: 8.80,       // shift — 32 km/h, the "worth every dollar" line
+    turnRate: 6.4,        // a bicycle arcs; it does not pivot
+    strideLength: 1e6,    // see above
+    accel: 22,            // it takes a moment to get going
+    decel: 14,            // and it rolls when you stop pedalling
+  };
+  const MOUNT_T = 0.62;   // must equal CLIPS['bike-mount'].duration
+  const DISMOUNT_T = 0.54;
+
+  let bike = null;                 // the prop, built on first equip
+  let bikeOwned = false;
+  let bikeEquipped = false;
+  let bikePhase = 'off';           // off | mounting | on | dismounting
+  let bikeT = 0;                   // seconds into a transition
+  let bikeRide = 0;                // 0..1, the prop's "is it under him"
+  let bikeLean = 0;
+  let bikeSpeedSaved = null;
+  let bikeSyncT = 0;
+  let ikSaved = true;
+  /* A debug hook or a cutscene has taken the bicycle over; stop
+     reconciling it against ctx.game, which does not know about them. */
+  let bikeForced = false;
+
+  function buildBike() {
+    if (bike) return bike;
+    bike = createBike(ctx);
+    bike.group.visible = false;
+    /* The shadow projector renders a private layer, and it was walked
+       over `root` before this existed — so opt the prop in by hand or
+       he casts a rider-shaped shadow with no bicycle in it. */
+    bike.group.traverse((o) => { if (o.isMesh) o.layers.enable(SHADOW_LAYER); });
+    root.add(bike.group);
+    return bike;
+  }
+
+  function bikeSpeeds(on) {
+    const c = controller;
+    if (!c || !c.opts) return;
+    if (on) {
+      if (!bikeSpeedSaved) {
+        bikeSpeedSaved = {};
+        for (const k in BIKE) bikeSpeedSaved[k] = c.opts[k];
+      }
+      for (const k in BIKE) c.opts[k] = BIKE[k];
+    } else if (bikeSpeedSaved) {
+      for (const k in bikeSpeedSaved) c.opts[k] = bikeSpeedSaved[k];
+      bikeSpeedSaved = null;
+    }
+  }
+
+  /**
+   * Get on or off. Idempotent, safe to call every frame, and safe to
+   * call before ctx.game exists.
+   * @param {boolean} on
+   * @param {{instant?:boolean}} o  instant skips the mount animation
+   */
+  function setBike(on, o = {}) {
+    const want = !!on;
+    const already = bikePhase === 'on' || bikePhase === 'mounting';
+    if (want === already) return api;
+
+    if (want) {
+      buildBike();
+      bike.group.visible = true;
+      bike.park(false);
+      bikeSpeeds(true);
+      ikSaved = secondary.ikEnabled;
+      secondary.ikEnabled = false;          // his feet are on pedals
+      if (o.instant) {
+        bikePhase = 'on'; bikeT = 0; bikeRide = 1;
+        anim.setBike(true, 0);
+      } else {
+        bikePhase = 'mounting'; bikeT = 0;
+        anim.setBike(true, MOUNT_T * 0.72);
+        if (!manual) { anim.play('bike-mount', { fade: 0.10, restart: true }); autoClip = 'bike-mount'; }
+      }
+      ctx.bus?.emit('wally:bike', { riding: true, instant: !!o.instant });
+    } else {
+      if (o.instant || !bike) {
+        bikePhase = 'off'; bikeT = 0; bikeRide = 0;
+        anim.setBike(false, 0);
+        if (bike) bike.group.visible = false;
+        bikeSpeeds(false);
+        secondary.ikEnabled = ikSaved;
+      } else {
+        bikePhase = 'dismounting'; bikeT = 0;
+        anim.setBike(false, DISMOUNT_T * 0.62);
+        if (!manual) { anim.play('bike-dismount', { fade: 0.08, restart: true }); autoClip = 'bike-dismount'; }
+      }
+      ctx.bus?.emit('wally:bike', { riding: false, instant: !!o.instant });
+    }
+    return api;
+  }
+
+  /* Per-frame: advance the transition, place the prop, turn the crank,
+     bank into the corner. Called from update() after the pose is
+     resolved, so the crank can be driven off the same phase the legs
+     were. */
+  function bikeUpdate(dt, speed) {
+    if (bikePhase === 'mounting') {
+      bikeT += dt;
+      bikeRide = clamp(bikeT / MOUNT_T, 0, 1);
+      if (bikeT >= MOUNT_T) { bikePhase = 'on'; bikeRide = 1; }
+    } else if (bikePhase === 'dismounting') {
+      bikeT += dt;
+      bikeRide = 1 - clamp(bikeT / DISMOUNT_T, 0, 1);
+      if (bikeT >= DISMOUNT_T) {
+        bikePhase = 'off'; bikeRide = 0;
+        if (bike) bike.group.visible = false;
+        bikeSpeeds(false);
+        secondary.ikEnabled = ikSaved;
+      }
+    }
+
+    /* ---- the lean ----
+       Roll on `root` about its own forward axis (Euler 'XYZ' composes
+       Rx*Ry*Rz, so z is applied inside the yaw and is therefore a bank,
+       not a world-space tilt). Proportional to yaw RATE times speed,
+       which is the real physics of it: you lean into a corner in
+       proportion to the lateral acceleration, and a stationary bicycle
+       does not lean at all. Damped, so it eases in and settles out with
+       the corner rather than snapping to the stick. */
+    const c = controller;
+    const want = c && bikeRide > 0
+      ? clamp((c.yawRate || 0) * 0.115 * clamp(speed / 5.5, 0, 1.25), -0.32, 0.32)
+      : 0;
+    bikeLean = damp(bikeLean, want, 5.5, dt);
+    root.rotation.z = bikeLean * bikeRide;
+
+    if (!bike || !bike.group.visible) return;
+
+    /* ---- where the prop is ----
+       Mounting, it comes up off its stand from his left and rights
+       itself under him. The two curves are deliberately different
+       shapes: the roll finishes early (it is upright before he is
+       fully on it) and the slide finishes late, which is what makes it
+       read as him pulling it under himself rather than the bicycle
+       teleporting into place. */
+    const slide = 1 - smoothstepLocal(0.10, 0.92, bikeRide);
+    const roll = 1 - smoothstepLocal(0.00, 0.62, bikeRide);
+    const g = bike.group;
+    g.position.set(-0.60 * slide, 0.02 * slide, -0.10 * slide);
+    g.rotation.set(0, 0.26 * slide, -0.30 * roll);
+    g.visible = bikeRide > 0.001;
+    /* Undo the landing squash: it is a soft-body effect on a clay
+       elephant, and a bicycle frame does not squash. */
+    const rs = root.scale;
+    g.scale.set(1 / (rs.x || 1), 1 / (rs.y || 1), 1 / (rs.z || 1));
+
+    /* ---- the crank ----
+       Straight off the animator's pedal phase, so the pedal is under
+       the foot by construction rather than by a ratio that has to be
+       kept in step by hand. */
+    bike.setCrankPhase(-anim.bikePhase + CRANK_OFFSET);
+    for (const w of bike.wheels) w.rotation.x = -anim.locPhase * Math.PI * 2 * WHEEL_PER_CRANK;
+  }
+
+  /* Local smoothstep so this block does not depend on the import list
+     changing under it. */
+  const smoothstepLocal = (a, b, x) => {
+    const t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  /* Measured, not guessed: see the CRANK note in the final report. The
+     leg's stroke bottom is at pedal phase 0 and the prop's crank arm
+     hangs straight DOWN at rotation.x 0, so the two already agree and
+     the offset is a straight sign flip for the direction of travel. */
+  const CRANK_OFFSET = 0;
+  /* Wheel revolutions per crank revolution: cycle (2.6 m per crank
+       revolution, CLIPS['ride-bicycle'].cycle) divided by the wheel's
+       own circumference. A visible drivetrain ratio — the wheels
+       turning nearly twice per pedal stroke — is what stops them
+       reading as decals painted on the frame. */
+  const WHEEL_PER_CRANK = 2.6 / (Math.PI * 2 * 0.225);
+
+  /* Ownership sync. The data agent emits 'bike' on buy and on equip;
+     a SAVE LOAD may restore state.bike without one, so the state is
+     also re-read on a slow timer. Twice a second, one object read —
+     cheaper than a class of bug where the player's bicycle silently
+     vanishes across a reload. */
+  function bikeSync(dt) {
+    if (bikeForced) return;
+    bikeSyncT -= dt;
+    if (bikeSyncT > 0) return;
+    bikeSyncT = 0.5;
+    const g = ctx.game?.actions?.bike;
+    if (!g) return;
+    let s = null;
+    try { s = g(); } catch (e) { return; }
+    if (!s) return;
+    bikeOwned = !!s.owned;
+    bikeEquipped = !!(s.owned && s.equipped);
+    if (bikeEquipped && bikeOwned) buildBike();
+    /* Never fight a cutscene: the intro drives root.position itself and
+       has its own bicycle. */
+    if (!controlled) return;
+    setBike(bikeEquipped);
+  }
+
+  if (ctx.bus) {
+    ctx.bus.on('bike', (e) => {
+      bikeOwned = !!e?.owned;
+      bikeEquipped = !!(e?.owned && e?.equipped);
+      if (bikeOwned) buildBike();
+      if (controlled) setBike(bikeEquipped);
     });
   }
 
@@ -911,6 +1240,16 @@ export async function init(ctx) {
       root.rotation.y = c.yaw;
     }
 
+    /* ---- does he have a bicycle, and is it with him? ---- */
+    bikeSync(dt);
+
+    /* ---- and it has to be a real number ----
+       One add and one isFinite per frame, in exchange for the whole
+       class of failure documented at finite3(): a NaN that gets past
+       here is a NaN in the camera anchor, the spring chains and the
+       audio panner within two frames, and none of them come back. */
+    guardFinite('phys.update');
+
     /* ---- locomotion inputs ---- */
     let speed = locoManual ? locoSpeed : (c ? c.planarSpeed : 0);
     let turn = locoManual ? locoTurn : (c ? c.yawRate : 0);
@@ -942,19 +1281,30 @@ export async function init(ctx) {
     const ex = expr.update(dt, rig.byName.head, root.rotation.y);
     anim.add(ex, 1);
 
-    /* ---- additive: lean into acceleration and into the turn (§4) ---- */
+    /* ---- additive: lean into acceleration and into the turn (§4) ----
+       Faded out on the bicycle: that lean models a body throwing its
+       weight against the ground through two feet, and a rider's weight
+       goes through the saddle and the bars instead. The bank on `root`
+       in bikeUpdate() replaces it. */
     if (c) {
+      const onFoot = 1 - bikeRide;
       const fwdA = c.acceleration.x * Math.sin(c.yaw) + c.acceleration.z * Math.cos(c.yaw);
       const sideA = c.acceleration.x * Math.cos(c.yaw) - c.acceleration.z * Math.sin(c.yaw);
       leanX = damp(leanX, clamp(fwdA * 0.010, -0.20, 0.20), 7, dt);
       leanZ = damp(leanZ, clamp(-sideA * 0.012, -0.22, 0.22) + (c.lean?.value ?? 0) * 0.5, 7, dt);
       const hi = BONE_INDEX.hips * 3, si = BONE_INDEX.spine * 3, ci = BONE_INDEX.chest * 3;
-      pose.e[hi] += leanX * 0.42; pose.e[hi + 2] += leanZ * 0.42;
-      pose.e[si] += leanX * 0.34; pose.e[si + 2] += leanZ * 0.34;
-      pose.e[ci] += leanX * 0.24; pose.e[ci + 2] += leanZ * 0.24;
+      pose.e[hi] += leanX * 0.42 * onFoot; pose.e[hi + 2] += leanZ * 0.42 * onFoot;
+      pose.e[si] += leanX * 0.34 * onFoot; pose.e[si + 2] += leanZ * 0.34 * onFoot;
+      pose.e[ci] += leanX * 0.24 * onFoot; pose.e[ci + 2] += leanZ * 0.24 * onFoot;
     }
 
     applyPose(pose);
+
+    /* ---- the bicycle: transition, prop placement, crank, bank ----
+       After applyPose so the crank is turned from the same phase the
+       legs were resolved at, and before secondary.update so the ear and
+       trunk chains hang off a root that has already banked. */
+    if (bikePhase !== 'off' || bikeLean !== 0) bikeUpdate(dt, speed);
 
     /* ---- secondary targets, then a forced world update so the spring
        chains in phys.lateUpdate see this frame's bone transforms ---- */
@@ -1130,21 +1480,148 @@ export async function init(ctx) {
     /** Aim his head. Vector3 | Object3D | {x,y,z} | null to release. */
     look(target, weight = 1) { expr.look(target, weight); return api; },
 
+    /* --- the bicycle ---
+       ctx.game owns whether he HAS one; this owns what that looks like.
+       setBike(true) mounts with the animation, {instant:true} skips it. */
+    setBike(on, o) { return setBike(on, o || {}); },
+    get riding() { return bikePhase === 'on' || bikePhase === 'mounting'; },
+    get bike() { return bike; },
+    get bikeState() {
+      return { owned: bikeOwned, equipped: bikeEquipped, phase: bikePhase,
+        ride: +bikeRide.toFixed(3), lean: +bikeLean.toFixed(3) };
+    },
+
     /** Set a facial/postural expression. See ctx.wally.expressions. */
     express(name, o = {}) { expr.set(name, o); return api; },
 
     /* --- placement --- */
     /** Teleport (feet position). Moves the controller too. */
     setPosition(x, y, z) {
-      _v.set(x, y ?? 0, z ?? 0);
+      const py = y ?? 0, pz = z ?? 0;
+      if (!finite3(x, py, pz)) {
+        console.warn('[wally] setPosition ignored — non-finite destination', x, py, pz);
+        return api;
+      }
+      _v.set(x, py, pz);
       if (controller) controller.teleport(_v);
       root.position.copy(_v);
+      guardFinite('setPosition');
       return api;
     },
     setYaw(rad) {
+      if (!Number.isFinite(rad)) return api;
       root.rotation.y = rad;
       if (controller) { controller.yaw = rad; controller._yawTarget = rad; }
       return api;
+    },
+
+    /**
+     * THE ARRIVAL. Put him down somewhere else in the world as though he
+     * had walked there — the whole of it, not just the coordinates.
+     *
+     * setPosition() is the minimum: root plus controller. Fast travel
+     * needs more than the minimum, because a 900 m jump is a
+     * discontinuity in every quantity anything downstream derives from
+     * his position, and each of them fails differently:
+     *
+     *   THE CONTROLLER'S THREE POSITIONS. simPosition is the end of the
+     *     fixed step, _prevPosition the start, and `position` is the
+     *     render lerp between them. Writing root.position behind the
+     *     controller's back — which is the tempting one-liner — leaves
+     *     all three at the old place, so the next frame drags him
+     *     straight back and the frame after that fights it again. Moving
+     *     simPosition alone is worse: the lerp then interpolates ACROSS
+     *     THE ISLAND, and the two endpoints are far enough apart that
+     *     the sweep in _move() runs its substep guard out and can hand
+     *     back a non-finite result. That is the NaN that takes Web Audio
+     *     down. controller.teleport() is the only path that moves all
+     *     three together, so it is the only path used here.
+     *
+     *   VELOCITY, ACCELERATION AND THE TIMERS. He was walking out of his
+     *     apartment; he is now standing at a noodle cart. Left alone,
+     *     the animator reads the old speed, the lean additive reads the
+     *     old acceleration, and the coyote/buffer/jump timers describe a
+     *     jump he took on the other side of the map.
+     *
+     *   THE SPRING CHAINS. The ears, trunk and tail are WORLD-SPACE
+     *     particles (springs.js SpringChain: points[] are world
+     *     positions). Teleport the root and leave them and they are
+     *     abandoned 900 m behind, then whip across the island over the
+     *     next second at whatever the angle limits allow. reset() snaps
+     *     each chain onto its rest pose at the new root, with zero
+     *     velocity — it is the difference between arriving and being
+     *     flung. It needs a current world matrix, so the root matrix is
+     *     forced before they are touched.
+     *
+     * @param {number} x  @param {number} y  @param {number} z  feet position
+     * @param {{yaw?:number, face?:object, keepLook?:boolean}} o
+     *        yaw   absolute facing, radians
+     *        face  world point to turn toward (ignored if yaw is given)
+     * @returns {boolean} true if he actually moved
+     */
+    warpTo(x, y, z, o = {}) {
+      const py = y ?? 0, pz = z ?? 0;
+      if (!finite3(x, py, pz)) {
+        console.warn('[wally] warpTo refused — non-finite destination', x, py, pz);
+        return false;
+      }
+      _wp.set(x, py, pz);
+
+      const c = controller;
+      if (c) {
+        c.teleport(_wp);                 // sim + prev + position + velocity, together
+        c.acceleration.set(0, 0, 0);
+        c._prevVelocity.set(0, 0, 0);
+        c.airTime = 0; c.groundTime = 0;
+        c.coyoteT = 0; c.bufferT = 0; c._stepGrace = 0;
+        c.jumping = false; c.jumpTime = 0; c._prevJump = false;
+        c.landImpact = 0;
+        c.touchingWall = false;
+        c.yawRate = 0;
+        c.lean?.set?.(0);
+        c.squash?.s?.set?.(1);
+        /* teleport() snapped him onto whatever is actually under the
+           destination, so read the settled point back rather than
+           trusting the one we asked for. */
+        if (vecFinite(c.position)) _wp.copy(c.position);
+      }
+      root.position.copy(_wp);
+
+      /* --- facing --- */
+      let yaw = o.yaw;
+      if (!Number.isFinite(yaw) && o.face) {
+        const f = o.face;
+        if (Number.isFinite(f.x) && Number.isFinite(f.z)) {
+          yaw = Math.atan2(f.x - _wp.x, f.z - _wp.z);
+        }
+      }
+      if (Number.isFinite(yaw)) {
+        root.rotation.y = yaw;
+        if (c) { c.yaw = yaw; c._yawTarget = yaw; c.yawRate = 0; }
+      }
+
+      /* --- locomotion state that describes a journey he did not make --- */
+      leanX = 0; leanZ = 0; landT = 0;
+      anim.setLocomotion(0, 0);
+      if (!manual) { anim.stop(0); autoClip = null; }
+      /* A look target at the old place is now 900 m behind his head. */
+      if (!o.keepLook) expr.look(null);
+
+      /* --- secondary, at the new place --- */
+      root.updateMatrixWorld(true);
+      const chains = secondary?.chains;
+      if (chains) {
+        for (const k in chains) {
+          try { chains[k].reset(); } catch (e) { /* a chain that cannot reset is not worth a throw */ }
+        }
+      }
+
+      const ok = guardFinite('warpTo');
+      ctx.bus?.emit('wally:warp', {
+        x: root.position.x, y: root.position.y, z: root.position.z,
+        yaw: root.rotation.y, ok,
+      });
+      return ok;
     },
     /** Turn to face a world point, immediately. */
     face(target) {
@@ -1215,6 +1692,8 @@ export async function init(ctx) {
     lateUpdate,
     dispose() {
       secondary.dispose();
+      bike?.dispose();
+      bike = null;
       ctx.scene.remove(root);
       if (shadowMesh) {
         ctx.scene.remove(shadowMesh);
@@ -1670,6 +2149,75 @@ export async function init(ctx) {
   dbg.turntable = (deg) => { dbgOrbit = deg || 0; if (dbgCam) applyDebugCam(); return dbgOrbit; };
 
   /* ================================================================
+     THE BICYCLE — WALLY.debug.bike(on, speed)
+
+     The verifier's entry point. Mounts him, drives the locomotion blend
+     by hand at a plausible riding speed (so the pedal cadence, the body
+     rock and the ear/trunk hints are all where they would be at speed
+     rather than frozen at a standstill), and frames the three-quarter
+     studio camera that shows the drivetrain, the bars and the rider's
+     fold at the hip in one shot.
+
+       WALLY.debug.bike(true)        mount + ride at 5.2 m/s
+       WALLY.debug.bike(true, 9)     sprinting
+       WALLY.debug.bike(false)       dismount, hand the camera back
+       WALLY.debug.bikeInfo()        the numbers, measured live
+     ================================================================ */
+  dbg.bike = (on = true, speed = 5.2, camName = 'bike') => {
+    if (on === false || on === 'off') {
+      bikeForced = false;
+      api.setBike(false, { instant: true });
+      api.setLocomotion(null);
+      dbg.studio(false);
+      return 'bike off';
+    }
+    /* THE FORCE FLAG IS NOT OPTIONAL HERE. bikeSync() reconciles the
+       prop against ctx.game every half second, and in a fresh save
+       state.bike.owned is false — so without this the hook mounts him
+       and the next sync tick quietly puts him back on his feet, three
+       seconds before the shutter. */
+    bikeForced = true;
+    api.setBike(true, { instant: true });
+    api.setLocomotion(speed, 0);
+    dbg.studio(true, camName);
+    return { riding: api.riding, speed, cam: camName, ...api.bikeState };
+  };
+  /* Sweep the reach to the bars live. See BIKE_SEAT in anim.js for why
+     this cannot be reasoned about from the angles. */
+  dbg.bikeArms = (a0x, a0z, a1x, a1z) => {
+    if (a0x != null) BIKE_SEAT.a0x = a0x;
+    if (a0z != null) BIKE_SEAT.a0z = a0z;
+    if (a1x != null) BIKE_SEAT.a1x = a1x;
+    if (a1z != null) BIKE_SEAT.a1z = a1z;
+    return { a0x: BIKE_SEAT.a0x, a0z: BIKE_SEAT.a0z, a1x: BIKE_SEAT.a1x, a1z: BIKE_SEAT.a1z };
+  };
+  /* Where the feet and hands actually are against where the prop puts
+     the pedals and the bars. This is the measurement the bike geometry
+     is fitted to; never eyeball it off a screenshot. */
+  dbg.bikeInfo = () => {
+    const p = new THREE.Vector3();
+    const rel = (n) => {
+      const b = rig.byName[n];
+      if (!b) return null;
+      b.getWorldPosition(p);
+      root.worldToLocal(p);
+      return [+p.x.toFixed(3), +p.y.toFixed(3), +p.z.toFixed(3)];
+    };
+    return {
+      phase: bikePhase, ride: +bikeRide.toFixed(3), lean: +bikeLean.toFixed(3),
+      bikeW: +anim.bikeW.toFixed(3), pedalPhase: +anim.locPhase.toFixed(3),
+      clip: anim.current,
+      hips: rel('hips'), footL: rel('footL'), footR: rel('footR'),
+      handL: rel('handL'), handR: rel('handR'), head: rel('head'),
+      prop: bike ? { saddle: bike.SADDLE, bars: bike.BARS, pedal: bike.PEDAL } : null,
+      speeds: controller ? {
+        walk: controller.opts.walkSpeed, run: controller.opts.runSpeed,
+        turn: controller.opts.turnRate,
+      } : null,
+    };
+  };
+
+  /* ================================================================
      STUDIO MODE — WALLY.debug.studio(pose)
 
      Every likeness iteration has to be compared against the reference
@@ -1711,6 +2259,11 @@ export async function init(ctx) {
       dbg.wallyFree();
       return 'studio off';
     }
+    /* `true` means KEEP whatever is playing — the studio backdrop and
+       key without the pose override. The bicycle needs it: its pose is
+       a live locomotion blend, not a held clip, and forcing 'cool' over
+       it would photograph a standing elephant beside a bicycle. */
+    const keep = pose === true;
     const name = typeof pose === 'string' && CLIPS[pose] ? pose : 'cool';
     /* Kill the post film grain while the studio rig is up: likeness
        comparisons against ref/wally-ref-cool.png must not be polluted
@@ -1733,15 +2286,17 @@ export async function init(ctx) {
       const el = document.getElementById(id);
       if (el) el.style.visibility = 'hidden';
     }
-    api.pose(name, { fade: 0.001, instant: true });
-    /* welcome is the SQUARE-ON reference (§1.6 pose 2, the title screen):
-       face the studio lens for it; cool keeps the three-quarter
-       composition of ref/wally-ref-cool.png. */
-    api.setYaw(name === 'welcome'
-      ? Math.atan2(CAMS.studio.pos[0], CAMS.studio.pos[2]) : 0);
+    if (!keep) {
+      api.pose(name, { fade: 0.001, instant: true });
+      /* welcome is the SQUARE-ON reference (§1.6 pose 2, the title
+         screen): face the studio lens for it; cool keeps the
+         three-quarter composition of ref/wally-ref-cool.png. */
+      api.setYaw(name === 'welcome'
+        ? Math.atan2(CAMS.studio.pos[0], CAMS.studio.pos[2]) : 0);
+    }
     dbg.wallyCam(camName && CAMS[camName] ? camName : 'studio');
     studioOn = true;
-    return `studio:${name}${camName ? ':' + camName : ''}`;
+    return `studio:${keep ? 'keep' : name}${camName ? ':' + camName : ''}`;
   };
 
   /* lighting.js re-pushes the sun, the ambient and the clear colour every
@@ -1923,6 +2478,13 @@ export async function init(ctx) {
   dbg.wallyGust = (x = 9, y = 2, z = 0) => { secondary.impulse(x, y, z); return 'gust'; };
   dbg.wallyLand = (i = 1) => { secondary.land(i); return 'land'; };
   dbg.wallyFree = () => { dbgCam = null; setSilhouette(false); contactShadow(true); };
+  /** The arrival, on its own. `WALLY.debug.wallyWarp(x, y, z, yaw)`. */
+  dbg.wallyWarp = (x, y, z, yaw) => {
+    const ok = api.warpTo(x, y, z, yaw == null ? {} : { yaw });
+    return { ok, pos: root.position.toArray().map((v) => +v.toFixed(2)), yaw: +root.rotation.y.toFixed(3) };
+  };
+  /** Is anything about him non-finite right now? For the travel test. */
+  dbg.wallyFinite = () => positionFinite();
   dbg.wallyContact = (on) => { contactShadow(on !== false); return !!on; };
   /* Live handles on the ground shadow: (cast, pool, canopy, blur). Pass
      null for any you do not want to change. `debug` paints `a` flat so

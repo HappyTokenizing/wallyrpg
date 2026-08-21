@@ -13,7 +13,7 @@
    plain node, and tools/test-game.mjs must be able to import us.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID } from './data.js';
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, OPENING_MESSAGE } from './data.js';
 
 /* --- tiny local maths, mirrored from core/contracts.js --- */
 export const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -48,7 +48,14 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     rep: 0,
 
     loc: 'apartment',
-    travel: 'bike',
+    /* The last mode used. WALKING, not the bicycle — you do not own a
+       bicycle yet. See TRAVEL and BIKE in data.js. */
+    travel: 'walk',
+    /* THE BICYCLE. owned and equipped are separate: buying it is a
+       decision, riding it is a different one. game.fares() refuses the
+       'bike' mode unless both are true. Persisted; forward-filled by
+       save.js for any save written before v6. */
+    bike: { owned: false, equipped: false },
     arrivals: [],
     seen: { apartment: true },
     known: {},
@@ -70,9 +77,16 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     swap: { unlocked: false, pools: {} },
 
     pawnDay: 0, pawnStock: [],
-    msgs: [], news: [], wallynet: [],
+    /* Otto's welcome is on the phone before the player touches
+       anything — cloned, because OPENING_MESSAGE is deep-frozen and
+       `read` has to be writable. */
+    msgs: [{ ...OPENING_MESSAGE, day: 1, time: CONFIG.dayStartMin, read: false }],
+    news: [], wallynet: [],
     rentDay: CONFIG.rentEveryDays,
     quests: {}, questIdx: 0,
+    /* SIDE QUESTS, kept apart from `quests` so the HUD objective can
+       never show one. id -> 'active' | 'done'. See quests.js. */
+    sides: {},
 
     stats: {
       jobsDone: 0, ordersDone: 0, tokenized: 0, ipos: 0, earned: 0, spent: 0,

@@ -167,6 +167,182 @@ function armsRest(w, flare = 6.5, fwd = 5) {
   w.r('handR', 5, 6, 4);
 }
 
+/* ==================================================================
+   THE BICYCLE POSTURE — one function, three clips, and the contract
+   bike.js is built against.
+
+   WHY THE HIPS GO **UP** AND NOT DOWN. The clip this replaces dropped
+   the pelvis 120 mm BELOW its bind height, which is what you do when a
+   character crouches; a rider does the opposite. Wally's hip joint
+   stands 0.524 m over his soles, a saddle is set so the leg is ~88 %
+   extended at the bottom of the stroke — 0.46 m of hip-to-spindle — and
+   the crank spindle has to sit at 0.215 m for a 0.27 m wheel to fit
+   under it. 0.215 + 0.46 = 0.675, i.e. 0.151 m ABOVE where the hip
+   stands. That is not a stylisation, it is the definition of a bicycle:
+   the pedals hold the feet off the floor, so the body rides higher than
+   it walks. Every earlier frame of this clip had him squatting six
+   inches into the road with his legs dangling half a metre over the
+   cranks, which is invisible in the intro's twelve-metre flyby and
+   impossible to miss from the four-metre follow camera.
+
+   ALL THREE LOCO CLIPS SHARE THIS ONE PEDAL DRIVE AT ONE PHASE, and
+   bike.js turns the real crank from the same phase (Animator.bikePhase),
+   so the foot and the pedal under it are the same number rather than
+   two numbers that agree. The blend between coasting, riding and
+   sprinting therefore cannot slip a stroke — only the body over the
+   pedals changes.
+
+   SIGN CONVENTIONS, read off `walk` and `jump-land` rather than
+   assumed: +x on leg*0 lifts the thigh forward, +x on leg*1 bends the
+   knee (heel back), +x on foot* points the toe down.
+   ================================================================== */
+export const BIKE_SEAT = {
+  /* pelvis offset from bind, metres — hips bone lands at 0.500 + dy */
+  dy: 0.036,
+  dz: -0.100,
+  /* the crank the legs are authored around, in root-local metres.
+     bike.js publishes the same three numbers and they must agree. */
+  bbY: 0.215, bbZ: 0.030, crank: 0.078,
+  /* THE REACH TO THE BARS, and it is mutable so that it can be SOLVED
+     rather than argued about. §1.1 gives him a 0.30 H arm hung off a
+     shoulder that is 0.355 H wide and abducted 19 degrees to clear the
+     pear — so a change of ten degrees at the deltoid moves the mitten
+     as much sideways as forward, and no amount of reasoning about
+     sagittal angles predicts where it lands. WALLY.debug.bikeArms()
+     writes these four and WALLY.debug.bikeInfo() reads back the world
+     position of the hand; bike.js's BARS is then set to the answer.
+     a0 = deltoid (x forward, z abduction), a1 = elbow. */
+  /* SOLVED, 20 August: seven trials at speed 0 with the pedal phase
+     frozen, reading handL/handR back out of bikeInfo(). Every
+     combination in the family lands the mitten within 25 mm of
+     (0.35, 0.885, 0.275) — the arm is short and the shoulder is
+     abducted, so the reach is nearly saturated and the ANGLES barely
+     move the hand. That is why bike.js's bars go to the hand and not
+     the other way round. */
+  a0x: -40, a0z: 19, a1x: -20, a1z: -10,
+};
+
+/**
+ * The seated posture over the cranks.
+ *
+ * @param {number} ph    pedal phase, 0..1
+ * @param {Writer} w
+ * @param {number} eff   0 = coasting upright, 1 = riding, 2 = sprinting
+ * @param {number} k     master weight, for the mount/dismount ramps
+ */
+function bikeBody(ph, w, eff = 1, k = 1) {
+  if (k <= 0) return;
+  const a = ph * TAU;
+  /* effort reshapes the torso, never the legs: the legs are on a crank
+     and a crank does not care how hard you are trying */
+  /* THE LEAN IS SMALL BECAUSE THE HEAD IS BIG. 25 degrees at the hip is
+     a road-bike fold, and on a figure whose cranium is 0.348 H across
+     it puts the crown out past the front hub and the face down in the
+     basket — measured on shots/_bikeside.png, where he read as being
+     sick over the handlebars rather than riding. 8 + 9 keeps the
+     upright city-bike back that the swept bars and the basket already
+     imply, and still gives the sprint something to fold into. */
+  const lean = (8 + eff * 9) * k;
+  const rock = (2.6 + eff * 2.2) * k;
+
+  /* ---- the pelvis onto the saddle ----
+     The pelvis tips forward on the saddle as the effort goes up, and
+     the pedal solve below has to know by how much: the legs hang off
+     the hips bone, so every degree of pelvic tilt is a degree the
+     thigh has already been given. `hipTilt` is subtracted back out. */
+  const hipTilt = (6 + eff * 3) * k;
+  w.p('hips', 0, BIKE_SEAT.dy * k, BIKE_SEAT.dz * k);
+  w.r('hips', -hipTilt, 0, 0);
+
+  /* ---- the pedal stroke ----
+
+     THESE FOUR NUMBERS ARE SOLVED, NOT DIALLED, and the first attempt
+     at dialling them is why: two plausible-looking sine waves put the
+     measured ankle 330 mm BEHIND the crank and 520 mm above it, with
+     one foot higher than the saddle. A leg on a crank is a closed
+     four-bar — the foot is not free to be roughly right.
+
+     SIGN, read off `sit` rather than assumed. A bone's child hangs at
+     -y, so R_x(t) sends it to -z for positive t: NEGATIVE x on leg*0
+     swings the thigh FORWARD, positive x on leg*1 is knee flexion, and
+     the world pitch of the foot is the sum of the three. `sit` agrees
+     exactly (-84 thigh forward, +88 knee).
+
+     THE SOLVE. Two-bone inverse kinematics in the sagittal plane at the
+     four quarter positions of the crank, with the rig's own segment
+     lengths — thigh 0.227 m (hip 0.524 to knee 0.297), shin 0.169
+     (knee to ankle 0.128) — and the ankle held 0.10 m above the pedal
+     because that is where the sole is:
+
+       crank phase      0        PI/2      PI       3PI/2
+       reach            0.345    0.315     0.206    0.249     (max 0.396)
+       thigh forward    45.4     70.3      81.4     51.5      degrees
+       knee flexion     59.5     75.6     119.4    103.6
+
+     Neither curve is a cosine — the circle is offset from the hip, so
+     both are phase-shifted and the fit needs the shift. Two terms each,
+     residual under 2.5 degrees, which is 4 mm at the ankle.
+
+     WHY THE HIP ONLY RISES 36 mm. §1.1 gives Wally a 0.30 H leg on a
+     1.00 H body, so hip-to-ankle is 0.396 m on a 1.60 m character —
+     stubby, and it is the whole reason his silhouette works. A saddle
+     is set from the LEG, not from the height: 0.345 m of reach at the
+     bottom of the stroke puts his hip at 0.560, which is 36 mm over
+     where it stands, and therefore puts the whole bicycle — 0.225 m
+     wheels, a 0.215 m bottom bracket, a 0.47 m saddle — at small-wheel
+     city-bike scale. That is not a stylisation either; it is what
+     happens when you build a bicycle for these legs. */
+  const pedal = (side, off) => {
+    const p = a + off;
+    const thigh = 63.4 - 20.3 * cos(p + 0.481);        // forward of vertical
+    const knee = 89.5 - 33.1 * cos(p - 0.437);         // flexion
+    w.r(`leg${side}0`, (-thigh + hipTilt) * k, 0, 0);
+    w.r(`leg${side}1`, knee * k, 0, 0);
+    /* the sole stays flat on the pedal — the foot cancels the sum of
+       the two above — with a few degrees of toe-down through the power
+       stroke, which is the one thing a rider's ankle actually does */
+    w.r(`foot${side}`, (thigh - knee - hipTilt + 5 * cos(p + 0.7)) * k, 0, 0);
+    /* knees track the top tube instead of splaying: a small inward
+       roll that grows as the thigh comes up */
+    w.r(`leg${side}0`, 0, 0, (side === 'L' ? -1 : 1) * (3.4 + 2.2 * -cos(p)) * k);
+  };
+  pedal('L', 0); pedal('R', Math.PI);
+
+  /* ---- the fold at the hip, and the body rocking with the stroke ----
+     The rock is at the PEDAL frequency, not twice it: the rider's mass
+     shifts onto whichever foot is pushing, so one sine per revolution,
+     with the shoulders counter-rotating a third of it. */
+  w.r('spine', lean, -1.5 * rock * sin(a) * 0.3, rock * sin(a));
+  w.r('chest', lean * 0.42, 2.0 * rock * sin(a) * 0.3, -rock * 0.55 * sin(a));
+  w.r('belly', 0, 0, -rock * 0.3 * sin(a));
+
+  /* ---- head up, watching the road ----
+     The head's WORLD pitch is spine + chest + head, i.e. lean * 1.42
+     plus whatever is written here, so cancelling the lean means
+     cancelling all of it and not just the head's own share. The
+     residual +4 is the few degrees of down-gaze a rider actually has:
+     level would read as staring into the middle distance. */
+  w.r('head', -(lean * 1.42 - 4) * k, (1.6 * sin(a) + 0.8 * sin(a * 0.37)) * k, -rock * 0.3 * sin(a));
+
+  /* ---- hands on the bars ----
+     Shoulders down and forward, elbows soft and OUT (a rider's elbows
+     are never locked), wrists rolled over the grips. The bar reach is
+     measured against these angles in bike.js — see BARS there. */
+  const A = BIKE_SEAT;
+  w.r('armL0', (A.a0x - eff * 4) * k, -6 * k, (A.a0z + eff * 3) * k);
+  w.r('armR0', (A.a0x - eff * 4) * k, 6 * k, (-A.a0z - eff * 3) * k);
+  w.r('armL1', (A.a1x - eff * 3) * k, 0, A.a1z * k);
+  w.r('armR1', (A.a1x - eff * 3) * k, 0, -A.a1z * k);
+  /* the arms take the road through the elbows, out of phase with the
+     legs so the whole figure is never symmetric on any frame */
+  w.r('armL1', -2.2 * rock * sin(a + 1.1) * k, 0, 0);
+  w.r('armR1', 2.2 * rock * sin(a + 1.1) * k, 0, 0);
+  w.r('handL', -22 * k, -4 * k, -13 * k);
+  w.r('handR', -22 * k, 4 * k, 13 * k);
+
+  breathe(w, ph * (1.4 + eff * 1.6), (0.35 + eff * 0.30) * k);
+}
+
 export const CLIPS = {
 
   /* ---------------- idle ----------------
@@ -586,22 +762,90 @@ export const CLIPS = {
 
   'ride-bicycle': {
     duration: 1.0, loop: true, loco: true, cycle: 2.6,
+    trunk: { curl: -0.04, side: 0.30, tip: -1.05, stiff: 300 },
+    ears: { perk: -0.10, spread: 0.09 },
+    fn(ph, w) { bikeBody(ph, w, 1.0); },
+  },
+
+  /* Rolling slowly, or stopped with the feet still on the pedals. The
+     Animator freezes the pedal phase under ~0.15 m/s (see `update`), so
+     the cranks and the feet stop together and stay where they stopped. */
+  'bike-coast': {
+    duration: 1.0, loop: true, loco: true, cycle: 2.6,
+    trunk: { curl: -0.03, side: 0.28, tip: -0.92, stiff: 400 },
+    ears: { perk: 0.02, spread: 0.02 },
+    fn(ph, w) { bikeBody(ph, w, 0.0); },
+  },
+
+  /* Flat out: a deeper fold at the hip, the head down between the
+     shoulders, twice the body rock and a bigger gear. */
+  'bike-sprint': {
+    duration: 1.0, loop: true, loco: true, cycle: 4.4,
+    trunk: { curl: 0.10, side: 0.30, tip: -0.72, stiff: 210 },
+    ears: { perk: -0.22, spread: 0.14 },
+    fn(ph, w) { bikeBody(ph, w, 2.0); },
+  },
+
+  /* ---- getting on ----
+     Ends EXACTLY on bikeBody(_, _, 0), so the crossfade out of it has
+     nothing left to travel. Reads as: dip, push, the right leg swings
+     round behind the saddle, the hands find the bars. */
+  'bike-mount': {
+    duration: 0.62, loop: false,
+    trunk: { curl: 0.10, side: 0.16, tip: -0.30, stiff: 300 },
     fn(ph, w) {
-      const a = ph * TAU;
-      const pedal = (side, off) => {
-        const p = a + off;
-        w.r(`leg${side}0`, -44 - 26 * cos(p), 0, 0);
-        w.r(`leg${side}1`, 52 + 32 * sin(p), 0, 0);
-        w.r(`foot${side}`, -14 - 14 * cos(p), 0, 0);
-      };
-      pedal('L', 0); pedal('R', Math.PI);
-      w.p('hips', 0, -0.120, -0.030);
-      w.r('spine', 22, 0, 1.6 * sin(a));
-      w.r('chest', 10, 0, 0);
-      w.r('head', -26, 2 * sin(a), 0);
-      w.r('armL0', -66, -8, 16); w.r('armR0', -66, 8, -16);
-      w.r('armL1', -14, 0, -8); w.r('armR1', -14, 0, 8);
-      w.r('handL', -14, 0, -10); w.r('handR', -14, 0, 10);
+      const dip = smoothstep(0, 0.24, ph) * (1 - smoothstep(0.22, 0.52, ph));
+      const rise = smoothstep(0.16, 0.86, ph);
+      const swing = smoothstep(0.20, 0.74, ph);
+
+      armsRest(w, 6.5 * (1 - rise), 5 * (1 - rise));
+      bikeBody(0.25, w, 0, rise);        // the destination pose, faded in
+
+      /* the dip before the push */
+      w.p('hips', 0, -0.085 * dip, 0);
+      w.r('legL0', 26 * dip, 0, 0); w.r('legR0', 26 * dip, 0, 0);
+      w.r('legL1', 38 * dip, 0, 0); w.r('legR1', 38 * dip, 0, 0);
+      w.r('spine', 10 * dip, 0, 0);
+
+      /* the right leg comes over the back of the saddle: an abduction
+         (z) and a yaw (y) that both die as it lands on the far pedal */
+      const over = sin(swing * Math.PI);
+      w.r('legR0', -14 * over, -26 * over, -34 * over);
+      w.r('legR1', 40 * over, 0, 0);
+      w.r('hips', 0, -10 * over, -6 * over);
+      w.r('spine', 0, 6 * over, 4 * over);
+
+      /* the near hand is on the bar first, the far one arrives late */
+      const late = smoothstep(0.34, 0.94, ph);
+      w.r('armR0', 26 * (1 - late), 0, -18 * (1 - late));
+      w.r('armR1', -18 * (1 - late), 0, 0);
+      w.r('head', -8 * (1 - rise), 12 * over, 0);
+      breathe(w, ph * 2.0, 0.4 * (1 - rise));
+    },
+  },
+
+  /* ---- and off again ---- the mount run backwards, with the landing
+     squashed into the last fifth so the step down reads as weight. */
+  'bike-dismount': {
+    duration: 0.54, loop: false,
+    trunk: { curl: 0.02, side: 0.22, tip: -0.66, stiff: 420 },
+    fn(ph, w) {
+      const off = smoothstep(0.06, 0.62, ph);
+      const land = smoothstep(0.52, 0.86, ph) * (1 - smoothstep(0.80, 1, ph));
+
+      armsRest(w, 6.5 * off, 5 * off);
+      bikeBody(0.25, w, 0, 1 - off);
+
+      const over = sin(off * Math.PI);
+      w.r('legR0', -10 * over, -30 * over, -30 * over);
+      w.r('legR1', 44 * over, 0, 0);
+      w.r('hips', 0, -12 * over, -5 * over);
+      w.p('hips', 0, -0.070 * land, 0);
+      w.r('legL0', 30 * land, 0, 0); w.r('legR0', 30 * land, 0, 0);
+      w.r('legL1', 42 * land, 0, 0); w.r('legR1', 42 * land, 0, 0);
+      w.r('spine', 12 * land, 0, 0);
+      w.r('head', 6 * land, 10 * over, 0);
+      breathe(w, ph * 2.0, 0.5 * off);
     },
   },
 
@@ -845,14 +1089,44 @@ const LOCO_STEPS = [
   { name: 'sprint', speed: 7.60 },
 ];
 
+/* THE BICYCLE IS A SECOND LOCOMOTION LADDER, NOT A CLIP.
+
+   The obvious implementation — play 'ride-bicycle' as an action clip —
+   is what the intro does, and it is why the intro has to cut away
+   rather than let him stop: an action clip is a single pose curve with
+   no speed in it, so a rider slowing to a halt keeps pedalling at the
+   same rate and a rider accelerating never changes shape. It also
+   cannot blend with `walk`, because the action layer REPLACES the
+   locomotion layer instead of mixing with it.
+
+   So the bike gets its own ladder, resolved exactly the way the foot
+   ladder is (same distance-driven phase, same interpolated cycle
+   length), and `bikeW` crossfades between the two ladders. That single
+   number is what makes mounting a blend rather than a cut: at bikeW 0.5
+   he is genuinely half-walking and half-pedalling, at any speed, and
+   the mount/dismount clips ride the action layer over the top of it to
+   carry the arc. Nothing in the foot ladder changed. */
+const BIKE_STEPS = [
+  { name: 'bike-coast', speed: 0.00 },
+  { name: 'ride-bicycle', speed: 3.40 },
+  { name: 'bike-sprint', speed: 8.20 },
+];
+
 export class Animator {
   constructor() {
     this.out = makePose();
     this._loA = makePose();
     this._loB = makePose();
     this._loco = makePose();
+    this._bike = makePose();
     this._act = makePose();
     this._w = new Writer();
+
+    /* 0 = on foot, 1 = on the bicycle. Damped, never assigned. */
+    this.bikeW = 0;
+    this.bikeTarget = 0;
+    this.bikeRate = 1 / 0.34;
+    this._bkA = CLIPS['bike-coast']; this._bkB = CLIPS['bike-coast']; this._bkF = 0;
 
     this.locPhase = 0;
     this.speed = 0;
@@ -893,6 +1167,20 @@ export class Animator {
     if (opts.instant) this.actionW = 1;
     return this;
   }
+
+  /**
+   * Crossfade the locomotion layer between the foot ladder and the
+   * bicycle ladder. `fade` in seconds; 0 snaps.
+   */
+  setBike(on, fade = 0.34) {
+    this.bikeTarget = on ? 1 : 0;
+    this.bikeRate = 1 / Math.max(fade, 0.016);
+    if (fade <= 0.016) this.bikeW = this.bikeTarget;
+    return this;
+  }
+
+  /** Crank angle in radians, for the prop under his feet. See bike.js. */
+  get bikePhase() { return this.locPhase * TAU; }
 
   /** Return to the locomotion layer. */
   stop(fade = 0.28) {
@@ -938,8 +1226,13 @@ export class Animator {
     };
     const aw = this.action ? this.actionW : 0;
     const lw = 1 - aw;
-    take(this._hintA, lw * (1 - this._hintF));
-    take(this._hintB, lw * this._hintF);
+    /* the locomotion layer's share is itself split between the two
+       ladders, so a half-mounted Wally gets half a bike trunk */
+    const fw = lw * (1 - this.bikeW), bw = lw * this.bikeW;
+    take(this._hintA, fw * (1 - this._hintF));
+    take(this._hintB, fw * this._hintF);
+    take(this._bkA, bw * (1 - this._bkF));
+    take(this._bkB, bw * this._bkF);
     if (this.action) take(this.action.clip, aw);
     if (cw <= 1e-4 && ew <= 1e-4) return null;
     /* Each group is normalised by its OWN accumulated weight and carries
@@ -990,15 +1283,34 @@ export class Animator {
        intent too, and it has to be weighted by this same blend */
     this._hintA = ca; this._hintB = cb; this._hintF = f;
 
+    /* ---- the bicycle ladder, resolved the same way ---- */
+    this.bikeW = damp(this.bikeW, this.bikeTarget, this.bikeRate, dt);
+    if (this.bikeTarget === 0 && this.bikeW < 0.003) this.bikeW = 0;
+    else if (this.bikeTarget === 1 && this.bikeW > 0.997) this.bikeW = 1;
+    const riding = this.bikeW > 0.5;
+    let j = 0;
+    while (j < BIKE_STEPS.length - 2 && this.speed > BIKE_STEPS[j + 1].speed) j++;
+    const KA = BIKE_STEPS[j], KB = BIKE_STEPS[j + 1];
+    const bf = clamp((this.speed - KA.speed) / Math.max(KB.speed - KA.speed, 1e-3), 0, 1);
+    const ka = CLIPS[KA.name], kb = CLIPS[KB.name];
+    this._bkA = ka; this._bkB = kb; this._bkF = bf;
+    if (riding) this.locoName = bf > 0.5 ? KB.name : KA.name;
+
     /* One shared phase for the whole blend so the feet of the walk and the
        feet of the run land together. Cycle length is interpolated, so the
        stride grows with speed instead of the legs spinning faster. */
-    const cycle = (ca.cycle ?? 1.34) * (1 - f) + (cb.cycle ?? 2.16) * f;
+    const cycle = riding
+      ? (ka.cycle ?? 2.6) * (1 - bf) + (kb.cycle ?? 2.6) * bf
+      : (ca.cycle ?? 1.34) * (1 - f) + (cb.cycle ?? 2.16) * f;
     if (this.speed > 0.10) {
       this.locPhase += (this.speed * dt) / Math.max(cycle, 0.2);
-    } else {
+    } else if (!riding) {
       this.locPhase += dt / (ca.duration || 1);
     }
+    /* ...and NOT while riding: a stopped bicycle has stopped pedals.
+       The `else if` above is the whole of that rule. Feet, cranks and
+       chainring all halt on the same frame and hold where they halted,
+       which is what makes a track stand read as one. */
     this.locPhase -= Math.floor(this.locPhase);
 
     const phA = ca.loco ? this.locPhase : (st.elapsed / ca.duration) % 1;
@@ -1007,8 +1319,20 @@ export class Animator {
     this._eval(cb, phB, this._loB, st);
     blendPose(this._loco, this._loA, this._loB, f);
 
-    /* turn-in-place blends in when he is pivoting on the spot */
-    const spin = clamp((Math.abs(this.turn) - 0.6) / 1.8, 0, 1) * (1 - clamp(this.speed / 1.2, 0, 1));
+    /* the bicycle ladder over the top of the foot ladder */
+    if (this.bikeW > 0.001) {
+      const phKA = this.locPhase;
+      this._eval(ka, phKA, this._loA, st);
+      this._eval(kb, phKA, this._loB, st);
+      blendPose(this._bike, this._loA, this._loB, bf);
+      blendPose(this._loco, this._loco, this._bike, this.bikeW);
+    }
+
+    /* turn-in-place blends in when he is pivoting on the spot.
+       Never on the bicycle: a bicycle does not pivot, and the shuffle
+       would be two feet stepping through the frame with no floor. */
+    const spin = (1 - this.bikeW)
+      * clamp((Math.abs(this.turn) - 0.6) / 1.8, 0, 1) * (1 - clamp(this.speed / 1.2, 0, 1));
     if (spin > 0.001) {
       this._eval(CLIPS['turn-in-place'], (st.elapsed / 0.9) % 1, this._loA, st);
       blendPose(this._loco, this._loco, this._loA, spin);

@@ -1664,8 +1664,16 @@ export async function init(ctx) {
   }
 
   /* Snap every spring onto the current ideal so a mode change never
-     produces a swoop from wherever the camera happened to be. */
-  function snap() {
+     produces a swoop from wherever the camera happened to be.
+
+     `forceYaw`, when finite, is an azimuth the CALLER has solved and
+     this must not second-guess. Without it the portrait branch below
+     fires on every snap of a stationary subject, which silently ate the
+     azimuth warp() was passed — a caller that asks for a specific shot
+     and is given a portrait instead has been lied to. It is also held,
+     not merely set: holdYaw takes it too, so the idle orbit sits on it
+     at orbitHold instead of drifting off it over the next second. */
+  function snap(forceYaw) {
     if (!readSubject()) return;
     anchor.copy(subj.pos); anchorReady = true;
     boomYaw = subj.yaw;
@@ -1680,7 +1688,13 @@ export async function init(ctx) {
        was of the back of his head. Now: if he is standing still, the
        snap is a portrait. If he is actually moving when something snaps
        the rig, behind him is still right and nothing changes. */
-    if (mode === 'follow' && (spawnPending || subj.speed <= 0.4)) {
+    if (Number.isFinite(forceYaw)) {
+      spawnPending = false;
+      boomYaw = holdYaw = wrapPi(forceYaw);
+      holdPending = false;
+      idleT = RIG.portraitDelay;
+      unhold = 0;
+    } else if (mode === 'follow' && (spawnPending || subj.speed <= 0.4)) {
       spawnPending = false;
       boomYaw = holdYaw = pickPortraitYaw();
       idleT = RIG.portraitDelay;
@@ -1910,6 +1924,73 @@ export async function init(ctx) {
       return api;
     },
 
+    /**
+     * CUT the rig onto the subject where he is standing NOW. This is
+     * what fast travel calls the instant the character is teleported.
+     *
+     * WHY THIS IS NOT follow(), resume() OR EVEN reframe().
+     *
+     * The position spring solves an OFFSET from an anchor, so an anchor
+     * that jumps 900 m does not on its own produce a swoop — the offset
+     * is still correct and the lens lands with him. What DOES produce
+     * one is everything else this rig is holding, all of which is state
+     * about a place he is no longer in:
+     *
+     *   anchor.y      damped at anchorYGround, so it spends about a
+     *                 second climbing or falling to the new terrain
+     *                 while the whole frame slides vertically
+     *   boomYaw       an azimuth solved against the OLD skyline; the
+     *                 idle orbit then eases it round to the new one in
+     *                 full view of the player
+     *   wedgeT/relief the boom was crushed against a wall back there
+     *   steerT        the player's manual-steer immunity, still ticking
+     *   holdYaw       a portrait azimuth for a building 900 m away
+     *   vista         a vista point on the other side of the island
+     *   trauma        a landing shake he is no longer standing in
+     *
+     * So all of it is dropped, `spawnPending` is set so snap() re-solves
+     * the opening azimuth against the NEW surroundings exactly the way
+     * the first frame of the game does, and snap() runs the full
+     * collision chain — which is why the lens does not commit inside the
+     * wall of whatever he has just arrived in front of.
+     *
+     * Deliberately leaves the transform alone unless we are in follow
+     * mode: if a debug hook, a cinematic or an override owns the lens,
+     * an arrival must not steal it. The state above is cleared either
+     * way, so when gameplay does get the camera back it gets it clean.
+     *
+     * @param {{yaw?:number, faceToward?:object}} o
+     */
+    warp(o = {}) {
+      wedgeT = 0; reliefT = 0; reliefYaw = null;
+      steerT = 0; pitchOffset = 0;
+      holdYaw = null; holdPending = false; idleT = 0; unhold = 0;
+      vistaT = 0; vistaPoint = null; vistaS.set(0);
+      trauma = 0; roll = 0;
+      anchorReady = false;          // re-seed at the new place, do not damp to it
+      spawnPending = true;          // snap() consumes it and re-solves the azimuth
+      if (mode !== 'follow') return api;
+      let want = Number.isFinite(o.yaw) ? o.yaw : undefined;
+      if (want === undefined && o.faceToward && readSubject()) {
+        const v = toVec(o.faceToward);
+        want = Math.atan2(v.x - subj.pos.x, v.z - subj.pos.z);
+      }
+      /* No azimuth given? Then snap() solves one against the NEW
+         surroundings — which is what an arrival usually wants, because
+         pickPortraitYaw scores clearance and openness and is therefore
+         the thing that stops the lens ending up in the facade of the
+         building he has just arrived at. */
+      snap(want);
+      /* snap() only moves the springs, so the transform we remembered is
+         still the one on the camera and foreignWrite() would stay quiet
+         anyway. Clearing it costs one frame of detection and removes any
+         chance of the arrival being read as somebody else's write on the
+         one frame the entire world changed underneath the rig. */
+      haveWrote = false;
+      started = true;               // lateUpdate must not snap() a second time
+      return api;
+    },
+
     /** Manual steer, radians. Suppresses auto-orbit for ~1.3 s. */
     steer(dYaw, dPitch = 0) {
       boomYaw = wrapPi(boomYaw + dYaw);
@@ -2084,6 +2165,8 @@ export async function init(ctx) {
     dbg.camInfo = () => api.state();
     /** Re-solve the opening azimuth from where he stands right now. */
     dbg.camReframe = () => { api.resume(); api.reframe(); return api.state(); };
+    /** The fast-travel cut, on its own. `WALLY.debug.camWarp()`. */
+    dbg.camWarp = (yaw) => { api.resume(); api.warp(yaw == null ? {} : { yaw }); return api.state(); };
     /** Every candidate azimuth the spawn/relief solver considered, with
         its clear / open / align terms. This is how the weights above
         were tuned; leave it in so the next pass can re-tune them. */

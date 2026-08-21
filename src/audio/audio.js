@@ -228,13 +228,19 @@ export async function init(ctx) {
      returning visitor who has interacted with this origin). Free when it
      fails, instant music when it works.
 
-     Screenshot runs skip it: there will never be a gesture, so the only
-     thing an eager context buys the harness is a repeated autoplay
-     warning in everyone else's console output. */
-  if (!ctx?.flags?.shot) {
-    build();
-    if (actx && actx.state === 'running') { unlocked = true; music.start(); }
-  }
+     THE TRANSPORT IS NOT STARTED HERE, even when the context is already
+     running. main.js names the score for the opening beat and only then
+     calls resume(); music.js can snap the tempo to a new score while it
+     is stopped but has to glide once it is running, and the cinematic's
+     cuts and its title are cut against exact 54 bpm bar lines from bar 0.
+     Starting a bar early costs the whole opener its timing. unlock() does
+     the starting, and unlock() runs either from the start beat or from
+     the player's first gesture — always before anything needs to be heard.
+
+     Screenshot runs skip the build entirely: there will never be a
+     gesture, so the only thing an eager context buys the harness is a
+     repeated autoplay warning in everyone else's console output. */
+  if (!ctx?.flags?.shot) build();
 
   /* ---------- listener ---------- */
   const lpos = [0, 0, 0], lfwd = [0, 0, -1], lup = [0, 1, 0];

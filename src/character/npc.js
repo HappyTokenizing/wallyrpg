@@ -77,7 +77,12 @@ export async function init(ctx) {
   }
   const t0 = performance.now();
   const q = ctx.quality || {};
+  /* BOOT PROFILE — this stage was 8.4 s of a 13.9 s cold boot, so every
+     phase of it is timed and the numbers live on ctx.npc.perf. */
+  const P = { humans: 0, build: 0, wrap: 0, place: 0, clients: 0, planned: 0, total: 0 };
+  const _tH = performance.now();
   const humans = createHumans(ctx);
+  P.humans = performance.now() - _tH;
 
   const root = new THREE.Group();
   root.name = 'npc';
@@ -114,6 +119,7 @@ export async function init(ctx) {
 
   const _door = new THREE.Vector3();
   function standingSpot(loc, rng, opts = {}) {
+    const _tp = performance.now();
     const want = opts.want ?? 2.1;
     const cx = loc.world.x, cz = loc.world.z;
     let ax = cx, az = cz, outA = rng() * Math.PI * 2, arc = Math.PI;
@@ -152,6 +158,7 @@ export async function init(ctx) {
     best.y = groundY(best.x, best.z);
     /* face away from the building — nobody stands looking at a wall */
     best.yaw = Math.atan2(best.x - cx, best.z - cz) + (rng() - 0.5) * 0.9;
+    P.place += performance.now() - _tp;
     return best;
   }
 
@@ -159,7 +166,9 @@ export async function init(ctx) {
      Build one person
      ------------------------------------------------------------ */
   function makeHuman(spec, seed, detail) {
+    let _t = performance.now();
     const h = humans.build(spec, seed, detail);
+    P.build += performance.now() - _t; _t = performance.now();
     h.anim = new HumanAnim(h, ctx.makeRng(seed || ('anim.' + spec.id)));
     h.id = spec.id;
     h.name = spec.n || '';
@@ -178,16 +187,73 @@ export async function init(ctx) {
     root.add(h.root);
     ctx.mat.register(h.root, { noOutline: true, castShadow: true, receiveShadow: true });
     all.push(h);
+    P.wrap += performance.now() - _t;
     return h;
+  }
+
+  /* ============================================================
+     PLACEMENT IS CHEAP, MESHING IS NOT. SO PLACE EVERYONE AND MESH
+     NOBODY UNTIL IT IS WORTH IT.
+
+     Deciding where four hundred people stand costs 134 ms; turning them
+     into geometry cost eight seconds, and it was the whole of the wait
+     before the game could be played. Nothing about a figure's identity
+     — who they are, where they stand, which way they face, what they
+     are doing — needs a mesh, so every one of them is *planned* during
+     boot and the plan is a `Rec`: a spec, a seed, a detail tier and a
+     spot on the island. Boot then meshes only the named clients close
+     enough to be seen from the start, and the streamer below turns the
+     rest into people over the first second or so of play, nearest to
+     the camera first, on a per-frame time budget.
+
+     Two things make this safe rather than merely fast. Records are
+     planned in exactly the order the old code built them, drawing on
+     exactly the same seeded streams, so every person comes out
+     identical to before — same face, same clothes, same spot. And the
+     build radius is a distance, never a timer, so two runs of the same
+     build populate the same world in the same order and a screenshot is
+     still reproducible.
+     ============================================================ */
+  const pending = [];          // planned, not yet meshed
+  let planIndex = 0;
+
+  /** Turn one planned record into an actual person in the scene. */
+  function buildRec(r) {
+    if (r.built) return r.built;
+    const h = makeHuman(r.spec, r.seed, r.detail);
+    r.built = h;
+    h.rec = r;
+    h.root.position.set(r.x, r.y, r.z);
+    h.baseYaw = r.yaw;
+    h.root.rotation.y = r.yaw;
+    h.home = new THREE.Vector3(r.x, r.y, r.z);
+    h.homeLoc = r.homeLoc || null;
+    h.baseMode = r.mode;
+    h.anim.setMode(r.mode);
+    if (r.kind === 'client') {
+      h.isClient = true;
+      named.set(r.id, h);
+    } else if (r.kind === 'wander') {
+      const a = crowd.add(h);
+      if (!a) { h.dispose(); all.pop(); r.built = null; r.dead = true; return null; }
+      h.agent = a;
+    }
+    return h;
+  }
+
+  /** Drop a record from the queue once it has been built. */
+  function takeRec(r) {
+    const i = pending.indexOf(r);
+    if (i >= 0) pending.splice(i, 1);
+    return buildRec(r);
   }
 
   /* ------------------------------------------------------------
      The 24 named clients
      ------------------------------------------------------------ */
-  function spawnClient(id, pos) {
+  function planClient(id, pos) {
     const c = CLIENT_BY_ID[id];
     if (!c) { console.warn(`[npc] no client "${id}"`); return null; }
-    if (named.has(id)) return named.get(id);
     const rng = ctx.makeRng('npc.place.' + id);
     /* their appearance row IS the spec — every field of it is used */
     const spec = {
@@ -198,11 +264,7 @@ export async function init(ctx) {
       build: 0.92 + rng() * 0.20 + (c.age === 2 ? 0.04 : 0),
       stature: (c.age === 2 ? 0.955 : 0.98) + rng() * 0.075,
     };
-    /* Named clients are the only people the camera ever frames from a
-       metre away, so they are the only ones that get the fine mesh. */
-    const h = makeHuman(spec, 'client.' + id, 'fine');
-
-    let p = pos;
+    let p = pos, homeLoc = null, yaw;
     if (!p) {
       /* their home is a district; stand them by a location inside it */
       const locs = LOCATIONS.filter((l) => l.z === c.home);
@@ -212,23 +274,40 @@ export async function init(ctx) {
         : null;
       const ref = anchor || { id: null, world: { x: z ? z.world.x : 0, z: z ? z.world.z : 0 }, radius: 16 };
       p = standingSpot(ref, rng, { near: 2.0, far: 6.0 });
-      h.homeLoc = anchor ? anchor.id : null;
-      h.baseYaw = p.yaw;
+      homeLoc = anchor ? anchor.id : null;
+      yaw = p.yaw;
     } else {
       p = { x: p.x, y: p.y ?? groundY(p.x, p.z), z: p.z };
-      h.baseYaw = rng() * Math.PI * 2;
+      yaw = rng() * Math.PI * 2;
     }
-    h.root.position.set(p.x, p.y, p.z);
-    h.root.rotation.y = h.baseYaw;
-    h.home = new THREE.Vector3(p.x, p.y, p.z);
-    h.isClient = true;
     /* a shopkeeper works, a customer waits, a coach stands and glares */
     const mode = c.role && /owner|barista|driver|dispatcher|engineer|researcher|artist/i.test(c.role)
       ? (rng() < 0.5 ? 'work' : 'idle') : 'idle';
-    h.baseMode = mode;
-    h.anim.setMode(mode);
-    named.set(id, h);
-    return h;
+    /* Named clients are the only people the camera ever frames from a
+       metre away, so they are the only ones that get the fine mesh. */
+    const r = {
+      kind: 'client', id, spec, seed: 'client.' + id, detail: 'fine',
+      x: p.x, y: p.y, z: p.z, yaw, mode, homeLoc, order: planIndex++,
+    };
+    pending.push(r);
+    return r;
+  }
+
+  /** Build a named client now, wherever they are. */
+  function spawnClient(id, pos) {
+    if (named.has(id)) return named.get(id);
+    const r = pending.find((q) => q.kind === 'client' && q.id === id)
+      || planClient(id, pos);
+    return r ? takeRec(r) : null;
+  }
+
+  /* ASKING FOR SOMEBODY IS A REASON TO BUILD THEM. Every path that
+     reaches for a client by name — the dialogue, the debug cameras, the
+     lineup — goes through here, so a client who is still in the queue is
+     meshed on the spot instead of coming back null. Nothing else has to
+     know the queue exists. */
+  function ensure(id) {
+    return named.get(id) || spawnClient(id) || all.find((x) => x.id === id) || null;
   }
 
   /* ------------------------------------------------------------
@@ -238,17 +317,26 @@ export async function init(ctx) {
   const crowdRng = ctx.makeRng('npc.crowd.spec');
   let crowdTarget = 0;
 
-  function spawnCrowd(n) {
-    let made = 0;
+  /* A WANDERER'S SPOT IS THE ROAD NETWORK'S TO GIVE, NOT MINE. crowd.add
+     drops them on a walkable node of its own choosing and consumes its
+     own seeded stream doing it, so wanderers are queued in plan order
+     and built in plan order — sorting them by distance would reorder
+     that stream and move the entire crowd. They are cheap by then (the
+     shared caches are warm) and they are walking, so where they enter
+     the world reads as traffic rather than as pop-in. The two seed
+     expressions below are the ones the immediate version produced —
+     `crowd.agents.length` was `i` and `all.length` was the 24 clients
+     plus `i` — written out so that deferring the build cannot change
+     one hair on one head. */
+  function planCrowd(n) {
     for (let i = 0; i < n; i++) {
-      const spec = randomSpec(crowdRng, 'crowd' + (crowd.agents.length + i));
-      const h = makeHuman(spec, 'crowd.' + (all.length), 'coarse');
-      const a = crowd.add(h);
-      if (!a) { h.dispose(); all.pop(); break; }
-      h.agent = a;
-      made++;
+      const spec = randomSpec(crowdRng, 'crowd' + (i + i));
+      pending.push({
+        kind: 'wander', spec, seed: 'crowd.' + (CLIENTS.length + i), detail: 'coarse',
+        x: 0, y: 0, z: 0, yaw: 0, mode: 'idle', order: planIndex++,
+      });
     }
-    return made;
+    return n;
   }
 
   /**
@@ -270,7 +358,7 @@ export async function init(ctx) {
      across the square. */
   const PLAZA_KIT = new Set(['market', 'city', 'gold', 'stadium', 'learn', 'water']);
 
-  function spawnResidents(perLoc) {
+  function planResidents(perLoc) {
     const rng = ctx.makeRng('npc.residents.v2');
     let made = 0;
     for (const l of LOCATIONS) {
@@ -278,20 +366,19 @@ export async function init(ctx) {
       const plaza = PLAZA_KIT.has(l.kit);
       const n = 1 + Math.floor(rng() * perLoc * (plaza ? 1.5 : 1));
       for (let i = 0; i < n; i++) {
+        /* the order of these three draws is the order the immediate
+           version made them in, and it has to stay that way: they come
+           off one stream, so a swap re-rolls the whole street */
         const spec = randomSpec(rng, 'res.' + l.id + '.' + i);
-        const h = makeHuman(spec, 'res.' + l.id + '.' + i, 'coarse');
         const p = plaza
           ? standingSpot(l, rng, { want: 1.4 + rng() * 3.4, near: 3.0, far: 22 + rng() * 6, tries: 34 })
           : standingSpot(l, rng, { want: 1.2 + rng() * 2.6, near: 1.8, far: 9.0 });
-        h.root.position.set(p.x, p.y, p.z);
-        h.baseYaw = p.yaw;
-        h.root.rotation.y = h.baseYaw;
-        h.home = new THREE.Vector3(p.x, p.y, p.z);
-        h.homeLoc = l.id;
         const r = rng();
         const mode = r < 0.30 ? 'work' : r < 0.50 ? 'talk' : r < 0.60 ? 'sit' : 'idle';
-        h.baseMode = mode;
-        h.anim.setMode(mode);
+        pending.push({
+          kind: 'res', spec, seed: 'res.' + l.id + '.' + i, detail: 'coarse',
+          x: p.x, y: p.y, z: p.z, yaw: p.yaw, mode, homeLoc: l.id, order: planIndex++,
+        });
         made++;
       }
     }
@@ -361,6 +448,63 @@ export async function init(ctx) {
   let elapsed = 0;
   let repopT = 0;
 
+  /* ------------------------------------------------------------
+     THE STREAMER — the rest of the island arriving.
+
+     Everything boot did not mesh is turned into a person here, a few
+     milliseconds at a time, nearest to the camera first. The budget is
+     deliberately fat for the first couple of seconds: the whole point is
+     that the streets are full by the time the player has finished
+     looking around, and by then the shared caches are warm and a person
+     costs well under a millisecond, so the queue drains in about thirty
+     frames. It thins to a trickle afterwards, which is what keeps the
+     late arrivals — and any district the player walks into before the
+     queue is empty — from costing a visible frame.
+
+     `sortT` is a timer only because re-sorting four hundred records
+     every frame would cost more than building one of them. The ORDER
+     records are built in is a function of position, never of time, so
+     the same build populates the same world the same way twice.
+     ------------------------------------------------------------ */
+  const STREAM_EARLY = 2.5;         // seconds of the fat budget
+  let sortT = 0;
+
+  function stream(dt, camPos) {
+    if (!pending.length) return;
+    sortT -= dt;
+    if (sortT <= 0) {
+      sortT = 0.35;
+      /* Wanderers keep their plan order (crowd.add owns their spot and
+         their stream); everyone else is ranked by how close they are.
+         Clients carry a bonus because a person you can talk to is worth
+         more than scenery at the same distance. */
+      for (const r of pending) {
+        r.key = r.kind === 'wander' ? 1e6 + r.order
+          : Math.hypot(r.x - camPos.x, r.z - camPos.z) - (r.kind === 'client' ? 120 : 0);
+      }
+      pending.sort((a, b) => a.key - b.key);
+    }
+    /* A SCREENSHOT IS NOT A PLAYER. tools/shot.mjs fires as soon as
+       __WALLY_READY__ is set and it has to photograph a settled world,
+       so under ?shot the queue drains on the first frame instead of
+       over the first second — same population, same order, no timing in
+       it at all, and every existing reference shot still matches. */
+    const ms = ctx.flags?.shot ? Infinity : (elapsed < STREAM_EARLY ? 14 : 4);
+    const t0 = performance.now();
+    let n = 0;
+    /* alternate the two queues so the crowd walks in while the
+       forecourts fill, instead of after them */
+    while (pending.length && performance.now() - t0 < ms) {
+      let i = 0;
+      if ((n & 1) && pending[0].kind !== 'wander') {
+        const w = pending.findIndex((r) => r.kind === 'wander');
+        if (w >= 0) i = w;
+      }
+      buildRec(pending.splice(i, 1)[0]);
+      n++;
+    }
+  }
+
   function update(dt, t) {
     elapsed = t;
     const cam = ctx.camera;
@@ -373,6 +517,8 @@ export async function init(ctx) {
     _mvp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     _frustum.setFromProjectionMatrix(_mvp);
     cam.getWorldPosition(_v);
+
+    stream(dt, _v);
 
     /* --- population tracks the clock: how many of the wanderers are
        out at all. Recomputed on a slow timer, never per frame. --- */
@@ -448,8 +594,366 @@ export async function init(ctx) {
       if (h.sayT > 0) { h.sayT -= dt; if (h.sayT <= 0) h.anim.setMode(h.baseMode || 'idle'); }
     }
 
+    happyUpdate(dt, t);
     updatePrompt(dt);
   }
+
+  /* ============================================================
+     HAPPY — the first person in Bull Bear City to say your name.
+
+     THE SPLIT. The data agent owns WHETHER this happens: it emits
+     bus 'story' { beat: 'happy' } the instant the phone is read, keeps
+     ctx.game.story.happyPending() true until it is over, and expects
+     ctx.game.actions.metHappy() when it is. The UI agent owns HOW THE
+     LINE IS PRESENTED: it goes out through ctx.ui.dialogue and nothing
+     here draws a pixel of text. What is left — and what this block is —
+     is the STAGING: who he is, where he comes from, how he crosses the
+     ground, where he stops, and how he stops being there.
+
+     WHY HE IS NOT A CROWD AGENT. crowd.js drives its wanderers along
+     the road network with a seeded random walk and its own pauses; it
+     is exactly the wrong tool for a character who has to arrive at one
+     specific spot, at one moment, facing one person. He is meshed by
+     the same humans.js as everyone else — same clay, same skeleton,
+     same animator — and steered by the code below instead.
+
+     THE FOUR BEATS
+
+       approach  He starts 11 m off, BEHIND Wally's shoulder where the
+                 follow camera is not looking, and walks in. A real
+                 crossing at 1.55 m/s with the walk cycle the rest of
+                 the city uses — not a pop-in and not a slide.
+       face      He stops 1.95 m out, which is conversational distance
+                 for two people who have not met, and turns over
+                 ~0.45 s. Wally turns back: ctx.wally.look() aims the
+                 head, and the trunk and ears follow through the spring
+                 chains for free.
+       speak     One dialogue card, the line exactly as written, his
+                 animator in 'talk'. The card is a promise; the beat
+                 waits on it, with a ceiling so a player who leaves an
+                 unclosed card cannot strand the story flag.
+       leave     He turns away, walks out past where he came in, and
+                 dissolves over 1.5 s once he is 6.6 m out and moving.
+                 The distance is the point: measured at 4.2 m he was
+                 still close enough to read as a model turning to glass
+                 beside you. From 6.6 m, walking away at 1.9 m/s, he is
+                 a receding figure that stops being there — which is
+                 the difference between mysterious and buggy. Then he
+                 is disposed and metHappy() is called.
+
+     "MYSTERIOUSLY" IS A TIMING DECISION, NOT AN EFFECT. The fade only
+     begins once his back is turned and he is already leaving, and it
+     runs slower than he walks, so what the eye reports afterwards is
+     "he walked off and I lost him", not "the model turned to glass".
+     See humans.fadeMaterial() for why it cannot be the material's own
+     opacity.
+     ============================================================ */
+  const HAPPY_LINE = "Hey Wally, I'm Happy. You're the new trader in town right? "
+    + 'This place could really use your help. Happy tokenizing!';
+
+  /* Blonde, fair, and built to be RECOGNISED later. Every field is a
+     deliberate outlier against randomSpec()'s distribution: the quiff
+     is one of seventeen hair styles and the only tall one, `platinum`
+     the lightest of thirteen hair colours, `porcelain` the lightest of
+     eight skins, and the hue is BRAND.token — the game's own orange,
+     which no ambient wanderer can wear because randomSpec picks from a
+     fourteen-colour list that does not contain it. So he is the only
+     pale blond in orange on the island: one silhouette, one colour, no
+     name tag needed. */
+  const HAPPY_SPEC = {
+    id: 'happy',
+    n: 'Happy',
+    role: 'Tokenizer',
+    skin: 'porcelain',
+    face: 'oval',
+    hair: 'quiff',
+    /* `blonde` (#C69A55), not `platinum` (#DCC9A4). Measured on the
+       first render: platinum sits 6 % from `porcelain` skin (#F0D2BC)
+       in luminance and 4 points in hue, so the quiff and the forehead
+       fused into one pale mass and he read as a bald man with a cone on
+       his head. A golden blonde is unambiguously HAIR against a fair
+       face, which is the whole point of the description. */
+    hairCol: 'blonde',
+    beard: 'none',
+    specs: 'none',
+    hat: 'none',
+    hue: '#F5913C',            // BRAND.token
+    age: 1,
+    mood: 'warm',
+    build: 0.94,
+    stature: 1.02,
+  };
+
+  const HAPPY = {
+    APPROACH_SPEED: 1.55,
+    LEAVE_SPEED: 1.90,
+    START_DIST: 11.0,
+    STOP_DIST: 1.95,
+    LEAVE_DIST: 17.0,
+    FADE_START: 6.6,           // metres of retreat before he starts to go
+    FADE_TIME: 1.5,
+    SPEAK_MAX: 22.0,           // ceiling on waiting for the dialogue card
+  };
+
+  let happy = null;            // the human, while he exists
+  let happyState = 'none';     // none|approach|face|speak|leave|done
+  let happyT = 0;
+  let happyFade = 1;
+  const _hTarget = new THREE.Vector3();
+  const _hExit = new THREE.Vector3();
+  const _hv = new THREE.Vector3();
+
+  /** Somewhere off-camera to come from: behind Wally, and preferably
+      near a road so he is not walking out of a hedge. */
+  function happyStart(wp, wyaw) {
+    const rng = ctx.makeRng('npc.happy.entry');
+    let best = null, bestScore = -1e9;
+    for (let i = 0; i < 20; i++) {
+      const a = wyaw + Math.PI + (rng() - 0.5) * 2.6;   // the arc behind him
+      const r = HAPPY.START_DIST * (0.86 + rng() * 0.30);
+      const x = wp.x + Math.sin(a) * r, z = wp.z + Math.cos(a) * r;
+      const y = ctx.world.heightAt(x, z);
+      if (!Number.isFinite(y)) continue;
+      const slope = Math.abs(y - wp.y);
+      const road = ctx.world.distanceToRoad ? ctx.world.distanceToRoad(x, z) : 1.6;
+      const s = -slope * 3.0 - Math.abs(road - 1.6) * 0.5;
+      if (s > bestScore) { bestScore = s; best = { x, y: y + roadLift(x, z), z }; }
+    }
+    return best || { x: wp.x, y: wp.y, z: wp.z - HAPPY.START_DIST };
+  }
+
+  function happyStopPoint(wp, wyaw) {
+    /* a shade off his centre line, so the two are not nose to nose */
+    const off = 0.34;
+    _hTarget.set(
+      wp.x + Math.sin(wyaw) * HAPPY.STOP_DIST + Math.cos(wyaw) * off, 0,
+      wp.z + Math.cos(wyaw) * HAPPY.STOP_DIST - Math.sin(wyaw) * off);
+    _hTarget.y = groundY(_hTarget.x, _hTarget.z);
+    return _hTarget;
+  }
+
+  /**
+   * Run the encounter. Safe to call twice: the second call is ignored
+   * while one is in flight.
+   * @param {{instant?:boolean}} o  instant places him at the stop point
+   *        already facing Wally — for the screenshot harness.
+   */
+  function playHappy(o = {}) {
+    if (happy) return happy;
+    const w = ctx.wally;
+    if (!w) return null;
+    const wp = w.position;
+    const wyaw = w.rotation.y;
+
+    happy = makeHuman(HAPPY_SPEC, 'npc.happy', 'fine');
+    happy.name = 'Happy';
+    happy.baseMode = 'idle';
+    named.set('happy', happy);
+    happyFade = 1;
+
+    happyStopPoint(wp, wyaw);
+
+    if (o.instant) {
+      happy.root.position.copy(_hTarget);
+      happy.root.rotation.y = Math.atan2(wp.x - _hTarget.x, wp.z - _hTarget.z);
+      happyState = 'face';
+      happyT = 0.42;                    // drops straight into `speak`
+    } else {
+      const s = happyStart(wp, wyaw);
+      happy.root.position.set(s.x, s.y, s.z);
+      happy.root.rotation.y = Math.atan2(_hTarget.x - s.x, _hTarget.z - s.z);
+      happyState = 'approach';
+      happyT = 0;
+    }
+    happy.baseYaw = happy.root.rotation.y;
+    happy.anim.setMode(o.instant ? 'idle' : 'walk');
+    ctx.bus?.emit('happy', { stage: happyState });
+    return happy;
+  }
+
+  /** Walk him toward (x, z); returns the distance still to go. */
+  function happyWalk(dt, t, tx, tz, speed) {
+    const p = happy.root.position;
+    _hv.set(tx - p.x, 0, tz - p.z);
+    const d = _hv.length();
+    if (d > 1e-3) {
+      _hv.multiplyScalar(1 / d);
+      const step = Math.min(speed * dt, d);
+      p.x += _hv.x * step;
+      p.z += _hv.z * step;
+      const want = Math.atan2(_hv.x, _hv.z);
+      const cur = happy.root.rotation.y;
+      const dy = Math.atan2(Math.sin(want - cur), Math.cos(want - cur));
+      happy.root.rotation.y = cur + dy * (1 - Math.exp(-6 * dt));
+    }
+    p.y = groundY(p.x, p.z);
+    happy.anim.update(dt, t, { speed, turn: 0 });
+    return d;
+  }
+
+  /** Turn him toward a world point. Returns the radians still to turn. */
+  function happyTurnTo(dt, x, z) {
+    const p = happy.root.position;
+    const want = Math.atan2(x - p.x, z - p.z);
+    const cur = happy.root.rotation.y;
+    const dy = Math.atan2(Math.sin(want - cur), Math.cos(want - cur));
+    happy.root.rotation.y = cur + dy * (1 - Math.exp(-7 * dt));
+    return Math.abs(dy);
+  }
+
+  function happySay() {
+    happy.anim.setMode('talk');
+    happy.sayT = 1e6;                   // the beat owns his mode, not the timer
+    const done = () => { if (happyState === 'speak') happyT = HAPPY.SPEAK_MAX; };
+    const ui = ctx.ui;
+    if (ui && ui.dialogue) {
+      /* The UI agent owns the card. All this hands over is who is
+         speaking and what they say — verbatim, from one constant, so
+         there is exactly one copy of the line in the codebase. */
+      const r = ui.dialogue({
+        speaker: 'Happy',
+        role: 'You have not met',
+        text: HAPPY_LINE,
+        portrait: 'happy',
+      });
+      if (r && typeof r.then === 'function') r.then(done, done);
+      else done();
+    } else {
+      /* No UI (a bare harness): play the beat on a timer anyway, so the
+         story flag can never be stranded behind a missing module. */
+      api.say('happy', HAPPY_LINE, 6.0);
+      setTimeout(done, 6000);
+    }
+    ctx.bus?.emit('happy', { stage: 'speak', line: HAPPY_LINE });
+  }
+
+  /** Swap him onto the transparent twin and drive its alpha. */
+  function happySetFade(f) {
+    happyFade = f;
+    if (f >= 1) return;
+    const m = humans.fadeMaterial();
+    if (happy.body.material !== m) {
+      happy.body.material = m;
+      happy.head.material = m;
+      /* It is transparent now, so the normal+depth prepass would leave
+         it on its own material and it would write colour into the
+         buffer that the DOF and the ground shadow both read. */
+      happy.body.userData.noPrepass = true;
+      happy.head.userData.noPrepass = true;
+      happy.body.castShadow = false;
+      happy.head.castShadow = false;
+      happy._cast = false;
+    }
+    if (m.uniforms && m.uniforms.uFade) m.uniforms.uFade.value = f;
+  }
+
+  function happyDispose() {
+    if (!happy) return;
+    named.delete('happy');
+    const i = all.indexOf(happy);
+    if (i >= 0) all.splice(i, 1);
+    happy.dispose();
+    happy = null;
+  }
+
+  function happyUpdate(dt, t) {
+    if (!happy || happyState === 'none' || happyState === 'done') return;
+    const w = ctx.wally;
+    const wp = w ? w.position : null;
+    if (!wp) return;
+
+    /* He is a story beat, so he is exempt from the LOD pass above: it
+       runs before this and would have hidden or frozen him the moment
+       he stepped out of the frustum mid-approach. */
+    happy.root.visible = true;
+    happy.active = true;
+    happy.asleep = false;
+    /* He looks at Wally from the moment he exists — that is most of
+       what makes an approach read as being aimed at YOU. */
+    happy.lookVec.set(wp.x, wp.y + 1.20, wp.z);
+    happy.anim.lookTarget = happy.lookVec;
+    happy.anim.lookW = damp(happy.anim.lookW || 0, happyState === 'leave' ? 0 : 1, 3.4, dt);
+
+    switch (happyState) {
+      case 'approach': {
+        happyT += dt;
+        /* Re-aim at the moving player, but only over the first second,
+           so a player who runs in circles does not get a homing
+           missile trailing him across the district. */
+        if (happyT > 0.4 && happyT < 1.4) happyStopPoint(wp, w.rotation.y);
+        const d = happyWalk(dt, t, _hTarget.x, _hTarget.z, HAPPY.APPROACH_SPEED);
+        if (happy.root.position.distanceTo(wp) < 6.5) w.look?.(happy.byName.head, 1);
+        if (d < 0.22 || happyT > 26) {
+          happyState = 'face';
+          happyT = 0;
+          happy.anim.setMode('idle');
+          ctx.bus?.emit('happy', { stage: 'face' });
+        }
+        break;
+      }
+      case 'face': {
+        happyT += dt;
+        const left = happyTurnTo(dt, wp.x, wp.z);
+        happy.anim.update(dt, t, _still);
+        w.look?.(happy.byName.head, 1);
+        if ((left < 0.10 && happyT > 0.30) || happyT > 1.6) {
+          happyState = 'speak';
+          happyT = 0;
+          happySay();
+        }
+        break;
+      }
+      case 'speak': {
+        happyT += dt;
+        happyTurnTo(dt, wp.x, wp.z);
+        happy.anim.update(dt, t, _still);
+        w.look?.(happy.byName.head, 1);
+        if (happyT >= HAPPY.SPEAK_MAX) {
+          /* The exit: out along the line away from Wally, turned a
+             quarter off it, so he rounds away rather than reversing
+             back down his own approach. */
+          const p = happy.root.position;
+          _hv.set(p.x - wp.x, 0, p.z - wp.z);
+          if (_hv.lengthSq() < 1e-4) _hv.set(0, 0, 1);
+          _hv.normalize();
+          const a = Math.atan2(_hv.x, _hv.z) + 0.55;
+          _hExit.set(p.x + Math.sin(a) * HAPPY.LEAVE_DIST, 0,
+            p.z + Math.cos(a) * HAPPY.LEAVE_DIST);
+          _hExit.y = groundY(_hExit.x, _hExit.z);
+          happyState = 'leave';
+          happyT = 0;
+          happy.sayT = 0;
+          happy.anim.setMode('walk');
+          w.look?.(null);
+          ctx.bus?.emit('happy', { stage: 'leave' });
+        }
+        break;
+      }
+      case 'leave': {
+        happyT += dt;
+        happyWalk(dt, t, _hExit.x, _hExit.z, HAPPY.LEAVE_SPEED);
+        if (happy.root.position.distanceTo(wp) > HAPPY.FADE_START) {
+          const t0 = HAPPY.FADE_START / HAPPY.LEAVE_SPEED;
+          happySetFade(clamp(1 - (happyT - t0) / HAPPY.FADE_TIME, 0, 1));
+        }
+        if (happyFade <= 0.002 || happyT > 20) {
+          happyDispose();
+          happyState = 'done';
+          ctx.bus?.emit('happy', { stage: 'done' });
+          try { ctx.game?.actions?.metHappy?.(); }
+          catch (e) { console.warn('[npc] metHappy threw', e); }
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+  /* THE TRIGGER IS THEIRS, NOT OURS. game.js emits this the instant the
+     opening phone message is read; nothing here decides when. The
+     replay-after-reload path is theirs too — story.replayHappy() emits
+     the same event and lands in the same place. */
+  ctx.bus?.on('story', (e) => { if (e && e.beat === 'happy') playHappy(); });
 
   /* ------------------------------------------------------------
      ctx.npc
@@ -465,7 +969,15 @@ export async function init(ctx) {
     spawn(clientId, pos) { return spawnClient(clientId, pos); },
 
     /** Add `n` anonymous wanderers to the road network. */
-    spawnCrowd(n) { return spawnCrowd(n | 0); },
+    spawnCrowd(n) { return planCrowd(n | 0); },
+
+    /** Mesh everything still queued, now. The screenshot harness and
+        any test that wants a settled world calls this rather than
+        guessing at how many frames the streamer needs. */
+    drain() { while (pending.length) buildRec(pending.shift()); return all.length; },
+
+    /** How many people are still queued for construction. */
+    get queued() { return pending.length; },
 
     /** Everyone standing at (or wandering through) a location. */
     at(locId) {
@@ -492,7 +1004,7 @@ export async function init(ctx) {
 
     /** Point someone's head at a world position (or null to release). */
     lookAt(id, target) {
-      const h = named.get(id) || all.find((x) => x.id === id);
+      const h = ensure(id);
       if (!h) return null;
       if (!target) { h.anim.lookTarget = null; h.anim.lookW = 0; h.lookW = 0; return h; }
       h.anim.lookTarget = target.isVector3 ? target.clone()
@@ -503,7 +1015,7 @@ export async function init(ctx) {
 
     /** A line over their head, and a gesture to go with it. */
     say(id, text, ttl = 3.6) {
-      const h = named.get(id) || all.find((x) => x.id === id);
+      const h = ensure(id);
       if (!h || !ctx.ui) return null;
       const p = h.root.position.clone();
       p.y += h.height * 1.08;
@@ -515,7 +1027,7 @@ export async function init(ctx) {
 
     /** Open the client dialogue for a named client. */
     talk(id) {
-      const h = named.get(id);
+      const h = ensure(id);
       if (!h || !h.client) return null;
       if (ctx.ui?.talkTo) ctx.ui.talkTo(h.client);
       h.anim.setMode('talk');
@@ -523,21 +1035,36 @@ export async function init(ctx) {
       return h;
     },
 
+    /* --- Happy, the opening encounter ---
+       The TRIGGER belongs to ctx.game (bus 'story', beat 'happy'). This
+       is here so a cutscene, a test or the screenshot harness can run
+       the beat directly; `happyStage` reports how far it has got. */
+    happy(o) { return playHappy(o || {}); },
+    get happyStage() { return happyState; },
+    get happyLine() { return HAPPY_LINE; },
+
     /** Pose someone by hand: 'idle' | 'walk' | 'talk' | 'sit' | 'work' | 'wave' */
     setMode(id, mode) {
-      const h = named.get(id) || all.find((x) => x.id === id);
+      const h = ensure(id);
       if (h) h.anim.setMode(mode);
       return h;
     },
 
-    get count() { return all.length; },
+    /** the whole population, meshed or merely planned */
+    get count() { return all.length + pending.length; },
+    get builtCount() { return all.length; },
     stats: humans.stats,
+    /** boot profile: this module's phases, plus humans.js's own. */
+    perf: P,
 
     update,
     dispose() {
       if (typeof window !== 'undefined') removeEventListener('keydown', onKey);
+      happy = null;
+      happyState = 'none';
       for (const h of all) h.dispose();
       all.length = 0;
+      pending.length = 0;
       named.clear();
       humans.dispose();
       ctx.scene.remove(root);
@@ -547,20 +1074,48 @@ export async function init(ctx) {
   /* ------------------------------------------------------------
      Boot: everyone in place
      ------------------------------------------------------------ */
-  /* PROGRESS + YIELD. This module is 63% of a ~13 s boot, and building
-     24 named clients plus a few hundred crowd figures in one synchronous
-     run means the browser cannot repaint for eight seconds — so a loading
-     bar would sit frozen no matter how it was weighted, and the tab looks
-     hung. Yield a frame every few characters and report the fraction, so
-     the bar actually moves and the page stays responsive. The yield costs
-     one frame each, not per character. */
+  /* WHAT BOOT ACTUALLY OWES THE PLAYER.
+
+     This module was 8.4 s of a 13.9 s cold boot — the entire wait before
+     anyone could play, spent meshing four hundred people of whom the
+     nearest was 38 m away and most were on the far side of a 900 m
+     island. What boot owes is the people you can see and the people you
+     can talk to; everything else is scenery arriving.
+
+     So boot PLANS the whole population — four hundred specs, positions,
+     facings and poses, 134 ms — and MESHES only the named clients within
+     BOOT_R of where Wally is standing. That is the set that populates
+     the district you start in, and it is the set whose shared caches the
+     streamer then inherits warm. The remainder is queued and streams in
+     over the first second or so of play (see `stream`), nearest first.
+
+     BOOT_R is a distance, not a timer, so the same build always meshes
+     the same people at boot and the loading bar and every screenshot
+     stay reproducible.
+
+     PROGRESS + YIELD. ctx.boot.tick(f) reports a fraction and yields a
+     frame so the bar can repaint and the tab stays responsive; the yield
+     costs one frame, not one per character. It is still called across
+     the client build and once per planning phase, so the bar advances
+     smoothly over a stage that is now a fifth of what it was. */
+  const BOOT_R = 150;
+
   const boot = ctx.boot;
-  const YIELD_EVERY = 4;
-  for (let i = 0; i < CLIENTS.length; i++) {
-    spawnClient(CLIENTS[i].id);
-    if (boot && (i % YIELD_EVERY === YIELD_EVERY - 1 || i === CLIENTS.length - 1)) {
-      /* named clients are the first ~35% of this stage's work */
-      await boot.tick(0.35 * ((i + 1) / CLIENTS.length));
+  let _tp = performance.now();
+  for (let i = 0; i < CLIENTS.length; i++) planClient(CLIENTS[i].id);
+
+  /* mode variety across the standing clients so a district is not a
+     row of statues in the same pose. Decided on the plan, in plan
+     order, off the same stream as before — so it lands on the same
+     people whether they are meshed now or in three seconds. */
+  {
+    const rng = ctx.makeRng('npc.modes');
+    for (const r of pending) {
+      if (r.kind !== 'client') continue;
+      const v = rng();
+      if (r.mode === 'work') continue;
+      if (v < 0.14) r.mode = 'sit';
+      else if (v < 0.24) r.mode = 'work';
     }
   }
 
@@ -568,28 +1123,33 @@ export async function init(ctx) {
      figure in the default 78 m framing of the market square and four at
      34 m: the square read as an evacuated diorama with Wally alone in a
      field, which is the one thing this module exists to prevent. A
-     wanderer costs 1.3 ms to build and two draw calls when it is in
-     frame, the 46-skeleton animation budget already caps the per-frame
-     cost by distance, and everything past FAR is hidden outright — so
-     the honest limit is boot time, and 350 people is half a second. */
+     wanderer costs two draw calls when it is in frame, the 46-skeleton
+     animation budget already caps the per-frame cost by distance, and
+     everything past FAR is hidden outright — so the population is what
+     it always was, 400-odd, and none of it is bought with boot time
+     any more. */
   const baseCrowd = Math.round(clamp(40 + (q.particles ?? 1) * 140, 24, 180));
-  if (boot) await boot.tick(0.40);
-  spawnCrowd(baseCrowd);
-  if (boot) await boot.tick(0.80);
-  spawnResidents(q.particles >= 0.9 ? 12 : q.particles >= 0.5 ? 7 : 3);
-  if (boot) await boot.tick(0.95);
+  planCrowd(baseCrowd);
+  planResidents(q.particles >= 0.9 ? 12 : q.particles >= 0.5 ? 7 : 3);
+  P.planned = pending.length;
+  P.place = performance.now() - _tp;
+  if (boot) await boot.tick(0.10);
 
-  /* mode variety across the standing clients so a district is not a
-     row of statues in the same pose */
+  /* The clients close enough to be part of the opening shot. Sorted so
+     the nearest is standing first if anything ever cuts this short. */
   {
-    const rng = ctx.makeRng('npc.modes');
-    for (const h of named.values()) {
-      const r = rng();
-      if (h.baseMode === 'work') continue;
-      if (r < 0.14) { h.anim.setMode('sit'); h.baseMode = 'sit'; }
-      else if (r < 0.24) { h.anim.setMode('work'); h.baseMode = 'work'; }
+    const anchor = ctx.wally?.position || new THREE.Vector3();
+    const near = pending
+      .filter((r) => r.kind === 'client' && Math.hypot(r.x - anchor.x, r.z - anchor.z) <= BOOT_R)
+      .sort((a, b) => Math.hypot(a.x - anchor.x, a.z - anchor.z)
+        - Math.hypot(b.x - anchor.x, b.z - anchor.z));
+    for (let i = 0; i < near.length; i++) {
+      takeRec(near[i]);
+      if (boot) await boot.tick(0.10 + 0.85 * ((i + 1) / near.length));
     }
+    P.clients = performance.now() - _tp;
   }
+  if (boot) await boot.tick(0.98);
 
   /* ------------------------------------------------------------
      Debug hooks — the screenshot harness drives these
@@ -620,7 +1180,7 @@ export async function init(ctx) {
 
   /** Stand in front of one named client and frame their head. */
   dbg.npcCam = (id, opts = {}) => {
-    const h = named.get(id);
+    const h = ensure(id);
     if (!h) { console.warn(`[npc] no client "${id}"`); return null; }
     h.root.visible = true;
     h.active = true;
@@ -661,7 +1221,7 @@ export async function init(ctx) {
     const pitch = opts.pitch ?? 0.95;
     const picked = [];
     for (let i = 0; i < n; i++) {
-      let h = named.get(ids[i % ids.length]);
+      let h = ensure(ids[i % ids.length]);
       if (!h || picked.includes(h)) h = all[(i * 7 + 3) % all.length];
       picked.push(h);
     }
@@ -750,7 +1310,7 @@ export async function init(ctx) {
   /** Walk Wally up to a named client — the approach, the prompt, the
       turn of the head. This is the interaction, in one call. */
   dbg.npcApproach = (id, opts = {}) => {
-    const h = named.get(id);
+    const h = ensure(id);
     if (!h) { console.warn(`[npc] no client "${id}"`); return null; }
     const yaw = h.root.rotation.y;
     const d = opts.stand ?? 2.5;
@@ -775,7 +1335,8 @@ export async function init(ctx) {
       if (h.body.castShadow) cast += t;
     }
     return {
-      total: all.length, named: named.size, crowd: crowd.agents.length,
+      total: all.length + pending.length, built: all.length, queued: pending.length,
+      named: named.size, crowd: crowd.agents.length,
       live: all.filter((h) => h.active).length,
       visible: vis, visibleTris: tris, shadowCasterTris: cast,
       bodyTris: humans.stats.bodyTriangles,
@@ -783,8 +1344,88 @@ export async function init(ctx) {
       buildMs: humans.stats.buildMs,
     };
   };
+  /** Finish the population immediately — for screenshots and tests. */
+  dbg.npcDrain = () => api.drain();
   dbg.npcSay = (id, text) => api.say(id, text || 'Morning, Wally.');
   dbg.npcMode = (id, m) => api.setMode(id, m);
+
+  /* ================================================================
+     HAPPY — WALLY.debug.happy(opts)
+
+     The verifier's entry point, and the one shot that has to prove the
+     encounter: Happy standing at conversational distance, facing Wally,
+     mid-line, with Wally's head turned back at him. It places him at
+     the stop point rather than making the harness wait eleven metres
+     for him to walk (`happy(true)` runs the real approach instead), and
+     it takes a TWO-SHOT camera — side-on, eye level, both figures in
+     frame with the gap between them visible, which is what makes it
+     read as a conversation and not as two people who happen to be near
+     each other.
+
+       WALLY.debug.happy()           stage it and frame it
+       WALLY.debug.happy(true)       play it for real, from 11 m out
+       WALLY.debug.happyInfo()       where the beat is, measured
+     ================================================================ */
+  dbg.happy = (walk = false, opts = {}) => {
+    const w = ctx.wally;
+    if (!w) return 'no wally';
+    /* The opening beat is meant to happen where the player starts, on
+       the ground, not wherever a previous debug hook parked him. */
+    w.setBike?.(false, { instant: true });
+    const h = api.happy({ instant: !walk });
+    if (!h) return 'no happy';
+    api.drain();
+
+    const wp = w.position;
+    const hp = h.root.position;
+    /* Wally faces him; without this the two-shot is a conversation with
+       the back of an elephant. */
+    w.face?.(hp);
+    w.look?.(h.byName.head, 1);
+
+    /* THE TWO-SHOT. Perpendicular to the line between them, so the gap
+       is visible, at 1.60 m — a shade over both their eye lines — and
+       pulled back far enough to hold a 1.68 m human and a 1.60 m
+       elephant plus air. Aimed at the midpoint at 1.16 m, which lands
+       both figures in the UPPER two thirds: the dialogue card owns the
+       bottom of the frame, and a two-shot that the card cuts in half is
+       not a two-shot. */
+    const mx = (wp.x + hp.x) * 0.5, mz = (wp.z + hp.z) * 0.5;
+    /* NOT dead perpendicular. At exactly 90 degrees the two stand at
+       opposite edges of the frame with two metres of empty grass down
+       the middle, which reads as two strangers ignoring each other.
+       Swung 26 degrees round toward Happy, their silhouettes just
+       overlap and the composition closes. */
+    const a = Math.atan2(hp.x - wp.x, hp.z - wp.z) + Math.PI / 2 - 0.45;
+    const d = opts.dist ?? 4.05;
+    takeCamera(
+      mx + Math.sin(a) * d, wp.y + 1.52, mz + Math.cos(a) * d,
+      mx, wp.y + 1.12, mz,
+      opts.fov ?? 36,
+    );
+    return {
+      stage: api.happyStage,
+      line: api.happyLine,
+      gap: +wp.distanceTo(hp).toFixed(2),
+      happy: hp.toArray().map((v) => +v.toFixed(2)),
+      wally: wp.toArray().map((v) => +v.toFixed(2)),
+    };
+  };
+  dbg.happyInfo = () => {
+    const w = ctx.wally;
+    return {
+      stage: api.happyStage,
+      spawned: !!happy,
+      fade: +happyFade.toFixed(3),
+      t: +happyT.toFixed(2),
+      pos: happy ? happy.root.position.toArray().map((v) => +v.toFixed(2)) : null,
+      yaw: happy ? +happy.root.rotation.y.toFixed(3) : null,
+      mode: happy ? happy.anim.mode : null,
+      gap: happy && w ? +happy.root.position.distanceTo(w.position).toFixed(2) : null,
+      flag: !!ctx.game?.story?.beats?.().happy,
+      dialogueOpen: !!ctx.ui?.dialogueOpen,
+    };
+  };
   if (window.WALLY) window.WALLY.debug = dbg;
 
   /* camera.js is the authority while an override is live (it writes
@@ -792,9 +1433,25 @@ export async function init(ctx) {
      only the belt to its braces for the frame the override is set. */
   api.lateUpdate = () => { if (camState && !ctx.cam) applyCam(); };
 
-  console.log(`[npc] ${all.length} people (${named.size} named, ${crowd.agents.length} crowd) `
-    + `${humans.stats.bodyTriangles} body tris, ${humans.stats.bones} bones, `
-    + `${(performance.now() - t0).toFixed(0)} ms`);
+  P.total = performance.now() - t0;
+  P.h = humans.perf;
+  console.log(`[npc] ${all.length + pending.length} people planned `
+    + `(${all.length} built at boot, ${pending.length} streaming), `
+    + `${humans.stats.bones} bones, ${P.total.toFixed(0)} ms`);
+  if (ctx.flags?.debug || new URLSearchParams(location.search).has('npcperf')) {
+    const r = (x) => +x.toFixed(0);
+    console.log('[npc.perf]', JSON.stringify({
+      total: r(P.total), planned: P.planned, builtAtBoot: all.length,
+      planning: r(P.place), clients: r(P.clients),
+      perChar: { build: r(P.build), wrapAnim: r(P.wrap) },
+      inBuild: {
+        n: P.h.n, skeleton: r(P.h.skel), bodyColors: r(P.h.bodyCol),
+        headMerge: r(P.h.head), meshBind: r(P.h.mesh), lazyCacheMiss: r(P.h.cacheMiss),
+      },
+      misses: P.h.m,
+      caches: { bodiesFine: r(P.h.bodiesFine), bodiesCoarse: r(P.h.bodiesCoarse), skinWeights: r(P.h.skin) },
+    }));
+  }
 
   return api;
 }

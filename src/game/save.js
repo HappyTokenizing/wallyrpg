@@ -10,11 +10,21 @@
      v4  the original "Wally: City of Assets" save
      v5  WALLY RPG — adds stats.spent/trips/metres, seen.apartment,
          pawnDay/pawnStock, msgs entries carry `read`
+     v6  the travel overhaul and the new opening — adds
+           state.bike  {owned, equipped}   the bicycle is bought, not given
+           state.sides {id: 'active'|'done'}  side quests, kept apart
+                                              from state.quests
+         and `state.travel` may now be 'walk'. A v5 file wakes up on
+         foot with no bicycle, which is exactly right: it never bought
+         one. Old saves keep their money, holdings and quest progress.
    migrate() forward-fills any field a newer version added, so a v4
-   file loads straight into v5 without losing a single asset.
+   file loads straight into v6 without losing a single asset — and
+   sanitize() repairs the same fields on EVERY load, version or not,
+   so a save written mid-upgrade cannot arrive without a bicycle
+   record and take game.fares() down with it.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID } from './data.js';
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, SIDE_QUEST_BY_ID } from './data.js';
 import { newState, clamp, round2 } from './state.js';
 
 /* ---------- storage driver ---------- */
@@ -59,7 +69,7 @@ export function createSave(env) {
     if (data.version < CONFIG.version) {
       const fresh = newState(env.makeRng('migrate'));
       for (const k of Object.keys(fresh)) if (!(k in data)) data[k] = fresh[k];
-      for (const k of ['settings', 'stats', 'farm', 'mine', 'stadium', 'swap']) {
+      for (const k of ['settings', 'stats', 'farm', 'mine', 'stadium', 'swap', 'bike']) {
         if (!data[k] || typeof data[k] !== 'object') data[k] = fresh[k];
         else for (const kk of Object.keys(fresh[k])) if (!(kk in data[k])) data[k][kk] = fresh[k][kk];
       }
@@ -108,6 +118,24 @@ export function createSave(env) {
     for (const id of Object.keys(m.tokenized || {})) if (!ASSET_BY_ID[id]) delete m.tokenized[id];
 
     if (!LOC_BY_ID[m.loc]) m.loc = 'apartment';
+    /* THE BICYCLE. Repaired on every load, not just on a version
+       bump: two booleans, and `equipped` cannot be true without
+       `owned` — a save that claims to be riding a bicycle it does not
+       have would make fares() offer a mode the player cannot use. */
+    if (!m.bike || typeof m.bike !== 'object') m.bike = { owned: false, equipped: false };
+    m.bike.owned = !!m.bike.owned;
+    m.bike.equipped = !!m.bike.equipped && m.bike.owned;
+    /* A v5 save's last mode was very often 'bike', from back when the
+       bicycle was handed to you. It is not any more, so a loaded save
+       that is "riding" a bicycle it does not own falls back to walking
+       — which is always available. */
+    if (!TRAVEL[m.travel] || (m.travel === 'bike' && !m.bike.owned)) m.travel = 'walk';
+    /* SIDE QUESTS. Only the two known statuses survive, and only for
+       side quests that still exist in the content tables. */
+    if (!m.sides || typeof m.sides !== 'object') m.sides = {};
+    for (const k of Object.keys(m.sides)) {
+      if (!SIDE_QUEST_BY_ID[k] || (m.sides[k] !== 'active' && m.sides[k] !== 'done')) delete m.sides[k];
+    }
     if (!Array.isArray(m.arrivals)) m.arrivals = [];
     if (!Array.isArray(m.orders)) m.orders = [];
     if (!Array.isArray(m.funds)) m.funds = [];

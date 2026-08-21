@@ -58,9 +58,9 @@
 
 /* ---------------- CONFIG ---------------- */
 export const CONFIG = Object.freeze({
-  version: 5,
-  saveKey: 'wally_rpg_save_v5',
-  legacyKeys: Object.freeze(['wally_city_of_assets_save_v4']),
+  version: 6,
+  saveKey: 'wally_rpg_save_v6',
+  legacyKeys: Object.freeze(['wally_rpg_save_v5', 'wally_city_of_assets_save_v4']),
   minutesPerSecond: 4,
   dayStartMin: 7 * 60,
   forceSleepMin: 26 * 60,      // 02:00
@@ -110,81 +110,170 @@ export const ASSETS = [
   { id: 'wflw', n: 'WaffleWorks',               tick: 'WFLW', cat: 'Stocks', v: 12, q: 4, ven: 'exchange', tq: 2, ico: '🧇', div: 0.2 },
   { id: 'nrth', n: 'NorthStar Manufacturing',   tick: 'NRTH', cat: 'Stocks', v: 57, q: 4, ven: 'exchange', tq: 2, ico: '⚙️', div: 0.7 },
 
-  /* 4 treasury bonds */
-  { id: 'bond3m',  n: 'Three-Month City Note',        cat: 'Bonds', v: 100,  q: 5, ven: 'treasury', tq: 1, ico: '🧾',  cpn: 0.6 },
-  { id: 'bond1y',  n: 'One-Year Community Bond',      cat: 'Bonds', v: 250,  q: 4, ven: 'treasury', tq: 1, ico: '📜',  cpn: 1.4 },
-  { id: 'bond5y',  n: 'Five-Year Infrastructure Bond',cat: 'Bonds', v: 500,  q: 3, ven: 'treasury', tq: 2, ico: '🏗️', cpn: 3.2 },
-  { id: 'bond10y', n: 'Ten-Year Restoration Bond',    cat: 'Bonds', v: 1000, q: 3, ven: 'treasury', tq: 2, ico: '🏛️', cpn: 7 },
+  /* 4 treasury bonds — tickers read as maturities */
+  { id: 'bond3m',  n: 'Three-Month City Note',         tick: 'B3M',  cat: 'Bonds', v: 100,  q: 5, ven: 'treasury', tq: 1, ico: '🧾',  cpn: 0.6 },
+  { id: 'bond1y',  n: 'One-Year Community Bond',       tick: 'B1Y',  cat: 'Bonds', v: 250,  q: 4, ven: 'treasury', tq: 1, ico: '📜',  cpn: 1.4 },
+  { id: 'bond5y',  n: 'Five-Year Infrastructure Bond', tick: 'B5Y',  cat: 'Bonds', v: 500,  q: 3, ven: 'treasury', tq: 2, ico: '🏗️', cpn: 3.2 },
+  { id: 'bond10y', n: 'Ten-Year Restoration Bond',     tick: 'B10Y', cat: 'Bonds', v: 1000, q: 3, ven: 'treasury', tq: 2, ico: '🏛️', cpn: 7 },
 
-  /* 8 farm */
-  { id: 'straw',  n: 'Strawberry Field Token', cat: 'Farm', v: 60,  q: 3, ven: 'farmcoop', tq: 1, ico: '🍓', farm: 1 },
-  { id: 'wheat',  n: 'Wheat Field Token',      cat: 'Farm', v: 45,  q: 3, ven: 'farmcoop', tq: 1, ico: '🌾', farm: 1 },
-  { id: 'corn',   n: 'Cornfield Token',        cat: 'Farm', v: 48,  q: 3, ven: 'farmcoop', tq: 1, ico: '🌽', farm: 2 },
-  { id: 'apple',  n: 'Apple Orchard Token',    cat: 'Farm', v: 75,  q: 3, ven: 'farmcoop', tq: 2, ico: '🍎', farm: 2 },
-  { id: 'milk',   n: 'Milk Route Token',       cat: 'Farm', v: 55,  q: 3, ven: 'farmcoop', tq: 2, ico: '🥛', farm: 3 },
-  { id: 'cattle', n: 'Cattle Herd Token',      cat: 'Farm', v: 140, q: 2, ven: 'farmcoop', tq: 3, ico: '🐄', farm: 3 },
-  { id: 'honey',  n: 'Honey Hive Token',       cat: 'Farm', v: 90,  q: 2, ven: 'farmcoop', tq: 3, ico: '🍯', farm: 4 },
-  { id: 'timber', n: 'Timber Stand Token',     cat: 'Farm', v: 120, q: 2, ven: 'farmcoop', tq: 2, ico: '🌲', farm: 4 },
+  /* 8 farm — the crop, spelled the way you would say it */
+  { id: 'straw',  n: 'Strawberry Field Token', tick: 'BERRY', cat: 'Farm', v: 60,  q: 3, ven: 'farmcoop', tq: 1, ico: '🍓', farm: 1 },
+  { id: 'wheat',  n: 'Wheat Field Token',      tick: 'WHEAT', cat: 'Farm', v: 45,  q: 3, ven: 'farmcoop', tq: 1, ico: '🌾', farm: 1 },
+  { id: 'corn',   n: 'Cornfield Token',        tick: 'CORN',  cat: 'Farm', v: 48,  q: 3, ven: 'farmcoop', tq: 1, ico: '🌽', farm: 2 },
+  { id: 'apple',  n: 'Apple Orchard Token',    tick: 'APPLE', cat: 'Farm', v: 75,  q: 3, ven: 'farmcoop', tq: 2, ico: '🍎', farm: 2 },
+  { id: 'milk',   n: 'Milk Route Token',       tick: 'MILK',  cat: 'Farm', v: 55,  q: 3, ven: 'farmcoop', tq: 2, ico: '🥛', farm: 3 },
+  { id: 'cattle', n: 'Cattle Herd Token',      tick: 'HERD',  cat: 'Farm', v: 140, q: 2, ven: 'farmcoop', tq: 3, ico: '🐄', farm: 3 },
+  { id: 'honey',  n: 'Honey Hive Token',       tick: 'HONEY', cat: 'Farm', v: 90,  q: 2, ven: 'farmcoop', tq: 3, ico: '🍯', farm: 4 },
+  { id: 'timber', n: 'Timber Stand Token',     tick: 'TIMBR', cat: 'Farm', v: 120, q: 2, ven: 'farmcoop', tq: 2, ico: '🌲', farm: 4 },
 
-  /* 4 minerals */
-  { id: 'gold',   n: 'Gold Seam Token',       cat: 'Minerals', v: 320, q: 3, ven: 'mineral', tq: 2, ico: '🥇', mine: 2 },
-  { id: 'silver', n: 'Silver Seam Token',     cat: 'Minerals', v: 180, q: 3, ven: 'mineral', tq: 1, ico: '🥈', mine: 1 },
-  { id: 'copper', n: 'Copper Vein Token',     cat: 'Minerals', v: 95,  q: 4, ven: 'mineral', tq: 1, ico: '🟤', mine: 1 },
-  { id: 'gems',   n: 'Gemstone Pocket Token', cat: 'Minerals', v: 420, q: 2, ven: 'mineral', tq: 3, ico: '💎', mine: 3 },
+  /* 4 minerals — the metal */
+  { id: 'gold',   n: 'Gold Seam Token',       tick: 'GOLD',  cat: 'Minerals', v: 320, q: 3, ven: 'mineral', tq: 2, ico: '🥇', mine: 2 },
+  { id: 'silver', n: 'Silver Seam Token',     tick: 'SILVR', cat: 'Minerals', v: 180, q: 3, ven: 'mineral', tq: 1, ico: '🥈', mine: 1 },
+  { id: 'copper', n: 'Copper Vein Token',     tick: 'COPPR', cat: 'Minerals', v: 95,  q: 4, ven: 'mineral', tq: 1, ico: '🟤', mine: 1 },
+  { id: 'gems',   n: 'Gemstone Pocket Token', tick: 'GEMS',  cat: 'Minerals', v: 420, q: 2, ven: 'mineral', tq: 3, ico: '💎', mine: 3 },
 
-  /* 8 property */
-  { id: 'flat',   n: 'Rusty Row Starter Flat',      cat: 'Property', v: 900,  q: 2, ven: 'property', tq: 1, ico: '🏚️' },
-  { id: 'store',  n: 'Main Street Storefront',      cat: 'Property', v: 1600, q: 2, ven: 'property', tq: 1, ico: '🏬' },
-  { id: 'wareh',  n: 'Iron Hills Warehouse',        cat: 'Property', v: 2100, q: 2, ven: 'property', tq: 2, ico: '🏭' },
-  { id: 'offblk', n: 'Market Square Office Block',  cat: 'Property', v: 3200, q: 2, ven: 'property', tq: 2, ico: '🏢' },
-  { id: 'luxapt', n: 'Waterfront Luxury Apartment', cat: 'Property', v: 5200, q: 1, ven: 'property', tq: 2, ico: '🌇' },
-  { id: 'induyd', n: 'Iron Hills Industrial Yard',  cat: 'Property', v: 2600, q: 1, ven: 'property', tq: 2, ico: '🚧' },
-  { id: 'dorm',   n: 'Learning Quarter Housing',    cat: 'Property', v: 1900, q: 2, ven: 'property', tq: 1, ico: '🏘️' },
-  { id: 'tower',  n: 'Waterfront Tower Floor',      cat: 'Property', v: 7400, q: 1, ven: 'property', tq: 3, ico: '🗼' },
+  /* 8 property — P + what kind of building it is */
+  { id: 'flat',   n: 'Rusty Row Starter Flat',      tick: 'PFLAT', cat: 'Property', v: 900,  q: 2, ven: 'property', tq: 1, ico: '🏚️' },
+  { id: 'store',  n: 'Main Street Storefront',      tick: 'PSHOP', cat: 'Property', v: 1600, q: 2, ven: 'property', tq: 1, ico: '🏬' },
+  { id: 'wareh',  n: 'Iron Hills Warehouse',        tick: 'PWHSE', cat: 'Property', v: 2100, q: 2, ven: 'property', tq: 2, ico: '🏭' },
+  { id: 'offblk', n: 'Market Square Office Block',  tick: 'POFFC', cat: 'Property', v: 3200, q: 2, ven: 'property', tq: 2, ico: '🏢' },
+  { id: 'luxapt', n: 'Waterfront Luxury Apartment', tick: 'PLUXE', cat: 'Property', v: 5200, q: 1, ven: 'property', tq: 2, ico: '🌇' },
+  { id: 'induyd', n: 'Iron Hills Industrial Yard',  tick: 'PYARD', cat: 'Property', v: 2600, q: 1, ven: 'property', tq: 2, ico: '🚧' },
+  { id: 'dorm',   n: 'Learning Quarter Housing',    tick: 'PDORM', cat: 'Property', v: 1900, q: 2, ven: 'property', tq: 1, ico: '🏘️' },
+  { id: 'tower',  n: 'Waterfront Tower Floor',      tick: 'PTWR',  cat: 'Property', v: 7400, q: 1, ven: 'property', tq: 3, ico: '🗼' },
 
-  /* 7 culture */
-  { id: 'gallery', n: 'Juniper Gallery Collection', cat: 'Culture', v: 480, q: 2, ven: 'bazaar', tq: 2, ico: '🖼️' },
-  { id: 'catalog', n: 'Bull Bear Music Catalog',    cat: 'Culture', v: 620, q: 2, ven: 'bazaar', tq: 2, ico: '🎵' },
-  { id: 'sneaks',  n: 'Vintage Trunk Sneakers',     cat: 'Culture', v: 210, q: 3, ven: 'bazaar', tq: 1, ico: '👟' },
-  { id: 'card',    n: 'Rare Stampede Rookie Card',  cat: 'Culture', v: 240, q: 2, ven: 'bazaar', tq: 1, ico: '🃏' },
-  { id: 'watch',   n: 'Historic Clocktower Watch',  cat: 'Culture', v: 560, q: 1, ven: 'bazaar', tq: 2, ico: '⌚' },
-  { id: 'film',    n: 'Riverlight Film Royalties',  cat: 'Culture', v: 700, q: 1, ven: 'bazaar', tq: 3, ico: '🎬' },
-  { id: 'museum',  n: 'City Museum Collection',     cat: 'Culture', v: 880, q: 1, ven: 'bazaar', tq: 3, ico: '🏺' },
+  /* 7 culture — the object itself */
+  { id: 'gallery', n: 'Juniper Gallery Collection', tick: 'GALRY', cat: 'Culture', v: 480, q: 2, ven: 'bazaar', tq: 2, ico: '🖼️' },
+  { id: 'catalog', n: 'Bull Bear Music Catalog',    tick: 'MUSIC', cat: 'Culture', v: 620, q: 2, ven: 'bazaar', tq: 2, ico: '🎵' },
+  { id: 'sneaks',  n: 'Vintage Trunk Sneakers',     tick: 'SNEAK', cat: 'Culture', v: 210, q: 3, ven: 'bazaar', tq: 1, ico: '👟' },
+  { id: 'card',    n: 'Rare Stampede Rookie Card',  tick: 'CARD',  cat: 'Culture', v: 240, q: 2, ven: 'bazaar', tq: 1, ico: '🃏' },
+  { id: 'watch',   n: 'Historic Clocktower Watch',  tick: 'WATCH', cat: 'Culture', v: 560, q: 1, ven: 'bazaar', tq: 2, ico: '⌚' },
+  { id: 'film',    n: 'Riverlight Film Royalties',  tick: 'FILM',  cat: 'Culture', v: 700, q: 1, ven: 'bazaar', tq: 3, ico: '🎬' },
+  { id: 'museum',  n: 'City Museum Collection',     tick: 'MUSEM', cat: 'Culture', v: 880, q: 1, ven: 'bazaar', tq: 3, ico: '🏺' },
 
-  /* 7 infrastructure */
-  { id: 'solar',   n: 'Green Edge Solar Field',   cat: 'Infrastructure', v: 1200, q: 2, ven: 'infra', tq: 2, ico: '🔆' },
-  { id: 'wind',    n: 'Ridge Wind Farm',          cat: 'Infrastructure', v: 1500, q: 2, ven: 'infra', tq: 2, ico: '🌬️' },
-  { id: 'battery', n: 'Battery Yard Facility',    cat: 'Infrastructure', v: 1100, q: 2, ven: 'infra', tq: 2, ico: '🔋' },
-  { id: 'water',   n: 'Bull Bear Water Utility',  cat: 'Infrastructure', v: 1800, q: 1, ven: 'infra', tq: 3, ico: '🚰' },
-  { id: 'bridge',  n: 'Old Toll Bridge',          cat: 'Infrastructure', v: 2200, q: 1, ven: 'infra', tq: 3, ico: '🌉' },
-  { id: 'station', n: 'Central Train Station',    cat: 'Infrastructure', v: 2800, q: 1, ven: 'infra', tq: 3, ico: '🚉' },
-  { id: 'fiber',   n: 'Fiber Backbone Network',   cat: 'Infrastructure', v: 1700, q: 2, ven: 'infra', tq: 3, ico: '🕸️' },
+  /* 7 infrastructure — the utility */
+  { id: 'solar',   n: 'Green Edge Solar Field',   tick: 'SOLAR', cat: 'Infrastructure', v: 1200, q: 2, ven: 'infra', tq: 2, ico: '🔆' },
+  { id: 'wind',    n: 'Ridge Wind Farm',          tick: 'WIND',  cat: 'Infrastructure', v: 1500, q: 2, ven: 'infra', tq: 2, ico: '🌬️' },
+  { id: 'battery', n: 'Battery Yard Facility',    tick: 'BATT',  cat: 'Infrastructure', v: 1100, q: 2, ven: 'infra', tq: 2, ico: '🔋' },
+  { id: 'water',   n: 'Bull Bear Water Utility',  tick: 'WATER', cat: 'Infrastructure', v: 1800, q: 1, ven: 'infra', tq: 3, ico: '🚰' },
+  { id: 'bridge',  n: 'Old Toll Bridge',          tick: 'BRDG',  cat: 'Infrastructure', v: 2200, q: 1, ven: 'infra', tq: 3, ico: '🌉' },
+  { id: 'station', n: 'Central Train Station',    tick: 'STATN', cat: 'Infrastructure', v: 2800, q: 1, ven: 'infra', tq: 3, ico: '🚉' },
+  { id: 'fiber',   n: 'Fiber Backbone Network',   tick: 'FIBER', cat: 'Infrastructure', v: 1700, q: 2, ven: 'infra', tq: 3, ico: '🕸️' },
 
-  /* 7 businesses */
-  { id: 'bakery',  n: 'Crumb & Co. Bakery',   cat: 'Business', v: 380,  q: 3, ven: 'broker', tq: 1, ico: '🥐' },
-  { id: 'cafe',    n: 'Rusty Row Café',       cat: 'Business', v: 420,  q: 3, ven: 'broker', tq: 1, ico: '☕' },
-  { id: 'resto',   n: "Rico's Restaurant",    cat: 'Business', v: 750,  q: 2, ven: 'broker', tq: 2, ico: '🍝' },
-  { id: 'fleet',   n: 'TRUNK Delivery Fleet', cat: 'Business', v: 980,  q: 2, ven: 'broker', tq: 2, ico: '🚚' },
-  { id: 'inn',     n: 'CozyBurrow Inn',       cat: 'Business', v: 1300, q: 2, ven: 'broker', tq: 2, ico: '🏨' },
-  { id: 'arcade',  n: 'Pixel Palace Arcade',  cat: 'Business', v: 400,  q: 3, ven: 'broker', tq: 1, ico: '🕹️' },
-  { id: 'mkthall', n: 'Market Hall Stalls',   cat: 'Business', v: 640,  q: 3, ven: 'broker', tq: 2, ico: '🧺' },
+  /* 7 businesses — what is written on the awning */
+  { id: 'bakery',  n: 'Crumb & Co. Bakery',   tick: 'CRUMB', cat: 'Business', v: 380,  q: 3, ven: 'broker', tq: 1, ico: '🥐' },
+  { id: 'cafe',    n: 'Rusty Row Café',       tick: 'CAFE',  cat: 'Business', v: 420,  q: 3, ven: 'broker', tq: 1, ico: '☕' },
+  { id: 'resto',   n: "Rico's Restaurant",    tick: 'RICO',  cat: 'Business', v: 750,  q: 2, ven: 'broker', tq: 2, ico: '🍝' },
+  { id: 'fleet',   n: 'TRUNK Delivery Fleet', tick: 'FLEET', cat: 'Business', v: 980,  q: 2, ven: 'broker', tq: 2, ico: '🚚' },
+  { id: 'inn',     n: 'CozyBurrow Inn',       tick: 'INN',   cat: 'Business', v: 1300, q: 2, ven: 'broker', tq: 2, ico: '🏨' },
+  { id: 'arcade',  n: 'Pixel Palace Arcade',  tick: 'PIXEL', cat: 'Business', v: 400,  q: 3, ven: 'broker', tq: 1, ico: '🕹️' },
+  { id: 'mkthall', n: 'Market Hall Stalls',   tick: 'STALL', cat: 'Business', v: 640,  q: 3, ven: 'broker', tq: 2, ico: '🧺' },
 
   /* 5 sports */
-  { id: 'academy',  n: 'Stampede Youth Academy',      cat: 'Sports', v: 900,  q: 2, ven: 'stadiumoffice', tq: 2, ico: '🎽' },
-  { id: 'concess',  n: 'Stadium Concessions',         cat: 'Sports', v: 1150, q: 2, ven: 'stadiumoffice', tq: 2, ico: '🌭' },
-  { id: 'rights',   n: 'Stampede Media Rights',       cat: 'Sports', v: 2400, q: 1, ven: 'stadiumoffice', tq: 3, ico: '📡' },
-  { id: 'minorlg',  n: 'Bull Bear Minor League Club', cat: 'Sports', v: 1900, q: 1, ven: 'stadiumoffice', tq: 3, ico: '⚾' },
-  { id: 'stampede', n: 'Bull Bear Stampede Team Token', cat: 'Sports', v: 9500, q: 1, ven: 'stadiumoffice', tq: 3, ico: '🐘' },
+  { id: 'academy',  n: 'Stampede Youth Academy',        tick: 'YOUTH', cat: 'Sports', v: 900,  q: 2, ven: 'stadiumoffice', tq: 2, ico: '🎽' },
+  { id: 'concess',  n: 'Stadium Concessions',           tick: 'CONCS', cat: 'Sports', v: 1150, q: 2, ven: 'stadiumoffice', tq: 2, ico: '🌭' },
+  { id: 'rights',   n: 'Stampede Media Rights',         tick: 'RIGHT', cat: 'Sports', v: 2400, q: 1, ven: 'stadiumoffice', tq: 3, ico: '📡' },
+  { id: 'minorlg',  n: 'Bull Bear Minor League Club',   tick: 'MINOR', cat: 'Sports', v: 1900, q: 1, ven: 'stadiumoffice', tq: 3, ico: '⚾' },
+  { id: 'stampede', n: 'Bull Bear Stampede Team Token', tick: 'TEAM',  cat: 'Sports', v: 9500, q: 1, ven: 'stadiumoffice', tq: 3, ico: '🐘' },
 
   /* 4 transport */
-  { id: 'ferry',  n: 'Harbor Ferry Line',          cat: 'Transport', v: 1400, q: 2, ven: 'infra', tq: 2, ico: '⛴️' },
-  { id: 'busdep', n: 'Crosstown Bus Depot',        cat: 'Transport', v: 1250, q: 2, ven: 'infra', tq: 2, ico: '🚌' },
-  { id: 'bikes',  n: 'City Bicycle Share Network', cat: 'Transport', v: 380,  q: 3, ven: 'infra', tq: 1, ico: '🚲' },
-  { id: 'hangar', n: 'Northfield Airfield Hangar', cat: 'Transport', v: 3100, q: 1, ven: 'infra', tq: 3, ico: '✈️' },
+  { id: 'ferry',  n: 'Harbor Ferry Line',          tick: 'FERRY', cat: 'Transport', v: 1400, q: 2, ven: 'infra', tq: 2, ico: '⛴️' },
+  { id: 'busdep', n: 'Crosstown Bus Depot',        tick: 'BUS',   cat: 'Transport', v: 1250, q: 2, ven: 'infra', tq: 2, ico: '🚌' },
+  { id: 'bikes',  n: 'City Bicycle Share Network', tick: 'BIKES', cat: 'Transport', v: 380,  q: 3, ven: 'infra', tq: 1, ico: '🚲' },
+  { id: 'hangar', n: 'Northfield Airfield Hangar', tick: 'HANGR', cat: 'Transport', v: 3100, q: 1, ven: 'infra', tq: 3, ico: '✈️' },
 ];
 
 export const ASSET_BY_ID = {};
 for (const a of ASSETS) ASSET_BY_ID[a.id] = a;
+
+/* ============================================================
+   TICKERS — every asset has one, and it is the primary handle.
+
+   THE SCHEME. All 69 are 3–5 characters, uppercase, unique, and
+   asserted unique in tools/test-game.mjs so a future edit cannot
+   collide. Per category:
+
+     Stocks    the 15 original symbols, untouched — they are in
+               save files and quest text (TRNK, ACRN, MMTR, …)
+     Bonds     the maturity          B3M B1Y B5Y B10Y
+     Farm      the crop              WHEAT CORN APPLE MILK HERD …
+     Minerals  the metal             GOLD SILVR COPPR GEMS
+     Property  P + the building      PFLAT PSHOP PWHSE POFFC PTWR …
+     Culture   the object            GALRY MUSIC SNEAK CARD WATCH …
+     Infra     the utility           SOLAR WIND BATT WATER BRDG …
+     Business  the awning            CRUMB CAFE RICO FLEET INN …
+     Sports    the thing you own     YOUTH CONCS RIGHT MINOR TEAM
+     Transport the vehicle           FERRY BUS BIKES HANGR
+
+   So an order reads like a trade ticket: "3x WHEAT", "buy GOLD".
+
+   normTicker() is deliberately forgiving — case, whitespace and
+   punctuation are all stripped — because players type into a
+   search box, not a form field.
+   ============================================================ */
+export const ASSET_BY_TICK = {};
+for (const a of ASSETS) ASSET_BY_TICK[a.tick] = a;
+
+export const normTicker = (s) => String(s == null ? '' : s).toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+/* Exact resolve: an asset id, or a ticker in any casing/spacing.
+   Never fuzzy — callers that want fuzzy use searchAssets(). */
+export function byTicker(s) {
+  if (s == null) return null;
+  const raw = String(s).trim();
+  if (ASSET_BY_ID[raw]) return ASSET_BY_ID[raw];
+  return ASSET_BY_TICK[normTicker(raw)] || null;
+}
+/* id | ticker -> canonical asset id, or null. */
+export function assetIdOf(s) {
+  const a = byTicker(s);
+  return a ? a.id : null;
+}
+/* 'GOLD · Gold Seam Token' — the one place ticker+name is joined. */
+export function assetLabel(s, sep = ' · ') {
+  const a = byTicker(s);
+  return a ? a.tick + sep + a.n : String(s == null ? '' : s);
+}
+/* '2x WHEAT' — one line of a trade ticket. */
+export function tickerQty(s, qty = 1) {
+  const a = byTicker(s);
+  return (qty === 1 ? '' : qty + 'x ') + (a ? a.tick : String(s));
+}
+
+/* Fuzzy/prefix search over TICKER **and** NAME, best first.
+   "gol" -> GOLD, "wheat" -> WHEAT, "rusty" -> PFLAT + CAFE.
+   Scores, high to low:
+     100 exact ticker or id   80 ticker prefix     70 ticker substring
+      60 name prefix          50 word-start in name
+      40 name substring       20 ticker subsequence ("gms" -> GEMS)
+   Ties break on the cheaper asset, so the common thing wins. */
+export function searchAssets(q, limit = 12) {
+  const raw = String(q == null ? '' : q).trim();
+  if (!raw) return [];
+  const T = normTicker(raw);
+  const L = raw.toLowerCase();
+  const out = [];
+  for (const a of ASSETS) {
+    const tick = a.tick, name = a.n.toLowerCase();
+    let score = 0;
+    if (tick === T) score = 100;
+    else if (T && tick.startsWith(T)) score = 80;
+    else if (T && tick.includes(T)) score = 70;
+    else if (name.startsWith(L)) score = 60;
+    else if (name.split(/[^a-z0-9]+/).some((w) => w && w.startsWith(L))) score = 50;
+    else if (name.includes(L)) score = 40;
+    else if (T && subseq(T, tick)) score = 20;
+    if (a.id === raw.toLowerCase()) score = 100;
+    if (score) out.push({ a, score });
+  }
+  out.sort((x, y) => y.score - x.score || x.a.v - y.a.v || x.a.id.localeCompare(y.a.id));
+  return out.slice(0, limit).map((x) => x.a);
+}
+function subseq(needle, hay) {
+  let i = 0;
+  for (const ch of hay) if (ch === needle[i]) i++;
+  return i === needle.length;
+}
 
 /* ---------------- 9 VENUES ---------------- */
 export const VENUES = {
@@ -335,12 +424,16 @@ export const LOCATIONS = [
   { id: 'apartment', n: 'Your Apartment', z: 'rustyrow', x: 88, y: 556, ico: '🏚️', see: 0, kit: 'interior', tint: '#6A5744', dy: 0.5,
     hours: [0, 24], desc: 'A mattress, a folding table, and a poster of a team that loses.',
     acts: ['sleep', 'desk', 'poster', 'wardrobe'] },
-  { id: 'trunkdepot', n: 'TRUNK Depot', z: 'rustyrow', x: 198, y: 492, ico: '🚕', see: 0, kit: 'interior', tint: '#4E5666', dy: 1.2,
+  /* DISPATCH. The id stays 'trunkdepot' — it is in save files, in the
+     3D placement table and in ui.js — but the name the player reads is
+     "Dispatch". The TRUNK brand is untouched everywhere else (TRUNK
+     Ride, Trunk Technologies, the TRUNK Delivery Fleet asset). */
+  { id: 'trunkdepot', n: 'Dispatch', z: 'rustyrow', x: 198, y: 492, ico: '🚕', see: 0, kit: 'interior', tint: '#4E5666', dy: 1.2,
     hours: [6, 22], desc: 'Rideshare dispatch. The coffee is free and tastes like it.',
-    acts: ['job:drive', 'job:nightdrive'] },
+    acts: ['job:drive', 'job:nightdrive', 'bike'] },
   { id: 'pawnshop', n: "Vic's Pawn & Trade", z: 'rustyrow', x: 96, y: 472, ico: '🏷️', see: { stat: 'jobsDone', n: 1 }, kit: 'interior', tint: '#5E4A5C', dy: 1.8,
     hours: [9, 20], desc: 'Assets with a past. Cheaper for exactly that reason.',
-    acts: ['pawn'] },
+    acts: ['pawn', 'bike'] },
   { id: 'noodlecart', n: 'Noodle Cart Alley', z: 'rustyrow', x: 214, y: 582, ico: '🍜', see: 0, kit: 'market', dy: -0.4,
     hours: [7, 23], desc: 'Four dollars, no questions, surprisingly good.',
     acts: ['food:4:26', 'food:9:52'] },
@@ -349,7 +442,9 @@ export const LOCATIONS = [
   { id: 'office', n: 'Your Office', z: 'mainstreet', x: 318, y: 352, ico: '🏢', see: { office: 1 }, kit: 'interior', tint: '#6E5C48', dy: 1.0,
     hours: [0, 24], desc: 'The centre of the operation, whatever size it currently is.',
     acts: ['hub'] },
-  { id: 'cafe', n: 'The Bent Spoon', z: 'mainstreet', x: 392, y: 414, ico: '☕', see: { stat: 'jobsDone', n: 1 }, kit: 'interior', tint: '#7A5A42', dy: 0.2,
+  /* see: 0 — the opening phone message tells you to meet a friend here,
+     so it has to be on the map before you have done anything at all. */
+  { id: 'cafe', n: 'The Bent Spoon', z: 'mainstreet', x: 392, y: 414, ico: '☕', see: 0, kit: 'interior', tint: '#7A5A42', dy: 0.2,
     hours: [6, 19], desc: 'Pastries, gossip, and a shift going spare.',
     acts: ['job:cafe', 'food:11:44'] },
   { id: 'propertyoffice', n: 'Property Office', z: 'mainstreet', x: 250, y: 414, ico: '🏘️', see: { rep: 9 }, kit: 'interior', tint: '#5C6470', dy: 0.6,
@@ -555,12 +650,71 @@ for (const key of Object.keys(ZONES)) {
 export const LOC_BY_ID = {};
 for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
 
-/* ---------------- TRAVEL ---------------- */
+/* ============================================================
+   TRAVEL — four modes, four different currencies.
+
+   THE TRADE-OFF EACH ONE MAKES
+     WALK   trades time and energy for money. Free, always available,
+            never refused — this is the floor that stops a broke,
+            exhausted player from being hard-locked. See game.fares().
+     BIKE   the reward for investing early. Free like walking, less
+            than half the time, a third of the energy — but you have
+            to OWN it (BIKE below, $180) and have it EQUIPPED.
+     METRO  trades ENERGY for money. Almost free, quick, and it grinds
+            Wally down: platforms, stairs, standing, crowds. Per
+            MINUTE it is roughly twice as tiring as walking. No trains
+            00:00–05:00.
+     UBER   trades MONEY for energy and time. Always expensive, never
+            cheap even for one hop, and the price climbs faster than
+            the distance (a per-hop term AND a hop² surge).
+
+   cost   = base + per·h + surge·h²
+   mins   = max(3, minBase + min·h)
+   energy = enBase + energy·h
+
+   THE TABLE, at 1 / 3 / 5 / 8 hops (8 is the widest trip on the
+   island — apartment to Golden Heights is 7):
+
+     mode    1 hop            3 hops            5 hops            8 hops
+     walk    $0      15m  4.2e  $0      41m 12.6e  $0      67m 21.0e  $0      106m 33.6e
+     bike    $0       6m  1.5e  $0      16m  4.5e  $0      26m  7.5e  $0       41m 12.0e
+     metro   $3.50    9m  5.7e  $6.50   15m 10.1e  $9.50   21m 14.5e  $14.00   30m 21.1e
+     uber    $24.20   5m  0.1e  $51.80   9m  0.4e  $89.00  13m  0.8e  $162.80  19m  1.2e
+
+   Read the columns, not the rows: walking one hop is fifteen minutes
+   you did not have to pay for; the metro across town is nine dollars
+   and a quarter of your day's energy; an Uber anywhere is a shift's
+   pay. Money buys energy back, energy buys money back, and the bike
+   quietly wins both once you have bought it.
+
+   MODE IDS ARE STABLE. 'train' and 'trunk' keep their ids — they are
+   in save files (state.travel), in ui/menus.js's icon map and in
+   tools/traveltest.mjs — and only their DISPLAY names changed to
+   Metro and Uber. 'walk' is promoted from a special case inside
+   game.fares() to a first-class mode here. 'bike' is unchanged as an
+   id but is now gated on ownership.
+   ============================================================ */
 export const TRAVEL = {
-  bike:  { n: 'Bicycle',    ico: '🚲', base: 0, per: 0, min: 9, energy: 2.4, note: 'Free. Squeaks. Costs your legs and your morning.' },
-  train: { n: 'City Train', ico: '🚈', base: 4, per: 3, min: 4, energy: 0.5, note: 'Cheap and reliable. Runs 05:00–00:00.' },
-  trunk: { n: 'TRUNK Ride', ico: '🚕', base: 9, per: 7, min: 2, energy: 0,   note: 'Fast, comfortable, and you are paying for both.' },
+  walk:  { id: 'walk',  n: 'On foot', ico: '🐘', base: 0,  per: 0,   surge: 0,   minBase: 2, min: 13, enBase: 0,   energy: 4.2,  note: 'Free, always. Slow, and your legs know it.' },
+  bike:  { id: 'bike',  n: 'Bicycle', ico: '🚲', base: 0,  per: 0,   surge: 0,   minBase: 1, min: 5,  enBase: 0,   energy: 1.5,  needs: 'bike', note: 'Free once it is yours. Squeaks. Worth every dollar.' },
+  train: { id: 'train', n: 'Metro',   ico: '🚈', base: 2,  per: 1.5, surge: 0,   minBase: 6, min: 3,  enBase: 3.5, energy: 2.2,  hours: [5, 24], note: 'Costs almost nothing and takes it out of you. Runs 05:00–00:00.' },
+  trunk: { id: 'trunk', n: 'Uber',    ico: '🚕', base: 14, per: 9,   surge: 1.2, minBase: 3, min: 2,  enBase: 0,   energy: 0.15, note: 'Door to door, no effort, and the fare grows faster than the distance.' },
 };
+
+/* THE BICYCLE — an item you buy, not a mode you are handed.
+   Owning it and riding it are separate: state.bike = {owned, equipped}.
+   Sold at Dispatch (a rideshare depot has beaters going spare) and at
+   Vic's pawn shop — both in Rusty Row, both reachable on day one. The
+   'bike' act string on those two locations is how the UI finds it. */
+export const BIKE = Object.freeze({
+  id: 'bike',
+  n: 'Second-hand Bicycle',
+  ico: '🚲',
+  cost: 180,
+  locs: Object.freeze(['trunkdepot', 'pawnshop']),
+  desc: 'One gear, two brakes, one of which works. Halves every journey in this city and costs nothing to run.',
+  line: 'It is a bicycle. It is not a good bicycle. It is, however, yours.',
+});
 
 /* distance in "hops", from the 2D map (the 3D island preserves it) */
 export function hops(a, b) {
@@ -573,10 +727,11 @@ export function fare(mode, a, b) {
   const t = TRAVEL[mode], h = hops(a, b);
   if (!t) return { cost: 0, mins: 0, energy: 0, hops: 0 };
   if (!h) return { cost: 0, mins: 0, energy: 0, hops: 0 };
+  const cost = t.base + t.per * h + (t.surge || 0) * h * h;
   return {
-    cost: t.base + t.per * h,
-    mins: Math.max(3, t.min * h),
-    energy: +(t.energy * h).toFixed(1),
+    cost: Math.round(cost * 100) / 100,
+    mins: Math.max(3, Math.round((t.minBase || 0) + t.min * h)),
+    energy: +((t.enBase || 0) + t.energy * h).toFixed(1),
     hops: h,
   };
 }
@@ -694,11 +849,17 @@ export const WALLYNET_BAD = [
    apartment desk until you rent a real one).
 --------------------------------------------- */
 export const QUESTS = [
-  { id: 'q_wake', act: 1, loc: 'apartment', t: 'Read the message from your mentor', d: 'Open the phone and read Messages.', hint: 'Press P',
+  /* ACT 1, THE OPENING, in the order the player lives it:
+       1  read the phone            (Otto's welcome; Happy is met on the way out)
+       2  work a shift at Dispatch  (the flag is set by actions.work)
+       3  take your first client order — which does not exist until 2 is done
+     The cafe beat sits ALONGSIDE this chain as a side quest and never
+     touches the objective strip. See SIDE_QUESTS below. */
+  { id: 'q_wake', act: 1, loc: 'apartment', t: 'Read the message from your friend', d: 'Open the phone and read Messages.', hint: 'Press P',
     check: (S) => !!S.flags.readMentor, rep: 1, money: 0 },
-  { id: 'q_first_job', act: 1, loc: 'trunkdepot', t: 'Earn your first money', d: 'The TRUNK office in Rusty Row is hiring drivers.', hint: 'TRUNK Depot',
-    check: (S) => S.stats.jobsDone >= 1, rep: 2, money: 0 },
-  { id: 'q_first_client', act: 1, loc: 'office', t: 'Take your first client order', d: 'Talk to someone in Rusty Row, then accept an order.', hint: 'Talk to NPCs',
+  { id: 'q_first_job', act: 1, loc: 'trunkdepot', t: 'Work a shift at Dispatch', d: 'Rideshare dispatch in Rusty Row is short of drivers.', hint: 'Dispatch',
+    check: (S) => !!S.flags.dispatchShift, rep: 2, money: 0 },
+  { id: 'q_first_client', act: 1, loc: 'office', t: 'Take your first client order', d: 'A shift at Dispatch put your name about. Someone will come to your desk.', hint: 'Your desk',
     check: (S) => S.orders.length > 0 || S.stats.ordersDone >= 1, rep: 2, money: 0 },
   { id: 'q_first_fee', act: 1, loc: 'office', t: 'Complete an order at your desk', d: 'Buy what the client asked for, then deliver it from your apartment desk.', hint: "Wally's Apartment",
     check: (S) => S.stats.ordersDone >= 1, rep: 4, money: 60 },
@@ -744,6 +905,38 @@ export const QUESTS = [
 export const QUEST_BY_ID = {};
 for (const q of QUESTS) QUEST_BY_ID[q.id] = q;
 
+/* ---------------- SIDE QUESTS ----------------
+   A SEPARATE LIST ON PURPOSE. quests.current() walks QUESTS and only
+   QUESTS, so the HUD objective strip can never be hijacked by a side
+   errand — which is the whole reason this list exists. Side quests
+   are dormant until something starts one (quests.startSide(id)); the
+   UI reads them through quests.sideCurrent() / quests.sides().
+
+   Same shape as a main quest, plus `side: true` and `from`, the
+   person who asked.
+--------------------------------------------- */
+export const SIDE_QUESTS = [
+  { id: 'q_side_otto', side: true, act: 1, loc: 'office', from: 'otto',
+    t: "Fill Otto's order", d: 'He asked for one thing over coffee. Buy it, bring it to your desk.',
+    hint: 'Your desk',
+    check: (S) => !!(S.clients.otto && S.clients.otto.done >= 1), rep: 3, money: 40 },
+];
+export const SIDE_QUEST_BY_ID = {};
+for (const q of SIDE_QUESTS) SIDE_QUEST_BY_ID[q.id] = q;
+
+/* ---------------- THE OPENING MESSAGE ----------------
+   On the phone the moment the game starts. Otto has run the Pixel
+   Palace arcade in Rusty Row for years; Wally has just moved back.
+   Cloned into state.msgs by newState() — never pushed by reference,
+   because this table is deep-frozen and `read` has to be writable.
+--------------------------------------------- */
+export const OPENING_MESSAGE = Object.freeze({
+  from: 'Otto',
+  text: 'WALLY. You actually came back. Welcome to Bull Bear City, which is louder and broker than you left it and is now, unfortunately, yours as well. '
+      + 'When you have put the mattress down, come and find me at the Bent Spoon on Main Street — the coffee is bad in a way I have grown to respect. '
+      + "I am buying, and I will not be saying that again. There is also a small thing I could use your help with. Small. Bring the sunglasses.",
+});
+
 /* ---------------- TOKENIZATION MILESTONES ---------------- */
 export const MILESTONES = [
   { p: 5,   t: 'A shared desk is within reach',    from: 'Main Street Lofts', msg: 'A desk opened up. $1,200.' },
@@ -761,7 +954,9 @@ export const MILESTONES = [
 
 /* ---------------- ONE-TIME TIPS ---------------- */
 export const TIPS = {
-  map:      { t: 'Getting around', d: 'Every trip costs something. The bicycle is free but slow and tiring; the train and a TRUNK ride cost money and buy the day back.' },
+  map:      { t: 'Getting around', d: 'Four ways across town, and each one charges you differently. Walking is free and always available — it costs you the morning. The Metro costs pennies and costs energy. An Uber costs a shift’s pay and costs you nothing else.' },
+  bike:     { t: 'Buy a bicycle',  d: 'A second-hand bike is $180 at Dispatch or Vic’s. Half the time of walking, a third of the energy, free forever after. It is the best money you will spend this week.' },
+  ticker:   { t: 'Tickers',        d: 'Every asset in the city has a symbol — GOLD, WHEAT, B5Y, TEAM. Orders are written in them, and you can search by symbol or by name.' },
   office:   { t: 'Your office',    d: 'This is your desk. Clients turn up here through the day with a job, a budget and a deadline. Take the ones you can actually finish.' },
   order:    { t: 'Filling an order', d: 'You have an order. Travel to wherever that asset is sold, buy it, then come back here and deliver.' },
   hours:    { t: 'Opening hours',  d: 'Places open and close. Check Phone → Places if you are not sure whether it is worth the fare.' },
@@ -771,9 +966,9 @@ export const TIPS = {
 
 /* ---------------- MORNING NOTES ---------------- */
 export const MORNING_NOTES = [
-  { day: 2,  from: 'Mentor',        msg: 'Second day. The city has not noticed you. That is normal — keep going.' },
+  { day: 2,  from: 'Otto',          msg: 'Second day. The city has not noticed you. That is normal — keep going.' },
   { day: 4,  from: 'Marcus Grimm',  msg: 'Rent, Wally. It is not personal, it is a business model.' },
-  { day: 9,  from: 'Mentor',        msg: 'Still the folding table? Good. Everyone starts there.', when: (S) => S.office === 0 },
+  { day: 9,  from: 'Otto',          msg: 'Still the folding table? Good. Everyone starts there.', when: (S) => S.office === 0 },
   { day: 15, from: 'Fenn',          msg: 'Is the Exchange hard to get into? Asking for a friend. It is me.', when: (S) => !S.unlocks.exchange },
 ];
 
@@ -792,7 +987,8 @@ function deepFreeze(o) {
 export const DATA = deepFreeze({
   config: CONFIG,
   categories: CATEGORIES,
-  assets: ASSETS, assetById: ASSET_BY_ID,
+  assets: ASSETS, assetById: ASSET_BY_ID, assetByTick: ASSET_BY_TICK,
+  byTicker, assetIdOf, assetLabel, tickerQty, searchAssets, normTicker,
   venues: VENUES, venueLoc: VENUE_LOC,
   clients: CLIENTS, clientById: CLIENT_BY_ID,
   courses: COURSES, courseById: COURSE_BY_ID,
@@ -801,7 +997,7 @@ export const DATA = deepFreeze({
   zones: ZONES,
   locations: LOCATIONS, locationById: LOC_BY_ID,
   map: MAP, world: WORLD,
-  travel: TRAVEL,
+  travel: TRAVEL, bike: BIKE,
   jobs: JOBS,
   employees: EMPLOYEE_POOL, employeeById: EMPLOYEE_BY_ID,
   ipos: IPOS, ipoSteps: IPO_STEPS,
@@ -809,6 +1005,8 @@ export const DATA = deepFreeze({
   news: NEWS_POOL,
   wallynetGood: WALLYNET_GOOD, wallynetBad: WALLYNET_BAD,
   quests: QUESTS, questById: QUEST_BY_ID,
+  sideQuests: SIDE_QUESTS, sideQuestById: SIDE_QUEST_BY_ID,
+  openingMessage: OPENING_MESSAGE,
   milestones: MILESTONES,
   tips: TIPS,
   morningNotes: MORNING_NOTES,

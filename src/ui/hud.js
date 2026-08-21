@@ -6,15 +6,26 @@
    cluster, toasts bottom-left, key hints bottom-right, banners
    centred high, and the world-space interaction prompt.
 
-   Everything lives at the edges. Nothing sits where Wally is.
+   Everything lives at the edges. Nothing sits where Wally is —
+   except the destination pointer, which sits centre-top because
+   "which way" is a question about the middle of the screen.
+
    The HUD polls ctx.game.hud() at 8 Hz and repaints only the
-   fields that actually changed — no per-frame DOM writes.
+   fields that actually changed — no per-frame DOM writes. The one
+   exception is the pointer's arrow, which is written every frame:
+   a compass that lags a turn is worse than no compass at all.
    ============================================================ */
 
 import { BRAND } from '../core/palette.js';
 import { clamp, damp } from '../core/contracts.js';
 import { h, icon, money, pad2, rgba, C, meterColour } from './style.js';
 
+/* The bottom-right row is the reminder tier and stays at four: B for
+   the buy sheet lives on the TICKER pill instead, which is a better
+   home for it anyway — the affordance and its shortcut in one object,
+   sitting against the money it spends. tools/touchtest.mjs counts
+   these four, so adding a fifth here is a test change as well as a
+   design one. */
 const KEY_HINTS = [
   { k: 'P', name: 'Phone', app: null, id: 'phone', code: 'KeyP' },
   { k: 'M', name: 'Places', app: 'places', id: 'phone', code: 'KeyM' },
@@ -58,10 +69,29 @@ export function createHud(ctx, ui) {
      carries a little more weight than the pills either side of it */
   const moneyPill = pill('cash', null, '$250');
   moneyPill.el.classList.add('money');
+  /* THE BUY AFFORDANCE, and it sits against the money readout on
+     purpose: cash is the number the player checks before spending
+     it, so the one control that spends it belongs in the same
+     glance. Before this there was no route to a purchase that did
+     not start with knowing which of nine venues sold the thing. */
+  const buyPill = h('button.w-pill.tap.w-pe', {
+    type: 'button', title: 'Search a ticker and buy it  ·  B',
+    onclick: () => { ui.click(); ui.openQuickBuy(); },
+  }, icon('search', 13, { w: 2 }), h('span.w-k', { text: 'TICKER' }),
+    h('span.kb', { text: 'B' }));
   const repPill = pill('star', null, '0', 'REP');
   const cityPill = ringPill();
   const right = h('div.w-bar.right', null,
-    h('div.w-pills', null, moneyPill.el, repPill.el, cityPill.el));
+    h('div.w-pills', null, moneyPill.el, buyPill, repPill.el, cityPill.el));
+
+  /* ---------------- the destination pointer ---------------- */
+  const ptrArrow = icon('nav', 17, { fill: 'currentColor', stroke: 'currentColor', w: 1.2, class: 'arw' });
+  const ptrT = h('div.t', { text: '—' });
+  const ptrD = h('div.d');
+  const pointer = h('div.w-ptr.w-pe.off', {
+    role: 'button', tabindex: '0', title: 'Where you are going',
+    onclick: () => onPointer(),
+  }, h('div.dial', null, ptrArrow), h('div', null, ptrT, ptrD));
 
   /* ---------------- toasts / banner / prompt / hints ---------------- */
   const toasts = h('div.w-toasts');
@@ -77,6 +107,7 @@ export function createHud(ctx, ui) {
         ui.click();
         if (hk.id === 'phone') ui.openPhone(hk.app);
         else if (hk.id === 'office') ui.openDesk();
+        else if (hk.id === 'buy') ui.openQuickBuy();
         else ui.show('pause');
       },
     }, h('span.kb', { text: hk.k }), hk.name);
@@ -100,7 +131,7 @@ export function createHud(ctx, ui) {
   }
   addEventListener('keydown', onHintKey);
 
-  root.append(left, right, toasts, promptLayer, hints);
+  root.append(left, right, pointer, toasts, promptLayer, hints);
 
   /* ============================================================
      builders
@@ -230,6 +261,149 @@ export function createHud(ctx, ui) {
     const loc = locId ? game().data.locationById[locId] : null;
     const where = loc && game().known(locId) ? loc.n : (q.hint || q.d);
     objD.textContent = where;
+  }
+
+  /* ============================================================
+     THE DESTINATION POINTER
+
+     Which way to go, and how far, from where Wally is standing and
+     facing. It follows the current objective unless the player has
+     picked somewhere else on the map, in which case it follows that
+     until they arrive or clear it.
+
+     THE BEARING IS TAKEN IN WALLY'S OWN FRAME, not in world north.
+     A compass rose would be honest and useless: the player does not
+     know which way north is, they know which way the elephant is
+     facing. So the arrow is the angle between his nose and the
+     door, which means "turn until the arrow points up".
+
+       forward  f = (sin yaw, cos yaw)      the convention in data.js
+       right    r = (-fz, fx)               forward x up — the same
+                                            basis wally.js strafes on
+       screen angle = atan2(d·r, d·f)       clockwise, 0 = straight on
+
+     The arrow is written every frame and damped, so a turn is a
+     sweep rather than a snap and a stationary player sees a still
+     pointer rather than a twitching one.
+     ============================================================ */
+  let destOverride = null;          // a place the player chose on the map
+  let ptrAngle = 0;                 // damped, radians
+  let ptrShown = { key: '', txt: '', sub: '' };
+
+  function pointerTarget() {
+    const g = game();
+    if (!g) return null;
+    if (destOverride && g.data.locationById[destOverride]) {
+      /* arriving retires it — otherwise it would point at his feet */
+      if (destOverride === g.state.loc) destOverride = null;
+      else return { id: destOverride, why: 'your destination', chosen: true };
+    }
+    const q = objQuest;
+    if (!q) return null;
+    const locId = g.quests.questLoc(q.id);
+    if (!locId || !g.known(locId)) return null;
+    return { id: locId, why: q.t, chosen: false };
+  }
+
+  /* The point to walk to. ctx.city.doorPosition is the real doorway;
+     data.js's world{} is the building centre and is the fallback.
+
+     CACHED ON THE ID. This runs inside a per-frame update and a door
+     does not move, so asking the city for it sixty times a second
+     would be sixty lookups for one answer. */
+  const _tp = { id: null, x: 0, y: 0, z: 0, ok: false };
+  function targetPoint(locId) {
+    if (_tp.id === locId) return _tp.ok ? _tp : null;
+    _tp.id = locId; _tp.ok = false;
+    try {
+      const d = ctx.city?.doorPosition?.(locId);
+      if (d && Number.isFinite(d.x + d.z)) {
+        _tp.x = d.x; _tp.y = d.y; _tp.z = d.z; _tp.ok = true;
+        return _tp;
+      }
+    } catch (e) { /* fall through */ }
+    const l = game().data.locationById[locId];
+    if (!l) return null;
+    _tp.x = l.world.x; _tp.y = l.world.y; _tp.z = l.world.z; _tp.ok = true;
+    return _tp;
+  }
+
+  const TAU = Math.PI * 2;
+  const wrapPi = (a) => { a = (a + Math.PI) % TAU; return (a < 0 ? a + TAU : a) - Math.PI; };
+
+  function updatePointer(dt) {
+    const t = pointerTarget();
+    if (!t) {
+      if (!pointer.classList.contains('off')) pointer.classList.add('off');
+      return;
+    }
+    const g = game();
+    const loc = g.data.locationById[t.id];
+    const tp = targetPoint(t.id);
+    if (!tp) { pointer.classList.add('off'); return; }
+
+    /* where he is and which way he is looking; before the character
+       exists, stand him at his current location facing north */
+    const w = ctx.wally;
+    const px = w?.position?.x ?? (g.data.locationById[g.state.loc]?.world.x || 0);
+    const pz = w?.position?.z ?? (g.data.locationById[g.state.loc]?.world.z || 0);
+    const yaw = w?.rotation?.y ?? Math.PI;
+
+    const dx = tp.x - px, dz = tp.z - pz;
+    const dist = Math.hypot(dx, dz);
+    const fx = Math.sin(yaw), fz = Math.cos(yaw);
+    const rx = -fz, rz = fx;
+    const want = dist > 0.4 ? Math.atan2(dx * rx + dz * rz, dx * fx + dz * fz) : 0;
+
+    ptrAngle += wrapPi(want - ptrAngle) * (1 - Math.exp(-13 * dt));
+    ptrArrow.style.transform = `rotate(${(ptrAngle * 180 / Math.PI).toFixed(1)}deg)`;
+
+    const arrived = dist < 9;
+    pointer.classList.toggle('here', arrived);
+    if (pointer.classList.contains('off')) {
+      pointer.classList.remove('off');
+      placePointer();               // place it before it is first seen
+    }
+
+    /* THE WORDS COME OFF `want`, NOT off ptrAngle. ptrAngle is
+       deliberately never wrapped — it accumulates shortest-arc steps
+       so the arrow sweeps through 350° rather than snapping back
+       through zero — which means after a couple of turns it is 700°
+       and `Math.abs(ptrAngle) > 2.3` is true forever. Measured: the
+       label read "behind you" at all four yaws while the arrow was
+       pointing correctly at every one of them. */
+    const bearing = arrived ? 'you are here'
+      : Math.abs(want) < 0.42 ? 'straight ahead'
+        : Math.abs(want) > 2.3 ? 'behind you'
+          : want > 0 ? 'to your right' : 'to your left';
+    const txt = loc ? loc.n : t.why;
+    const sub = arrived ? (t.chosen ? 'arrived' : 'go inside — press E')
+      : Math.round(dist) + ' m · ' + bearing;
+    if (ptrShown.txt !== txt) { ptrShown.txt = txt; ptrT.textContent = txt; }
+    if (ptrShown.sub !== sub) { ptrShown.sub = sub; ptrD.textContent = sub; }
+  }
+
+  /* WHERE THE POINTER SITS. Centre-top, unless centre-top is already
+     occupied: at 1600 px there is 700 px of clear sky between the two
+     stat clusters and at 390 px there is none, so the placement is
+     measured rather than guessed and the phone gets the row below. */
+  function placePointer() {
+    if (pointer.classList.contains('off')) return;
+    const lb = left.getBoundingClientRect();
+    const rb = right.getBoundingClientRect();
+    const pw = pointer.offsetWidth || 230;
+    const cx = window.innerWidth / 2;
+    const clash = (cx - pw / 2 - 12) < lb.right || (cx + pw / 2 + 12) > rb.left;
+    const top = clash ? Math.max(lb.bottom, rb.bottom) + 8 : Math.max(lb.top, rb.top);
+    pointer.style.setProperty('--w-ptr-top', Math.round(top) + 'px');
+  }
+
+  function onPointer() {
+    ui.click();
+    const t = pointerTarget();
+    if (!t) { ui.toast('Nowhere left to be.', 'token'); return; }
+    if (t.id === game().state.loc) { ui.openPlace(t.id); return; }
+    ui.goto(t.id, t.why);
   }
 
   /* ============================================================
@@ -466,6 +640,8 @@ export function createHud(ctx, ui) {
     /* the touch pad stands in for this row on a phone and wants the
        same count — one poll, two readouts */
     ui.touch?.setBadge?.(unread);
+
+    placePointer();
   }
 
   /* ============================================================
@@ -480,10 +656,20 @@ export function createHud(ctx, ui) {
     demoDelta(text) { moneyPill.flash(); moneyPill.delta(text || '+$56', /^−/.test(text || '')); },
     get nearLocation() { return DOOR.loc; },
     setObjective,
+    /* the pointer follows this until he gets there; null hands it
+       back to the current objective */
+    setDestination(locId) {
+      destOverride = locId && game()?.data?.locationById?.[locId] ? locId : null;
+      ptrShown.txt = ptrShown.sub = '';
+      refresh(true);
+      return destOverride;
+    },
+    get destination() { return destOverride; },
     update(dt) {
       acc += dt;
       if (acc >= 0.125) { acc = 0; refresh(false); }
       updateDoorPrompt(dt);
+      updatePointer(dt);
       projectPrompts(dt);
     },
     setHintsVisible(on) { hints.style.display = on ? '' : 'none'; },

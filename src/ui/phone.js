@@ -19,8 +19,9 @@ import { BRAND, CATEGORY, SEA, LAND, BUILD, css } from '../core/palette.js';
 import { clamp } from '../core/contracts.js';
 import {
   h, clear, icon, money, money2, pad2, portrait, glyphAvatar, hueFor,
-  wallyMark, rgba, mix, C, meterColour,
+  wallyMark, rgba, mix, C, meterColour, tickerTag,
 } from './style.js';
+import { cityMap } from './map.js';
 
 export function createPhone(ctx, ui) {
   const g = () => ctx.game;
@@ -205,40 +206,101 @@ export function createPhone(ctx, ui) {
   const timeStr = (mins) => pad2(Math.floor((mins / 60) % 24)) + ':' + pad2(Math.floor(mins % 60));
 
   /* ============================================================
-     Places
+     Places — AN ACTUAL MAP.
+
+     This screen used to be a list of buttons grouped by district,
+     which is a table of contents. A map answers "where is that",
+     "how far", "what is near it" and "which way", and none of those
+     four could be answered here before. ui/map.js draws it from the
+     same board coordinates the 3D island is projected from, so the
+     map and the world cannot drift apart.
+
+     Below the map: the selected place, then every way of getting to
+     it at its real price in dollars, minutes and energy — the same
+     fare board menus.js shows, so a fare reads the same wherever it
+     is quoted, and the bicycle is offered for sale here rather than
+     sitting greyed out with no way to learn what it is.
      ============================================================ */
+  let placeSel = null;
+
   function renderPlaces(b) {
     const game = g();
     const st = game.state;
     const known = game.data.locations.filter((l) => game.known(l.id));
-    const zones = {};
-    for (const l of known) (zones[l.z] || (zones[l.z] = [])).push(l);
+    if (!placeSel || !game.known(placeSel)) placeSel = st.loc;
 
-    b.append(h('div.w-label', { text: known.length + ' of ' + game.data.locations.length + ' places' }));
+    const detail = h('div');
+    const map = cityMap(ctx, {
+      compact: true,
+      selected: placeSel,
+      onPick: (id) => {
+        placeSel = id;
+        ui.sfx('ui.tab');
+        ui.setDestination(id);
+        drawDetail();
+      },
+    });
+    b.append(map.el);
 
-    const wp = ctx.wally?.position;
-    for (const zid of Object.keys(game.data.zones)) {
-      const list = zones[zid];
-      if (!list) continue;
-      const z = game.data.zones[zid];
-      b.append(h('div.w-label', { text: z.n, style: { color: z.tint } }));
-      for (const l of list) {
-        const open = game.isOpen(l.id);
-        const here = st.loc === l.id;
-        const dist = wp ? Math.round(Math.hypot(l.world.x - wp.x, l.world.z - wp.z)) : null;
-        b.append(h('button.w-card.w-pe', {
-          type: 'button',
-          onclick: () => { ui.sfx('ui.select'); ui.hide('phone'); ui.goto(l.id); },
+    b.append(h('div', {
+      style: { display: 'flex', gap: 'calc(7px * var(--w-ts))', margin: '0 0 calc(8px * var(--w-ts))' },
+    },
+      h('button.w-btn.sm.ghost.w-pe', {
+        type: 'button', style: { flex: '1' },
+        onclick: () => { ui.sfx('ui.select'); ui.hide('phone'); ui.openMap(placeSel); },
+      }, icon('map', 14), 'Full map'),
+      h('button.w-btn.sm.ghost.w-pe', {
+        type: 'button', style: { flex: '1' },
+        title: 'Point the yellow HUD arrow at it',
+        onclick: () => {
+          ui.sfx('ui.select');
+          ui.setDestination(placeSel);
+          const l = game.data.locationById[placeSel];
+          ui.toast('Pointing you at ' + (l ? l.n : 'it'), 'token');
         },
-          h('div.ic', { style: { fontSize: '17px', background: rgba(BRAND.ink, 0.06) }, text: l.ico }),
-          h('div.w-grow', null,
-            h('div.t', { text: l.n }),
-            h('div.d', { text: here ? 'You are here' : l.desc })),
-          h('div.m', {
-            style: { color: open ? C(BRAND.good) : C(BRAND.bad) },
-          }, open ? 'Open' : 'Closed',
-            h('small', { text: dist != null ? dist + ' m' : pad2(l.hours[0]) + ':00' }))));
+      }, icon('nav', 13, { fill: 'currentColor', w: 1 }), 'Point me')));
+
+    b.append(detail);
+    drawDetail();
+
+    function drawDetail() {
+      clear(detail);
+      const l = game.data.locationById[placeSel];
+      if (!l) return;
+      const z = game.data.zones[l.z];
+      const open = game.isOpen(l.id);
+      const wp = ctx.wally?.position;
+      const dist = wp ? Math.round(Math.hypot(l.world.x - wp.x, l.world.z - wp.z)) : null;
+      detail.append(h('div.w-label', { text: z.n + ' · ' + z.blurb, style: { color: z.tint } }));
+      detail.append(h('div.w-card', null,
+        h('div.ic', { style: { fontSize: '17px', background: rgba(BRAND.ink, 0.06) }, text: l.ico }),
+        h('div.w-grow', null,
+          h('div.t', { text: l.n }),
+          h('div.d', { text: st.loc === l.id ? 'You are here' : l.desc })),
+        h('div.m', { style: { color: open ? C(BRAND.good) : C(BRAND.bad) } },
+          open ? 'Open' : 'Closed',
+          h('small', {
+            text: dist != null && st.loc !== l.id ? dist + ' m'
+              : pad2(l.hours[0]) + ':00–' + pad2(l.hours[1]) + ':00',
+          }))));
+
+      ui.renderTravelModes(detail, l.id, () => ui.hide('phone'));
+
+      /* the rest of the city, still listed — the map is for finding,
+         a list is for knowing what you have found */
+      detail.append(h('div.w-label', {
+        text: known.length + ' of ' + game.data.locations.length + ' places found',
+      }));
+      const bar = h('div.w-chipbar', {
+        style: { flexWrap: 'wrap', overflowX: 'visible', rowGap: 'calc(6px * var(--w-ts))' },
+      });
+      for (const l2 of known) {
+        bar.append(h('button.w-chip.w-pe' + (l2.id === placeSel ? '.on' : ''), {
+          type: 'button', text: l2.ico + ' ' + l2.n,
+          onclick: () => { ui.sfx('ui.tab'); placeSel = l2.id; map.select(l2.id); drawDetail(); },
+        }));
       }
+      detail.append(bar);
     }
   }
 
@@ -300,10 +362,9 @@ export function createPhone(ctx, ui) {
           h('small', { text: cs.done + ' done' }))));
     }
   }
+  /* an order, written the way a venue would quote it */
   function orderLine(o) {
-    const g_ = g();
-    const items = o.items.map((it) => (it.q > 1 ? it.q + '× ' : '') + g_.data.assetById[it.a].n);
-    return (o.type === 'fund' ? 'Fund · ' : '') + items.join(', ');
+    return (o.type === 'fund' ? 'Fund · ' : '') + g().economy.ticket(o);
   }
   function trustDots(n) {
     const wrap = h('span', { style: { display: 'inline-flex', gap: '3px' } });
@@ -327,6 +388,26 @@ export function createPhone(ctx, ui) {
     const E = game.economy;
 
     b.append(bigNumber(money2(st.money), 'in hand', BRAND.good));
+
+    /* THE BUY BOX LIVES HERE. The wallet is where a player looks
+       when they are thinking about money, and "buy something" was
+       the one verb the phone could not do — every purchase used to
+       require already knowing which of nine venues stocked the
+       thing, and then walking there to find out. */
+    b.append(h('button.w-card.w-pe', {
+      type: 'button',
+      style: {
+        background: rgba(BRAND.token, 0.14),
+        boxShadow: `inset 0 0 0 1.4px ${rgba(BRAND.token, 0.36)}`,
+      },
+      onclick: () => { ui.sfx('ui.select'); ui.hide('phone'); ui.openQuickBuy(); },
+    },
+      h('div.ic', { style: { background: rgba(BRAND.token, 0.22), color: C(BRAND.token2) } }, icon('search', 17)),
+      h('div.w-grow', null,
+        h('div.t', { text: 'Buy an asset by ticker' }),
+        h('div.d', { text: 'GOLD · WHEAT · B5Y · TEAM — price, venue and total before you confirm' })),
+      h('div.m', { text: 'B', style: { color: C(BRAND.token2) } })));
+
     put(b,
       kv('Net worth', money(E.netWorth())),
       kv('Holdings', E.invCount() + ' / ' + E.invCap() + ' units'),
@@ -349,9 +430,17 @@ export function createPhone(ctx, ui) {
       const chk = tok ? null : E.canTokenize(id);
       const row = h('div.w-card', null,
         h('div.ic', { style: { fontSize: '17px', background: rgba(CATEGORY[a.cat] ?? BRAND.info, 0.16) }, text: a.ico }),
-        h('div.w-grow', null,
-          h('div.t', { text: a.n }),
-          h('div.d', { text: e.qty + ' × ' + money2(E.price(id)) + (e.locked ? ' · ' + e.locked + ' locked' : '') })),
+        /* The symbol on its own line and the English name under it:
+           on a 360 px screen a row carrying a chip, a name, a value
+           and a Tokenize button has no width left, and the first
+           build of this truncated the name to "Wheat …". The ticker
+           is the handle, so the ticker gets the line. */
+        h('div.w-grow', { style: { minWidth: '0' } },
+          h('div', { style: { display: 'flex' } }, tickerTag(a, { qty: e.qty })),
+          h('div.d', {
+            text: a.n + ' · ' + e.qty + ' × ' + money2(E.price(id))
+              + (e.locked ? ' · ' + e.locked + ' locked' : ''),
+          })),
         h('div.m', { text: money(val) },
           h('small', { text: a.cat })));
       b.append(row);

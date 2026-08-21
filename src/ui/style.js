@@ -11,7 +11,7 @@
    sits in the middle of the frame.
    ============================================================ */
 
-import { BRAND, SHADOW, CATEGORY, SEA, LAND, CLAY, css } from '../core/palette.js';
+import { BRAND, SHADOW, CATEGORY, SEA, LAND, CLAY, SKY, css } from '../core/palette.js';
 import { mulberry32, clamp } from '../core/contracts.js';
 
 /* ------------------------------------------------------------
@@ -139,6 +139,45 @@ export function money(n) {
 export const money2 = (n) => '$' + (Math.round(n * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: Math.abs(n) < 100 ? 2 : 0 });
 export const pad2 = (n) => String(n).padStart(2, '0');
 
+/* ------------------------------------------------------------
+   THE TICKER — the primary handle for every asset in the game.
+
+   data.js gives all 69 assets a 3–5 character symbol and says why in
+   as many words: "an order reads like a trade ticket: 3x WHEAT".
+   The interface has to agree, which means the symbol is what the eye
+   lands on first — set in the mono face, tabular, tracked and
+   boxed — and the English name is the caption beside it rather than
+   the other way round.
+
+     tickerTag(asset)             ->  [GOLD]
+     tickerTag(asset, {qty: 3})   ->  [3× GOLD]
+
+   Accepts an asset record or a bare symbol string.
+   ------------------------------------------------------------ */
+export function tickerTag(asset, opts = {}) {
+  const tick = typeof asset === 'string'
+    ? asset.toUpperCase()
+    : (asset && asset.tick) || '?';
+  const el = h('span.w-tick'
+    + (opts.lg ? '.lg' : '') + (opts.sm ? '.sm' : '') + (opts.hot ? '.hot' : ''));
+  if (opts.qty != null && opts.qty !== 1) el.append(h('span.q', { text: opts.qty + '×' }));
+  el.append(document.createTextNode(tick));
+  if (opts.title) el.setAttribute('title', opts.title);
+  return el;
+}
+
+/* A whole order as one ticket: [2× WHEAT] · [GOLD].
+   `items` is data.js's [{a, q}]; `lookup` resolves an id to an asset. */
+export function ticketLine(items, lookup, opts = {}) {
+  const list = Array.isArray(items) ? items : [items];
+  const wrap = h('span.w-ticket');
+  list.forEach((it, i) => {
+    if (i) wrap.append(h('span.sep', { text: '·' }));
+    wrap.append(tickerTag(lookup(it.a) || it.a, { qty: it.q, sm: opts.sm }));
+  });
+  return wrap;
+}
+
 /* ============================================================
    ICONS — every one drawn here, stroked, 24x24 viewbox.
    No emoji in chrome, no external assets.
@@ -180,6 +219,13 @@ const P = {
   save:     'M5 4.6h10.4L19.4 8.6V19.4H5z M8.2 4.6v5h6.4v-5 M8.2 19.4v-5.6h7.6v5.6',
   info:     'M12 3.2a8.8 8.8 0 110 17.6 8.8 8.8 0 010-17.6z M12 10.6v6 M12 7.4v.1',
   play:     'M8.4 5.6l10 6.4-10 6.4z',
+  search:   'M10.8 3.6a7.2 7.2 0 110 14.4 7.2 7.2 0 010-14.4z M16.1 16.1l4.3 4.3',
+  /* the destination pointer's arrowhead — a solid chevron-kite, not
+     a triangle: it has a direction even at 14 px */
+  nav:      'M12 3.2l6.6 16.4-6.6-4-6.6 4L12 3.2z',
+  minus:    'M5.4 12h13.2',
+  plus:     'M12 5.4v13.2 M5.4 12h13.2',
+  ticket:   'M4 7.4h16v3a1.7 1.7 0 000 3.2v3H4v-3a1.7 1.7 0 000-3.2z M9.4 7.4v9.2',
 };
 
 export function icon(name, size = 16, opts = {}) {
@@ -413,6 +459,13 @@ export function stylesheet() {
   --w-warn:${C(BRAND.warn)};
   --w-info:${C(BRAND.info)};
   --w-gem:${C(BRAND.gem)};
+  /* THE DESTINATION YELLOW. The palette has no pure yellow, and the
+     pointer must not be the token orange — the objective strip
+     already owns that, and a pointer the same colour as the thing it
+     points at is one signal wearing two hats. Warn amber lifted
+     toward the sun halo, so it reads yellow beside the orange. */
+  --w-yellow:${C(mix(BRAND.warn, SKY.sunHalo, 0.30))};
+  --w-yellow2:${C(BRAND.warn)};
   --w-text:${C(BRAND.text)};
   --w-dim:${rgba(BRAND.text, 0.60)};
   --w-dim2:${rgba(BRAND.text, 0.40)};
@@ -507,6 +560,15 @@ export function stylesheet() {
 .w-pill.money .w-i{opacity:1;color:var(--w-token)}
 .w-pill.tap{cursor:pointer;transition:transform .16s var(--w-ease),border-color .16s}
 .w-pill.tap:active{transform:scale(.96)}
+/* the TICKER pill carries its own keycap — the affordance and the
+   shortcut in one object, against the money it spends */
+.w-pill .kb{
+  display:grid;place-items:center;min-width:calc(15px * var(--w-ts));height:calc(15px * var(--w-ts));
+  border-radius:calc(4.5px * var(--w-ts));background:${rgba(BRAND.token, 0.8)};
+  color:${C(BRAND.ink)};font-size:calc(8.6px * var(--w-ts));font-weight:800;padding:0 3px;
+  margin-left:calc(-2px * var(--w-ts));
+}
+.w-pill.tap:hover{border-color:${rgba(BRAND.token, 0.6)}}
 .w-pill.flash{animation:wFlash .7s var(--w-ease)}
 @keyframes wFlash{0%{border-color:var(--w-token);box-shadow:0 0 0 0 ${rgba(BRAND.token, 0.5)}}100%{border-color:var(--w-line);box-shadow:var(--w-shadow),var(--w-inset)}}
 
@@ -800,11 +862,12 @@ export function stylesheet() {
    a reading experience. While someone is speaking the HUD steps
    back; the objective holds a little higher because it is the one
    thing a player may want to check mid-conversation. */
-.w-root .w-pills,.w-root .w-obj,.w-root .w-hints,.w-root .w-toasts,.w-root .w-promptlayer{
+.w-root .w-pills,.w-root .w-obj,.w-root .w-hints,.w-root .w-toasts,.w-root .w-promptlayer,.w-root .w-ptr{
   transition:opacity .35s var(--w-ease);
 }
 .w-root.w-dlg-open .w-pills{opacity:.26}
 .w-root.w-dlg-open .w-obj{opacity:.5}
+.w-root.w-dlg-open .w-ptr{opacity:.34}
 .w-root.w-dlg-open .w-hints{opacity:.18}
 .w-root.w-dlg-open .w-toasts{opacity:.3}
 .w-root.w-dlg-open .w-promptlayer{opacity:.22}
@@ -1043,8 +1106,168 @@ export function stylesheet() {
 .w-pause .brand .sm{font-size:calc(10px * var(--w-ts));letter-spacing:.24em;text-transform:uppercase;color:var(--w-dim2);font-weight:800}
 .w-pause .w-btn{width:100%}
 
+/* ============================================================
+   TICKERS — the primary handle for an asset (style.js tickerTag).
+
+   Mono, tabular, tracked and boxed, so that in a list of nine rows
+   the eye lands on the symbol column and not on the prose. The
+   default is tuned for paper (sheets, the phone); .on-dark is the
+   chrome variant for anything sitting over the world.
+   ============================================================ */
+.w-tick{
+  display:inline-flex;align-items:center;gap:.28em;flex:none;
+  font-family:var(--w-mono);font-weight:800;letter-spacing:.055em;
+  font-variant-numeric:tabular-nums;font-size:calc(12.6px * var(--w-ts));
+  line-height:1;padding:calc(4px * var(--w-ts)) calc(7px * var(--w-ts));
+  border-radius:calc(7px * var(--w-ts));white-space:nowrap;
+  color:${rgba(BRAND.ink, 0.92)};background:${rgba(BRAND.ink, 0.07)};
+  box-shadow:inset 0 0 0 1.2px ${rgba(BRAND.ink, 0.16)};
+}
+.w-tick.lg{font-size:calc(19px * var(--w-ts));padding:calc(6px * var(--w-ts)) calc(10px * var(--w-ts));
+  letter-spacing:.07em;border-radius:calc(9px * var(--w-ts))}
+.w-tick.sm{font-size:calc(11px * var(--w-ts));padding:calc(3px * var(--w-ts)) calc(5.5px * var(--w-ts))}
+/* the one the player is about to buy */
+.w-tick.hot{color:${C(BRAND.token2)};background:${rgba(BRAND.token, 0.18)};
+  box-shadow:inset 0 0 0 1.4px ${rgba(BRAND.token, 0.5)}}
+.w-tick .q{font-weight:700;opacity:.62;letter-spacing:.01em}
+.w-tick.on-dark{color:var(--w-text);background:${rgba(BRAND.paper, 0.12)};
+  box-shadow:inset 0 0 0 1.2px ${rgba(BRAND.paper, 0.2)}}
+.w-ticket{display:inline-flex;align-items:center;gap:calc(5px * var(--w-ts));flex-wrap:wrap}
+.w-ticket .sep{opacity:.35;font-weight:800}
+
+/* ============================================================
+   THE DESTINATION POINTER — centre-top of the HUD.
+
+   Which way, and how far. The bearing is taken in Wally's own
+   frame, so the arrow points where he would have to turn, and it is
+   written every frame rather than at the 8 Hz the rest of the HUD
+   repaints at: a compass that lags a turn is worse than no compass.
+
+   It is placed by JS, not by CSS, because at 1600 px there is a
+   clear gutter between the two stat clusters and at 390 px there is
+   not — see placePointer() in hud.js. --w-ptr-top is what that
+   measurement writes.
+   ============================================================ */
+.w-ptr{
+  position:absolute;left:50%;transform:translateX(-50%);
+  top:var(--w-ptr-top,max(12px,env(safe-area-inset-top)));
+  display:flex;align-items:center;gap:calc(10px * var(--w-ts));
+  padding:calc(6px * var(--w-ts)) calc(14px * var(--w-ts)) calc(6px * var(--w-ts)) calc(6px * var(--w-ts));
+  border-radius:999px;
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid ${rgba(BRAND.warn, 0.42)};
+  box-shadow:var(--w-shadow),var(--w-inset),0 0 26px ${rgba(BRAND.warn, 0.16)};
+  cursor:pointer;max-width:min(340px,42vw);
+  transition:opacity .3s var(--w-ease),transform .18s var(--w-ease);
+}
+.w-ptr:active{transform:translateX(-50%) scale(.97)}
+.w-ptr.off{opacity:0;pointer-events:none}
+.w-ptr .dial{
+  position:relative;flex:none;
+  width:calc(34px * var(--w-ts));height:calc(34px * var(--w-ts));border-radius:50%;
+  display:grid;place-items:center;
+  background:radial-gradient(circle at 50% 34%,${rgba(BRAND.warn, 0.30)},${rgba(BRAND.warn, 0.10)});
+  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.warn, 0.62)};
+}
+/* the tick marks that make it read as a dial rather than a badge */
+.w-ptr .dial:before{content:'';position:absolute;inset:calc(3px * var(--w-ts));border-radius:50%;
+  border:1px dashed ${rgba(BRAND.warn, 0.30)}}
+.w-ptr .arw{color:var(--w-yellow);filter:drop-shadow(0 0 6px ${rgba(BRAND.warn, 0.7)});
+  transform-origin:50% 50%;will-change:transform}
+.w-ptr .t{font-size:calc(12.4px * var(--w-ts));font-weight:800;letter-spacing:.01em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(210px * var(--w-ts))}
+.w-ptr .d{font-size:calc(10.4px * var(--w-ts));color:var(--w-dim);font-weight:700;
+  font-variant-numeric:tabular-nums;margin-top:1px}
+.w-ptr .d b{color:var(--w-yellow);font-weight:800}
+.w-ptr.here .dial{background:${rgba(BRAND.good, 0.22)};box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.good, 0.6)}}
+.w-ptr.here .arw{color:${C(BRAND.good)};filter:none}
+
+/* ============================================================
+   THE MAP — ui/map.js
+   ============================================================ */
+.w-map{
+  position:relative;border-radius:calc(15px * var(--w-ts));overflow:hidden;
+  background:${C(mix(SEA.shallow, BRAND.paper, 0.42))};
+  box-shadow:inset 0 0 0 1.4px ${rgba(BRAND.ink, 0.16)},0 5px 16px ${rgba(BRAND.ink, 0.14)};
+  margin:calc(4px * var(--w-ts)) 0 calc(9px * var(--w-ts));
+}
+.w-map-svg{display:block;width:100%;height:auto;font-family:var(--w-font)}
+.w-map-svg text{user-select:none;-webkit-user-select:none}
+.w-map .w-map-tools{
+  position:absolute;right:calc(8px * var(--w-ts));bottom:calc(8px * var(--w-ts));
+  display:flex;gap:calc(6px * var(--w-ts));
+}
+.w-map .wm-me circle:first-child{animation:wPing 2.6s ease-out infinite}
+@keyframes wPing{0%{opacity:.55;transform-box:fill-box;transform-origin:center;transform:scale(.6)}
+  70%{opacity:0;transform:scale(1.25)}100%{opacity:0;transform:scale(1.25)}}
+.w-mapwrap{display:flex;flex-direction:column;height:100%;min-height:0}
+.w-mapwrap .w-map{flex:1;min-height:0;display:flex}
+.w-mapwrap .w-map-svg{width:100%;height:100%;object-fit:contain}
+
+/* ============================================================
+   QUICK BUY — the search box, the results and the trade ticket.
+   ============================================================ */
+.w-srch{
+  display:flex;align-items:center;gap:calc(8px * var(--w-ts));
+  padding:0 calc(12px * var(--w-ts));min-height:calc(42px * var(--w-ts));
+  border-radius:calc(12px * var(--w-ts));background:${rgba(0xffffff, 0.72)};
+  box-shadow:inset 0 0 0 1.5px ${rgba(BRAND.ink, 0.16)};
+  margin-bottom:calc(9px * var(--w-ts));
+}
+.w-srch:focus-within{box-shadow:inset 0 0 0 2px ${rgba(BRAND.token, 0.7)}}
+.w-srch .w-i{opacity:.5;flex:none}
+.w-srch input{
+  flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--w-ink);
+  font-family:var(--w-mono);font-size:calc(14.5px * var(--w-ts));font-weight:800;
+  letter-spacing:.06em;text-transform:uppercase;padding:calc(9px * var(--w-ts)) 0;
+}
+.w-srch input::placeholder{font-family:var(--w-font);font-weight:700;letter-spacing:.01em;
+  text-transform:none;opacity:.42}
+.w-srch .clr{flex:none}
+
+/* the ticket. A perforated stub down the left is the one bit of
+   skeuomorphism here and it earns its keep: it says "this is an
+   order you are about to place", which is exactly the thing the
+   player could not previously tell. */
+.w-tkt{
+  position:relative;border-radius:calc(14px * var(--w-ts));overflow:hidden;
+  background:${rgba(0xffffff, 0.78)};
+  box-shadow:inset 0 0 0 1.5px ${rgba(BRAND.ink, 0.15)},0 4px 14px ${rgba(BRAND.ink, 0.10)};
+  padding:calc(13px * var(--w-ts)) calc(14px * var(--w-ts)) calc(12px * var(--w-ts)) calc(20px * var(--w-ts));
+  margin-top:calc(4px * var(--w-ts));
+}
+.w-tkt:before{content:'';position:absolute;left:calc(9px * var(--w-ts));top:calc(10px * var(--w-ts));
+  bottom:calc(10px * var(--w-ts));width:0;border-left:2px dashed ${rgba(BRAND.ink, 0.22)}}
+.w-tkt .hd{display:flex;align-items:center;gap:calc(10px * var(--w-ts))}
+.w-tkt .nm{font-weight:800;font-size:calc(13.4px * var(--w-ts));line-height:1.2}
+.w-tkt .sb{font-size:calc(10.6px * var(--w-ts));opacity:.62;font-weight:700;margin-top:2px}
+.w-tkt .w-kv{border-bottom-color:${rgba(BRAND.ink, 0.08)}}
+.w-tkt .tot{border-top:1.6px solid ${rgba(BRAND.ink, 0.22)};margin-top:calc(4px * var(--w-ts));padding-top:calc(8px * var(--w-ts))}
+.w-tkt .tot span{font-weight:800;letter-spacing:.14em;text-transform:uppercase;font-size:calc(10px * var(--w-ts))}
+.w-tkt .tot b{font-size:calc(18px * var(--w-ts));letter-spacing:-.01em}
+.w-tkt .warn{margin-top:calc(9px * var(--w-ts));padding:calc(9px * var(--w-ts)) calc(11px * var(--w-ts));
+  border-radius:calc(11px * var(--w-ts));font-size:calc(11.4px * var(--w-ts));font-weight:700;line-height:1.42;
+  background:${rgba(BRAND.bad, 0.11)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.bad, 0.3)}}
+.w-tkt .warn.ok{background:${rgba(BRAND.good, 0.12)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.good, 0.3)}}
+.w-tkt .warn.wait{background:${rgba(BRAND.warn, 0.14)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.warn, 0.36)}}
+
+/* the quantity stepper — big targets, tabular figure */
+.w-qty{display:flex;align-items:center;gap:calc(7px * var(--w-ts));margin:calc(10px * var(--w-ts)) 0}
+.w-qty .stp{
+  -webkit-appearance:none;appearance:none;border:0;font-family:inherit;cursor:pointer;
+  width:calc(34px * var(--w-ts));height:calc(34px * var(--w-ts));border-radius:calc(11px * var(--w-ts));
+  display:grid;place-items:center;color:var(--w-ink);
+  background:${rgba(BRAND.ink, 0.07)};box-shadow:inset 0 0 0 1.4px ${rgba(BRAND.ink, 0.16)};
+}
+.w-qty .stp:active{transform:scale(.94)}
+.w-qty .stp[disabled]{opacity:.35;pointer-events:none}
+.w-qty .n{min-width:calc(52px * var(--w-ts));text-align:center;font-family:var(--w-mono);
+  font-variant-numeric:tabular-nums;font-size:calc(19px * var(--w-ts));font-weight:800}
+.w-qty .pre{margin-left:auto;display:flex;gap:calc(5px * var(--w-ts))}
+
 /* ---------- accessibility modes ---------- */
-.w-hc .w-chrome,.w-hc .w-pill,.w-hc .w-obj,.w-hc .w-toast,.w-hc .w-prompt,.w-hc .w-banner,.w-hc .w-hint{
+.w-hc .w-chrome,.w-hc .w-pill,.w-hc .w-obj,.w-hc .w-toast,.w-hc .w-prompt,.w-hc .w-banner,.w-hc .w-hint,.w-hc .w-ptr{
   background:${rgba(0x05070c, 0.94)} !important;border-color:${rgba(BRAND.paper, 0.42)} !important;
   -webkit-backdrop-filter:none !important;backdrop-filter:none !important;
 }
@@ -1085,6 +1308,14 @@ export function stylesheet() {
   .w-obj{max-width:min(300px,76vw);padding:calc(7px * var(--w-ts)) calc(11px * var(--w-ts))}
   .w-obj .t{font-size:calc(12px * var(--w-ts))}
   .w-toasts{max-width:74vw}
+  /* the two stat clusters own the whole top row on a phone, so the
+     pointer drops under them (hud.js measures) and is allowed the
+     full width it just got */
+  .w-ptr{max-width:min(300px,84vw);padding:calc(5px * var(--w-ts)) calc(12px * var(--w-ts)) calc(5px * var(--w-ts)) calc(5px * var(--w-ts))}
+  .w-ptr .dial{width:calc(30px * var(--w-ts));height:calc(30px * var(--w-ts))}
+  .w-ptr .t{font-size:calc(11.6px * var(--w-ts));max-width:calc(168px * var(--w-ts))}
+  .w-tkt{padding-left:calc(17px * var(--w-ts))}
+  .w-qty .n{min-width:calc(44px * var(--w-ts));font-size:calc(17px * var(--w-ts))}
 }
 @media (max-height:560px){
   .w-banner{top:8vh}

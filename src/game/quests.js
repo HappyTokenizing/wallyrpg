@@ -17,9 +17,31 @@
      { mine: true }     the mine is yours
      { stadium: n }     stadium questline at step n
      { stat: 'k', n: x} stats[k] >= x
+
+   ------------------------------------------------------------
+   MAIN CHAIN vs SIDE QUESTS
+   ------------------------------------------------------------
+   Two lists, deliberately. QUESTS is the spine: linear, one open at
+   a time, and current() — which is what hud().objective and the HUD
+   objective strip read — walks QUESTS AND NOTHING ELSE. A side quest
+   can therefore never overwrite the main objective, which is the
+   whole reason the split exists.
+
+   SIDE_QUESTS start dormant. Something in the world calls
+   startSide(id); it goes into state.sides as 'active', check()
+   evaluates it every tick alongside the main chain, and completing
+   it pays out and marks it 'done'. Several can be open at once.
+
+     current()       the main objective        -> the HUD strip
+     sideCurrent()   the first open side quest -> a second, quieter slot
+     sides()         every side quest with a status
+     startSide(id)   arm one
+     isSideActive/isSideDone(id)
+
+   Events: 'quest' {kind:'side:start'|'side:complete', quest, title}.
    ============================================================ */
 
-import { QUESTS, LOCATIONS, MILESTONES, ZONES, CONFIG } from './data.js';
+import { QUESTS, SIDE_QUESTS, SIDE_QUEST_BY_ID, LOCATIONS, MILESTONES, ZONES, CONFIG } from './data.js';
 
 export function createQuests(env) {
   const bus = env.bus;
@@ -71,12 +93,15 @@ export function createQuests(env) {
     for (const q of QUESTS) if (!S().quests[q.id]) return q;
     return null;
   }
-  /* 'office' resolves to wherever your desk currently is */
+  /* 'office' resolves to wherever your desk currently is. Accepts a
+     main quest id or a side quest id. */
   function questLoc(qid) {
-    const q = QUESTS.find((x) => x.id === qid);
+    const q = QUEST_OR_SIDE(qid);
     if (!q || !q.loc) return null;
     return q.loc === 'office' ? env.officeLoc() : q.loc;
   }
+  const QUEST_OR_SIDE = (qid) =>
+    (typeof qid === 'object' ? qid : QUESTS.find((x) => x.id === qid) || SIDE_QUEST_BY_ID[qid]) || null;
   function questAt(locId) {
     const q = current();
     return q && questLoc(q.id) === locId ? q : null;
@@ -86,7 +111,49 @@ export function createQuests(env) {
     return { done: n, total: QUESTS.length, pct: Math.round(n / QUESTS.length * 100) };
   }
 
-  /* Re-evaluate every open quest. Cheap: 23 predicate calls. */
+  /* ---------- side quests ----------
+     state.sides[id] is 'active' | 'done'. Absent means dormant: the
+     player has not been given it yet, and check() ignores it. */
+  const sideStatus = (id) => S().sides?.[id] || null;
+  const isSideActive = (id) => sideStatus(id) === 'active';
+  const isSideDone = (id) => sideStatus(id) === 'done';
+
+  function startSide(id) {
+    const q = SIDE_QUEST_BY_ID[id];
+    const st = S();
+    if (!q) return false;
+    if (!st.sides) st.sides = {};
+    if (st.sides[id]) return false;                 // already active or done
+    st.sides[id] = 'active';
+    M().note('token', '✦ ' + q.t);
+    bus.emit('quest', { kind: 'side:start', quest: q.id, title: q.t, from: q.from || null });
+    check();                                        // it may already be satisfied
+    return true;
+  }
+  function completeSide(q) {
+    if (typeof q === 'string') q = SIDE_QUEST_BY_ID[q];
+    const st = S();
+    if (!q || st.sides?.[q.id] === 'done') return false;
+    if (!st.sides) st.sides = {};
+    st.sides[q.id] = 'done';
+    if (q.rep) M().addRep(q.rep);
+    if (q.money) M().pay(q.money, 'favour returned');
+    M().note('good', '✔ ' + q.t);
+    bus.emit('quest', { kind: 'side:complete', quest: q.id, title: q.t, from: q.from || null });
+    return true;
+  }
+  /* Every side quest the player has been given, newest state first. */
+  const sides = () => SIDE_QUESTS.filter((q) => !!sideStatus(q.id))
+    .map((q) => ({ ...q, status: sideStatus(q.id) }));
+  const sideActive = () => SIDE_QUESTS.filter((q) => isSideActive(q.id));
+  const sideCurrent = () => sideActive()[0] || null;
+  function sideProgress() {
+    const done = SIDE_QUESTS.filter((q) => isSideDone(q.id)).length;
+    return { done, active: sideActive().length, total: SIDE_QUESTS.length };
+  }
+
+  /* Re-evaluate every open quest — main chain and any ACTIVE side
+     quest. Cheap: two dozen predicate calls. */
   let inCheck = false;
   function check() {
     if (inCheck) return false;            // check() -> pay() -> check() guard
@@ -101,6 +168,16 @@ export function createQuests(env) {
         if (!ok) continue;
         complete(q);
         moved = true;
+      }
+      /* Side quests are evaluated separately and NEVER set `moved`,
+         so finishing an errand does not fire a main-chain 'advance'
+         and does not flash the objective strip. */
+      for (const q of SIDE_QUESTS) {
+        if (!isSideActive(q.id)) continue;
+        let ok = false;
+        try { ok = !!q.check(S()); }
+        catch (e) { ok = false; }
+        if (ok) completeSide(q);
       }
       refreshKnown();
     } finally {
@@ -152,7 +229,12 @@ export function createQuests(env) {
   }
 
   return {
+    /* main chain — current() is the ONLY thing the HUD objective reads */
     list, done, current, questLoc, questAt, progress, check, complete,
+    /* side quests, alongside and quieter */
+    sideList: () => SIDE_QUESTS, sides, sideActive, sideCurrent, sideProgress,
+    startSide, completeSide, isSideActive, isSideDone, sideStatus,
+    /* discovery, milestones, tips */
     knows, refreshKnown, ruleMet, milestones, cityPct, tip,
   };
 }

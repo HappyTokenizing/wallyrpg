@@ -24,9 +24,17 @@
    Also, for anyone who needs it:
    openPhone(app) openDesk() openPlace(loc) goto(loc) showOrder(o)
    addPrompt(spec) removePrompt(id) refresh() closeAll() placeWally(loc)
+   arrive(loc) flushArrival() arrivalPoint(loc)
    modal (bool)  visible (bool)  near (the location Wally is standing at)
 
-   DEBUG: WALLY.debug.ui(name), WALLY.debug.uiAll()
+   ARRIVAL. This module also owns the half of fast travel that moves the
+   player. ctx.game.travel() changes state.loc and emits 'travel'; the
+   listener at the bottom of this file turns that into a real arrival at
+   ctx.city.doorPosition(loc), through ctx.wally.warpTo() and
+   ctx.cam.warp(), behind a 180/260 ms fade. See the ARRIVAL block.
+
+   DEBUG: WALLY.debug.ui(name), WALLY.debug.uiAll(),
+          WALLY.debug.travel(loc, mode), WALLY.debug.arrive(loc)
    ============================================================ */
 
 import { clamp } from '../core/contracts.js';
@@ -163,27 +171,274 @@ export async function init(ctx) {
   }
   function click() { sfx('ui.click'); try { ctx.audio?.resume?.(); } catch (e) {} }
 
+  /* ============================================================
+     ARRIVAL — the other half of fast travel.
+
+     THE BUG THIS EXISTS TO FIX. ctx.game.travel() charged the fare,
+     burned the clock, moved state.loc, refreshed the HUD and swapped
+     the zone music — and left Wally standing exactly where he was.
+     Nothing in the build listened for 'travel' in order to MOVE him,
+     so in a 3D remake of a location-based RPG, travelling did not take
+     you anywhere: the Places app, the fares, the travel times and all
+     28 locations were disconnected from the world the player was
+     standing in.
+
+     It is wired to the EVENT, not to the button. game.travel() and
+     game.enter() both emit 'travel' synchronously, so this one listener
+     covers the Places app, the fare board, the HUD's objective jump,
+     a door walked through in the world, and a bare ctx.game.travel()
+     typed into the console — which is the case that had no coverage at
+     all, because the only caller that moved him was one onclick handler
+     inside menus.js.
+
+     WALKING THROUGH A DOOR IS NOT AN ARRIVAL. game.enter() emits the
+     same event, and he is already standing at that door — that is how
+     he triggered it. Teleporting him "there" would jolt him a metre
+     sideways and blink the screen every single time he entered a shop.
+     The ARRIVE_NEAR test below is what separates the two cases, and it
+     separates them by the only thing that actually distinguishes them:
+     how far away he is.
+     ============================================================ */
+
+  /* Under this many metres from the destination door he is already
+     there. Covers game.enter(), a repeat travel to the same place, and
+     the two locations in Rusty Row that share a forecourt. */
+  const ARRIVE_NEAR = 6;
+  /* The transition. Kept short on purpose: this fires every time the
+     player crosses the island, which in this game is constantly, and a
+     cinematic wipe you have seen four hundred times is a loading
+     screen. Measured end to end at 350 ms, comfortably inside the
+     budget.
+
+     THE TWO CURVES ARE NOT THE SAME CURVE, AND THE OUT ONE WAS WRONG.
+     It started as `ease-in`, which is slow at the start — so when the
+     teleport fired at the end of the fade, the screen was sampled at
+     only 0.67 opacity and the player would have seen a third of the cut
+     straight through it. Sampled per animation frame:
+
+       ease-in, land at 170 ms   peak painted opacity 0.67   visible cut
+       ease-out, land at 180 ms  peak painted opacity 1.00   clean
+
+     So: OUT is ease-out over 140 ms and the landing waits 180, which
+     leaves 40 ms of solid black to move him inside — the compositor is
+     a frame or two behind the style change and that margin is what pays
+     for it. IN is ease-in over 260 ms, which holds the black a moment
+     and then opens, so the arrival reveals rather than blinks. */
+  const FADE_OUT_MS = 140;      // the curtain's own transition
+  const FADE_HOLD = 180;        // when the teleport fires: must exceed the above
+  const FADE_IN = 260;
+
+  /* Tallest building the arrival camera will look straight AT rather
+     than across. Derived, and shot, in land() below. */
+  const LOOK_AT_MAX_H = 6;
+
+  /* The curtain. z-index 60 puts it over the HUD (10), the modal
+     overlay (20) and the film grain and vignette (30/31), and under the
+     boot screen (100). It is inert to the pointer at all times: a fade
+     that could eat a click would be a worse bug than the one it is
+     part of fixing. */
+  const curtain = h('div.w-warp');
+  Object.assign(curtain.style, {
+    position: 'fixed', inset: '0', background: '#000',
+    opacity: '0', pointerEvents: 'none', zIndex: '60',
+    transition: `opacity ${FADE_OUT_MS}ms ease-out`,
+  });
+  document.body.append(curtain);
+
+  /* An arrival that has faded out but not yet landed. */
+  let armed = null;      // {locId, p, t}
+
+  /** Where you end up when you travel to `locId` — feet position + facing. */
+  function arrivalPoint(locId) {
+    const loc = ctx.game?.data?.locationById?.[locId];
+    /* ctx.city.doorPosition is documented as "the point you walk to",
+       which is the arrival point by definition — it is built from the
+       building's own doorway rather than from its centre, so it already
+       accounts for footprint, facing and porch. data.js's world{} is
+       the building CENTRE, so it is only the fallback for a location
+       the city never built a record for, pushed out along the
+       location's own yaw to the front of its footprint. */
+    let dx = null, dy = null, dz = null;
+    try {
+      const d = ctx.city?.doorPosition?.(locId);
+      if (d && Number.isFinite(d.x + d.y + d.z)) { dx = d.x; dy = d.y; dz = d.z; }
+    } catch (e) { /* fall through to the data.js fallback */ }
+    if (dx === null) {
+      if (!loc) return null;
+      const out = (loc.size?.d ?? 8) * 0.5 + 3.4;
+      dx = loc.world.x + Math.sin(loc.yaw) * out;
+      dz = loc.world.z + Math.cos(loc.yaw) * out;
+      dy = loc.world.y;
+    }
+
+    /* Stand a short step BACK from the threshold rather than in the
+       doorway: the door point is 1.5 m off the facade, which is inside
+       the porch on the locations that have one, and a character clipped
+       into his own front porch is the first thing anyone notices about
+       an arrival.
+
+       0.9 m, AND NOT MORE, which was measured rather than guessed.
+       2.2 m was tried and shot at four locations: at Waterfront Docks
+       it walked him off the pier apron, and the camera's ground and
+       penetration clamps then dropped the lens to deck height with
+       Wally out of the bottom of frame entirely. The door apron is the
+       only ground near a building that is reliably flat, reliably level
+       and reliably clear, and a step is as far as you can go before you
+       are off it. */
+    let x = dx, z = dz, faceX = dx, faceZ = dz;
+    if (loc) {
+      const ox = dx - loc.world.x, oz = dz - loc.world.z;
+      const len = Math.hypot(ox, oz);
+      if (len > 0.05) { x = dx + (ox / len) * 0.9; z = dz + (oz / len) * 0.9; }
+      faceX = loc.world.x; faceZ = loc.world.z;   // turn to face the door
+    }
+
+    /* Start him a touch high and let the controller's own snapToGround
+       find the real surface — the door's y is the building's base, and
+       the apron, steps and terrain under his feet are collision
+       geometry the terrain height function does not know about. */
+    let y = dy;
+    try {
+      const t = ctx.world?.heightAt?.(x, z);
+      if (Number.isFinite(t)) y = Math.max(y, t);
+    } catch (e) { /* keep the door's own y */ }
+    if (!Number.isFinite(x + y + z)) return null;
+
+    return { x, y: y + 0.3, z, faceX, faceZ };
+  }
+
+  /** Put him down. The camera cut goes with it — they are one event. */
+  function land(locId, p) {
+    const w = ctx.wally;
+    if (!w) return false;
+    let ok = false;
+    try {
+      if (typeof w.warpTo === 'function') {
+        ok = w.warpTo(p.x, p.y, p.z, { face: { x: p.faceX, z: p.faceZ } });
+      } else {
+        /* Older wally.js: setPosition still goes through the controller,
+           which is the part that matters. */
+        w.setPosition(p.x, p.y, p.z);
+        w.setYaw(Math.atan2(p.faceX - p.x, p.faceZ - p.z));
+        ok = true;
+      }
+    } catch (e) { console.warn('[ui] arrival failed', e); return false; }
+    if (!ok) return false;
+
+    /* CUT, do not fly. The rig would otherwise ease its anchor height,
+       its boom azimuth and its wedge relief across 900 m of island in
+       full view of the player. cam.warp() drops all of that and
+       re-solves against the new surroundings in one frame.
+
+       WHICH WAY THE LENS POINTS IS DECIDED BY THE BUILDING'S HEIGHT,
+       because both of the obvious answers were tried, shot at four
+       locations, and each is reproducibly wrong at half of them:
+
+         LOOK AT IT — warp({yaw: his facing}), so the lens sits out on
+           the street behind him and looks at the door. Perfect at the
+           Noodle Cart: the stall, its awning, the two customers at the
+           counter and the "you are here" prompt, all in frame. A wall
+           of stucco at the bank — a 14 m facade two metres from his
+           nose fills the frame edge to edge and nothing is readable.
+
+         LET IT SOLVE — warp() with no azimuth runs pickPortraitYaw,
+           which sweeps the azimuths and scores each for boom clearance
+           and open world. Excellent at the bank: its steps and columns
+           on the right, the street running back behind him. At the
+           Noodle Cart it put the lens behind a barrel with the cart out
+           of frame entirely — the sweep scores CLEARANCE and OPENNESS,
+           neither of which knows that the thing you just travelled to
+           is the thing that ought to be in the picture.
+
+       The discriminator is whether the building fits in the frame from
+       where the lens ends up. He stands ~2.4 m off the facade and the
+       boom is ~3.2 m, so the lens is ~5.5 m out; at the follow preset's
+       50 deg that frames 2 * 5.5 * tan(25) = 5.1 m of height. Anything
+       up to about a storey and a half can be looked AT and be seen;
+       anything taller has to be looked ACROSS, which is the portrait.
+       Hence 6 m, and hence: carts, stalls and huts get the arrival shot,
+       banks and stadiums get the portrait. */
+    const loc = ctx.game?.data?.locationById?.[locId];
+    const bh = loc?.size?.h ?? 0;
+    const yaw = (bh > 0 && bh <= LOOK_AT_MAX_H)
+      ? Math.atan2(p.faceX - p.x, p.faceZ - p.z)
+      : undefined;
+    try {
+      if (ctx.cam?.warp) ctx.cam.warp(yaw === undefined ? {} : { yaw });
+      else ctx.cam?.reframe?.();
+    } catch (e) {}
+    ctx.bus?.emit('arrive', { loc: locId, x: p.x, y: p.y, z: p.z });
+    return true;
+  }
+
+  /** Reduced motion gets the teleport without the blink. */
+  const canFade = () => !ctx.game?.state?.settings?.reduced;
+
+  function fadeIn() {
+    curtain.style.transition = `opacity ${FADE_IN}ms ease-in`;
+    curtain.style.opacity = '0';
+  }
+
+  /** Land any arrival still behind the curtain, right now. */
+  function flushArrival() {
+    if (!armed) return false;
+    const a = armed;
+    armed = null;
+    land(a.locId, a.p);
+    fadeIn();
+    return true;
+  }
+
+  /**
+   * Travel arrived somewhere. Move him there, behind a short fade.
+   *
+   * The fade is driven from update(dt), not from setTimeout: a
+   * backgrounded tab throttles timers to whole seconds, and an arrival
+   * that commits a second late is a second in which state.loc and the
+   * world disagree about where the player is — which is the very bug
+   * this function exists to close.
+   */
+  function arrive(locId, o = {}) {
+    if (!locId || !ctx.wally) return false;
+    /* Already in flight to the same place: menus.js calls placeWally()
+       immediately after game.travel(), and game.travel() has already
+       emitted 'travel' by then, so this function is legitimately called
+       twice for one journey. It must not fade twice. */
+    if (armed && armed.locId === locId) return true;
+
+    const p = arrivalPoint(locId);
+    if (!p) return false;
+
+    const w = ctx.wally.position;
+    if (Math.hypot(w.x - p.x, w.z - p.z) <= ARRIVE_NEAR) return true;   // he walked here
+
+    flushArrival();                    // a different arrival mid-fade lands first
+    if (o.instant || !canFade()) { land(locId, p); return true; }
+
+    armed = { locId, p, t: 0 };
+    curtain.style.transition = `opacity ${FADE_OUT_MS}ms ease-out`;
+    curtain.style.opacity = '1';
+    return true;
+  }
+
+  /** Drive the curtain. Runs even while the interface is hidden. */
+  function tickArrival(dt) {
+    if (!armed) return;
+    armed.t += dt > 0 ? Math.min(dt, 0.25) : 0;
+    if (armed.t * 1000 >= FADE_HOLD) flushArrival();
+  }
+
   /* ------------------------------------------------------------
      navigation
      ------------------------------------------------------------ */
 
-  /* Stand Wally just outside a location's front door. Fast travel has
-     to move him too, or the state and the world disagree about where
-     he is. Uses only public APIs (wally.setPosition, world.heightAt). */
-  function placeWally(locId) {
-    const loc = ctx.game?.data?.locationById?.[locId];
-    if (!loc || !ctx.wally) return false;
-    const fx = Math.sin(loc.yaw), fz = Math.cos(loc.yaw);
-    const out = loc.size.d * 0.5 + 3.4;
-    const x = loc.world.x + fx * out;
-    const z = loc.world.z + fz * out;
-    const y = ctx.world?.heightAt ? ctx.world.heightAt(x, z) : loc.world.y;
-    try {
-      ctx.wally.setPosition(x, y + 0.06, z);
-      ctx.wally.setYaw(Math.atan2(loc.world.x - x, loc.world.z - z));
-    } catch (e) { return false; }
-    return true;
-  }
+  /* Stand Wally just outside a location's front door.
+
+     Kept as the published name — menus.js calls it — but it is now the
+     same code path as a travel event rather than a second, competing
+     implementation of "put him at the door". Two of those is how the
+     double fade gets in. */
+  const placeWally = (locId) => arrive(locId);
 
   function goto(locId, why) {
     const game = ctx.game;
@@ -213,6 +468,21 @@ export async function init(ctx) {
     phone.open(app);
     sfx('ui.open');
   }
+
+  /* TICKER SEARCH / QUICK BUY. One box, one confirm. Reachable from
+     the pill beside the money readout, from B, from the Wallet app
+     and from the head of any venue's order book — "how do I buy a
+     thing" should not have a route you can fail to find. */
+  function openQuickBuy(preset) {
+    const el = pushSheet(menus.quickBuy(preset), 'buy');
+    try { ctx.game?.quests?.tip?.('ticker'); } catch (e) {}
+    setTimeout(() => { try { el?.querySelector?.('input')?.focus(); } catch (e) {} }, 80);
+    return el;
+  }
+
+  /* The yellow pointer follows this instead of the current objective
+     until he gets there. Null hands it back to the objective. */
+  const setDestination = (locId) => hud.setDestination(locId);
 
   /* The one "confirm" verb — E on a keyboard, the round button on a
      phone. Advance the conversation if someone is talking, otherwise
@@ -265,6 +535,7 @@ export async function init(ctx) {
         case 'places': case 'map': openPhone('places'); break;
         case 'messages': openPhone('messages'); break;
         case 'desk': case 'office': openDesk(); break;
+        case 'buy': case 'quickbuy': case 'ticker': openQuickBuy(arg); break;
         case 'place': openPlace(arg); break;
         case 'travel': goto(arg || ctx.game?.state?.loc); break;
         case 'pause': pushSheet(menus.pause(), 'pause'); break;
@@ -307,11 +578,25 @@ export async function init(ctx) {
 
     /* --- navigation --- */
     openPhone, openDesk, openPlace, goto, placeWally, interact,
+    /** Ticker search + one-confirm buy. `preset` is an id or ticker. */
+    openQuickBuy,
+    /** Point the yellow HUD pointer at a place (null = the objective). */
+    setDestination,
+    /** Move him to a location's door. Fires on every 'travel' event. */
+    arrive,
+    /** Land an arrival still behind the curtain. Saves, tests, cutscenes. */
+    flushArrival,
+    /** Where travelling to `locId` puts him: {x,y,z,faceX,faceZ}. */
+    arrivalPoint,
     showOrder: (o) => menus.showOrder(o),
     talkTo: (c) => menus.talkTo(c),
     addPrompt: hud.addPrompt, removePrompt: hud.removePrompt,
     pushSheet, popSheet, closeAll, refresh, rebuildTop,
     renderSettings: (el) => menus.renderSettings(el),
+    /** The fare board, so the phone and the map quote fares identically. */
+    renderTravelModes: (el, locId, onDone) => menus.travelModes(el, locId, onDone),
+    /** The map at full size. */
+    openMap: (locId) => pushSheet(menus.bigMap(locId), 'map'),
 
     /* --- accessibility --- */
     setTextSize, setReducedMotion, setHighContrast,
@@ -337,15 +622,20 @@ export async function init(ctx) {
     /* --- module contract --- */
     update(dt) {
       touch.update(dt);            // runs while hidden: it owns the input fn
+      /* Before the visibility gate: a cinematic that hides the HUD must
+         not strand a half-landed arrival behind a black screen. */
+      tickArrival(dt);
       if (!visible) return;
       hud.update(dt);
       dlg.update(dt);
     },
     resize() { touch.measure(); },
     dispose() {
+      flushArrival();
       closeAll();
       hud.dispose(); dlg.dispose(); phone.dispose(); touch.dispose();
       scrim.remove(); panels.remove(); film.remove(); vignette.remove();
+      curtain.remove();
       for (const off of subs) off();
       removeEventListener('keydown', onKey);
     },
@@ -382,6 +672,10 @@ export async function init(ctx) {
       case 'KeyO':
         e.preventDefault();
         openDesk();
+        break;
+      case 'KeyB':
+        e.preventDefault();
+        if (topName() === 'buy') api.hide('buy'); else openQuickBuy();
         break;
       case 'KeyE':
         /* the camera keeps Q/E while a panel is open — interact() says so */
@@ -423,6 +717,11 @@ export async function init(ctx) {
     const a = ZONE_AUDIO[p.zone];
     if (a) ctx.bus.emit('game:zone', { name: a, zone: p.zone });
   });
+  /* THE ONE LINE THE WHOLE NAVIGATION LOOP WAS MISSING. Every route into
+     travel ends here: menus.js's fare board, the Places app (via goto),
+     the HUD's objective jump, game.enter() from a door in the world, and
+     a bare ctx.game.travel() from anywhere at all. */
+  on('travel', (t) => { if (t && t.to) arrive(t.to); });
   on('endgame', () => api.dialogue({
     speaker: 'The City', role: 'Bull Bear City',
     text: ['Every asset. Every field, every seam, every seat in that stadium — connected, and held by the people who live beside them.',
@@ -512,6 +811,8 @@ export async function init(ctx) {
         case 'place': closeAll(); openPlace(arg || 'apartment'); break;
         case 'desk': closeAll(); openDesk(); break;
         case 'travel': closeAll(); pushSheet(menus.travel(arg || 'trunkdepot')); break;
+        case 'buy': case 'quickbuy': closeAll(); openQuickBuy(arg); break;
+        case 'map': closeAll(); pushSheet(menus.bigMap(arg), 'map'); break;
         case 'pause': closeAll(); api.show('pause'); break;
         case 'settings': closeAll(); pushSheet(menus.settings()); break;
         case 'market': closeAll(); pushSheet(menus.market(arg || 'bazaar')); break;
@@ -526,7 +827,7 @@ export async function init(ctx) {
       closeAll();
       hud.refresh(true);
       toast('+$56 · shift', 'money');
-      toast('Discovered TRUNK Depot', 'token');
+      toast('Discovered Dispatch', 'token');
       demoPrompt();
       openPhone(null);
       api.dialogue(sampleDialogue());
@@ -540,6 +841,32 @@ export async function init(ctx) {
       return touch.demo(nx, ny);
     };
     d.touchState = () => ({ enabled: touch.enabled, active: touch.active, ...touch.axes });
+    /* --- travel, for the arrival screenshots and tools/traveltest.mjs --- */
+    /** Full fast travel: fare, clock, state AND the arrival. */
+    d.travel = (loc, mode = 'train') => {
+      const r = ctx.game?.travel?.(loc, mode);
+      return { ...r, loc: ctx.game?.state?.loc };
+    };
+    /** The arrival alone, no fare and no clock. `instant` skips the fade. */
+    d.arrive = (loc, instant) => arrive(loc, { instant: instant !== false });
+    /** Land an arrival still behind the curtain. */
+    d.arriveNow = () => flushArrival();
+    /** Where travelling to `loc` would put him. */
+    d.arriveAt = (loc) => arrivalPoint(loc);
+    /* --- the buy path, for the screenshots ---
+       `q` is typed into the search box exactly as a player would;
+       `pick` selects the first hit, so a shot can pose the ticket. */
+    d.uiBuy = (q, pick = true) => {
+      closeAll();
+      openQuickBuy(pick && q ? q : undefined);
+      if (q && !pick) {
+        const i = document.querySelector('.w-srch input');
+        if (i) { i.value = q; i.dispatchEvent(new Event('input')); }
+      }
+      return q || 'quickbuy';
+    };
+    d.uiMap = (loc) => { closeAll(); api.openMap(loc); return loc || 'map'; };
+    d.uiDest = (loc) => setDestination(loc);
     d.uiToast = (t, k) => { toast(t || 'Toast', k || 'info'); return true; };
     d.uiBanner = (t, s) => { banner(t || 'TOKENIZED', s || '3% of the city is connected'); return true; };
     d.uiPrompt = (t) => { demoPrompt(t); return true; };

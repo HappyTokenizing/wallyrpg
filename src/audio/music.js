@@ -679,6 +679,11 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
   let bar = 0, beat = 0;
   let nextTime = 0;
   let running = false;
+  /* True once the transport has actually put a bar on the wire. Until
+     then a context change may snap the tempo instead of gliding to it —
+     there is nothing to glide away from, and the opening cinematic is
+     cut against exact 54 bpm bar lines from bar 0. */
+  let scheduled = false;
   /* 0..1 — how many voices we may spend. Driven from ctx.quality so the
      low tier gets the same *piece*, thinner, rather than a different one. */
   let detail = 1;
@@ -778,6 +783,7 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
   function beatDur() { return 60 / bpm; }
 
   function scheduleBar(when) {
+    scheduled = true;
     advanceChord();
     progBarsLeft--;
     const bd = beatDur();
@@ -923,8 +929,9 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
     score = next;
     meter = next.meter;
     bpmTarget = next.bpm;
-    // Nothing to glide from if the transport has not started yet.
-    if (!running) bpm = bpmTarget;
+    // Nothing to glide from if the transport has not started, or has
+    // started but not yet scheduled its first bar.
+    if (!running || !scheduled) bpm = bpmTarget;
     // Re-key: reset the progression but keep the voicing as the seed for
     // voice-leading, so the first chord of the new zone reaches for the
     // nearest notes to where we already were.
@@ -1031,8 +1038,10 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
     start(at = actx.currentTime + 0.06) {
       if (running) return engine;
       running = true;
+      scheduled = false;
       nextTime = at;
       bar = 0; beat = 0;
+      bpm = bpmTarget;
       return engine;
     },
 
@@ -1065,6 +1074,7 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
         this never produces a click; `hard` cuts the bus instead. */
     stop({ fade = 1.5, hard = false } = {}) {
       running = false;
+      scheduled = false;
       const t = actx.currentTime;
       out.gain.cancelScheduledValues(t);
       out.gain.setValueAtTime(out.gain.value, t);
