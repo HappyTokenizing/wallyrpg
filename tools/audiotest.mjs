@@ -38,7 +38,36 @@
    already running. A player
    who is allowed to hear music must never be asked to click first.
 
-   Both passes also assert __WALLY_READY__ arrives without a gesture,
+   PASS C — THE PHONE. Reported from the field: "music doesn't work
+   from my phone on chrome browser." A mobile context (isMobile,
+   hasTouch, an Android UA), the same imposed autoplay block, and a
+   REAL trusted touch through CDP — touchstart + touchend, never a
+   synthesised click, which carries no user activation and would make
+   the test a lie. Two things make it a mobile test rather than a
+   desktop test in a narrow window:
+
+     · the tap lands on a full-screen DOM OVERLAY, not the canvas. Every
+       first tap in this game does: the loading screen, the title card,
+       the touch controls, a dialogue scrim. An unlock bound to the
+       canvas never sees any of them.
+     · the overlay calls preventDefault() on touchstart, exactly as a
+       canvas game must to kill scroll and double-tap zoom. That is the
+       spec-guaranteed way to suppress the compatibility mousedown /
+       mouseup / click a tap would otherwise synthesise — so `click`
+       and `mousedown` are simply not available as an unlock, and only
+       an activation-triggering TOUCH event can save us. This is the
+       exact shape of the reported bug.
+
+   The pass prints which gesture types actually arrived and which of
+   them carried navigator.userActivation, so the reason it passes is
+   visible rather than assumed.
+
+   PASS D — the tools/ escape hatches. ?shot and ?skipIntro must still
+   bypass the start beat entirely and never build an AudioContext, or
+   every screenshot tool in tools/ hangs on a keystroke that will not
+   come.
+
+   Every pass also asserts __WALLY_READY__ arrives without a gesture,
    because every tool in tools/ waits on it.
 
        node tools/audiotest.mjs
@@ -80,7 +109,19 @@ const note = (t, o) => { if (VERBOSE) console.log(`  ${t}`, JSON.stringify(o)); 
    finding about the audio system — so a crashed pass is rolled back and
    retried rather than reported as a failure. It only becomes a failure
    when it will not complete at all. */
+/* `--only C` / `--only A,C` runs a subset. Nothing but a development
+   convenience — CI runs the file bare, which runs everything. */
+const ONLY = (() => {
+  const i = process.argv.indexOf('--only');
+  if (i < 0) return null;
+  return new Set((process.argv[i + 1] || '').toUpperCase().split(/[,\s]+/).filter(Boolean));
+})();
+
 async function attempt(label, fn, tries = 3) {
+  if (ONLY && !ONLY.has(label.replace(/^PASS\s+/i, '').toUpperCase())) {
+    console.log(`\n${label} — skipped (--only)`);
+    return;
+  }
   for (let i = 1; i <= tries; i++) {
     const p0 = passed, f0 = failures.length;
     try { await fn(); return; } catch (e) {
@@ -116,15 +157,63 @@ const port = server.address().port;
    user-gesture-required, document-user-activation-required and
    no-user-gesture-required all give `running`, muted or not.
 
-   So pass A installs the policy itself, before any page script runs:
-   an AudioContext that is born suspended and whose resume() returns a
-   promise that NEVER SETTLES until the page holds real user
-   activation, which is exactly what Chrome does to a blocked context.
-   The gate is navigator.userActivation.isActive, so a page-side
-   dispatchEvent still cannot unlock it — only a trusted gesture can.
-   The game sees an ordinary blocked context and has to cope. */
-async function installAutoplayBlock(page) {
-  await page.addInitScript(() => {
+   So the blocked passes install the policy itself, before any page
+   script runs: an AudioContext that is born suspended and whose
+   resume() returns a promise that NEVER SETTLES until the page holds
+   real user activation, which is exactly what Chrome does to a blocked
+   context. A page-side dispatchEvent still cannot unlock it — only a
+   trusted gesture can. The game sees an ordinary blocked context and
+   has to cope.
+
+   AND THE TOUCH RULE IS MODELLED, because headless Chrome does not
+   apply it. Measured here: a CDP touch tap sets
+   navigator.userActivation.isActive as early as `pointerdown`. A real
+   phone does not — the HTML Standard's "activation triggering input
+   event" list is:
+
+       keydown (not Esc)   ·   mousedown   ·   click
+       pointerdown  ONLY when pointerType is "mouse"
+       pointerup    ONLY when pointerType is NOT "mouse"
+       touchend
+
+   So on a touchscreen the DOWN half of a tap carries no activation at
+   all; the activation lands on pointerup / touchend. Leaving the
+   harness permissive would let an unlock bound only to `pointerdown`
+   pass a test named "mobile", which is precisely the bug that shipped.
+   The gate below is therefore the spec list AND the browser's own
+   isActive — never more permissive than the real browser, only
+   correctly less. */
+async function installAutoplayBlock(page, { touchRule = false } = {}) {
+  await page.addInitScript((useTouchRule) => {
+    /* Registered here, at window capture, before any page script — so
+       it always updates before the game's own unlock listener sees the
+       same event. */
+    const gate = { at: -1e9, ever: false };
+    window.__ACTGATE__ = gate;
+    const activating = (e) => {
+      if (!e.isTrusted) return false;
+      switch (e.type) {
+        case 'keydown':     return e.key !== 'Escape';
+        case 'mousedown':   return true;
+        case 'click':       return true;
+        case 'pointerdown': return e.pointerType === 'mouse';
+        case 'pointerup':   return e.pointerType !== 'mouse';
+        case 'touchend':    return true;
+        default:            return false;
+      }
+    };
+    for (const t of ['keydown', 'mousedown', 'click', 'pointerdown', 'pointerup', 'touchend']) {
+      window.addEventListener(t, (e) => {
+        if (!activating(e)) return;
+        gate.at = performance.now(); gate.ever = true;
+      }, { capture: true, passive: true });
+    }
+    const permitted = () => {
+      const browserSaysActive = !!navigator.userActivation?.isActive;
+      if (!useTouchRule) return browserSaysActive;
+      return browserSaysActive && (performance.now() - gate.at) < 5000;
+    };
+
     const Real = window.AudioContext || window.webkitAudioContext;
     if (!Real) return;
     class Blocked extends Real {
@@ -135,36 +224,117 @@ async function installAutoplayBlock(page) {
       }
       get state() { return this.__blocked ? 'suspended' : super.state; }
       resume() {
-        const active = !!navigator.userActivation?.isActive;
-        if (!active) return new Promise(() => {});   // hangs, like the real thing
+        /* Only an autoplay-BLOCKED context needs activation. Once it
+           has started once, a later suspend/resume — the tab going away
+           and coming back, a phone call — is ordinary and ungated, and
+           Chrome's own rule there is *sticky* activation, not transient.
+           Gating this too would make the mobile pass's backgrounding
+           test fail for a reason no real browser has. */
+        if (!this.__blocked) return super.resume();
+        if (!permitted()) return new Promise(() => {});  // hangs, like the real thing
         this.__blocked = false;
         return super.resume();
       }
     }
     window.AudioContext = Blocked;
     window.webkitAudioContext = Blocked;
+  }, touchRule);
+}
+
+/* WHICH GESTURE ACTUALLY CARRIES ACTIVATION.
+
+   The reported bug is not "the unlock is broken", it is "the unlock is
+   listening to the wrong events". On a touchscreen `pointerdown` and
+   `touchstart` grant no user activation at all — `pointerup` and
+   `touchend` do — and the mouse events a tap synthesises afterwards can
+   be suppressed entirely. So rather than assume which event saves us,
+   record it. Installed before any page script, at window capture, so it
+   sees every gesture in the order the browser really delivers them. */
+async function installGestureProbe(page) {
+  await page.addInitScript(() => {
+    window.__ACT__ = [];
+    const TYPES = ['pointerdown', 'pointerup', 'touchstart', 'touchend',
+      'mousedown', 'mouseup', 'click', 'keydown', 'keyup'];
+    /* `act` is the HTML Standard's rule — what a real phone does.
+       `raw` is what this headless build claims, which is looser. The
+       gap between the two columns is the whole reason the bug was
+       invisible in a harness. */
+    const spec = (e) => (
+      e.type === 'keydown' ? e.key !== 'Escape'
+      : e.type === 'mousedown' || e.type === 'click' || e.type === 'touchend' ? true
+      : e.type === 'pointerdown' ? e.pointerType === 'mouse'
+      : e.type === 'pointerup' ? e.pointerType !== 'mouse'
+      : false);
+    for (const t of TYPES) {
+      window.addEventListener(t, (e) => {
+        if (!e.isTrusted) return;
+        window.__ACT__.push({
+          t, act: spec(e), raw: !!navigator.userActivation?.isActive,
+        });
+      }, { capture: true, passive: true });
+    }
   });
 }
 
+/* A full-screen DOM overlay that behaves like the game's own touch
+   surface: it swallows the tap and preventDefaults touchstart, which is
+   the spec-guaranteed way to suppress the compatibility mousedown /
+   mouseup / click. Nothing but a touch event can unlock audio through
+   this, and it sits above every other layer — so the tap provably never
+   reaches the canvas. */
+const HOSTILE_OVERLAY = () => {
+  const d = document.createElement('div');
+  d.id = 'hostileOverlay';
+  d.style.cssText =
+    'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.01);touch-action:none';
+  window.__OVL__ = [];
+  const swallow = (e) => {
+    window.__OVL__.push(e.type);
+    e.preventDefault();          // kills the compat mouse events + click
+    e.stopPropagation();         // nothing below the overlay sees it either
+  };
+  for (const t of ['touchstart', 'touchend', 'pointerdown', 'pointerup', 'mousedown', 'click']) {
+    d.addEventListener(t, swallow, { passive: false });
+  }
+  document.body.appendChild(d);
+  return true;
+};
+
+const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 '
+  + '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+
 /* --mute-audio only silences the output device; the context still runs
    and the scheduler still schedules, which is what we measure. */
-async function boot({ block = false } = {}) {
+async function boot({ block = false, mobile = false, query = '', settle = 1400 } = {}) {
   const browser = await chromium.launch({
     channel: 'chrome',
     args: ['--enable-unsafe-swiftshader', '--hide-scrollbars', '--mute-audio'],
   });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const context = await browser.newContext(mobile
+    ? {
+        viewport: { width: 393, height: 851 },
+        deviceScaleFactor: 2.75,
+        isMobile: true,
+        hasTouch: true,
+        userAgent: ANDROID_UA,
+      }
+    : { viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message.split('\n')[0]));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('crash', () => errors.push('[renderer crashed]'));
-  if (block) await installAutoplayBlock(page);
+  /* The touch rule is only meaningful — and only honest — on a device
+     that actually has a touchscreen. */
+  if (block) await installAutoplayBlock(page, { touchRule: mobile });
+  if (mobile) await installGestureProbe(page);
 
-  /* NO ?shot and NO ?skipIntro — this is how a player loads the game. */
-  await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'load', timeout: 120000 });
+  /* NO ?shot and NO ?skipIntro unless a pass asks for them — this is
+     how a player loads the game. */
+  await page.goto(`http://127.0.0.1:${port}/index.html${query}`, { waitUntil: 'load', timeout: 120000 });
   await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 120000 });
   /* Let openTheDoor()'s resume() probe finish its 400 ms race. */
-  await page.waitForTimeout(1400);
+  if (settle) await page.waitForTimeout(settle);
   return { browser, page, errors };
 }
 
@@ -364,6 +534,178 @@ await attempt('PASS B', async () => {
   const real2 = errors.filter((e) => !/favicon|status of 404|autoplay/i.test(e));
   ok(real2.length === 0, 'no page errors', real2.slice(0, 4).join(' | '));
   } finally { await browser.close().catch(() => {}); }
+});
+
+/* ================================================================
+   PASS C — THE PHONE. Android Chrome, a blocked context, and one real
+   touch that lands on a DOM overlay instead of the canvas.
+   ================================================================ */
+await attempt('PASS C', async () => {
+  console.log('\nPASS C — mobile Chrome, tap on an overlay');
+  const { browser, page, errors } = await boot({ block: true, mobile: true });
+  try {
+
+  head('mobile boot');
+  ok(true, 'ready signal arrives without a gesture');
+  const gate = await page.evaluate(gateState);
+  note('gate:', gate);
+  ok(gate.state === 'suspended', 'the AudioContext starts suspended', String(gate.state));
+  ok(gate.asking, 'the boot screen asks for the start beat');
+  ok(/begin/i.test(gate.prompt), 'the prompt reads as a start beat', `"${gate.prompt}"`);
+  ok(gate.started === false, 'the opener has not rolled yet');
+  ok(!gate.introRunning, 'the cinematic is NOT playing into a suspended context');
+
+  const touch = await page.evaluate(() => ({
+    hasTouch: navigator.maxTouchPoints > 0,
+    coarse: matchMedia('(pointer: coarse)').matches,
+    mobileUA: /Android/.test(navigator.userAgent),
+  }));
+  note('device:', touch);
+  ok(touch.hasTouch && touch.mobileUA, 'the page really is a touch device on Android',
+    JSON.stringify(touch));
+
+  /* ---- the overlay goes on top of everything, including #boot ---- */
+  head('the tap');
+  const laid = await page.evaluate(HOSTILE_OVERLAY);
+  ok(laid, 'a full-screen DOM overlay covers the canvas');
+
+  /* The element that would receive a tap in the middle of the screen —
+     proof the gesture never touches the canvas the game draws into. */
+  const target = await page.evaluate(() =>
+    document.elementFromPoint(innerWidth / 2, innerHeight / 2)?.id || null);
+  ok(target === 'hostileOverlay', 'the tap target is the overlay, not #gl', String(target));
+
+  /* A REAL touch: Input.dispatchTouchEvent through CDP, touchStart then
+     touchEnd. Not page.click(), not dispatchEvent — neither carries the
+     user activation the blocked context gates on. */
+  await page.touchscreen.tap(196, 425);
+
+  const reached = await page
+    .waitForFunction('WALLY.ctx.audio && WALLY.ctx.audio.running === true', { timeout: 15000 })
+    .then(() => true).catch(() => false);
+
+  const probe = await page.evaluate(() => ({
+    seenByWindow: (window.__ACT__ || []).map((e) => e.t + (e.act ? '*' : '')),
+    activating: (window.__ACT__ || []).filter((e) => e.act).map((e) => e.t),
+    swallowed: window.__OVL__ || [],
+    unlocked: WALLY.ctx.audio.unlocked === true,
+    state: WALLY.ctx.audio.actx?.state || null,
+    dbg: WALLY.debug.audioState ? WALLY.debug.audioState() : null,
+  }));
+  note('gestures (* = activation, per the HTML rule):', probe.seenByWindow);
+  note('overlay swallowed:', probe.swallowed);
+  note('audio:', probe.dbg);
+
+  ok(reached, 'the AudioContext reaches "running" from a touch on an overlay',
+    String(probe.state));
+  ok(probe.unlocked, 'the module considers itself unlocked');
+  /* The point of the overlay: no click, no mousedown. If either of
+     these ever shows up the pass is weaker than it claims to be. */
+  ok(!probe.activating.includes('click') && !probe.activating.includes('mousedown'),
+    'the unlock did NOT come from a synthesised mouse event',
+    probe.activating.join(',') || 'none');
+
+  head('the score, after the touch');
+  await page.waitForTimeout(3000);
+  const play = await page.evaluate(() => ({
+    count: WALLY.ctx.audio.notes.length,
+    layers: Object.keys(WALLY.ctx.audio.notes.reduce((a, n) => (a[n.layer] = 1, a), {})),
+    bar: WALLY.ctx.audio.bar,
+    bpm: Math.round(WALLY.ctx.audio.bpm),
+    context: WALLY.ctx.audio.context,
+    bootGone: !!document.getElementById('boot')?.classList.contains('gone'),
+    introRunning: !!WALLY.ctx.intro?.running,
+  }));
+  note('play:', play);
+  ok(play.bootGone, 'the boot screen is dismissed');
+  ok(play.introRunning, 'the cinematic rolls, now that it can be heard');
+  ok(play.context === 'cinematic', 'the score is on the cinematic context', play.context);
+  ok(play.bpm === 54, 'the transport snapped to 54 bpm from bar 0', `${play.bpm} bpm`);
+  ok(play.count > 0, 'the scheduler produced note events after the touch',
+    `${play.count} notes`);
+  ok(play.layers.length >= 2, 'more than one layer is sounding', play.layers.join(','));
+
+  /* A running context with a stopped scheduler is still silence. */
+  await page.waitForTimeout(5200);
+  const on = await page.evaluate(() => ({
+    n: WALLY.ctx.audio.notes.length, b: WALLY.ctx.audio.bar,
+    running: WALLY.ctx.audio.running,
+  }));
+  ok(on.n > play.count, 'the transport keeps scheduling on mobile',
+    `${play.count} -> ${on.n} notes`);
+  ok(on.b > play.bar, 'bars keep turning', `bar ${play.bar} -> ${on.b}`);
+  ok(on.running, 'the context is still running');
+
+  /* ---- it has to SURVIVE being backgrounded ---- */
+  head('backgrounding');
+  const back = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    await a.actx.suspend();                       // what a phone call does to us
+    const dipped = a.actx.state;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await new Promise((r) => setTimeout(r, 1200));
+    return { dipped, back: a.actx.state, notes: a.notes.length };
+  });
+  note('background:', back);
+  ok(back.dipped === 'suspended', 'the context can be taken away', back.dipped);
+  ok(back.back === 'running', 'it comes back by itself when the page returns', back.back);
+
+  head('console');
+  const real3 = errors.filter((e) => !/favicon|status of 404|autoplay/i.test(e));
+  ok(real3.length === 0, 'no page errors', real3.slice(0, 4).join(' | '));
+  } finally { await browser.close().catch(() => {}); }
+});
+
+/* ================================================================
+   PASS D — the tools/ escape hatches still escape.
+   ================================================================ */
+await attempt('PASS D', async () => {
+  console.log('\nPASS D — ?shot and ?skipIntro bypass the start beat');
+  const { browser, page, errors } = await boot({ block: true, query: '?shot=1', settle: 600 });
+  try {
+
+  head('?shot');
+  const shot = await page.evaluate(() => ({
+    ready: window.__WALLY_READY__ === true,
+    asking: !!document.getElementById('boot')?.classList.contains('ask'),
+    gone: !!document.getElementById('boot')?.classList.contains('gone'),
+    started: WALLY.debug.started(),
+    built: WALLY.ctx.audio?.ready === true,
+    introRunning: !!WALLY.ctx.intro?.running,
+    context: WALLY.ctx.audio?.context,
+  }));
+  note('shot:', shot);
+  ok(shot.ready, '__WALLY_READY__ arrives with no gesture');
+  ok(!shot.asking, 'no start beat is demanded');
+  ok(shot.gone, 'the boot screen is already dismissed');
+  ok(shot.started === true, 'the door is open');
+  ok(shot.built === false, 'no AudioContext is built at all under ?shot');
+  ok(!shot.introRunning, 'the cinematic does not roll under ?shot');
+  ok(shot.context === 'silence', 'the score sits on the silence context', String(shot.context));
+
+  await browser.close().catch(() => {});
+  } finally { await browser.close().catch(() => {}); }
+
+  const two = await boot({ block: true, query: '?skipIntro=1', settle: 600 });
+  try {
+  head('?skipIntro');
+  const skip = await two.page.evaluate(() => ({
+    ready: window.__WALLY_READY__ === true,
+    asking: !!document.getElementById('boot')?.classList.contains('ask'),
+    gone: !!document.getElementById('boot')?.classList.contains('gone'),
+    started: WALLY.debug.started(),
+    introRunning: !!WALLY.ctx.intro?.running,
+  }));
+  note('skipIntro:', skip);
+  ok(skip.ready, '__WALLY_READY__ arrives with no gesture');
+  ok(!skip.asking, 'no start beat is demanded');
+  ok(skip.gone, 'the boot screen is already dismissed');
+  ok(skip.started === true, 'the door is open');
+  ok(!skip.introRunning, 'the cinematic does not roll under ?skipIntro');
+
+  const real4 = [...errors, ...two.errors].filter((e) => !/favicon|status of 404|autoplay/i.test(e));
+  ok(real4.length === 0, 'no page errors', real4.slice(0, 4).join(' | '));
+  } finally { await two.browser.close().catch(() => {}); }
 });
 
 server.close();

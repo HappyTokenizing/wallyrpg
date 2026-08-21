@@ -894,6 +894,11 @@ export async function init(ctx) {
   let autoClip = null;
   let leanX = 0, leanZ = 0;
   let landT = 0;
+  /* THE ANIMATION'S OWN NOTION OF "HE WAS IN THE AIR". Set in update()
+     from the same `air` test that starts `jump-air`, and consumed by the
+     phys:land handler below. See the long note there for why the
+     controller's `grounded` flag is not, on its own, good enough. */
+  let airborne = false;
   let controlled = true;        // false = position/rotation driven externally
   let locoSpeed = 0, locoTurn = 0;
   let locoManual = false;
@@ -955,7 +960,51 @@ export async function init(ctx) {
     ctx.bus.on('phys:jump', () => {
       if (!manual) { anim.play('jump-takeoff', { fade: 0.06, restart: true }); autoClip = 'jump-takeoff'; }
     });
+    /* A LANDING IS NOT THE SAME THING AS A phys:land EVENT, AND CONFUSING
+       THE TWO IS WHY WALLY WALKED WITHOUT MOVING HIS LEGS FOR A WHOLE
+       RELEASE. Reported as "the mobile version doesn't show the elephant
+       moving his legs"; it was never a mobile bug and never a touch bug.
+
+       Measured, running at 5.9 m/s up a 1.4-degree rise (per-frame dump,
+       tools/mobilebugs.mjs):
+
+         grounded  1 1 0 1 1 0 1 1 0 1 1 0 ...
+         airTime   0 0 0.017 0 0 0.017 ...
+         vy        0 0 +0.24 0 0 +0.24 ...
+
+       The controller's ground snap lets go for ONE frame in three on a
+       gentle uphill, and re-acquires on the next — so it emits phys:land
+       at roughly 20 Hz. Every one of those restarted `jump-land`, a 0.42 s
+       one-shot on the ACTION layer, and the action layer REPLACES the
+       locomotion layer at weight 1. Restarted every 50 ms it could never
+       finish, `landT` never reached 0, so the release branch in update()
+       never fired either: actionW sat pinned at 1.0 indefinitely and the
+       legs froze in the landing crouch while he tore across the map. The
+       locomotion layer was correct the entire time — anim.speed 5.89,
+       locoName 'run', locPhase advancing — it was simply never visible.
+
+       It looked mobile-only because it is HEADING-dependent: it needs a
+       rising surface underfoot. A desktop sweep of eight headings from
+       the spawn (synthetic input, no touch anywhere) reproduces it on
+       exactly one of them, legL0 range 0.96 rad against 1.8 on the other
+       seven. The thumbstick's default camera heading happens to point at
+       one of those surfaces, which is the whole of the "mobile" in the
+       bug report.
+
+       So the gate: a landing needs either a real airborne interval — the
+       same 0.09 s test that starts `jump-air`, so the two clips can never
+       disagree about whether he flew — or a real downward impact. These
+       blips have neither (impact is 0, because impactSpeed is -0.24: he
+       was moving UP when he "landed"). Anything the controller reports
+       that is neither is a ground-snap flicker, and the correct animation
+       for a ground-snap flicker is to keep walking.
+
+       If the flicker itself is ever fixed in physics/controller.js this
+       gate stays correct and costs one boolean. */
     ctx.bus.on('phys:land', (e) => {
+      const real = airborne || (e && e.impact > 0.05);
+      airborne = false;
+      if (!real) return;
       landT = 0.34;
       if (!manual) { anim.play('jump-land', { fade: 0.05, restart: true }); autoClip = 'jump-land'; }
     });
@@ -1256,15 +1305,30 @@ export async function init(ctx) {
     anim.setLocomotion(speed, turn);
 
     /* ---- automatic clip selection ---- */
+    /* `air` is resolved OUTSIDE the !manual guard: it is the fact the
+       phys:land gate above reads, and a fact must not depend on whether a
+       cutscene happens to be holding a pose at the time. */
+    const air = !!c && !c.grounded && c.airTime > 0.09;
+    if (air) airborne = true;
     if (!manual && c) {
       landT = Math.max(0, landT - dt);
-      const air = !c.grounded && c.airTime > 0.09;
       if (air) {
         if (autoClip !== 'jump-air') { anim.play('jump-air', { fade: 0.14 }); autoClip = 'jump-air'; }
       } else if (autoClip === 'jump-air') {
         anim.play('jump-land', { fade: 0.05, restart: true }); autoClip = 'jump-land';
       } else if (autoClip && landT <= 0 && anim.action && anim.action.time > (anim.action.clip.duration || 1)) {
         anim.stop(0.20); autoClip = null;
+      } else if (autoClip === 'jump-land' && c.grounded && speed > 1.2
+                 && anim.action && anim.action.time > 0.20) {
+        /* THE SAFETY NET, and it is also better animation. A landing at
+           speed is a stride, not a stop: the crouch has done its job by
+           0.20 s (jump-land's own `c` term is spent by ph 0.85 = 0.36 s)
+           and holding it any longer reads as a stumble. Releasing here
+           also means the locomotion layer is guaranteed to be back within
+           ~0.34 s of ANY landing while he is moving, whatever the land
+           event does — so the failure above cannot silently return by a
+           different route. Landing from a standstill is untouched. */
+        anim.stop(0.14); autoClip = null;
       } else if (!autoClip) {
         anim.stop(0.24);
       }
@@ -1601,7 +1665,7 @@ export async function init(ctx) {
       }
 
       /* --- locomotion state that describes a journey he did not make --- */
-      leanX = 0; leanZ = 0; landT = 0;
+      leanX = 0; leanZ = 0; landT = 0; airborne = false;
       anim.setLocomotion(0, 0);
       if (!manual) { anim.stop(0); autoClip = null; }
       /* A look target at the old place is now 900 m behind his head. */

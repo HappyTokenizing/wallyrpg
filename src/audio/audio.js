@@ -11,8 +11,12 @@
        into the boot sequence;
      - if it starts `suspended` (the normal case), nothing schedules and
        nothing errors — the score is simply not running;
-     - the first real user gesture resumes it and starts the score at the
-       context the game has already asked for.
+     - the FIRST INTERACTION OF ANY KIND, ANYWHERE ON THE PAGE, unlocks
+       it and starts the score at the context the game has already asked
+       for. See the big comment on GESTURE UNLOCK below: on a phone the
+       event you have to listen for is not the one you would guess, and
+       getting it wrong is a game that is silent on mobile and perfect
+       on every desktop you test it on.
    Boot is never blocked, and a missing or blocked Web Audio implementation
    degrades to a complete no-op API rather than a crash.
 
@@ -83,7 +87,7 @@ const WEATHER = {
 function nullAudio(reason) {
   const api = {
     unavailable: reason,
-    ready: false, running: false, suspended: true, muted: true,
+    ready: false, running: false, suspended: true, muted: true, unlocked: false,
     context: 'silence', pendingContext: null,
     contexts: CONTEXT_NAMES, sfxNames: [], beds: [], surfaces: SURFACES,
     spaces: Object.keys(SPACES), stings: [], notes: [],
@@ -144,6 +148,17 @@ export async function init(ctx) {
       return false;
     }
 
+    /* The context tells us itself when it changes state — which is how
+       we learn that a resume() we could not await has landed, and how
+       we learn that the OS took the audio away again. */
+    try {
+      actx.onstatechange = () => {
+        if (!actx) return;
+        if (actx.state === 'running') finish();
+        else nudge();
+      };
+    } catch {}
+
     master = actx.createGain();
     master.gain.value = vol.muted ? 0 : vol.master;
 
@@ -198,31 +213,204 @@ export async function init(ctx) {
     reverb.setSpace(space, immediate ? 0.05 : Math.max(0.8, fade));
   }
 
-  /* ---------- gesture unlock ---------- */
-  let unlocked = false;
-  const GESTURES = ['pointerdown', 'mousedown', 'touchstart', 'keydown', 'click'];
+  /* ---------- teardown of the graph (not of the module) ---------- */
+  let rebuilds = 0;
 
-  function onGesture() { unlock().catch(() => {}); }
-
-  async function unlock() {
-    if (!build()) return false;
-    if (actx.state === 'suspended') {
-      try { await actx.resume(); } catch { return false; }
+  function teardownGraph() {
+    rebuilds++;
+    if (built) {
+      try { music.dispose(); sfx.dispose(); reverb.dispose(); } catch {}
+      try {
+        musicGain.disconnect(); sfxGain.disconnect();
+        duck.disconnect(); master.disconnect(); limiter.disconnect();
+      } catch {}
     }
-    if (actx.state !== 'running') return false;
+    try { actx?.close?.(); } catch {}
+    actx = master = limiter = duck = musicGain = sfxGain = null;
+    reverb = music = sfx = null;
+    silentBuf = null;
+    built = false;
+  }
+
+  /* ============================================================
+     GESTURE UNLOCK — the mobile path.
+
+     This is the part that was silent on a phone, and every line of it
+     is load-bearing. Four things a desktop browser lets you get away
+     with and a mobile one does not:
+
+     1  WHICH EVENT. Only an "activation triggering input event" grants
+        the transient user activation that `resume()` needs. On a
+        TOUCHSCREEN that is `pointerup` / `touchend` — NOT `pointerdown`
+        and NOT `touchstart`, which carry no activation at all. The
+        compatibility `mousedown`/`click` that a tap synthesises do
+        carry it, but they are suppressed outright the moment any
+        handler calls `preventDefault()` — which src/ui/touch.js does on
+        every `pointerdown` in the joystick zone, as every touch
+        controller must. Listening to the "down" half only is therefore
+        a game that is permanently silent on a phone, which is exactly
+        what this was.
+
+     2  SYNCHRONOUSLY. Activation is transient. Nothing between the
+        listener and `resume()` may await, defer to a rAF or a timeout,
+        or the browser no longer considers us user-activated and the
+        resume silently never settles. `onGesture` is not async, and
+        `unlockSync` does its work before it returns — the promise
+        bookkeeping happens afterwards, off the critical path.
+
+     3  A BUFFER MUST ACTUALLY PLAY. iOS and some Android builds leave
+        the output path muted until a source has been started from
+        inside the gesture; the context reads `running` and you hear
+        nothing. One frame of zeroes settles it.
+
+     4  IT MAY HAVE TO BE BUILT IN THE GESTURE. A few builds only
+        honour a context CREATED under activation, not merely resumed.
+        We keep the cheap path (build at boot) and fall back: two
+        refused resumes and the next gesture throws the dead context
+        away and constructs a fresh one inside the handler.
+
+     Nothing here throws, and nothing here is removed until the context
+     is genuinely running — every later interaction is another attempt.
+     ============================================================ */
+  const SHOT = !!ctx?.flags?.shot;
+  /* Has anybody actually ASKED to be unlocked yet? The transport may
+     not start before main.js has named the opening score (see the note
+     on the eager build below): the cinematic's cuts are struck against
+     54 bpm bar lines from bar 0, and a transport that started a beat
+     early under the overworld's 76 bpm costs the opener its timing.
+     statechange, visibilitychange and the keep-alive timer may
+     therefore COMPLETE an unlock, but none of them may start one. */
+  let wantUnlock = false;
+  let unlocked = false;
+  let resumeAttempts = 0;
+  let recreate = false;
+  let silentBuf = null;
+  let watchdog = null;
+  let lastNudge = 0;
+
+  const GESTURES = [
+    'pointerdown', 'pointerup', 'touchstart', 'touchend',
+    'mousedown', 'mouseup', 'click', 'keydown', 'keyup',
+  ];
+
+  /* Strictly synchronous, and it never throws into someone else's
+     input handler. */
+  function onGesture() { try { unlockSync(); } catch {} }
+
+  /** One frame of silence, started inside the gesture. See (3). */
+  function primeSilence() {
+    if (!actx) return;
+    try {
+      if (!silentBuf) silentBuf = actx.createBuffer(1, 1, actx.sampleRate || 22050);
+      const s = actx.createBufferSource();
+      s.buffer = silentBuf;
+      s.connect(actx.destination);
+      s.onended = () => { try { s.disconnect(); } catch {} };
+      if (s.start) s.start(0); else s.noteOn?.(0);
+    } catch { /* a prime that fails must not cost us the resume */ }
+  }
+
+  /** Commit, but only once the context is genuinely making sound. */
+  function finish() {
+    if (!wantUnlock) return false;
+    if (!built || !actx || actx.state !== 'running') return false;
     if (!unlocked) {
       unlocked = true;
+      recreate = false;
+      resumeAttempts = 0;
+      if (watchdog) { clearTimeout(watchdog); watchdog = null; }
       for (const g of GESTURES) globalThis.removeEventListener?.(g, onGesture, true);
       // Start the transport now that we are actually allowed to make noise.
       music.start();
       applyContext(wantContext, { immediate: true, fade: 0.6 });
+      /* Schedule the first bar HERE. A running context with a stopped
+         scheduler is still silence, and the frame loop may be a whole
+         vsync away — or throttled, if the unlock came from a tab that
+         has just become visible again. */
+      music.tick();
       ctx?.bus?.emit('audio:unlocked', api);
     }
     return true;
   }
+
+  /* If a gesture's resume produced nothing, arrange for the next one to
+     rebuild the context from scratch inside its own handler. See (4). */
+  function armWatchdog() {
+    if (watchdog || unlocked) return;
+    watchdog = setTimeout(() => {
+      watchdog = null;
+      if (unlocked || !actx) return;
+      if (finish()) return;
+      if (resumeAttempts >= 2 && rebuilds < 2) recreate = true;
+    }, 500);
+    watchdog?.unref?.();
+  }
+
+  function unlockSync() {
+    /* Screenshot runs never build a context at all — there will never
+       be a gesture, and an eager one only buys the harness a repeated
+       autoplay warning in everybody's console output. Every tool in
+       tools/ boots with ?shot, so this is the guard that keeps them
+       silent and fast. */
+    if (SHOT || failed) return false;
+    wantUnlock = true;
+    if (unlocked) return finish();
+
+    if (recreate) { recreate = false; teardownGraph(); }
+    if (!build()) return false;
+
+    // (3) — before the resume, so it is queued the instant we are live.
+    primeSilence();
+
+    if (actx.state !== 'running') {
+      resumeAttempts++;
+      try {
+        // (2) — called here, not after an await. Never awaited inline:
+        // a blocked context's resume() can stay pending forever.
+        const p = actx.resume();
+        if (p && typeof p.then === 'function') p.then(() => finish(), () => {});
+      } catch { /* older builds throw where newer ones reject */ }
+      armWatchdog();
+    }
+    return finish();
+  }
+
   for (const g of GESTURES) {
+    /* window, capture phase: the first stop on the way to ANY target,
+       so a tap that lands on the loading screen, the title card, the
+       touch controls or a modal scrim unlocks exactly as well as one on
+       the canvas. Passive — we must never interfere with the gesture we
+       are riding. */
     globalThis.addEventListener?.(g, onGesture, { capture: true, passive: true });
   }
+
+  /* ---------- staying unlocked ----------
+     A mobile browser re-suspends the context when the tab is hidden,
+     the screen locks or a call arrives, and nothing brings it back on
+     its own — the player returns to a silent world. The page keeps
+     STICKY activation after that first gesture, so a resume from here
+     is allowed even though we are not in a handler. */
+  function nudge() {
+    if (!unlocked || !built || !actx || actx.state === 'running') return;
+    const now = Date.now();
+    if (now - lastNudge < 400) return;
+    lastNudge = now;
+    try {
+      const p = actx.resume();
+      if (p && typeof p.then === 'function') p.then(() => { try { music.tick(); } catch {} }, () => {});
+    } catch {}
+  }
+
+  /* Only ever a RE-resume. Coming back to the tab is not a request to
+     start the score for the first time — the gesture listeners above
+     own that, and starting one here would jump the start beat. */
+  const onVisible = () => {
+    if (globalThis.document?.visibilityState === 'hidden') return;
+    nudge();
+  };
+  globalThis.document?.addEventListener?.('visibilitychange', onVisible, false);
+  globalThis.addEventListener?.('pageshow', onVisible, false);
+  globalThis.addEventListener?.('focus', onVisible, false);
 
   /* Build the graph immediately if the page already has permission (a
      returning visitor who has interacted with this origin). Free when it
@@ -317,7 +505,31 @@ export async function init(ctx) {
 
     /* --- lifecycle --- */
     init() { build(); return api; },
-    resume() { return unlock(); },
+
+    /* Callable from inside a gesture handler (the unlock is done before
+       this returns, so the caller's activation still counts) or from
+       anywhere else (the promise then just reports what happened).
+
+       The promise ALWAYS settles. A blocked context's own resume() can
+       stay pending for the life of the page, and main.js's start beat
+       must never be left waiting on it — so we poll our own state and
+       give up after 1.5 s with the truth. */
+    resume() {
+      if (SHOT) return Promise.resolve(false);
+      if (unlockSync()) return Promise.resolve(true);
+      return new Promise((res) => {
+        let done = false;
+        const settle = (v) => {
+          if (done) return;
+          done = true; clearInterval(iv); clearTimeout(to); res(v);
+        };
+        const iv = setInterval(() => { if (finish()) settle(true); }, 60);
+        const to = setTimeout(() => settle(api.running === true), 1500);
+        iv?.unref?.(); to?.unref?.();
+      });
+    },
+    /** True once a gesture has actually got sound out of the device. */
+    get unlocked() { return unlocked; },
 
     /* --- musical context ---
        The change is queued inside music.js and committed on the next bar
@@ -427,15 +639,14 @@ export async function init(ctx) {
 
     dispose() {
       for (const g of GESTURES) globalThis.removeEventListener?.(g, onGesture, true);
+      globalThis.document?.removeEventListener?.('visibilitychange', onVisible, false);
+      globalThis.removeEventListener?.('pageshow', onVisible, false);
+      globalThis.removeEventListener?.('focus', onVisible, false);
       clearInterval(keepAlive);
+      if (watchdog) { clearTimeout(watchdog); watchdog = null; }
       if (!built) return;
-      try { music.dispose(); sfx.dispose(); reverb.dispose(); } catch {}
-      try {
-        musicGain.disconnect(); sfxGain.disconnect();
-        duck.disconnect(); master.disconnect(); limiter.disconnect();
-      } catch {}
-      try { actx.close(); } catch {}
-      built = false;
+      try { if (actx) actx.onstatechange = null; } catch {}
+      teardownGraph();
     },
   };
 
@@ -444,7 +655,12 @@ export async function init(ctx) {
      browser backgrounds it. A slow timer keeps the score from stalling —
      and, more importantly, from scheduling a catch-up burst on return. */
   const keepAlive = setInterval(() => {
-    if (built && actx.state === 'running') music.tick();
+    if (!built || !actx) return;
+    if (actx.state === 'running') music.tick();
+    /* A phone that re-suspended us without ever firing a statechange we
+       heard (it happens on return from a call) gets picked up here.
+       nudge() is throttled and a no-op before the first gesture. */
+    else nudge();
   }, 120);
   keepAlive?.unref?.();   // no-op in a browser; lets a node test exit cleanly
 
@@ -502,6 +718,7 @@ export async function init(ctx) {
     dbg.audioResume = () => api.resume();
     dbg.audioState = () => ({
       ready: api.ready, running: api.running, context: api.context,
+      unlocked, resumeAttempts, rebuilds, state: actx?.state ?? null,
       pending: api.pendingContext, bar: api.bar, bpm: Math.round(api.bpm),
       voices: api.voices, muted: api.muted, weather: wantWeather,
       space: built ? reverb.space : null,

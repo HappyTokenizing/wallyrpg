@@ -1136,17 +1136,17 @@ export function stylesheet() {
 .w-ticket .sep{opacity:.35;font-weight:800}
 
 /* ============================================================
-   THE DESTINATION POINTER — centre-top of the HUD.
+   THE DESTINATION POINTER — centre-top wide, upper-right narrow.
 
    Which way, and how far. The bearing is taken in Wally's own
    frame, so the arrow points where he would have to turn, and it is
    written every frame rather than at the 8 Hz the rest of the HUD
    repaints at: a compass that lags a turn is worse than no compass.
 
-   It is placed by JS, not by CSS, because at 1600 px there is a
-   clear gutter between the two stat clusters and at 390 px there is
-   not — see placePointer() in hud.js. --w-ptr-top is what that
-   measurement writes.
+   It is placed by JS, not by CSS, because the width it may have
+   depends on what the left-hand cluster is showing right now — see
+   placePointer() in hud.js, which writes --w-ptr-top and, in the
+   rail, --w-ptr-max. hud.js owns the breakpoint between the two.
    ============================================================ */
 .w-ptr{
   position:absolute;left:50%;transform:translateX(-50%);
@@ -1163,6 +1163,23 @@ export function stylesheet() {
 }
 .w-ptr:active{transform:translateX(-50%) scale(.97)}
 .w-ptr.off{opacity:0;pointer-events:none}
+
+/* THE RIGHT-HAND RAIL — the narrow-screen placement. Same right edge
+   as the REP and CITY pills above it, so the upper-right corner reads
+   as one column. The width comes from --w-ptr-max, which hud.js
+   measures against the left cluster every repaint; the label column
+   needs min-width:0 or flex will refuse to shrink it and the pill
+   will barge into the energy meter instead of ellipsing. */
+.w-ptr.rail{
+  left:auto;right:max(12px,env(safe-area-inset-right));
+  transform:none;transform-origin:100% 50%;
+  max-width:var(--w-ptr-max,min(300px,74vw));
+}
+.w-ptr.rail:active{transform:scale(.97)}
+.w-ptr .tx{min-width:0}
+.w-ptr.rail .t,.w-ptr.rail .d{
+  max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
 .w-ptr .dial{
   position:relative;flex:none;
   width:calc(34px * var(--w-ts));height:calc(34px * var(--w-ts));border-radius:50%;
@@ -1308,10 +1325,14 @@ export function stylesheet() {
   .w-obj{max-width:min(300px,76vw);padding:calc(7px * var(--w-ts)) calc(11px * var(--w-ts))}
   .w-obj .t{font-size:calc(12px * var(--w-ts))}
   .w-toasts{max-width:74vw}
-  /* the two stat clusters own the whole top row on a phone, so the
-     pointer drops under them (hud.js measures) and is allowed the
-     full width it just got */
-  .w-ptr{max-width:min(300px,84vw);padding:calc(5px * var(--w-ts)) calc(12px * var(--w-ts)) calc(5px * var(--w-ts)) calc(5px * var(--w-ts))}
+  /* On a phone the pointer is in the right-hand rail under REP and
+     CITY, sharing a ~190 px slot with nothing to its left but the
+     energy meter. Every pixel of chrome here is a pixel the words
+     "· to your left" does not get, so the dial shrinks, the gap
+     closes and the trailing padding comes in. The width itself is
+     --w-ptr-max, written by hud.js. */
+  .w-ptr{padding:calc(5px * var(--w-ts)) calc(11px * var(--w-ts)) calc(5px * var(--w-ts)) calc(5px * var(--w-ts));
+    gap:calc(8px * var(--w-ts))}
   .w-ptr .dial{width:calc(30px * var(--w-ts));height:calc(30px * var(--w-ts))}
   .w-ptr .t{font-size:calc(11.6px * var(--w-ts));max-width:calc(168px * var(--w-ts))}
   .w-tkt{padding-left:calc(17px * var(--w-ts))}

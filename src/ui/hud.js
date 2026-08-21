@@ -7,8 +7,10 @@
    centred high, and the world-space interaction prompt.
 
    Everything lives at the edges. Nothing sits where Wally is —
-   except the destination pointer, which sits centre-top because
-   "which way" is a question about the middle of the screen.
+   except the destination pointer on a wide screen, which sits
+   centre-top because "which way" is a question about the middle of
+   the screen. On a narrow one it joins the right-hand column,
+   directly under REP and CITY. See placePointer().
 
    The HUD polls ctx.game.hud() at 8 Hz and repaints only the
    fields that actually changed — no per-frame DOM writes. The one
@@ -91,7 +93,10 @@ export function createHud(ctx, ui) {
   const pointer = h('div.w-ptr.w-pe.off', {
     role: 'button', tabindex: '0', title: 'Where you are going',
     onclick: () => onPointer(),
-  }, h('div.dial', null, ptrArrow), h('div', null, ptrT, ptrD));
+    /* .tx so the label column can be told min-width:0 — without it a
+       flex child refuses to shrink below its content and the ellipsis
+       in the right-hand rail never fires */
+  }, h('div.dial', null, ptrArrow), h('div.tx', null, ptrT, ptrD));
 
   /* ---------------- toasts / banner / prompt / hints ---------------- */
   const toasts = h('div.w-toasts');
@@ -383,19 +388,111 @@ export function createHud(ctx, ui) {
     if (ptrShown.sub !== sub) { ptrShown.sub = sub; ptrD.textContent = sub; }
   }
 
-  /* WHERE THE POINTER SITS. Centre-top, unless centre-top is already
-     occupied: at 1600 px there is 700 px of clear sky between the two
-     stat clusters and at 390 px there is none, so the placement is
-     measured rather than guessed and the phone gets the row below. */
+  /* ============================================================
+     WHERE THE POINTER SITS — TWO PLACEMENTS, CHOSEN ON PURPOSE.
+
+     THE RAIL — upper right, tucked directly under the REP and CITY
+     pills and sharing their right edge, so that corner reads as one
+     column: rep, city, where you are going. This is the phone
+     placement and it is what the pointer falls back to everywhere
+     else. It used to hang under the objective strip on the LEFT,
+     which buried "which way" beneath two lines of quest text in the
+     busiest corner of a 390 px frame.
+
+     CENTRE-TOP — kept, but only where the centre is genuinely empty.
+     At 1600 px there is ~700 px of clear sky between the two
+     clusters, and "which way do I go" is a question about the middle
+     of the screen, so a screen with a middle to spare should answer
+     there rather than in a corner the eye has to hunt for.
+
+     THE RULE, stated once: centre-top if the screen is at least
+     PTR_RAIL_W wide AND the pointer fits in the gutter with room to
+     spare; the rail otherwise. Both halves are deliberate. The width
+     floor exists so no phone can ever argue its way into centre-top
+     on a stubby place name, and the fit test exists so a 1200 px
+     laptop degrades to the rail — the same corner the phone uses —
+     instead of dangling under the objective strip, which is the very
+     thing we are fixing. There is no third placement.
+
+     THE WIDTH IS MEASURED, NOT ASSUMED. In the rail the pointer must
+     never crowd the left cluster, whose widest pill is the energy
+     meter and whose objective strip is wider still. So we take the
+     right edge of every left-hand chrome box that actually shares the
+     pointer's horizontal band and refuse to grow past it. Measuring
+     the `left` bar as a whole would be wrong: it is a max-width:49vw
+     flex column, so its rect is 49vw regardless of what is in it, and
+     the pointer would be squeezed to nothing by empty space.
+     ============================================================ */
+  const PTR_RAIL_W = 900;     // never centre-top below this
+  const PTR_GAP = 10;         // clearance from the left cluster
+  const PTR_MIN_W = 150;      // below this the pill cannot hold its own sentence
+  const PTR_MAX_W = 320;
+
+  /* Every left-hand box that shares the horizontal band [top, top+h):
+     how far right it reaches, and how far down it goes. */
+  const _obs = { right: 0, bottom: 0 };
+  function leftObstacle(top, hgt) {
+    _obs.right = 0; _obs.bottom = 0;
+    for (const el of left.querySelectorAll('.w-pill,.w-obj')) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > top - 2 && r.top < top + hgt + 2) {
+        if (r.right > _obs.right) _obs.right = r.right;
+        if (r.bottom > _obs.bottom) _obs.bottom = r.bottom;
+      }
+    }
+    return _obs;
+  }
+
+  /* The width the pointer WANTS, measured without disturbing it.
+     Toggling .rail off to read offsetWidth would also work, but it
+     would write the class twice every repaint and invite the transform
+     transition to fire on a state no frame ever shows. The chrome
+     (dial + gap + padding) is fixed, and the labels report their full
+     length through scrollWidth even while they are being ellipsed. */
+  function pointerWantsWidth() {
+    const tx = ptrT.parentElement;
+    const chrome = pointer.offsetWidth - tx.offsetWidth;
+    return chrome + Math.max(ptrT.scrollWidth, ptrD.scrollWidth) + 2;
+  }
+
   function placePointer() {
     if (pointer.classList.contains('off')) return;
+    const vw = window.innerWidth;
     const lb = left.getBoundingClientRect();
     const rb = right.getBoundingClientRect();
-    const pw = pointer.offsetWidth || 230;
-    const cx = window.innerWidth / 2;
-    const clash = (cx - pw / 2 - 12) < lb.right || (cx + pw / 2 + 12) > rb.left;
-    const top = clash ? Math.max(lb.bottom, rb.bottom) + 8 : Math.max(lb.top, rb.top);
-    pointer.style.setProperty('--w-ptr-top', Math.round(top) + 'px');
+
+    if (vw >= PTR_RAIL_W) {
+      const half = pointerWantsWidth() / 2;
+      const cx = vw / 2;
+      if ((cx - half - 16) > lb.right && (cx + half + 16) < rb.left) {
+        pointer.classList.remove('rail');
+        pointer.style.removeProperty('--w-ptr-max');
+        pointer.style.setProperty('--w-ptr-top', Math.round(Math.max(lb.top, rb.top)) + 'px');
+        return;
+      }
+    }
+
+    /* ---- the rail ---- */
+    pointer.classList.add('rail');
+    const inset = Math.max(8, vw - rb.right);       // the right safe-area gutter
+    const ph = pointer.offsetHeight || 42;
+    let top = Math.round(rb.bottom + 8);
+    let ob = leftObstacle(top, ph);
+    let room = vw - inset - (ob.right ? ob.right + PTR_GAP : 12);
+
+    /* On a very narrow phone the left cluster can be wide enough that
+       no usable slot survives beside it — at 320 px the energy meter
+       alone leaves 121 px, which is not a sentence. Overlapping it is
+       the one thing this placement must never do, so step down past
+       the obstruction and take the full width one row lower. Still the
+       right rail, still aligned under REP and CITY. */
+    if (room < PTR_MIN_W && ob.bottom) {
+      top = Math.round(ob.bottom + 8);
+      ob = leftObstacle(top, ph);
+      room = vw - inset - (ob.right ? ob.right + PTR_GAP : 12);
+    }
+    pointer.style.setProperty('--w-ptr-top', top + 'px');
+    pointer.style.setProperty('--w-ptr-max', Math.round(clamp(room, PTR_MIN_W, PTR_MAX_W)) + 'px');
   }
 
   function onPointer() {

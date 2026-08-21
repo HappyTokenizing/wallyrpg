@@ -238,6 +238,23 @@ export function createTouch(ctx, ui) {
 
   /* ------------------------------------------------------------
      THE INPUT SOURCE — the only thing here that moves anything.
+
+     `out`, `_kb` and `_sv` are deliberately SHARED and mutated in place:
+     one allocation for the life of the layer instead of three per frame.
+     That is safe because the consumer copies rather than retains —
+     PhysicsController.setInput() reads the six fields into its own
+     `this.input` the moment we return (controller.js), and
+     wally.camRelative() writes into whatever scratch it is handed. No
+     one downstream keeps the reference or compares this frame's object
+     against last frame's.
+
+     This is written down because "touch returns a shared mutable object,
+     a fresh literal animates fine" was the leading theory for the
+     legs-don't-move bug and it cost an afternoon. It was wrong twice
+     over: the aliasing is benign, and the bug was not in this file or on
+     mobile at all — it was the phys:land handler in character/wally.js
+     mistaking a one-frame ground-snap flicker for a landing. See the
+     note there before suspecting this seam again.
      ------------------------------------------------------------ */
   const out = { x: 0, z: 0, jump: false, jumpHeld: false, run: false };
   function input(dt, c) {

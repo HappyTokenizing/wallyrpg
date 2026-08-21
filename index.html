@@ -23,6 +23,10 @@
   #boot{
     position:fixed;inset:0;z-index:100;display:grid;place-items:center;
     background:#0a0d16;transition:opacity .5s ease;
+    /* No double-tap-zoom delay on the one tap that unlocks the audio:
+       mobile Chrome otherwise holds the synthesised click for ~300 ms,
+       and the start beat is the tap the whole soundtrack hangs off. */
+    touch-action:manipulation;
   }
   #boot.gone{opacity:0;pointer-events:none}
   #bootInner{text-align:center}
@@ -110,6 +114,7 @@
     color:#f5913c;background:rgba(245,145,60,.07);
     border:1px solid rgba(245,145,60,.34);border-radius:9px;
     cursor:pointer;-webkit-appearance:none;appearance:none;
+    touch-action:manipulation;
     animation:bootPulse 2.4s ease-in-out infinite;
   }
   #bootGo:hover,#bootGo:focus-visible{
