@@ -96,6 +96,11 @@ export const CONFIG = Object.freeze({
   totalAssets: 69,
   totalClients: 24,
   totalLocations: 28,
+  /* THE HUNDRED-PERCENT SHOW. quests.js emits 'city:tokenized' once
+     the last of the 69 assets is tokenized, and this is how long the
+     world agent's fireworks are meant to run for. One place to tune
+     it; the number rides on the event payload as `durationMs`. */
+  fireworksMs: 60000,
 });
 
 /* ---------------- CATEGORIES ---------------- */
@@ -405,14 +410,45 @@ export const COURSES = [
 export const COURSE_BY_ID = {};
 for (const c of COURSES) COURSE_BY_ID[c.id] = c;
 
-/* ---------------- 6 OFFICE STAGES ---------------- */
+/* ---------------- 6 OFFICE STAGES ----------------
+
+   FOUR CAPACITIES, ONE TABLE, AND THE TOP ONE FITS THE WHOLE CITY.
+
+   THE BUG THIS FIXES. Every upgrade in the game competed for a seat
+   or a slot, and the top office was too small to run them all:
+
+     seats    was NOT IN THIS TABLE AT ALL. game.hire() read the
+              literal expression `state.office + 1`, so Wally Tower
+              had SIX chairs for the TEN specialists in EMPLOYEE_POOL.
+              At the very top of the game the player still had to
+              choose between Kite (Wally Swap), Orla (cheap filing),
+              Mattie (+1 fund), Pim (+1 slot), Reg (free travel),
+              Tilda / Bruno / Sable (the three daily income streams),
+              Nora and Gus. Four upgrades bought and paid for had to
+              sit on the pavement. `seats` is now a real column and
+              the top stage seats EMPLOYEE_POOL.length — all ten.
+     slots    open client jobs. clients.candidates() refuses a client
+              who already has a live order, so the true ceiling is
+              CONFIG.totalClients — 24. The top stage is now 24: every
+              person in Bull Bear City may have a job with you at once.
+     fundCap  live client funds. Same ceiling, same reason: one fund
+              per client, 24.
+     invCap   shelf units. The top stage must hold ONE OF ALL 69
+              ASSETS (quest q_all) *plus* a completely full order book
+              at its worst case (24 orders x 2 items x 3 units = 144).
+              69 + 144 = 213, so 220. Fund holdings no longer sit on
+              the shelf at all — see economy.invCount().
+
+   The intermediate stages are still a climb, and stages 0 and 1 are
+   untouched, so the opening plays exactly as it did.
+--------------------------------------------------- */
 export const OFFICE_STAGES = [
-  { n: 'Apartment Desk',      cost: 0,      slots: 1, invCap: 12,  fundCap: 0,  rep: 0,  desc: 'A folding table that is also your dining table.' },
-  { n: 'Shared Desk',         cost: 1200,   slots: 2, invCap: 20,  fundCap: 1,  rep: 12, desc: 'Main Street. Free coffee, questionable chair.' },
-  { n: 'Small Office',        cost: 5500,   slots: 3, invCap: 32,  fundCap: 3,  rep: 30, desc: 'A waiting area! People can wait for you now.' },
-  { n: 'Professional Office', cost: 22000,  slots: 4, invCap: 48,  fundCap: 5,  rep: 55, desc: 'Departments. A conference room. A research terminal.' },
-  { n: 'City Headquarters',   cost: 55000,  slots: 6, invCap: 70,  fundCap: 8,  rep: 80, desc: 'Automated operations and a city-wide asset map.' },
-  { n: 'Wally Tower',         cost: 150000, slots: 8, invCap: 110, fundCap: 12, rep: 95, desc: 'Rooftop watering hole. Actual water. It is a joke about elephants.' },
+  { n: 'Apartment Desk',      cost: 0,      seats: 1,  slots: 1,  invCap: 12,  fundCap: 0,  rep: 0,  desc: 'A folding table that is also your dining table.' },
+  { n: 'Shared Desk',         cost: 1200,   seats: 2,  slots: 2,  invCap: 20,  fundCap: 1,  rep: 12, desc: 'Main Street. Free coffee, questionable chair.' },
+  { n: 'Small Office',        cost: 5500,   seats: 4,  slots: 4,  invCap: 40,  fundCap: 3,  rep: 30, desc: 'A waiting area! People can wait for you now.' },
+  { n: 'Professional Office', cost: 22000,  seats: 6,  slots: 8,  invCap: 76,  fundCap: 6,  rep: 55, desc: 'Departments. A conference room. A research terminal.' },
+  { n: 'City Headquarters',   cost: 55000,  seats: 8,  slots: 14, invCap: 140, fundCap: 12, rep: 80, desc: 'Automated operations and a city-wide asset map.' },
+  { n: 'Wally Tower',         cost: 150000, seats: 10, slots: 24, invCap: 220, fundCap: 24, rep: 95, desc: 'Every department, every desk, every seat filled at once. Rooftop watering hole. Actual water. It is a joke about elephants.' },
 ];
 
 /* ---------------- 5 HOMES ---------------- */
@@ -1445,6 +1481,31 @@ export const MILESTONES = [
   { p: 100, t: 'BULL BEAR CITY IS WHOLE',          from: 'The City',          msg: 'Every asset, connected. Thank you, Wally.', endgame: true },
 ];
 
+/* ---------------- HAPPY'S ENDING ----------------
+   The last words in the game. Happy delivers them when the whole
+   thing is finished — see quests.completion() for exactly what that
+   means — and quests.js hands this object out on the 'game:complete'
+   event so the UI never has to retype it.
+
+   `text` IS THE SPEECH, VERBATIM AND WHOLE. Do not reflow it, do not
+   split it, do not "fix" the punctuation. The suite asserts it
+   character for character.
+
+   `links` are LINKS, NOT PROSE. Both labels appear inside `text`
+   exactly as written; the UI must find each label in the sentence and
+   wrap it in an anchor to its url, and the sentence must still read
+   the same afterwards. Two clickable things, in the running text.
+--------------------------------------------------- */
+export const HAPPY_ENDING = Object.freeze({
+  speaker: 'Happy',
+  role: 'Your oldest friend',
+  text: "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAFx.xyz",
+  links: Object.freeze([
+    Object.freeze({ label: 'RWAF.ai',    url: 'https://rwaf.ai' }),
+    Object.freeze({ label: 'RWAFx.xyz', url: 'https://rwafx.xyz' }),
+  ]),
+});
+
 /* ---------------- ONE-TIME TIPS ---------------- */
 export const TIPS = {
   map:      { t: 'Getting around', d: 'Four ways across town, and each one charges you differently. Walking is free and always available — it costs you the morning. The Metro costs pennies and costs energy. A Yoober costs a shift’s pay and costs you nothing else.' },
@@ -1505,6 +1566,7 @@ export const DATA = deepFreeze({
   sideQuests: SIDE_QUESTS, sideQuestById: SIDE_QUEST_BY_ID,
   openingMessage: OPENING_MESSAGE,
   milestones: MILESTONES,
+  happyEnding: HAPPY_ENDING,
   tips: TIPS,
   morningNotes: MORNING_NOTES,
   hops, fare, rideFare, worldDistance,

@@ -34,6 +34,8 @@ import {
 import { buildLocation, silhouette } from './buildings.js';
 import { createSign } from './signs.js';
 import { createProps } from './props.js';
+import { createFireworks } from './fireworks.js';
+import { HOME_TIERS, homeTierIndex, buildHomeTier } from './home.js';
 
 const PI = Math.PI;
 
@@ -1016,63 +1018,303 @@ export async function init(ctx) {
     let n = 0;
     for (const c of clothQueue) {
       if (n >= MAX) break;
-      /* AN AWNING IS STRETCHED OVER A FRAME. Pinning only its top row
-         makes it hang down the wall like a curtain — which is exactly
-         what it did — so the outer edge is pinned to the frame rail too
-         and the fabric bellies between them in the wind. Banners,
-         bunting, laundry and netting hang, and keep the top pin. */
-      const stretched = c.kind === 'awning' || c.kind === 'canopy';
-      let sim;
-      try {
-        sim = ctx.phys.createCloth({
-          cols: c.cols, rows: c.rows, width: c.width, height: c.height,
-          origin: c.origin, right: c.right, down: c.down,
-          pin: stretched ? ((col, row, C, R) => row === 0 || row === R - 1) : (c.pin || 'top'),
-          flutter: c.kind === 'banner' ? 1.7 : 1.15,
-          bend: c.kind === 'net' ? 0.42 : 0.2,
-          gravity: stretched ? 5.0 : 9.4,
-          windLift: stretched ? 0.85 : 0.55,
-          flutterWaves: stretched ? 1.0 : 1.3,
-          /* a stretched awning needs the passes to hold its shape; a
-             hanging banner or a washing line does not, and there are
-             now enough of them for the difference to matter */
-          structuralPasses: stretched ? 8 : 5,
-          doubleSided: true,
-          phase: n * 0.7,
-        });
-      } catch (e) { console.warn('[city] cloth failed', c.locId, e); continue; }
-      const mat = lib.mats.fabric(c.color);
-      const mesh = new THREE.Mesh(sim.geometry, mat);
-      mesh.name = `city.cloth.${c.locId}.${c.kind}`;
-      /* FIFTY-SIX AWNINGS ON A 970 m ISLAND, ALL OF THEM DRAWN, ALL
-         THE TIME. The solver writes world-space positions into a
-         geometry that sits at the identity, so the bounding sphere it
-         computes from the origin is meaningless and culling was simply
-         switched off — which cost one main-pass draw plus one per
-         shadow cascade for every cloth in the game, on every frame,
-         including the ones behind the camera. Measured in the Main
-         Street fly-to: 138 of 1013 draw calls were cloth, and only a
-         handful of cloths were on screen.
-
-         A cloth cannot leave the box its own pins define, so the
-         sphere is knowable up front: centre the panel, take its
-         diagonal, and add half a metre of belly for the wind. Written
-         once, never recomputed, and the mesh is culled like everything
-         else. */
-      const _half = Math.hypot(c.width, c.height) * 0.5;
-      mesh.frustumCulled = true;
-      sim.geometry.boundingSphere = new THREE.Sphere(
-        c.origin.clone()
-          .addScaledVector(c.right, c.width * 0.5)
-          .addScaledVector(c.down, c.height * 0.5),
-        _half + 0.6,
-      );
-      root.add(mesh);
-      ctx.mat.register(mesh, { color: c.color });
-      cloths.push({ sim, mesh, rec: records.get(c.locId) });
-      n++;
+      if (makeCloth(c, n)) n++;
     }
     console.log(`[city] wired ${collideQueue.length} collision volumes, ${cloths.length} cloths`);
+  }
+
+  /* ONE CLOTH. Lifted out of wirePhysics because the player's home is
+     rebuilt at runtime when he moves up a tier (see 4b) and its
+     washing line, awning or banner has to be re-strung then — the
+     queue is only ever drained once, on frame 1. */
+  function makeCloth(c, phase = 0) {
+    if (!ctx.phys) return null;
+    /* AN AWNING IS STRETCHED OVER A FRAME. Pinning only its top row
+       makes it hang down the wall like a curtain — which is exactly
+       what it did — so the outer edge is pinned to the frame rail too
+       and the fabric bellies between them in the wind. Banners,
+       bunting, laundry and netting hang, and keep the top pin. */
+    const stretched = c.kind === 'awning' || c.kind === 'canopy';
+    let sim;
+    try {
+      sim = ctx.phys.createCloth({
+        cols: c.cols, rows: c.rows, width: c.width, height: c.height,
+        origin: c.origin, right: c.right, down: c.down,
+        pin: stretched ? ((col, row, C, R) => row === 0 || row === R - 1) : (c.pin || 'top'),
+        flutter: c.kind === 'banner' ? 1.7 : 1.15,
+        bend: c.kind === 'net' ? 0.42 : 0.2,
+        gravity: stretched ? 5.0 : 9.4,
+        windLift: stretched ? 0.85 : 0.55,
+        flutterWaves: stretched ? 1.0 : 1.3,
+        /* a stretched awning needs the passes to hold its shape; a
+           hanging banner or a washing line does not, and there are
+           now enough of them for the difference to matter */
+        structuralPasses: stretched ? 8 : 5,
+        doubleSided: true,
+        phase: phase * 0.7,
+      });
+    } catch (e) { console.warn('[city] cloth failed', c.locId, e); return null; }
+    const mat = lib.mats.fabric(c.color);
+    const mesh = new THREE.Mesh(sim.geometry, mat);
+    mesh.name = `city.cloth.${c.locId}.${c.kind}`;
+    /* FIFTY-SIX AWNINGS ON A 970 m ISLAND, ALL OF THEM DRAWN, ALL
+       THE TIME. The solver writes world-space positions into a
+       geometry that sits at the identity, so the bounding sphere it
+       computes from the origin is meaningless and culling was simply
+       switched off — which cost one main-pass draw plus one per
+       shadow cascade for every cloth in the game, on every frame,
+       including the ones behind the camera. Measured in the Main
+       Street fly-to: 138 of 1013 draw calls were cloth, and only a
+       handful of cloths were on screen.
+
+       A cloth cannot leave the box its own pins define, so the
+       sphere is knowable up front: centre the panel, take its
+       diagonal, and add half a metre of belly for the wind. Written
+       once, never recomputed, and the mesh is culled like everything
+       else. */
+    const _half = Math.hypot(c.width, c.height) * 0.5;
+    mesh.frustumCulled = true;
+    sim.geometry.boundingSphere = new THREE.Sphere(
+      c.origin.clone()
+        .addScaledVector(c.right, c.width * 0.5)
+        .addScaledVector(c.down, c.height * 0.5),
+      _half + 0.6,
+    );
+    root.add(mesh);
+    ctx.mat.register(mesh, { color: c.color });
+    const rec = { sim, mesh, rec: records.get(c.locId), home: !!c.home };
+    cloths.push(rec);
+    return rec;
+  }
+
+  /* ================================================================
+     4b. THE PLAYER'S HOME.
+
+     data.js sells five homes and the world used to show one building
+     for all of them. world/home.js builds the five — each one out of
+     its own district's kit, all five on the apartment's own 11 x 10 m
+     plot so the collision volume baked above stays correct — and this
+     swaps them in when `unlock {key:'home'}` says he has moved.
+
+     Tiers are built LAZILY and then cached: a rebuild is ~15 ms of
+     merging, which is fine on a move-in banner and would be five
+     times that on every boot for four buildings nobody is living in.
+     ================================================================ */
+  const homeRec = records.get('apartment');
+  /* The queued laundry line belongs to whichever tier is current, so
+     the one the generic build emitted is dropped before it is wired. */
+  for (let i = clothQueue.length - 1; i >= 0; i--) {
+    if (clothQueue[i].locId === 'apartment') clothQueue.splice(i, 1);
+  }
+
+  const homeCache = new Map();
+  let homeTier = -1;
+  let homeClothsPending = null;
+
+  function buildHome(idx) {
+    const T = HOME_TIERS[idx];
+    if (homeCache.has(T.id)) return homeCache.get(T.id);
+    const t0 = performance.now();
+    const rng = ctx.makeRng('wally.home.' + T.id);
+    let built;
+    try { built = buildHomeTier(ctx, { tier: T, base: homeRec.loc, rng }); }
+    catch (e) { console.error('[city] home tier failed:', T.id, e); return null; }
+    const { K, meta, loc, S } = built;
+    const groundY = homeRec.groundY;
+    /* founded in the ground exactly as the other 28 are */
+    const spr = SPRAWL[loc.kit] ?? 0.6;
+    groundBerm(K, world, loc, groundY, {
+      w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
+      reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
+    });
+    footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d });
+
+    const full = new THREE.Group();
+    full.name = `home.${T.id}.full`;
+    for (const m of lib.meshes(K, 'home.' + T.id)) { full.add(m); registerCityMesh(ctx, m, S); }
+
+    let lod = null;
+    try {
+      const LK = silhouette(loc, S, meta, ctx.makeRng('wally.home.lod.' + T.id));
+      const lm = lib.meshes(LK, 'home.' + T.id + '.lod');
+      if (lm.length) {
+        lod = new THREE.Group(); lod.name = `home.${T.id}.lod`;
+        for (const m of lm) { lod.add(m); ctx.mat.register(m, { color: outlineBase(m.userData.family, S) }); }
+        lod.visible = false;
+      }
+    } catch (e) { console.warn('[city] home lod failed', T.id, e); }
+
+    const entry = { id: T.id, tier: T, full, lod, meta, S, loc, ms: performance.now() - t0 };
+    homeCache.set(T.id, entry);
+    return entry;
+  }
+
+  function dropHomeCloths() {
+    for (let i = cloths.length - 1; i >= 0; i--) {
+      const c = cloths[i];
+      if (!c.home) continue;
+      try { c.sim.dispose?.(); } catch (e) { /* already gone */ }
+      ctx.mat.removeOutline?.(c.mesh);
+      c.mesh.parent?.remove(c.mesh);
+      c.mesh.geometry?.dispose?.();
+      cloths.splice(i, 1);
+    }
+  }
+
+  const _rotY = new THREE.Matrix4();
+  function stringHomeCloths(entry) {
+    dropHomeCloths();
+    if (!entry.meta.cloths.length) { homeClothsPending = null; return; }
+    if (!ctx.phys) { homeClothsPending = entry; return; }   // phys boots after us
+    homeClothsPending = null;
+    homeRec.group.updateMatrixWorld(true);
+    _rotY.makeRotationY(homeRec.loc.yaw);
+    let n = 0;
+    for (const c of entry.meta.cloths) {
+      const rec = makeCloth({
+        ...c,
+        locId: 'apartment', home: true,
+        origin: c.origin.clone().applyMatrix4(homeRec.group.matrixWorld),
+        right: c.right.clone().applyMatrix4(_rotY).normalize(),
+        down: c.down.clone().applyMatrix4(_rotY).normalize(),
+      }, n);
+      if (rec) n++;
+    }
+  }
+
+  /* The generic apartment the 28-loop built. It is replaced on the
+     first setHome and has to be released, not merely unparented. */
+  let stale = homeRec ? [homeRec.full, homeRec.lod] : null;
+  function releaseStale() {
+    if (!stale) return;
+    for (const g of stale) {
+      if (!g) continue;
+      g.traverse((o) => {
+        if (!o.isMesh || o.userData.isOutlineHull) return;
+        ctx.mat.removeOutline?.(o);
+        o.geometry?.dispose?.();
+      });
+    }
+    stale = null;
+  }
+
+  const _hbox = new THREE.Box3();
+  function setHome(id) {
+    if (!homeRec) return null;
+    const idx = typeof id === 'number'
+      ? clamp(id | 0, 0, HOME_TIERS.length - 1)
+      : homeTierIndex(id);
+    if (idx === homeTier) return HOME_TIERS[idx].id;
+    const e = buildHome(idx);
+    if (!e) return null;
+
+    if (homeRec.full && homeRec.full !== e.full) homeRec.group.remove(homeRec.full);
+    if (homeRec.lod && homeRec.lod !== e.lod) homeRec.group.remove(homeRec.lod);
+    /* THE NAMEBOARD SURVIVES EVERY REBUILD. It is the one part of the
+       building the player has learned to read, and rebuilding it would
+       also invalidate the world position signs[] sways around. */
+    if (homeRec.sign && homeRec.sign.group.parent !== e.full) e.full.add(homeRec.sign.group);
+    homeRec.group.add(e.full);
+    if (e.lod) homeRec.group.add(e.lod);
+    homeRec.group.updateMatrixWorld(true);
+
+    homeRec.full = e.full;
+    homeRec.lod = e.lod || null;
+    homeRec.meta = e.meta;
+    homeRec.style = e.S;
+    homeRec.kit = e.S.form;
+    e.full.visible = homeRec.visible;
+    if (e.lod) e.lod.visible = !homeRec.visible;
+    homeRec._casts = undefined;                 // re-decide the shadow pass
+    homeRec.door.copy(e.meta.door).applyMatrix4(homeRec.group.matrixWorld);
+    homeRec.interior.copy(e.meta.interior).applyMatrix4(homeRec.group.matrixWorld);
+    homeRec.box = _hbox.setFromObject(e.full).clone();
+    homeRec.center = homeRec.box.getCenter(new THREE.Vector3());
+    /* A 25 m penthouse has to stay built further out than an 11 m
+       flat, or it pops to a silhouette while it is still the tallest
+       thing on the street. */
+    homeRec.lodDist = Math.max(240, homeRec.loc.radius * 11, e.loc.size.h * 14);
+
+    stringHomeCloths(e);
+    releaseStale();
+    homeTier = idx;
+    ctx.bus.emit('city:home', { home: e.id, name: e.tier.name, tier: idx, buildMs: Math.round(e.ms) });
+    return e.id;
+  }
+
+  /* Boot at whatever the rules layer says he owns. game boots after
+     us, so the first sync arrives on its 'ready:game'; every later
+     move-in arrives on 'unlock'. */
+  setHome(0);
+  const syncHome = () => {
+    const h = ctx.game?.state?.home;
+    if (h) setHome(h);
+  };
+  ctx.bus.on('ready:game', syncHome);
+  ctx.bus.on('unlock', (p) => { if (p && p.key === 'home' && p.home) setHome(p.home); });
+
+  /* ================================================================
+     4c. THE HUNDRED-PERCENT SHOW.
+     quests.js fires 'city:tokenized' with a durationMs the moment the
+     sixty-ninth asset is tokenized. It fires exactly once per save
+     (a latch in quests.js) and start() latches again on its own side,
+     so nothing here can run two shows at once.
+     ================================================================ */
+  const fireworks = createFireworks(ctx);
+  ctx.bus.on('city:tokenized', (p) => {
+    fireworks.start({ durationMs: p?.durationMs ?? 60000, force: !!p?.forced });
+  });
+
+  /* THE LIGHT A BREAK THROWS ON THE TOWN.
+
+     ctx.mat's ambient belongs to sky/lighting.js, which rewrites it
+     every frame — and city.update runs AFTER sky.update, so tinting it
+     here lands on this frame and is gone by the next one. That is the
+     whole mechanism, and it is also the failure mode: if lighting ever
+     stops writing, our own tint would compound. So we remember exactly
+     what we wrote, and if the uniforms still hold it when we come back
+     round, we put the base values back before tinting again. */
+  const showLight = {
+    wrote: false,
+    sky: new THREE.Color(), ground: new THREE.Color(), i: 0, sat: 0,
+    baseSky: new THREE.Color(), baseGround: new THREE.Color(), baseI: 0, baseSat: 0,
+    tint: new THREE.Color(),
+  };
+  const sameC = (a, b) => Math.abs(a.r - b.r) < 1e-5 && Math.abs(a.g - b.g) < 1e-5 && Math.abs(a.b - b.b) < 1e-5;
+
+  let showLightOn = true;
+  function applyShowLight() {
+    const g = ctx.mat?.globals;
+    if (!g || !g.uAmbSky || !showLightOn) return;
+    if (showLight.wrote
+      && sameC(g.uAmbSky.value, showLight.sky)
+      && Math.abs(g.uAmbIntensity.value - showLight.i) < 1e-5) {
+      g.uAmbSky.value.copy(showLight.baseSky);
+      g.uAmbGround.value.copy(showLight.baseGround);
+      g.uAmbIntensity.value = showLight.baseI;
+      g.uAmbSat.value = showLight.baseSat;
+    }
+    showLight.wrote = false;
+    const L = fireworks.light;
+    if (!(L.k > 0.004)) return;
+    showLight.baseSky.copy(g.uAmbSky.value);
+    showLight.baseGround.copy(g.uAmbGround.value);
+    showLight.baseI = g.uAmbIntensity.value;
+    showLight.baseSat = g.uAmbSat.value;
+    const k = clamp(L.k, 0, 1.2);
+    showLight.tint.setRGB(L.r, L.g, L.b);
+    /* The sky lobe takes most of it — an upward-facing roof sees the
+       burst — and the ground lobe a third of it, so the colour also
+       comes back off the paving onto the walls. */
+    g.uAmbSky.value.lerp(showLight.tint, clamp(k * 0.46, 0, 0.55));
+    g.uAmbGround.value.lerp(showLight.tint, clamp(k * 0.24, 0, 0.32));
+    g.uAmbIntensity.value = showLight.baseI * (1 + k * 0.40);
+    g.uAmbSat.value = Math.min(1.5, showLight.baseSat * (1 + k * 0.22));
+    showLight.sky.copy(g.uAmbSky.value);
+    showLight.ground.copy(g.uAmbGround.value);
+    showLight.i = g.uAmbIntensity.value;
+    showLight.sat = g.uAmbSat.value;
+    showLight.wrote = true;
   }
 
   /* ================================================================
@@ -1080,6 +1322,53 @@ export async function init(ctx) {
      ================================================================ */
   const dbg = (window.WALLY && window.WALLY.debug) || {};
   const order = LOCATIONS.map((l) => l.id);
+
+  /* ---- the home ladder ----
+       setHome('rusty'|'studio'|'loft'|'water'|'penthouse')  or 0..4
+       setHome(id, {fly:false}) to stay where you are          */
+  dbg.setHome = (id = 'rusty', opts = {}) => {
+    const r = setHome(id);
+    const e = r ? homeCache.get(r) : null;
+    if (e && opts.fly !== false && dbg.flyTo) {
+      /* Stand off far enough to see the whole of THIS tier: the flat
+         is 11.5 m and the penthouse 24.5, and one fixed distance
+         either crops the tower or loses the flat. */
+      /* flyTo aims four metres off the ground, so the stand-off has to
+         cover the WHOLE elevation inside a 46-degree lens: solved for
+         the top of the crown, not for the eaves. 34 m frames the flat;
+         the penthouse needs ninety. */
+      const top = e.loc.size.h * 1.32;
+      dbg.flyTo('apartment', {
+        dist: opts.dist ?? clamp(top * 2.4, 34, 74),
+        elev: opts.elev ?? 0.46, fov: opts.fov ?? 46, turn: opts.turn ?? 0.30,
+      });
+    }
+    return r ? {
+      home: r, name: e.tier.name, tier: homeTier,
+      district: e.tier.zone, height: e.loc.size.h, buildMs: Math.round(e.ms),
+    } : null;
+  };
+  dbg.homes = () => HOME_TIERS.map((t, i) => ({
+    i, id: t.id, name: t.name, district: t.zone, form: t.form, h: t.h,
+    built: homeCache.has(t.id), current: i === homeTier,
+  }));
+
+  /* ---- the hundred-per-cent show ----
+       fireworks()            re-run the whole minute from the top
+       fireworks({durationMs: 12000})   a short rehearsal
+       fireworksStop()        kill it, drop every particle           */
+  dbg.fireworks = (opts = {}) => {
+    fireworks.start({ force: true, ...opts });
+    return fireworks.stats();
+  };
+  dbg.fireworksStop = () => { fireworks.stop(); return fireworks.stats(); };
+  dbg.fireworksStats = () => fireworks.stats();
+  /* one break, in front of the lens, without the show — how every
+     number in the shell table was measured
+       fireworksBurst('willow', {dist: 140}) */
+  dbg.fireworksBurst = (type = 'peony', opts = {}) => fireworks.testBurst({ type, ...opts });
+  /* the ambient tint a break throws on the town, on its own */
+  dbg.fireworksLight = (on = true) => { showLightOn = on !== false; return showLightOn; };
 
   dbg.cityTour = (i = 0, opts = {}) => {
     const id = order[((i | 0) % order.length + order.length) % order.length];
@@ -1154,9 +1443,25 @@ export async function init(ctx) {
     get locations() { return records; },
     get stats() { return dbg.cityStats(); },
 
+    /* the show and the home ladder, for anything that wants them
+       without going through window.WALLY.debug */
+    fireworks,
+    setHome: (id) => setHome(id),
+    get homeTier() { return homeTier; },
+    get homeTiers() { return HOME_TIERS; },
+
     update(dt, elapsed) {
       wirePhysics();
+      /* A tier chosen before physics existed still owes us its
+         washing line / awning / banner. */
+      if (homeClothsPending && ctx.phys) stringHomeCloths(homeClothsPending);
       applyNight(ctx.sky?.night ?? 0);
+
+      /* THE SHOW. Stepped here, after sky.update has written this
+         frame's ambient, so a break can tint it and be gone again by
+         the next frame. */
+      fireworks.update(dt);
+      applyShowLight();
 
       /* signs sway in the shared wind field */
       const wind = ctx.wind;
@@ -1214,9 +1519,23 @@ export async function init(ctx) {
     },
 
     dispose() {
+      fireworks.dispose();
       props.dispose();
       for (const s of signs) s.dispose();
       for (const c of cloths) { c.sim.dispose(); c.mesh.geometry?.dispose?.(); }
+      /* the four home tiers he is not living in are still on the heap */
+      for (const e of homeCache.values()) {
+        for (const g of [e.full, e.lod]) {
+          if (!g) continue;
+          g.traverse((o) => {
+            if (!o.isMesh || o.userData.isOutlineHull) return;
+            ctx.mat.removeOutline?.(o);
+            o.geometry?.dispose?.();
+          });
+          g.parent?.remove(g);
+        }
+      }
+      homeCache.clear();
       root.parent?.remove(root);
       propsRoot.parent?.remove(propsRoot);
       lib.dispose();

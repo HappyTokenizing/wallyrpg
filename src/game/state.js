@@ -33,6 +33,27 @@ export function hashStr(s) {
 }
 
 /* ------------------------------------------------------------
+   THE SETTINGS BLOCK, in one place.
+
+   Its own export rather than an object literal inside newState(),
+   because save.js repairs `state.settings` against exactly this on
+   EVERY load (migrateSettings) — version bump or not. Settings grow
+   a key whenever a comfort option ships and those ships do not
+   always move CONFIG.version, so a second copy of the defaults over
+   in save.js would drift the first time one of them changed.
+
+   `landscape` is the odd one and deliberately so: it is a
+   PREFERENCE, not a state. Off is the default, portrait is the
+   game, and what "on" is actually able to do depends entirely on
+   the browser — ui/orient.js is the only thing that knows.
+   ------------------------------------------------------------ */
+export const DEFAULT_SETTINGS = Object.freeze({
+  music: 0.16, sfx: 0.35, speed: 1, relaxed: false,
+  contrast: false, reduced: false, textSize: 1, touch: false,
+  landscape: false,
+});
+
+/* ------------------------------------------------------------
    A fresh game. `rng` must be a deterministic 0..1 source so the
    opening prices are reproducible between builds (screenshots!).
    ------------------------------------------------------------ */
@@ -113,10 +134,7 @@ export function newState(rng = mulberry32(0x5eed1e)) {
       daysPlayed: 1, negotiations: 0, ordersFailed: 0, meals: 0, classes: 0,
       minigames: 0, trips: 0, metres: 0, repLost: 0,
     },
-    settings: {
-      music: 0.16, sfx: 0.35, speed: 1, relaxed: false,
-      contrast: false, reduced: false, textSize: 1, touch: false,
-    },
+    settings: { ...DEFAULT_SETTINGS },
   };
 
   for (const a of ASSETS) {

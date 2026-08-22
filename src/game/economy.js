@@ -104,7 +104,23 @@ export function createEconomy(env) {
   /* ---------- inventory ---------- */
   function owned(id) { const e = S().inv[idOf(id)]; return e ? e.qty : 0; }
   function free(id) { const e = S().inv[idOf(id)]; return e ? Math.max(0, e.qty - (e.locked || 0)) : 0; }
-  function invCount() { let n = 0; for (const k in S().inv) n += S().inv[k].qty; return round2(n); }
+  /* SHELF UNITS — what actually takes up room in the office.
+     A LOCKED unit is inside a client fund: it is in custody, it
+     belongs to that fund's holders, and Wally can neither sell it nor
+     spend it. Counting it against his own shelf meant every fund he
+     launched permanently shrank his inventory, so at the top of the
+     game "run a full book of funds" and "own all 69 assets" were two
+     upgrades fighting over one number. Three separate questions now:
+       invCount()   shelf units  (qty - locked)   — what invCap gates
+       invHeld()    gross units  (qty)            — everything on paper
+       invLocked()  the difference                — committed to funds */
+  function invCount() {
+    let n = 0;
+    for (const k in S().inv) { const e = S().inv[k]; n += Math.max(0, e.qty - (e.locked || 0)); }
+    return round2(n);
+  }
+  function invHeld() { let n = 0; for (const k in S().inv) n += S().inv[k].qty; return round2(n); }
+  function invLocked() { let n = 0; for (const k in S().inv) { const e = S().inv[k]; n += Math.min(e.qty, e.locked || 0); } return round2(n); }
   function invCap() {
     const home = HOME_BY_ID[S().home] || HOME_BY_ID.rusty;
     return OFFICE_STAGES[S().office].invCap + (home.store || 0);
@@ -227,7 +243,17 @@ export function createEconomy(env) {
   }
   function sourceable() { return ASSETS.filter((a) => venueOpen(a.ven)); }
 
-  /* ---------- order capacity ---------- */
+  /* ---------- office capacity ----------
+     THREE NUMBERS, ONE TABLE. Every one of them reads OFFICE_STAGES
+     and nothing else, and the top stage is sized to the content:
+     10 seats for 10 specialists, 24 slots and 24 funds for 24
+     clients. The two employee bonuses stay, but at Wally Tower they
+     are a courtesy rather than the difference between shipping and
+     not — see the note above OFFICE_STAGES in data.js. */
+  function teamSeats() {
+    return OFFICE_STAGES[S().office].seats;
+  }
+  function teamFree() { return Math.max(0, teamSeats() - S().employees.length); }
   function orderSlots() {
     let n = OFFICE_STAGES[S().office].slots;
     if (S().employees.includes('pim')) n += 1;
@@ -506,11 +532,11 @@ export function createEconomy(env) {
     fmt, price, prices: () => ({ ...S().prices }), clampPrice, liquidity, spread,
     buyPrice, sellPrice, trend, history, venueOf, venueHours, venueOpenNow,
     /* inventory */
-    owned, free, add, remove, invCount, invCap, distinctOwned, avgCost, netWorth, afford,
+    owned, free, add, remove, invCount, invHeld, invLocked, invCap, distinctOwned, avgCost, netWorth, afford,
     /* trade */
     buy, sell, venueOpen, sourceable,
-    /* orders + funds */
-    orderSlots, fundCap, acceptOrder, canComplete, completeOrder, failOrder, dissolveFund,
+    /* office capacity, orders + funds */
+    teamSeats, teamFree, orderSlots, fundCap, acceptOrder, canComplete, completeOrder, failOrder, dissolveFund,
     failRep: orderFailRep, tradeGate, postWallyNet,
     /* tokenization */
     tokenizeCost, canTokenize, tokenize, cityPct,

@@ -226,6 +226,9 @@ const P = {
   minus:    'M5.4 12h13.2',
   plus:     'M12 5.4v13.2 M5.4 12h13.2',
   ticket:   'M4 7.4h16v3a1.7 1.7 0 000 3.2v3H4v-3a1.7 1.7 0 000-3.2z M9.4 7.4v9.2',
+  /* "opens in a new tab" — the box with the arrow leaving it. Drawn
+     here like every other glyph: no emoji, no font dependency. */
+  ext:      'M13.6 4.4h6v6 M19.6 4.4L11.2 12.8 M17 14.2v4.4a1.8 1.8 0 01-1.8 1.8H5.4a1.8 1.8 0 01-1.8-1.8V8.8A1.8 1.8 0 015.4 7h4.4',
 };
 
 export function icon(name, size = 16, opts = {}) {
@@ -1100,6 +1103,21 @@ export function stylesheet() {
   box-shadow:0 1px 3px rgba(0,0,0,.32);transition:transform .22s var(--w-ease)}
 .w-switch.on{background:var(--w-token)}
 .w-switch.on:after{transform:translateX(calc(19px * var(--w-ts)))}
+/* A SETTINGS ROW THAT HAS TO EXPLAIN ITSELF — ui/menus.js
+   landscapeRow(). The line underneath is not a description, it is a
+   live status: an orientation lock dies when fullscreen closes and
+   the row has to say so. .warn is a refusal, which is worth reading
+   rather than skimming, so it comes up out of the .55 register. */
+.w-lsrow{padding-bottom:calc(8px * var(--w-ts));
+  border-bottom:1px solid ${rgba(BRAND.ink, 0.07)}}
+.w-lsrow .w-kv{border-bottom:0;padding-bottom:calc(2px * var(--w-ts))}
+.w-lsrow .sub{font-size:calc(10.6px * var(--w-ts));line-height:1.42;font-weight:600;
+  opacity:.55;max-width:46ch}
+.w-lsrow.warn .sub{opacity:.92;color:${C(BRAND.bad)}}
+/* the row still has a right-hand column when it has no switch — an
+   empty gutter would read as a control that failed to draw */
+.w-tagoff{flex:none;align-self:center;font-size:calc(9.4px * var(--w-ts));font-weight:800;
+  letter-spacing:.14em;text-transform:uppercase;opacity:.42;white-space:nowrap}
 .w-slider{-webkit-appearance:none;appearance:none;width:100%;height:calc(5px * var(--w-ts));border-radius:99px;
   background:${rgba(BRAND.ink, 0.14)};outline:0;cursor:pointer}
 .w-slider::-webkit-slider-thumb{-webkit-appearance:none;width:calc(20px * var(--w-ts));height:calc(20px * var(--w-ts));
@@ -1563,6 +1581,458 @@ button.w-stat:active{transform:scale(.97)}
 @media (max-height:560px){
   .w-banner{top:8vh}
   .w-phone{height:94vh}
+}
+
+/* ============================================================
+   THE NOTIFICATION LAYER — ui/notify.js
+
+   z-index 25: ABOVE #overlay (20) — the scrim, every sheet, the
+   phone and the dialogue card — and BELOW the film grain (30) and
+   vignette (31), so a notification is still inside the colour grade
+   rather than pasted on top of it (§3.8). It is parented to <body>,
+   not to #ui, precisely so the modal stack cannot reach it.
+
+   THREE DOCKS, each chosen to miss the furniture:
+     corner  bottom-left, where toasts have always lived. Pills and
+             the objective strip are top-left, the key hints are
+             bottom-right, the dialogue is bottom-centre.
+     strip   top-left under the objective strip, whose height
+             touch.js measures into --w-toasty. Used on touch,
+             because bottom-left is the thumbstick.
+     top     top-centre, whenever a panel or a dialogue is open. A
+             sheet is centred and at most 84vh / a phone is 90vh, so
+             this band is the one strip of screen they cannot reach.
+   ============================================================ */
+.w-notify{
+  position:fixed;inset:0;z-index:25;pointer-events:none;
+  display:flex;flex-direction:column;
+}
+.w-notes{
+  position:absolute;display:flex;gap:calc(7px * var(--w-ts));
+  align-items:flex-start;
+}
+/* the resting dock: bottom-left, newest nearest the corner */
+.w-notify.dock-corner .w-notes{
+  left:max(12px,env(safe-area-inset-left));
+  bottom:calc(max(12px,env(safe-area-inset-bottom)) + 10px);
+  flex-direction:column-reverse;max-width:min(380px,58vw);
+}
+
+/* touch: under the objective strip, whose bottom touch.js measures */
+.w-notify.dock-strip .w-notes{
+  left:max(12px,env(safe-area-inset-left));
+  top:var(--w-toasty,calc(max(12px,env(safe-area-inset-top)) + 96px));
+  flex-direction:column;max-width:min(330px,74vw);
+}
+/* a panel is open: the band above it */
+.w-notify.dock-top .w-notes{
+  left:50%;transform:translateX(-50%);
+  top:calc(max(10px,env(safe-area-inset-top)) + 4px);
+  flex-direction:column;align-items:center;
+  width:min(430px,92vw);
+}
+.w-notify.dock-top .w-note.tier-ach{width:100%;max-width:none}
+/* the queue depth, so a backlog is a number and not a wall of cards */
+.w-morechip{
+  flex:none;align-self:center;pointer-events:none;
+  padding:calc(2px * var(--w-ts)) calc(9px * var(--w-ts));border-radius:999px;
+  font-size:calc(9.4px * var(--w-ts));font-weight:800;letter-spacing:.14em;
+  text-transform:uppercase;color:${rgba(BRAND.text, 0.62)};
+  background:${rgba(BRAND.ink, 0.62)};border:1px solid var(--w-line);
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+}
+
+/* ---------- tier 1: the routine toast ---------- */
+.w-note{position:relative;pointer-events:none}
+.w-note.tier-toast{
+  display:flex;align-items:center;gap:calc(9px * var(--w-ts));
+  padding:calc(7px * var(--w-ts)) calc(14px * var(--w-ts));border-radius:999px;
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid var(--w-line);box-shadow:var(--w-shadow),var(--w-inset);
+  font-size:calc(12px * var(--w-ts));font-weight:600;
+  animation:wNoteIn .42s var(--w-ease) both;
+}
+.w-note.tier-toast .bul{width:calc(6px * var(--w-ts));height:calc(6px * var(--w-ts));
+  border-radius:99px;flex:none}
+.w-note.tier-toast .tx{min-width:0}
+
+/* ---------- tier 2: the achievement ----------
+   An achievement is not a louder toast, it is a different object: a
+   plaque. Gold medallion, an eyebrow naming what KIND of thing was
+   won, a heavy title, a token-gold rail down the left edge, a single
+   shine that crosses it once on arrival, and a hairline clock along
+   the bottom that visibly STOPS when the layer is held. Twice the
+   ink, twice the dwell, and no chance of being read as a receipt. */
+.w-note.tier-ach{
+  display:flex;align-items:center;gap:calc(11px * var(--w-ts));
+  min-width:calc(250px * var(--w-ts));max-width:min(430px,92vw);
+  padding:calc(10px * var(--w-ts)) calc(15px * var(--w-ts)) calc(11px * var(--w-ts))
+          calc(11px * var(--w-ts));
+  border-radius:calc(15px * var(--w-ts));overflow:hidden;
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid ${rgba(BRAND.token, 0.30)};
+  border-left:calc(3px * var(--w-ts)) solid var(--nc,var(--w-token));
+  box-shadow:var(--w-shadow),var(--w-inset),0 0 34px ${rgba(BRAND.token, 0.16)};
+  animation:wAchIn .62s var(--w-ease) both;
+}
+.w-note.tier-ach .medal{
+  flex:none;width:calc(36px * var(--w-ts));height:calc(36px * var(--w-ts));
+  border-radius:50%;display:grid;place-items:center;
+}
+.w-note.tier-ach .eb{
+  font-size:calc(9.2px * var(--w-ts));font-weight:800;letter-spacing:.19em;
+  text-transform:uppercase;opacity:.95;
+}
+.w-note.tier-ach .ti{
+  font-size:calc(13.5px * var(--w-ts));font-weight:800;line-height:1.25;
+  margin-top:calc(1px * var(--w-ts));
+}
+.w-note.tier-ach .sb{
+  font-size:calc(10.6px * var(--w-ts));color:var(--w-dim);font-weight:600;
+  margin-top:calc(1px * var(--w-ts));line-height:1.3;
+}
+/* the dismissal clock, drawn */
+.w-note.tier-ach .bar{
+  position:absolute;left:0;right:0;bottom:0;height:calc(2.6px * var(--w-ts));
+  background:linear-gradient(90deg,var(--nc,var(--w-token)),${rgba(BRAND.token, 0.45)});
+  box-shadow:0 0 10px ${rgba(BRAND.token, 0.55)};
+  transform-origin:0 50%;transform:scaleX(1);opacity:1;
+}
+/* one pass of light, once, on arrival */
+.w-note.tier-ach .sheen{
+  position:absolute;top:0;bottom:0;width:46%;left:-60%;pointer-events:none;
+  background:linear-gradient(100deg,transparent,${rgba(BRAND.paper, 0.16)},transparent);
+  animation:wAchSheen 1.5s cubic-bezier(.4,0,.4,1) .38s 1 both;
+}
+.w-note.out{animation:wNoteOut .32s var(--w-ease) both}
+/* HELD: the layer is not being looked at (curtain down, cinematic,
+   background tab, the ending playing). The clock stops and the
+   plaque says so rather than pretending. */
+.w-notify.held .w-note.tier-ach .bar{opacity:.34}
+.w-notify.hushed{opacity:0;transition:opacity .3s var(--w-ease)}
+
+@keyframes wNoteIn{from{opacity:0;transform:translateX(-14px) scale(.96)}to{opacity:1;transform:none}}
+@keyframes wNoteOut{to{opacity:0;transform:translateX(-10px) scale(.97)}}
+@keyframes wAchIn{
+  0%{opacity:0;transform:translateY(-16px) scale(.9)}
+  62%{opacity:1;transform:translateY(0) scale(1.025)}
+  100%{opacity:1;transform:none}}
+@keyframes wAchSheen{from{left:-60%}to{left:130%}}
+/* the top dock drops in from above instead of sliding in from the left */
+.w-notify.dock-top .w-note.tier-toast{animation-name:wNoteDrop}
+@keyframes wNoteDrop{from{opacity:0;transform:translateY(-12px) scale(.97)}to{opacity:1;transform:none}}
+.w-rm .w-note,.w-notify.w-rm .w-note{animation-duration:.01s !important}
+
+@media (max-width:480px){
+  .w-note.tier-ach{min-width:0;width:100%;
+    padding:calc(9px * var(--w-ts)) calc(12px * var(--w-ts))}
+  .w-note.tier-ach .ti{font-size:calc(12.6px * var(--w-ts))}
+  .w-notify.dock-corner .w-notes{max-width:76vw}
+}
+
+/* ============================================================
+   THE ENDING — ui/ending.js
+
+   z-index 28: above the notification layer, still under the grain.
+   The interface is faded out underneath it, so this is the only
+   thing on the screen.
+   ============================================================ */
+.w-endroot{
+  position:fixed;inset:0;z-index:28;pointer-events:none;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:calc(16px * var(--w-ts));padding:3vh 4vw;
+  font-family:var(--w-font);color:var(--w-text);
+  font-size:calc(14px * var(--w-ts));
+}
+.w-endroot.out{animation:wEndOut .46s var(--w-ease) both}
+@keyframes wEndOut{to{opacity:0}}
+/* the wash. Not opaque — the city stays faintly readable behind it,
+   which is the whole point of ending IN the place you built. */
+.w-endsky{
+  position:absolute;inset:0;
+  background:radial-gradient(128% 96% at 50% 42%,
+    ${rgba(mix(BRAND.ink, BRAND.token2, 0.20), 0.62)} 0%,
+    ${rgba(BRAND.ink, 0.88)} 62%, ${rgba(0x05070c, 0.96)} 100%);
+  -webkit-backdrop-filter:blur(7px) saturate(112%);backdrop-filter:blur(7px) saturate(112%);
+  animation:wEndSky 1.1s var(--w-ease) both;
+}
+@keyframes wEndSky{from{opacity:0}to{opacity:1}}
+.w-endbloom{
+  position:absolute;left:50%;top:44%;width:min(1100px,150vw);height:min(1100px,150vw);
+  transform:translate(-50%,-50%);pointer-events:none;
+  background:radial-gradient(circle at 50% 50%,${rgba(BRAND.token, 0.24)} 0%,
+    ${rgba(BRAND.token, 0.09)} 34%,transparent 66%);
+  animation:wEndBloom 2.6s var(--w-ease) .16s both;
+}
+@keyframes wEndBloom{from{opacity:0;transform:translate(-50%,-50%) scale(.72)}
+  to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+.w-endmotes{position:absolute;inset:0;overflow:hidden}
+.w-endmotes i{
+  position:absolute;border-radius:50%;
+  background:radial-gradient(circle at 40% 36%,${rgba(0xffe9c4, 0.95)},${rgba(BRAND.token, 0)} 68%);
+  animation:wEndMote 13s linear infinite;opacity:0;
+}
+@keyframes wEndMote{
+  0%{opacity:0;transform:translateY(26px) scale(.7)}
+  16%{opacity:.85}
+  76%{opacity:.5}
+  100%{opacity:0;transform:translateY(-120px) scale(1.15)}}
+
+.w-endhead{position:relative;text-align:center}
+.w-endhead .eb{
+  font-size:calc(10.4px * var(--w-ts));font-weight:800;letter-spacing:.34em;
+  text-transform:uppercase;color:${rgba(BRAND.text, 0.55)};
+  animation:wEndRise .8s var(--w-ease) .34s both;
+}
+.w-endhead .big{
+  display:flex;justify-content:center;gap:calc(2px * var(--w-ts));
+  margin:calc(7px * var(--w-ts)) 0 calc(9px * var(--w-ts));
+}
+.w-endhead .big span{
+  font-size:calc(40px * var(--w-ts));font-weight:800;letter-spacing:.20em;
+  background:linear-gradient(178deg,${C(mix(BRAND.token, 0xffffff, 0.42))},var(--w-token) 52%,var(--w-token2));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  filter:drop-shadow(0 3px 16px ${rgba(BRAND.token, 0.42)});
+  animation:wEndLetter .74s var(--w-ease) both;
+}
+.w-endhead .tal{
+  font-size:calc(11.4px * var(--w-ts));font-weight:700;letter-spacing:.03em;
+  color:${rgba(BRAND.text, 0.66)};font-variant-numeric:tabular-nums;
+  animation:wEndRise .8s var(--w-ease) 1.55s both;
+}
+@keyframes wEndLetter{from{opacity:0;transform:translateY(18px) scale(.86)}to{opacity:1;transform:none}}
+@keyframes wEndRise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+
+.w-endcard{
+  position:relative;display:flex;flex-direction:column;align-items:center;
+  gap:calc(15px * var(--w-ts));width:min(660px,94vw);
+}
+.w-endpaper{
+  width:100%;border-radius:calc(24px * var(--w-ts));color:var(--w-ink);
+  padding:calc(19px * var(--w-ts)) calc(22px * var(--w-ts)) calc(20px * var(--w-ts));
+  border:1px solid ${rgba(BRAND.token, 0.36)};
+  box-shadow:0 30px 80px ${rgba(0x05070c, 0.6)},var(--w-inset),
+             0 0 60px ${rgba(BRAND.token, 0.16)};
+  animation:wEndCard .9s var(--w-ease) .82s both;
+}
+@keyframes wEndCard{from{opacity:0;transform:translateY(26px) scale(.965)}to{opacity:1;transform:none}}
+.w-endwho{display:flex;align-items:center;gap:calc(14px * var(--w-ts));
+  padding-bottom:calc(13px * var(--w-ts));
+  border-bottom:1px solid ${rgba(BRAND.ink, 0.12)}}
+.w-endpor{position:relative;flex:none;animation:wEndRise .7s var(--w-ease) 1.05s both}
+.w-endpor>*{border-radius:99px;
+  box-shadow:0 8px 22px ${rgba(0x05070c, 0.34)},0 0 0 3px ${rgba(BRAND.token, 0.55)},
+             0 0 0 6px ${rgba(0xffffff, 0.45)}}
+.w-endwho .nm{font-size:calc(17px * var(--w-ts));font-weight:800;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--w-token2)}
+.w-endwho .rl{font-size:calc(11.6px * var(--w-ts));font-weight:700;opacity:.6;margin-top:1px}
+.w-endwho .seal{flex:none;width:calc(38px * var(--w-ts));height:calc(38px * var(--w-ts));
+  border-radius:50%;display:grid;place-items:center;color:var(--w-token2);
+  background:radial-gradient(circle at 50% 34%,${rgba(BRAND.token, 0.34)},${rgba(BRAND.token, 0.10)});
+  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.token2, 0.5)}}
+.w-endtx{
+  margin:calc(14px * var(--w-ts)) 0 0;
+  font-size:calc(16.4px * var(--w-ts));line-height:1.62;font-weight:600;
+  letter-spacing:.002em;
+  animation:wEndRise .8s var(--w-ease) 1.3s both;
+}
+/* THE TWO LINKS, INSIDE THE SENTENCE. Token gold, underlined with a
+   real offset, and an external-link glyph after them through CSS so
+   the anchor's textContent stays the user's line to the character. */
+.w-endlink{
+  color:var(--w-token2);font-weight:800;text-decoration:underline;
+  text-decoration-thickness:calc(2px * var(--w-ts));text-underline-offset:3px;
+  text-decoration-color:${rgba(BRAND.token, 0.6)};
+  border-radius:4px;padding:0 1px;
+  transition:color .16s,background .16s,text-decoration-color .16s;
+}
+.w-endlink:after{content:'↗';font-size:.8em;font-weight:800;
+  margin-left:1px;vertical-align:.08em;opacity:.8}
+.w-endlink:hover{color:${C(BRAND.token)};background:${rgba(BRAND.token, 0.14)};
+  text-decoration-color:${C(BRAND.token)}}
+.w-endlinks{display:flex;gap:calc(10px * var(--w-ts));flex-wrap:wrap;
+  margin-top:calc(17px * var(--w-ts));
+  animation:wEndRise .8s var(--w-ease) 1.75s both}
+.w-endbtn{
+  flex:1 1 calc(46% - 10px);min-width:calc(190px * var(--w-ts));
+  display:flex;align-items:center;gap:calc(11px * var(--w-ts));
+  padding:calc(11px * var(--w-ts)) calc(14px * var(--w-ts));
+  border-radius:calc(14px * var(--w-ts));text-decoration:none;color:${C(BRAND.ink)};
+  background:linear-gradient(180deg,var(--w-token),var(--w-token2));
+  box-shadow:0 3px 0 ${rgba(BRAND.token2, 0.8)},0 8px 22px ${rgba(BRAND.token, 0.34)};
+  transition:transform .15s var(--w-ease),filter .15s,box-shadow .15s;
+}
+.w-endbtn:hover{filter:brightness(1.06)}
+.w-endbtn:active{transform:translateY(2px);box-shadow:0 1px 0 ${rgba(BRAND.token2, 0.8)}}
+.w-endbtn .ic{flex:none;width:calc(30px * var(--w-ts));height:calc(30px * var(--w-ts));
+  border-radius:calc(9px * var(--w-ts));display:grid;place-items:center;
+  background:${rgba(0xffffff, 0.34)}}
+.w-endbtn .t{display:block;font-size:calc(14px * var(--w-ts));font-weight:800;letter-spacing:.01em}
+.w-endbtn .d{display:block;font-size:calc(10.6px * var(--w-ts));font-weight:700;opacity:.72}
+.w-endclose{
+  color:var(--w-text);
+  min-height:calc(42px * var(--w-ts));padding:0 calc(24px * var(--w-ts));
+  letter-spacing:.04em;
+  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.paper, 0.34)},0 10px 26px ${rgba(0x05070c, 0.42)};
+  background:${rgba(BRAND.ink, 0.62)};
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  animation:wEndRise .8s var(--w-ease) 2.1s both;
+}
+.w-endclose:hover{background:${rgba(BRAND.ink, 0.82)};
+  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.token, 0.5)},0 10px 26px ${rgba(0x05070c, 0.42)}}
+
+@media (max-width:480px){
+  .w-endroot{gap:calc(11px * var(--w-ts));padding:2vh 3vw}
+  .w-endhead .big span{font-size:calc(27px * var(--w-ts));letter-spacing:.14em}
+  .w-endhead .tal{font-size:calc(10.2px * var(--w-ts))}
+  .w-endpaper{padding:calc(15px * var(--w-ts)) calc(15px * var(--w-ts)) calc(16px * var(--w-ts));
+    border-radius:calc(19px * var(--w-ts))}
+  .w-endtx{font-size:calc(14.2px * var(--w-ts));line-height:1.56}
+  .w-endbtn{flex:1 1 100%;min-width:0;padding:calc(10px * var(--w-ts)) calc(12px * var(--w-ts))}
+  .w-endwho .nm{font-size:calc(15px * var(--w-ts))}
+}
+@media (max-height:700px){
+  .w-endhead .big{margin:calc(4px * var(--w-ts)) 0 calc(6px * var(--w-ts))}
+  .w-endtx{margin-top:calc(11px * var(--w-ts))}
+}
+
+/* ============================================================
+   LANDSCAPE PLAY — THE SHORT, WIDE PHONE            ui/orient.js
+
+   The optional setting is worthless if the game does not play well
+   sideways, so this block is the larger half of that feature. It is
+   NOT the portrait layout scaled down. A landscape phone is about
+   390 css px tall, held in two hands, and:
+
+     · the vertical axis is the scarce one. Anything that stacked
+       happily down a 844 px column has to stop stacking. The left
+       pill cluster was three rows deep, which pushed the objective
+       strip to the vertical middle of the frame and parked it
+       across Wally's face — measured, not guessed.
+     · both thumbs are at the BOTTOM CORNERS and nowhere else. The
+       stick and the pad move OUTWARD into them and shrink; the pad
+       stops being a column climbing a third of the way up the
+       screen and becomes one band along the bottom edge.
+     · the notch and the home indicator are on the LEFT and RIGHT.
+       env(safe-area-inset-top/bottom) are ~0 here and the two that
+       matter are the ones every rule below reaches for.
+     · a phone-shaped panel in a short viewport is not a squeeze
+       problem, it is a different panel. The phone becomes a wide
+       slab with a five-across app grid; the pause menu becomes two
+       columns; sheets take the height back from their margins.
+
+   THE TRIGGER IS THE VIEWPORT, NEVER THE SETTING. A player on iOS
+   Safari — where no page may rotate anything — turns the phone by
+   hand and lands in exactly this layout, which is the only thing
+   that makes the settings row's advice honest.
+   ============================================================ */
+@media (orientation:landscape) and (max-height:540px){
+  /* ---------- the top bars: two rows, not three ---------- */
+  .w-bar{top:max(9px,env(safe-area-inset-top));max-width:52vw}
+  .w-bar.left{left:max(12px,env(safe-area-inset-left))}
+  .w-bar.right{right:max(12px,env(safe-area-inset-right))}
+  .w-pills{max-width:52vw}
+  .w-bar.right .w-pills{max-width:44vw;justify-content:flex-end}
+  .w-pill{height:calc(27px * var(--w-ts));padding:0 calc(9px * var(--w-ts));
+    gap:calc(5px * var(--w-ts));font-size:calc(11.5px * var(--w-ts))}
+  .w-pill.money .w-num{font-size:calc(12.6px * var(--w-ts))}
+  .w-pill .w-mnum{font-size:calc(11.6px * var(--w-ts))}
+  .w-meter{width:calc(44px * var(--w-ts))}
+  /* the rep title is the widest optional thing on the right and the
+     one that can afford to ellipsise soonest */
+  .w-pill.rep .ttl{max-width:calc(92px * var(--w-ts))}
+  /* THE OBJECTIVE STRIP HAS TO CLEAR HIS HEAD. It rides up with the
+     row the pills gave back, on a smaller dial. */
+  .w-obj{margin-top:calc(5px * var(--w-ts));max-width:min(340px,44vw);
+    padding:calc(5px * var(--w-ts)) calc(11px * var(--w-ts)) calc(5px * var(--w-ts)) calc(5px * var(--w-ts))}
+  .w-obj .t{font-size:calc(12px * var(--w-ts))}
+  .w-obj .d,.w-obj .why{font-size:calc(9.8px * var(--w-ts))}
+  .w-obj .dial{width:calc(28px * var(--w-ts));height:calc(28px * var(--w-ts))}
+  .w-lock{max-width:min(380px,44vw);margin-top:calc(5px * var(--w-ts))}
+  .w-race{top:calc(44px * var(--w-ts));width:min(420px,46vw)}
+  .w-banner{top:6vh;padding:calc(10px * var(--w-ts)) calc(24px * var(--w-ts))}
+  .w-banner .t{font-size:calc(17px * var(--w-ts))}
+
+  /* ---------- both thumbs, both bottom corners ---------- */
+  /* A SMALLER ZONE IS A SMALLER STICK: touch.js sizes the ring from
+     this box's shorter side, so capping the height is what stops a
+     151 px ring eating 39% of a 390 px screen. */
+  .w-stickzone{width:min(34vw,240px);height:min(74vh,180px);
+    padding:0 0 max(10px,env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left))}
+  /* THE PAD LIES DOWN. Four shortcuts, interact and jump in ONE row
+     along the bottom edge instead of a column climbing 150 px up a
+     390 px screen — and it hugs the corner, because that is where
+     the right thumb already is. */
+  .w-acts{flex-direction:row;align-items:flex-end;gap:calc(13px * var(--w-ts));
+    right:max(14px,env(safe-area-inset-right));
+    bottom:calc(max(9px,env(safe-area-inset-bottom)) + 15px)}
+  .w-touch .w-abtn.mid{margin-bottom:14px}
+  .w-hints{max-width:44vw;right:max(14px,env(safe-area-inset-right));
+    bottom:calc(max(9px,env(safe-area-inset-bottom)) + 8px)}
+  .w-toasts{max-width:min(300px,40vw);left:max(12px,env(safe-area-inset-left))}
+  .w-touch-on .w-toasts{max-width:min(300px,40vw)}
+  .w-notify.dock-corner .w-notes,.w-notify.dock-strip .w-notes{
+    left:max(12px,env(safe-area-inset-left));max-width:min(300px,40vw)}
+  .w-notify.dock-top .w-notes{width:min(430px,54vw)}
+
+  /* ---------- panels: buy the height back ---------- */
+  .w-panels{padding:1.5vh 2.5vw;
+    padding-left:max(2.5vw,env(safe-area-inset-left));
+    padding-right:max(2.5vw,env(safe-area-inset-right))}
+  .w-sheet{width:min(560px,74vw);max-height:94vh;border-radius:calc(18px * var(--w-ts))}
+  .w-sheet-head{padding:calc(9px * var(--w-ts)) calc(14px * var(--w-ts))}
+  .w-sheet-head h2{font-size:calc(15px * var(--w-ts))}
+  .w-sheet-body{padding:calc(10px * var(--w-ts)) calc(14px * var(--w-ts)) calc(13px * var(--w-ts))}
+  .w-label{margin:calc(10px * var(--w-ts)) 0 calc(5px * var(--w-ts))}
+  /* the pause menu is a list of six one-line buttons — in landscape
+     that list is two columns, or it scrolls for no reason */
+  .w-pause{width:min(520px,70vw);max-height:94vh;overflow-y:auto;
+    display:grid;grid-template-columns:1fr 1fr;align-content:start;
+    gap:calc(8px * var(--w-ts));padding:calc(14px * var(--w-ts)) calc(17px * var(--w-ts))}
+  .w-pause>.brand{grid-column:1 / -1;flex-direction:row;justify-content:center;
+    align-items:center;gap:calc(13px * var(--w-ts));margin-bottom:0}
+  .w-pause>.brand .wm{font-size:calc(21px * var(--w-ts))}
+  .w-pause>.brand+div{grid-column:1 / -1;margin:0 !important}
+
+  /* ---------- the phone stops being a phone shape ---------- */
+  .w-phone{width:min(660px,84vw);height:min(560px,94vh);
+    border-radius:calc(26px * var(--w-ts));padding:calc(7px * var(--w-ts))}
+  .w-screen{border-radius:calc(20px * var(--w-ts))}
+  .w-status{padding:calc(7px * var(--w-ts)) calc(20px * var(--w-ts)) calc(3px * var(--w-ts))}
+  .w-appbar{padding:calc(1px * var(--w-ts)) calc(15px * var(--w-ts)) calc(4px * var(--w-ts));
+    min-height:calc(24px * var(--w-ts))}
+  .w-apps{grid-template-columns:repeat(5,1fr);gap:calc(9px * var(--w-ts))}
+  .w-app .tile{width:calc(50px * var(--w-ts));height:calc(50px * var(--w-ts));
+    border-radius:calc(15px * var(--w-ts))}
+  .w-home-ind{height:calc(11px * var(--w-ts))}
+
+  /* ---------- dialogue: clear of both thumbs ---------- */
+  .w-dlg{width:min(600px,76vw);
+    bottom:calc(max(10px,env(safe-area-inset-bottom)) + 8px)}
+  .w-dlg-in{gap:calc(12px * var(--w-ts));
+    padding:calc(11px * var(--w-ts)) calc(16px * var(--w-ts)) calc(10px * var(--w-ts))}
+  .w-dlg-por{width:calc(52px * var(--w-ts));height:calc(52px * var(--w-ts))}
+  .w-dlg-tx{font-size:calc(14px * var(--w-ts));line-height:1.44;margin-top:calc(4px * var(--w-ts))}
+  .w-dlg-ch{padding:0 calc(16px * var(--w-ts)) calc(11px * var(--w-ts))}
+  .w-dlg-more{padding:0 calc(16px * var(--w-ts)) calc(10px * var(--w-ts))}
+  /* WITH THE PAD UP, THE CARD LIFTS OFF THE FLOOR. Bottom-centre is
+     the floor, and in landscape the floor is a thumbstick on the
+     left and an action row on the right. The card clears the tallest
+     of them (the interact button, 95 px up) and narrows so its ends
+     stay inside them; it stays CENTRED, because a dialogue that
+     slides sideways when the controls appear reads as a bug. */
+  .w-touch-on .w-dlg{width:min(560px,62vw);
+    bottom:calc(max(9px,env(safe-area-inset-bottom)) + 104px)}
+
+  /* ---------- the ending ---------- */
+  .w-endroot{gap:calc(9px * var(--w-ts));padding:2vh 4vw}
+  .w-endhead .big span{font-size:calc(26px * var(--w-ts))}
+  .w-endcard{gap:calc(10px * var(--w-ts));width:min(660px,80vw)}
+  .w-endpaper{padding:calc(13px * var(--w-ts)) calc(18px * var(--w-ts)) calc(14px * var(--w-ts))}
+  .w-endtx{font-size:calc(13.6px * var(--w-ts));line-height:1.5;margin-top:calc(9px * var(--w-ts))}
+  .w-endlinks{margin-top:calc(11px * var(--w-ts))}
 }
 `;
 }

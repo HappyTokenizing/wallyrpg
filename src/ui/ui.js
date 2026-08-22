@@ -4,10 +4,14 @@
    Layers (both already in index.html, both pointer-events:none —
    only the interactive children opt back in with .w-pe):
 
-     #ui        the always-on HUD: pills, objective strip, toasts,
-                banners, world-space prompts, key hints
+     #ui        the always-on HUD: pills, objective strip, banners,
+                world-space prompts, key hints
      #overlay   the modal stack: scrim, phone, sheets, pause,
                 and the dialogue card above all of it
+     .w-notify  ui/notify.js — achievements and toasts, on <body> at
+                z-index 25, ABOVE the modal stack. Nothing the player
+                is told may be delivered underneath a sheet.
+     .w-endroot ui/ending.js — Happy's ending, on 'game:complete'.
 
    ------------------------------------------------------------
    PUBLIC API — ctx.ui
@@ -34,7 +38,8 @@
    ctx.cam.warp(), behind a 180/260 ms fade. See the ARRIVAL block.
 
    DEBUG: WALLY.debug.ui(name), WALLY.debug.uiAll(),
-          WALLY.debug.travel(loc, mode), WALLY.debug.arrive(loc)
+          WALLY.debug.travel(loc, mode), WALLY.debug.arrive(loc),
+          WALLY.debug.landscape(on) / WALLY.debug.orient()
    ============================================================ */
 
 import { clamp } from '../core/contracts.js';
@@ -44,6 +49,9 @@ import { createDialogue } from './dialogue.js';
 import { createPhone } from './phone.js';
 import { createMenus } from './menus.js';
 import { createTouch, shouldEnable } from './touch.js';
+import { createOrient } from './orient.js';
+import { createNotify } from './notify.js';
+import { createEnding } from './ending.js';
 
 /* which musical context each district wants */
 const ZONE_AUDIO = {
@@ -100,6 +108,13 @@ export async function init(ctx) {
   const phone = createPhone(ctx, uiRef);
   const menus = createMenus(ctx, uiRef);
   const touch = createTouch(ctx, uiRef);
+  /* No DOM of its own: the optional landscape lock, and the honest
+     account of whether this browser can actually hold one. */
+  const orient = createOrient(ctx, uiRef);
+  /* Both of these parent themselves to <body>, ABOVE #overlay — see
+     the header. They are deliberately not children of #ui. */
+  const notify = createNotify(ctx, uiRef);
+  const ending = createEnding(ctx, uiRef);
 
   uiRoot.append(hud.root);
   uiRoot.append(touch.root);        // above the HUD, below the modal stack
@@ -291,6 +306,15 @@ export async function init(ctx) {
     transition: `opacity ${FADE_OUT_MS}ms ease-out`,
   });
   document.body.append(curtain);
+
+  /* A NOTIFICATION BEHIND THE TRAVEL CURTAIN HAS NOT BEEN SEEN.
+     The curtain is opaque black over the whole frame at z-index 60,
+     which is above the notification layer, so anything presenting
+     during a fast travel is invisible for 350 ms of its life — and a
+     short toast could spend most of itself in there. The clock stops
+     until the black lifts. Same predicate covers the boot screen,
+     which notify.js checks on its own. */
+  notify.obscuredBy(() => curtain.style.opacity !== '0');
 
   /* An arrival that has faded out but not yet landed. */
   let armed = null;      // {locId, p, t}
@@ -685,8 +709,41 @@ export async function init(ctx) {
     vignette.style.display = on ? 'none' : '';
   };
 
-  const toast = (text, kind = 'info') => { hud.toast(text, kind); return api; };
-  const banner = (title, sub) => { hud.banner(title, sub); sfx('chime'); return api; };
+  /* ------------------------------------------------------------
+     SAYING SOMETHING TO THE PLAYER
+
+     Every route ends in notify.js, which draws above the modal stack
+     and counts its dismissal clocks only while the layer is actually
+     being looked at. Nothing here writes into #ui any more.
+     ------------------------------------------------------------ */
+  const toast = (text, kind = 'info') => { notify.toast(text, kind); return api; };
+
+  /* THE TITLE CARD IS NOT ALWAYS THE RIGHT SHAPE.
+
+     hud.banner() is a 20 px letterspaced card at 14vh, inside #ui —
+     which is under the scrim. Fired while a sheet is open it used to
+     be invisible AND still time out. Showing it on top instead would
+     be worse: a full-width title slab over the card the player is
+     reading. So a banner raised while anything modal is open becomes
+     an achievement plaque carrying the same two lines, in the band
+     that exists for exactly this, and the title card is kept for the
+     moments it was designed for — an empty screen. */
+  const banner = (title, sub) => {
+    if (api.modal || dlg.isOpen) {
+      notify.achievement({
+        eyebrow: title, title: sub || String(title), icon: 'spark',
+        kind: 'token', life: 7,
+        /* state.js's mutate.banner() raises a note alongside every
+           banner, worded `title · sub`. The plaque IS that sentence,
+           so the receipt underneath it goes. */
+        replaces: sub ? title + ' · ' + sub : String(title),
+      });
+      return api;
+    }
+    hud.banner(title, sub);
+    sfx('chime');
+    return api;
+  };
 
   /* ------------------------------------------------------------
      the public object
@@ -727,6 +784,12 @@ export async function init(ctx) {
       return api;
     },
     toast, banner,
+    /** The notification centre. Above every panel; see notify.js. */
+    notify,
+    /** achievement({title, sub, eyebrow, icon, kind}) — the heavy tier. */
+    achievement: (spec) => { notify.achievement(spec); return api; },
+    /** Happy's ending. Opened by 'game:complete', never by a button. */
+    ending,
     dialogue(spec) { return dlg.open(spec || sampleDialogue()); },
     prompt(text, worldPos, opts = {}) {
       if (!text) { hud.removePrompt(opts.id || 'ui'); return null; }
@@ -793,6 +856,17 @@ export async function init(ctx) {
       if (s) s.touch = !!on;
       return api;
     },
+
+    /* --- landscape play (ui/orient.js) --- */
+    /** mode / handheld / status() / onChange() — what this browser
+        can honestly promise about holding the phone sideways. */
+    orient,
+    /** Flip the optional landscape lock. Persists in settings.
+        MUST be reached synchronously from a user gesture: fullscreen
+        and the orientation lock are both gated on user activation,
+        and one yield in front of this call loses both. Returns the
+        promise so a tool can await the real outcome. */
+    setLandscape(on) { return orient.setEnabled(on); },
     /** Park an input source to restore whenever the modal stack empties. */
     setBaseInput,
 
@@ -808,6 +882,10 @@ export async function init(ctx) {
       /* Before the visibility gate: a cinematic that hides the HUD must
          not strand a half-landed arrival behind a black screen. */
       tickArrival(dt);
+      /* Also before it, and for the same reason inverted: the
+         notification layer is NOT inside #ui, so it has to be told
+         when the interface is away. It stops its clocks itself. */
+      notify.update(dt);
       /* the race runs whether or not the HUD is showing: a cinematic
          must not silently stop the clock the result is judged on */
       raceTick(dt);
@@ -819,7 +897,8 @@ export async function init(ctx) {
     dispose() {
       flushArrival();
       closeAll();
-      hud.dispose(); dlg.dispose(); phone.dispose(); touch.dispose();
+      hud.dispose(); dlg.dispose(); phone.dispose(); touch.dispose(); orient.dispose();
+      notify.dispose(); ending.dispose();
       scrim.remove(); panels.remove(); film.remove(); vignette.remove();
       curtain.remove();
       for (const off of subs) off();
@@ -887,11 +966,36 @@ export async function init(ctx) {
 
   on('note', (n) => toast(n.text, n.kind));
   on('banner', (b) => banner(b.title, b.sub));
-  on('msg', (m) => { toast('Message from ' + m.from, 'token'); sfx('ui.toast'); });
+  on('msg', (m) => toast('Message from ' + m.from, 'token'));
   on('tip', (t) => api.dialogue({ speaker: t.title, role: 'A note for you', text: t.text, portrait: 'wally' }));
+
+  /* QUESTS ARE THE ACHIEVEMENT TIER.
+     quests.js fires a plain note AND a 'quest' event for one act, so
+     `replaces` drops the toast wherever it is — queued or already on
+     screen — and the plaque carries the moment instead. A milestone
+     is not doubled here: it already raises its own banner through
+     mutate.banner(), which becomes a plaque by itself whenever
+     anything modal is open. */
   on('quest', (q) => {
-    if (q.kind === 'complete') sfx('quest.done');
-    else if (q.kind === 'milestone') sfx('fanfare');
+    if (!q) return;
+    if (q.kind === 'complete') {
+      sfx('quest.done');
+      notify.achievement({
+        eyebrow: 'Quest complete', title: q.title, icon: 'trophy',
+        kind: 'token', sound: null, replaces: q.title,
+      });
+    } else if (q.kind === 'side:complete') {
+      notify.achievement({
+        eyebrow: 'Favour returned', title: q.title, icon: 'check',
+        kind: 'good', sub: q.from ? 'for ' + q.from : '',
+        sound: 'quest.done', replaces: q.title,
+      });
+    } else if (q.kind === 'side:start') {
+      notify.promote(q.title);
+      toast('New: ' + q.title, 'token');
+    } else if (q.kind === 'milestone') {
+      sfx('fanfare');
+    }
     hud.refresh(true);
   });
   on('unlock', (u) => { if (u && !u.quiet) sfx('unlock'); });
@@ -947,12 +1051,37 @@ export async function init(ctx) {
     }
     hud.refresh(true);
   });
-  on('endgame', () => api.dialogue({
-    speaker: 'The City', role: 'Bull Bear City',
-    text: ['Every asset. Every field, every seam, every seat in that stadium — connected, and held by the people who live beside them.',
-           'You did that on a squeaky bicycle. Thank you, Wally.'],
-    choices: [{ label: 'Keep playing', value: null, kind: 'prim' }],
-  }));
+  /* ============================================================
+     THE TWO ENDINGS (quests.js)
+
+     'city:tokenized'  all 69 assets carry a token. It can land with
+                       quests still open — q_city is the 23rd of 24 —
+                       so it is a celebration, not an ending. The
+                       milestone table already raises the 100 %
+                       banner; this adds the plaque that says which
+                       69 and how far that is.
+     'game:complete'   EVERYTHING is finished. Happy turns up and
+                       says the last line in the game. See ending.js.
+
+     The old 'endgame' listener lived here and put two placeholder
+     lines from "The City" into an ordinary dialogue card — the same
+     box a shopkeeper uses, and wired to the 100 % event rather than
+     to completion. Both halves of that are now fixed; 'endgame' is
+     left alone deliberately, because quests.js still emits it as a
+     legacy alias of 'city:tokenized' and listening to both would
+     celebrate the same moment twice.
+     ============================================================ */
+  on('city:tokenized', (p) => {
+    sfx('fanfare');
+    notify.achievement({
+      eyebrow: 'The whole city',
+      title: (p?.total || 69) + ' of ' + (p?.total || 69) + ' assets tokenized',
+      sub: 'Every field, every seam, every seat in that stadium.',
+      icon: 'city', kind: 'token', life: 9, sound: null,
+    });
+    hud.refresh(true);
+  });
+  on('game:complete', (p) => { ending.open(p || {}); });
   on('ready:game', () => {
     hud.refresh(true);
     const st = ctx.game?.state;
@@ -974,6 +1103,10 @@ export async function init(ctx) {
      one-shot touchstart listener, so a hybrid laptop grows controls
      the moment a finger lands on it and never before. */
   if (shouldEnable(ctx)) touch.setEnabled(true);
+  /* Landscape play, if the player left it on last time. An
+     orientation lock cannot be retaken without a gesture, so this
+     arms one rather than pretending; see ui/orient.js boot(). */
+  orient.boot();
   /* audio boots after us — apply the saved mix once it exists */
   on('ready', () => {
     if (!ctx.audio || !S) return;
@@ -1066,6 +1199,17 @@ export async function init(ctx) {
       return touch.demo(nx, ny);
     };
     d.touchState = () => ({ enabled: touch.enabled, active: touch.active, ...touch.axes });
+    /* --- landscape play, for the verifier and tools/shot.mjs ---
+       Drives exactly the path the switch drives, minus the finger.
+       Returns the PROMISE so the harness sees the real outcome:
+       headless Chrome refuses both fullscreen and the lock, and
+       `{locked:false, why:'nofullscreen'}` is the honest answer the
+       settings row then has to print. */
+    d.landscape = (on) => (on === undefined
+      ? Promise.resolve(orient.status())
+      : api.setLandscape(on).then(() => orient.status()));
+    /** The capability report, with nothing changed. */
+    d.orient = () => orient.status();
     /* --- travel, for the arrival screenshots and tools/traveltest.mjs --- */
     /** Full fast travel: fare, clock, state AND the arrival. */
     d.travel = (loc, mode = 'train') => {
@@ -1093,6 +1237,85 @@ export async function init(ctx) {
     d.uiMap = (loc) => { closeAll(); api.openMap(loc); return loc || 'map'; };
     d.uiDest = (loc) => setDestination(loc);
     d.uiToast = (t, k) => { toast(t || 'Toast', k || 'info'); return true; };
+
+    /* ============================================================
+       THE NOTIFICATION LAYER, AND THE CASE IT EXISTS FOR
+
+       achievementOverModal(what) opens the panels that used to bury
+       a notification and then fires one on top of them:
+
+         'phone'     the phone
+         'dialogue'  a speaker card
+         'stack'     two sheets, one over the other
+         'all'       two sheets AND a dialogue (the default)
+         'none'      nothing open, the plain HUD case
+
+       It then FREEZES the dismissal clock, because the screenshot
+       harness waits 12 s between the --eval and the shutter and the
+       point of the shot is what the player sees, not what is left of
+       it twelve seconds later. Freezing is the same code path the
+       layer uses whenever it is obscured.
+       ============================================================ */
+    d.achievementOverModal = (what = 'all') => {
+      api.setVisible(true);
+      closeAll();
+      dlg.close(null);
+      notify.clear();
+      notify.freeze(false);
+      if (what === 'phone' || what === 'all') openPhone(null);
+      if (what === 'stack' || what === 'all') {
+        pushSheet(menus.travel('trunkdepot'));
+        openPlace('bazaar');
+      }
+      if (what === 'dialogue' || what === 'all') api.dialogue(sampleDialogue());
+      notify.achievement({
+        eyebrow: 'Quest complete', title: 'Tokenize the Strawberry Field',
+        sub: '3% of the city is connected', icon: 'trophy', kind: 'token',
+      });
+      toast('+$1,240 · Mabel paid up', 'money');
+      toast('Discovered Wally Tower', 'token');
+      toast('Reputation 74 · the Exchange is watching', 'info');
+      /* one frame to lay it out, then stop the clock where it stands */
+      notify.update(0);
+      setTimeout(() => notify.freeze(true), 900);
+      return { open: api.panels, dialogue: dlg.isOpen, notify: notify.state() };
+    };
+    d.uiAchievement = (title, sub) => {
+      notify.achievement({ title: title || 'Tokenize the Strawberry Field', sub });
+      return notify.state();
+    };
+    d.notify = () => notify.state();
+    d.notifyFreeze = (on) => notify.freeze(on !== false);
+    d.notifyClear = () => { notify.clear(); return notify.state(); };
+
+    /* ---- HAPPY'S ENDING ----
+       ending() finishes the game FOR REAL — every asset tokenized,
+       every main quest, every side quest — so quests.js fires
+       'game:complete' through its own gate and the card is filled
+       from the true payload rather than from a fixture. */
+    d.ending = () => {
+      api.setVisible(true);
+      closeAll();
+      dlg.close(null);
+      const c = ctx.game?.debug?.completeGame?.();
+      if (!ending.isOpen) ctx.game?.debug?.fireComplete?.(true);
+      return { open: ending.isOpen, complete: c?.complete, links: ending.links() };
+    };
+    /** Pose the card from the data table alone — no state change. */
+    d.endingCard = () => {
+      const d2 = ctx.game?.data?.happyEnding || {};
+      ending.close();
+      ending.open({ ...d2, day: ctx.game?.state?.day });
+      return ending.links();
+    };
+    d.endingClose = () => ending.close();
+    /** What the verifier asserts: the anchors, and the line verbatim. */
+    d.endingLinks = () => ({
+      open: ending.isOpen,
+      links: ending.links(),
+      spoken: ending.spoken(),
+      verbatim: ending.spoken() === (ctx.game?.data?.happyEnding?.text || ''),
+    });
     d.uiBanner = (t, s) => { banner(t || 'TOKENIZED', s || '3% of the city is connected'); return true; };
     d.uiPrompt = (t) => { demoPrompt(t); return true; };
     d.uiHide = () => { closeAll(); dlg.close(null); return true; };

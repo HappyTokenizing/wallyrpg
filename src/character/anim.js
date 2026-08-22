@@ -28,10 +28,11 @@
    and the locomotion blend itself is continuous in speed.
    ============================================================ */
 
-import { BONE_INDEX, BONES } from './rig.js';
+import { BONE_INDEX, BONES, PROP, bindWorld } from './rig.js';
 import { clamp, smoothstep, damp } from '../core/contracts.js';
 
 const D2R = Math.PI / 180;
+const R2D = 180 / Math.PI;
 const NB = BONES.length;
 const TAU = Math.PI * 2;
 
@@ -85,6 +86,396 @@ class Writer {
 }
 
 const sin = Math.sin, cos = Math.cos;
+
+/* ==================================================================
+   THE GAIT SOLVER — walk, run and sprint are one function.
+
+   WHY THIS IS BUILT BACKWARDS FROM THE FOOT.
+
+   The clip this replaces drove the thigh with a cosine and let the foot
+   land wherever the arithmetic put it. On a 0.42 m leg a 24-degree
+   cosine buys about 0.32 m of foot travel, while `cycle` told the phase
+   integrator the stride was 1.34 m — so the planted foot skated forward
+   at HALF of ground speed, and the only way to hide that was to keep the
+   stride tiny. That is the shuffle: both legs near vertical, no contact
+   pose, no passing pose, no weight.
+
+   Here the ANKLE PATH is the thing that is authored:
+
+     STANCE   a straight line moving backward at exactly ground speed,
+              corrected by the foot's own roll (see `rollGain`)
+     SWING    a Hermite arc whose end tangents MATCH the stance line, so
+              the foot is already travelling backward at ground speed on
+              the frame it touches down and there is no contact skid
+
+   The thigh, knee and ankle angles are then whatever two-bone IK needs
+   to reach that path, and `cycle` — metres of ground per gait cycle — is
+   DERIVED from the path rather than tuned against it. "The foot does not
+   slide" is therefore a property of the construction, not a setting.
+
+   THE PELVIS HEIGHT IS ALSO SOLVED, NOT KEYED. His legs are 0.42 m long
+   and his hip sits 0.535 m over the sole: in bind the leg is DEAD
+   STRAIGHT, so it has no reach to spend on a stride until the pelvis
+   comes down. `hipCeiling` is the highest the pelvis can be and still
+   let both feet touch their targets with a knee left in the leg; the
+   real bob falls out of it — deepest just after each contact, highest at
+   each passing — which is exactly the DOWN and UP of the four key poses.
+   ================================================================== */
+
+const _hipsW = bindWorld('hips');
+const _hipJW = bindWorld('legL0');
+const _kneeW = bindWorld('legL1');
+const _ankW = bindWorld('footL');
+
+const GAIT_T = Math.hypot(_kneeW[0] - _hipJW[0], _kneeW[1] - _hipJW[1], _kneeW[2] - _hipJW[2]);
+const GAIT_S = Math.hypot(_ankW[0] - _kneeW[0], _ankW[1] - _kneeW[1], _ankW[2] - _kneeW[2]);
+const LEG_MAX = GAIT_T + GAIT_S;
+const LEG_MIN = Math.abs(GAIT_T - GAIT_S) + 0.03;
+
+/* the hip joint in the pelvis bone's own frame */
+const HIPJ_X = _hipJW[0] - _hipsW[0];
+const HIPJ_Y = _hipJW[1] - _hipsW[1];
+const HIPJ_Z = _hipJW[2] - _hipsW[2];
+
+/* the sole plane, and everything measured off it */
+const SOLE_Y = PROP.foot.c[1] - PROP.foot.h[1] - PROP.foot.r;
+const ANK_H = _ankW[1] - SOLE_Y;                                  // ankle over the sole
+const HEEL_Z = PROP.foot.c[2] - PROP.foot.h[2] - PROP.foot.r;     // heel, ankle-relative
+const TOE_Z = PROP.foot.c[2] + PROP.foot.h[2] + PROP.foot.r;      // toe,  ankle-relative
+const STANCE_X = _ankW[0];                                        // half the stance width
+const HIPS_Y = _hipsW[1] - SOLE_Y;                                // pelvis bone over the sole
+
+/** Ankle height that puts the lowest point of the sole exactly on the
+ *  ground for a given foot pitch. Positive pitch = toe down, so the toe
+ *  is the low point; negative = heel down. This is the whole of the foot
+ *  roll: heel strike, flat, heel off, toe off all come out of it. */
+function soleH(th) {
+  return ANK_H * cos(th) + (th < 0 ? HEEL_Z : TOE_Z) * sin(th);
+}
+
+/** Foot pitch, radians, positive = plantarflexion (toe down).
+ *  strike -> flat -> hold -> heel off -> toe off -> swing -> strike. */
+function footPitch(p, G) {
+  if (p < G.beta) {
+    const u = p / G.beta;
+    if (u < G.flat) return G.strike * (1 - smoothstep(0, G.flat, u));
+    if (u < G.rise) return 0;
+    return G.toeOff * smoothstep(G.rise, 1, u);
+  }
+  const u = (p - G.beta) / (1 - G.beta);
+  const a = G.toeOff + (G.swing - G.toeOff) * smoothstep(0, 0.42, u);
+  return a + (G.strike - a) * smoothstep(0.46, 1, u);
+}
+
+const ROLL_N = 72;
+
+/** Resolve a gait config: integrate the roll, derive the stride, cache
+ *  the stance table and the Hermite tangents. Runs once per gait. */
+function buildGait(G) {
+  /* ---- roll gain -------------------------------------------------
+     A rolling foot is a wheel: while the pitch changes by dTheta about a
+     pivot that is `soleH` below the ankle, the ankle itself travels
+     soleH * dTheta FORWARD over that pivot. Integrated across the
+     stance this is worth ~0.13 m on a 0.42 m leg — a third of the whole
+     stride, bought for free by not keeping the foot flat. It is also
+     why the trailing leg does not have to reach absurdly far back. */
+  const roll = new Float64Array(ROLL_N + 1);
+  let acc = 0, prev = footPitch(0, G);
+  for (let i = 1; i <= ROLL_N; i++) {
+    const th = footPitch((i / ROLL_N) * G.beta, G);
+    acc += soleH((th + prev) * 0.5) * (th - prev);
+    roll[i] = acc;
+    prev = th;
+  }
+  G.rollTab = roll;
+  /* metres of ground covered while one foot is down, and hence the
+     cycle: two of those, back to back. */
+  G.travel = G.zf - G.zb + acc;
+  G.cycle = G.travel / G.beta;
+  /* stance tangents in swing-parameter units, damped by `whip` so the
+     foot trails after toe-off and whips through instead of pinging */
+  const h = 1 / ROLL_N;
+  const zAt = (u) => {
+    const f = clamp(u, 0, 1) * ROLL_N;
+    const i = Math.min(ROLL_N - 1, Math.floor(f)), t = f - i;
+    return G.zf - G.travel * clamp(u, 0, 1) + roll[i] * (1 - t) + roll[i + 1] * t;
+  };
+  G.zAt = zAt;
+  const k = (1 - G.beta) / G.beta * G.whip;
+  G.m0 = (zAt(1) - zAt(1 - h)) / h * k;     // leaving the ground
+  G.m1 = (zAt(h) - zAt(0)) / h * k;         // arriving at it
+  /* the mean pelvis height this gait will actually settle at, once the
+     reach ceiling has had its say — the head's counter-bob is measured
+     against it, and a keyed guess would be wrong by the whole bob */
+  const reach = LEG_MAX * (1 - G.slack);
+  let sum = 0;
+  for (let i = 0; i < 32; i++) {
+    const ph = i / 32;
+    const pl = ph, pr = (ph + 0.5) % 1;
+    ankleAt(pl, G, _fl); ankleAt(pr, G, _fr);
+    const c = Math.min(hipCeiling(1, STANCE_X, _fl[1], _fl[0], 0, 0, reach),
+      hipCeiling(-1, -STANCE_X, _fr[1], _fr[0], 0, 0, reach));
+    sum += Math.min(G.hipY, c);
+  }
+  G.hipMean = sum / 32;
+  return G;
+}
+
+/** The ankle, in the root's frame, for one leg at phase p. */
+function ankleAt(p, G, out) {
+  const th = footPitch(p, G);
+  if (p < G.beta) {
+    out[0] = G.zAt(p / G.beta);
+    out[1] = soleH(th);
+  } else {
+    const u = (p - G.beta) / (1 - G.beta);
+    const u2 = u * u, u3 = u2 * u;
+    out[0] = (2 * u3 - 3 * u2 + 1) * G.zb + (u3 - 2 * u2 + u) * G.m0
+           + (-2 * u3 + 3 * u2) * G.zf + (u3 - u2) * G.m1;
+    /* the arc: clearance over whatever the pitch alone would give, so
+       the ends stitch to the stance exactly */
+    const s = Math.pow(u, 0.72);
+    out[1] = soleH(th) + G.lift * sin(Math.PI * s);
+  }
+  out[2] = th;
+  return out;
+}
+
+/* scratch — module scope, never allocated per frame */
+const _M = new Float64Array(9);
+const _fl = new Float64Array(3);
+const _fr = new Float64Array(3);
+const _d = new Float64Array(3);
+
+/** R = Rx * Ry * Rz, the order THREE.Euler('XYZ') composes in. */
+function pelvisMat(rx, ry, rz, M) {
+  const cx = cos(rx), sx = sin(rx), cy = cos(ry), sy = sin(ry), cz = cos(rz), sz = sin(rz);
+  M[0] = cy * cz;               M[1] = -cy * sz;              M[2] = sy;
+  M[3] = cx * sz + sx * sy * cz; M[4] = cx * cz - sx * sy * sz; M[5] = -sx * cy;
+  M[6] = sx * sz - cx * sy * cz; M[7] = sx * cz + cx * sy * sz; M[8] = cx * cy;
+}
+/** d = R^T * (t - p) - hipOffset : the ankle target in the hip's frame.
+ *  `sgn` is +1 for his left hip, -1 for his right; only x mirrors. */
+function toHip(M, sgn, px, py, pz, tx, ty, tz, d) {
+  const ax = tx - px, ay = ty - py, az = tz - pz;
+  d[0] = M[0] * ax + M[3] * ay + M[6] * az - sgn * HIPJ_X;
+  d[1] = M[1] * ax + M[4] * ay + M[7] * az - HIPJ_Y;
+  d[2] = M[2] * ax + M[5] * ay + M[8] * az - HIPJ_Z;
+}
+
+/** Highest the pelvis bone may sit OVER THE SOLE PLANE and still let this
+ *  foot reach its target, with `slack` of the leg held in reserve so the
+ *  knee never locks dead straight. `ankY` is sole-relative too. */
+function hipCeiling(sgn, footX, ankY, ankZ, swayX, surgeZ, reach) {
+  const dx = footX - (_hipsW[0] + swayX) - sgn * HIPJ_X;
+  const dz = ankZ - (_hipsW[2] + surgeZ) - HIPJ_Z;
+  const v = reach * reach - dx * dx - dz * dz;
+  return ankY - HIPJ_Y + (v > 1e-4 ? Math.sqrt(v) : 0.01);
+}
+
+/**
+ * One frame of gait. Writes legs, pelvis, spine, arms and head.
+ *
+ * THE FOUR KEY POSES ARE NOT KEYED ANYWHERE IN HERE, and that is the
+ * point: CONTACT is where the ankle path starts, DOWN is where the reach
+ * ceiling pulls the pelvis to its lowest a beat later, PASSING is where
+ * the swing arc carries the foot under the hip with the knee at its
+ * deepest, and UP is where the ceiling releases and the pelvis rides
+ * over the straight support leg. Author the foot and the four poses are
+ * consequences; key the four poses and the foot slides.
+ */
+function gait(ph, w, s, G) {
+  const a = ph * TAU;
+  const sw = sin(a), cs = cos(a);
+
+  /* ---- pelvis attitude -------------------------------------------
+     Three separate things, and the walk was missing all three:
+       sway   the pelvis slides on to the supporting foot, or the mass
+              is not over the leg carrying it
+       roll   the SWINGING side's hip drops away — the pelvic list that
+              makes a walk look like it costs something
+       yaw    the pelvis counter-rotates against the ribcage, which is
+              also worth ~0.02 m of free stride at each hip */
+  const swayX = G.sway * sw;
+  const rollZ = G.pelvisRoll * sw * D2R;
+  const yawY = -G.pelvisYaw * cs * D2R;
+  const pitchX = G.lean * D2R;
+  /* a small fore/aft surge, twice a cycle, so the pelvis leads the push */
+  const surgeZ = G.surge * cos(2 * a);
+
+  /* nominal bob; `lowAt` puts the low point where the gait wants it —
+     just after contact for a walk, at mid-stance for a run */
+  const bobT = 0.5 + 0.5 * cos(2 * TAU * (ph - G.lowAt));
+  let hipY = G.hipY - G.drop * bobT;
+
+  /* ---- feet ---- */
+  const pL = ph - Math.floor(ph);
+  const pR = (ph + 0.5) - Math.floor(ph + 0.5);
+  ankleAt(pL, G, _fl);
+  ankleAt(pR, G, _fr);
+  /* the swing foot passes closer to the midline than it plants */
+  const inL = G.pass * clamp((pL - G.beta) / (1 - G.beta), 0, 1) * (1 - clamp((pL - G.beta) / (1 - G.beta), 0, 1)) * 4;
+  const inR = G.pass * clamp((pR - G.beta) / (1 - G.beta), 0, 1) * (1 - clamp((pR - G.beta) / (1 - G.beta), 0, 1)) * 4;
+  const xL = STANCE_X - inL;
+  const xR = -STANCE_X + inR;
+
+  /* ---- and the pelvis height they will actually allow ---- */
+  const reach = LEG_MAX * (1 - G.slack);
+  const cL = hipCeiling(1, xL, _fl[1], _fl[0], swayX, surgeZ, reach);
+  const cR = hipCeiling(-1, xR, _fr[1], _fr[0], swayX, surgeZ, reach);
+  const ceil = Math.min(cL, cR);
+  /* SOFT min. A hard one puts a corner in the bob on every changeover
+     between which leg is the binding one, and a corner in a height curve
+     reads as a hitch in the step. */
+  const kk = 0.011;
+  hipY = Math.min(hipY, ceil) - kk * Math.log(1 + Math.exp(-Math.abs(hipY - ceil) / kk));
+  /* THE WEIGHT SETTLE, and it is subtracted AFTER the ceiling on purpose.
+     Geometry gives him a ~20 mm bob, which is what a 0.42 m leg is worth
+     and is correct and invisible. The settle is the animator's thumb on
+     it: an extra sink through the frames just after each contact, where
+     the mass arrives. Taking the pelvis DOWN can never break a foot
+     contact — the IK below simply re-solves to the same targets — so
+     this is free, whereas exaggerating the rise would put a foot in
+     the air. */
+  hipY -= G.settle * bobT * bobT;
+
+  const py = SOLE_Y + hipY;
+  w.p('hips', swayX, py - _hipsW[1], surgeZ);
+  w.r('hips', pitchX * R2D, yawY * R2D, rollZ * R2D);
+
+  pelvisMat(pitchX, yawY, rollZ, _M);
+
+  /* ---- two-bone IK, both legs ---- */
+  const solve = (sd, sgn, fx, f) => {
+    toHip(_M, sgn, _hipsW[0] + swayX, py, _hipsW[2] + surgeZ, fx, SOLE_Y + f[1], f[0], _d);
+    let r = Math.hypot(_d[0], _d[1], _d[2]);
+    if (r < 1e-5) return;
+    const rc = clamp(r, LEG_MIN, LEG_MAX * 0.9995);
+    const abd = Math.asin(clamp(_d[0] / r, -1, 1));
+    const aim = Math.atan2(-_d[2], -_d[1]);
+    const A = Math.acos(clamp((GAIT_T * GAIT_T + rc * rc - GAIT_S * GAIT_S) / (2 * GAIT_T * rc), -1, 1));
+    const K = Math.acos(clamp((GAIT_T * GAIT_T + GAIT_S * GAIT_S - rc * rc) / (2 * GAIT_T * GAIT_S), -1, 1));
+    const thigh = aim - A;
+    const knee = Math.PI - K;
+    w.r(`leg${sd}0`, thigh * R2D, 0, abd * R2D);
+    w.r(`leg${sd}1`, knee * R2D, 0, 0);
+    /* the ankle carries the roll: whatever is left after the leg */
+    w.r(`foot${sd}`, (f[2] - thigh - knee - pitchX) * R2D, -yawY * R2D * 0.55, -abd * R2D * 0.55);
+  };
+  solve('L', 1, xL, _fl);
+  solve('R', -1, xR, _fr);
+
+  /* ---- spine: the ribcage opposes the pelvis --------------------
+     These are LOCAL angles on a chain that already carries the pelvis,
+     so the sum has to overshoot to land the shoulders on the far side
+     of zero — that is what makes it a counter-swing and not a lag. */
+  const cw = G.counter;
+  w.r('spine', G.spineX * 0.45, -yawY * R2D * (0.55 + cw * 0.45), -rollZ * R2D * 0.55);
+  w.r('chest', G.spineX * 0.55, -yawY * R2D * (0.55 + cw * 0.85), -rollZ * R2D * 0.75);
+
+  /* ---- head: level, with a counter-bob against the pelvis ---- */
+  const bobV = hipY - G.hipMean;
+  w.r('head', G.headX + bobV * 40, yawY * R2D * 0.55, rollZ * R2D * 0.35);
+  w.p('head', 0, -bobV * 0.22, 0);
+
+  /* ---- arms: opposition, lagging the legs, elbow soft on the back
+     swing so it is a limb and not a pendulum ---- */
+  const al = cos(a - G.armLag * TAU);
+  const zOut = G.armOut - G.armOutSwing * al;
+  w.r('armL0', G.arm * al + G.armBias, 0, zOut);
+  w.r('armR0', -G.arm * al + G.armBias, 0, -zOut);
+  w.r('armL1', -(G.elbow + G.elbowSwing * clamp(al, 0, 1)), 0, -G.elbowOut);
+  w.r('armR1', -(G.elbow + G.elbowSwing * clamp(-al, 0, 1)), 0, G.elbowOut);
+  w.r('handL', G.hand, 0, -G.handOut);
+  w.r('handR', G.hand, 0, G.handOut);
+}
+
+/* ------------------------------------------------------------------
+   The three gaits.
+
+   `zf` / `zb` are how far forward the ankle is at heel strike and how
+   far back it is at toe-off; `beta` is the fraction of the cycle the
+   foot is down. Everything about the stride — its length, its cadence,
+   its cycle in metres — follows from those three and the foot roll.
+
+   A RUN IS NOT A FAST WALK. Its numbers say so: `beta` drops under a
+   half so both feet leave the ground, `zf`/`zb` grow, the pelvis sits
+   lower and its bob turns over (low at MID-STANCE, where a runner's
+   knee absorbs, instead of low at contact where a walker's does), and
+   the trunk pitches into it.
+   ------------------------------------------------------------------ */
+const GAITS = {
+  /* A SLOW WALK IS ITS OWN RUNG, and it is not a nicety. The ladder used
+     to run idle -> walk with nothing between, so 1.0 m/s — which is
+     exactly what a half-deflected touch stick holds — resolved to 43%
+     walk blended with 57% of a STANDING POSE. A standing pose has feet
+     that do not move, so the blend slid the contact foot at most of
+     ground speed: measured, 95% slip. Every gentle approach in the game
+     was a moonwalk. This rung is a real gait with a real ankle path, so
+     the idle blend now only has to cover 0 to 1.25 m/s, which is the
+     band he is genuinely stopping in. */
+  'walk-slow': buildGait({
+    beta: 0.62, flat: 0.22, rise: 0.62,
+    strike: -12 * D2R, toeOff: 23 * D2R, swing: -11 * D2R,
+    zf: 0.132, zb: -0.150,
+    lift: 0.036, whip: 0.58, pass: 0.020,
+    hipY: HIPS_Y + 0.004, drop: 0.008, settle: 0.012, lowAt: 0.07, slack: 0.006,
+    sway: 0.026, pelvisRoll: 2.6, pelvisYaw: 5.5, surge: 0.004,
+    lean: 0.8, spineX: 1.6, headX: -1.4, counter: 0.80,
+    arm: 14, armBias: 1.0, armOut: 7.0, armOutSwing: 1.4,
+    elbow: 5, elbowSwing: 9, elbowOut: 3, armLag: 0.055,
+    hand: 3, handOut: 4,
+  }),
+  walk: buildGait({
+    beta: 0.56, flat: 0.19, rise: 0.60,
+    strike: -16 * D2R, toeOff: 30 * D2R, swing: -14 * D2R,
+    zf: 0.186, zb: -0.215,
+    lift: 0.052, whip: 0.62, pass: 0.026,
+    hipY: HIPS_Y + 0.004, drop: 0.010, settle: 0.019, lowAt: 0.06, slack: 0.007,
+    sway: 0.030, pelvisRoll: 3.4, pelvisYaw: 7.5, surge: 0.006,
+    lean: 1.6, spineX: 2.6, headX: -2.2, counter: 0.90,
+    arm: 22, armBias: 1.5, armOut: 7.5, armOutSwing: 2.0,
+    elbow: 7, elbowSwing: 13, elbowOut: 3, armLag: 0.045,
+    hand: 5, handOut: 4,
+  }),
+  run: buildGait({
+    beta: 0.40, flat: 0.14, rise: 0.52,
+    strike: -8 * D2R, toeOff: 46 * D2R, swing: -18 * D2R,
+    zf: 0.235, zb: -0.210,
+    lift: 0.095, whip: 0.70, pass: 0.030,
+    hipY: HIPS_Y - 0.014, drop: 0.020, settle: 0.026, lowAt: 0.16, slack: 0.012,
+    sway: 0.022, pelvisRoll: 3.0, pelvisYaw: 10.5, surge: 0.010,
+    lean: 7.0, spineX: 7.5, headX: -8.0, counter: 1.05,
+    arm: 46, armBias: -3, armOut: 11, armOutSwing: 2.5,
+    elbow: 30, elbowSwing: 16, elbowOut: 6, armLag: 0.030,
+    hand: 10, handOut: 6,
+  }),
+  sprint: buildGait({
+    beta: 0.34, flat: 0.12, rise: 0.50,
+    strike: -4 * D2R, toeOff: 52 * D2R, swing: -22 * D2R,
+    zf: 0.255, zb: -0.225,
+    lift: 0.125, whip: 0.74, pass: 0.032,
+    hipY: HIPS_Y - 0.024, drop: 0.026, settle: 0.032, lowAt: 0.14, slack: 0.014,
+    sway: 0.018, pelvisRoll: 2.6, pelvisYaw: 12.0, surge: 0.012,
+    lean: 12.0, spineX: 12.0, headX: -13.0, counter: 1.10,
+    arm: 58, armBias: -7, armOut: 13, armOutSwing: 3.0,
+    elbow: 44, elbowSwing: 18, elbowOut: 8, armLag: 0.025,
+    hand: 12, handOut: 7,
+  }),
+};
+
+/** Stance fraction at a given locomotion speed — secondary.js weights
+ *  the terrain conform with it so a swinging foot is never flattened
+ *  on to the ground it is passing over. */
+export function gaitBeta(speed) {
+  let i = 0;
+  while (i < LOCO_STEPS.length - 2 && speed > LOCO_STEPS[i + 1].speed) i++;
+  const A = LOCO_STEPS[i], B = LOCO_STEPS[i + 1];
+  const f = clamp((speed - A.speed) / Math.max(B.speed - A.speed, 1e-3), 0, 1);
+  const ba = GAITS[A.name] ? GAITS[A.name].beta : 1;
+  const bb = GAITS[B.name] ? GAITS[B.name].beta : 1;
+  return ba * (1 - f) + bb * f;
+}
 
 /* ==================================================================
    Clip library
@@ -582,7 +973,15 @@ export const CLIPS = {
      camera on his right. The hip and leg work happens to agree with
      `cool` already; the head yaw and the trunk side do not. */
   idle: {
-    duration: 8.4, loop: true,
+    /* `cycle` on a clip with no feet in motion looks like a mistake and is
+       not. The locomotion blend interpolates cycle length between the two
+       rungs it sits on, and idle used to have none — so the fallback,
+       1.34 m, was what the phase integrator used across the whole
+       stopping band. A blend that is half a standing pose was therefore
+       ALSO being told the stride was 1.34 m, and the feet skated for it.
+       Matching the rung above collapses that to a stride the half-weight
+       pose can nearly cover. */
+    duration: 8.4, loop: true, cycle: GAITS['walk-slow'].cycle,
     /* THE TRUNK HINT IS BACK, AND SAFELY. The long note that used to live
        here documented the orbit: the spring chain never settled, so any
        authored curl shipped a random frame of a half-metre tip orbit —
@@ -677,91 +1076,28 @@ export const CLIPS = {
     },
   },
 
-  /* ---------------- locomotion ---------------- */
+  /* ---------------- locomotion ----------------
+     Three sets of numbers, one solver. `cycle` is not typed in: it is
+     whatever the authored ankle path covers in one stride, so the phase
+     integrator and the feet cannot disagree. See GAITS above. */
+  'walk-slow': {
+    duration: 0.78, loop: true, loco: true, cycle: GAITS['walk-slow'].cycle,
+    fn(ph, w, s) { gait(ph, w, s, GAITS['walk-slow']); breathe(w, ph * 1.7, 0.55); },
+  },
+
   walk: {
-    duration: 1.15, loop: true, loco: true, cycle: 1.34,
-    fn(ph, w, s) {
-      const a = ph * TAU;
-      const legs = (side, off) => {
-        const p = a + off;
-        const thigh = -24 * cos(p);
-        const swing = clamp(sin(p + 0.55), 0, 1);
-        const knee = 30 * swing * swing;
-        const ankle = 12 * cos(p + 1.1);
-        w.r(`leg${side}0`, thigh, 0, 0);
-        w.r(`leg${side}1`, knee, 0, 0);
-        w.r(`foot${side}`, -thigh * 0.30 - knee * 0.42 + ankle, 0, 0);
-      };
-      legs('L', 0); legs('R', Math.PI);
-
-      w.p('hips', 0.010 * sin(a), 0.016 * cos(2 * a) - 0.008, 0);
-      w.r('hips', 0, 5.5 * sin(a), 3.0 * sin(a));
-      w.r('spine', 3.0, -2.4 * sin(a), -1.4 * sin(a));
-      w.r('chest', 1.2, -4.0 * sin(a), 0);
-      w.r('head', -2.4, 2.0 * sin(a), 0);
-
-      w.r('armL0', 20 * cos(a), 0, 7 - 2 * cos(a));
-      w.r('armR0', -20 * cos(a), 0, -7 + 2 * cos(a));
-      w.r('armL1', -6 - 5 * cos(a), 0, -3);
-      w.r('armR1', -6 + 5 * cos(a), 0, 3);
-      breathe(w, ph * 2.4, 0.5);
-    },
+    duration: 0.62, loop: true, loco: true, cycle: GAITS.walk.cycle,
+    fn(ph, w, s) { gait(ph, w, s, GAITS.walk); breathe(w, ph * 2.2, 0.42); },
   },
 
   run: {
-    duration: 0.72, loop: true, loco: true, cycle: 2.16,
-    fn(ph, w, s) {
-      const a = ph * TAU;
-      const legs = (side, off) => {
-        const p = a + off;
-        const thigh = -40 * cos(p);
-        const swing = clamp(sin(p + 0.5), 0, 1);
-        const knee = 62 * swing * swing + 10;
-        w.r(`leg${side}0`, thigh, 0, 0);
-        w.r(`leg${side}1`, knee, 0, 0);
-        w.r(`foot${side}`, -thigh * 0.24 - knee * 0.42 + 16 * cos(p + 1.2), 0, 0);
-      };
-      legs('L', 0); legs('R', Math.PI);
-
-      w.p('hips', 0.014 * sin(a), 0.040 * cos(2 * a) - 0.030, 0);
-      w.r('hips', 2.0, 9.0 * sin(a), 4.5 * sin(a));
-      w.r('spine', 8.5, -4.5 * sin(a), -2.0 * sin(a));
-      w.r('chest', 4.0, -7.0 * sin(a), 0);
-      w.r('head', -9.0, 3.0 * sin(a), 0);
-
-      w.r('armL0', 46 * cos(a) - 4, 0, 11);
-      w.r('armR0', -46 * cos(a) - 4, 0, -11);
-      w.r('armL1', -30 - 12 * cos(a), 0, -6);
-      w.r('armR1', -30 + 12 * cos(a), 0, 6);
-      w.r('handL', 10, 0, -6); w.r('handR', 10, 0, 6);
-    },
+    duration: 0.42, loop: true, loco: true, cycle: GAITS.run.cycle,
+    fn(ph, w, s) { gait(ph, w, s, GAITS.run); },
   },
 
   sprint: {
-    duration: 0.58, loop: true, loco: true, cycle: 2.86,
-    fn(ph, w, s) {
-      const a = ph * TAU;
-      const legs = (side, off) => {
-        const p = a + off;
-        const thigh = -52 * cos(p);
-        const swing = clamp(sin(p + 0.45), 0, 1);
-        const knee = 82 * swing * swing + 14;
-        w.r(`leg${side}0`, thigh, 0, 0);
-        w.r(`leg${side}1`, knee, 0, 0);
-        w.r(`foot${side}`, -thigh * 0.2 - knee * 0.4 + 18 * cos(p + 1.2), 0, 0);
-      };
-      legs('L', 0); legs('R', Math.PI);
-
-      w.p('hips', 0.016 * sin(a), 0.052 * cos(2 * a) - 0.046, 0);
-      w.r('hips', 3.0, 11 * sin(a), 5.0 * sin(a));
-      w.r('spine', 14.0, -5.5 * sin(a), -2.4 * sin(a));
-      w.r('chest', 6.5, -9.0 * sin(a), 0);
-      w.r('head', -15.0, 3.4 * sin(a), 0);
-      w.r('armL0', 58 * cos(a) - 8, 0, 13);
-      w.r('armR0', -58 * cos(a) - 8, 0, -13);
-      w.r('armL1', -44 - 14 * cos(a), 0, -8);
-      w.r('armR1', -44 + 14 * cos(a), 0, 8);
-    },
+    duration: 0.34, loop: true, loco: true, cycle: GAITS.sprint.cycle,
+    fn(ph, w, s) { gait(ph, w, s, GAITS.sprint); },
   },
 
   /* Turn in place — the feet shuffle, the shoulders lead. Signed by
@@ -1329,11 +1665,18 @@ export const CLIP_NAMES = Object.keys(CLIPS);
    The state machine
    ================================================================== */
 
+/* THE RUNGS SIT ON THE CONTROLLER'S OWN SPEEDS, not near them. His walk
+   is 2.45 m/s and his run 5.90 (wally.js), and a rung two tenths off
+   either means the game's most-seen states are permanently a few per
+   cent of something else — a walk with a trace of run in the pelvis, a
+   run with a trace of walk in the stride. `walk-slow` covers the band a
+   touch stick can hold; see the note on its gait config. */
 const LOCO_STEPS = [
   { name: 'idle', speed: 0.00 },
-  { name: 'walk', speed: 2.30 },
-  { name: 'run', speed: 5.20 },
-  { name: 'sprint', speed: 7.60 },
+  { name: 'walk-slow', speed: 0.80 },
+  { name: 'walk', speed: 2.45 },
+  { name: 'run', speed: 5.90 },
+  { name: 'sprint', speed: 7.90 },
 ];
 
 /* THE BICYCLE IS A SECOND LOCOMOTION LADDER, NOT A CLIP.
@@ -1401,8 +1744,15 @@ export class Animator {
     this.rideSteps = BIKE_STEPS;
 
     this.locPhase = 0;
+    this.locoCycle = 1;
     this.speed = 0;
     this.turn = 0;
+    /* debug: pin the gait phase so a screenshot strip can walk the cycle
+       frame by frame instead of hoping --wait lands somewhere useful */
+    this.phaseLock = null;
+    /* how planted each foot is, 0..1, published for secondary.js's
+       terrain conform — see the note on _footIK */
+    this.plant = [1, 1];
     this.state = { speed: 0, gait: 0, turn: 0, grounded: true, vy: 0, airTime: 0, elapsed: 0 };
 
     /* action layer */
@@ -1550,6 +1900,12 @@ export class Animator {
     return this;
   }
 
+  /** Debug only: pin the gait phase. null releases it. */
+  setPhaseLock(p) {
+    this.phaseLock = (p == null) ? null : p - Math.floor(p);
+    return this;
+  }
+
   /** Evaluate one clip into `pose`. */
   _eval(clip, ph, pose, s) {
     clearPose(pose);
@@ -1598,6 +1954,7 @@ export class Animator {
     const cycle = riding
       ? (ka.cycle ?? 2.6) * (1 - bf) + (kb.cycle ?? 2.6) * bf
       : (ca.cycle ?? 1.34) * (1 - f) + (cb.cycle ?? 2.16) * f;
+    this.locoCycle = cycle;
     if (this.speed > 0.10) {
       this.locPhase += (this.speed * dt) / Math.max(cycle, 0.2);
     } else if (!riding) {
@@ -1608,6 +1965,21 @@ export class Animator {
        chainring all halt on the same frame and hold where they halted,
        which is what makes a track stand read as one. */
     this.locPhase -= Math.floor(this.locPhase);
+    if (this.phaseLock != null) this.locPhase = this.phaseLock;
+
+    /* Which feet are down, for the terrain conform in secondary.js. The
+       gait is authored so the planted foot does not slide; the conform
+       must therefore be allowed to press on the planted foot only, or it
+       flattens the swing foot on to the ground it is passing over and
+       the lift, the heel strike and the toe-off all vanish. */
+    {
+      const beta = riding ? 1 : gaitBeta(this.speed);
+      const e = 0.05;
+      const pl = this.locPhase, pr = (pl + 0.5) % 1;
+      const down = (p) => smoothstep(-e, e, p) * (1 - smoothstep(beta - e, beta + e, p));
+      this.plant[0] = riding ? 1 : down(pl);
+      this.plant[1] = riding ? 1 : down(pr);
+    }
 
     const phA = ca.loco ? this.locPhase : (st.elapsed / ca.duration) % 1;
     const phB = cb.loco ? this.locPhase : (st.elapsed / cb.duration) % 1;

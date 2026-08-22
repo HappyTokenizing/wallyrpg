@@ -50,6 +50,9 @@ const _q0 = new THREE.Quaternion();
 const _q1 = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
 const _q3 = new THREE.Quaternion();
+/* the foot's authored world orientation, held across the leg solve */
+const _q4 = new THREE.Quaternion();
+const _q5 = new THREE.Quaternion();
 
 /** Rotate `v` about a unit `axis` by `ang`, into `out`. */
 function rotAxis(v, axis, ang, out) {
@@ -634,6 +637,24 @@ export class Secondary {
      foot needs the most downward reach, re-evaluate, then solve each leg.
      Solving legs before dropping the hips gives you a character who does
      the splits on a slope.
+
+     IT CORRECTS FOR THE GROUND, NOT TO IT — and that is the whole of the
+     change here. The version this replaces pinned BOTH ankles to one
+     fixed height over whatever ground was under them, every frame. On
+     flat terrain that is a no-op for a static pose and a wrecking ball
+     for a walk cycle: the swing foot's lift, the heel strike and the
+     heel-high toe-off are all ANKLE HEIGHT, and pinning the ankle
+     deletes every one of them. Measured on the shipped build, both feet
+     came out within 2 mm of the same height through the entire cycle,
+     which is exactly the "feet stay flat blocks" note.
+
+     So the target is now the animated ankle SHIFTED BY THE GROUND'S OWN
+     DELTA — the difference between the terrain under that foot and the
+     terrain under his root. On flat ground that is identically zero and
+     the clip is played untouched; on a slope or a step each foot still
+     finds its own surface and the hips still drop to the lower one. The
+     conform to the surface normal is weighted by how PLANTED the foot is
+     (anim.plant), so a foot swinging over a boulder is not tilted by it.
      ------------------------------------------------------------------ */
   _footIK(dt, s) {
     const phys = this.ctx.phys;
@@ -643,18 +664,30 @@ export class Secondary {
     if (this.ikBlend < 0.004) { this.hipDrop = damp(this.hipDrop, 0, 8, dt); return; }
 
     this.root.updateMatrixWorld(true);
-    const rootY = this.root.position.y;
     const sy = this.root.scale.y || 1;
+    const plant = s?.plant;
+
+    /* the ground his ROOT is standing on — the datum the clip assumes */
+    const gRef = phys.groundAt(this.root.position.x, this.root.position.z).y;
+    /* the shallowest the ankle may sit over the ground it is on, so no
+       additive layer (lean, squash, a blend mid-transition) can bury a
+       sole in the floor */
+    const ankMin = (PROP.leg[2][1] - 0.024 - (PROP.foot.c[1] - PROP.foot.h[1] - PROP.foot.r)) * sy * 0.55;
 
     let lowest = 0;
-    for (const l of this.legs) {
+    for (let i = 0; i < this.legs.length; i++) {
+      const l = this.legs[i];
       l.foot.getWorldPosition(_v0);
       const g = phys.groundAt(_v0.x, _v0.z);
-      /* the ankle should sit a fixed height above the ground it stands on */
-      const ankleH = (PROP.leg[2][1] - PROP.foot.c[1] + PROP.foot.h[1] + PROP.foot.r) * sy;
-      l.targetY = g.y + ankleH;
+      l.plant = plant ? clamp(plant[i], 0, 1) : 1;
+      const delta = g.y - gRef;
+      l.targetY = Math.max(_v0.y + delta, g.y + ankMin);
       l.normal.copy(g.normal);
-      const need = l.targetY - _v0.y;
+      /* ONLY A PLANTED FOOT MAY PULL THE HIPS DOWN. Weighting this by
+         the gait's own plant curve is not a nicety: a swing foot passes
+         over 0.4 m of terrain, and letting the dip under it drop the
+         pelvis makes him sink into every gutter he steps OVER. */
+      const need = delta * l.plant;
       if (need < lowest) lowest = need;
     }
 
@@ -672,8 +705,21 @@ export class Secondary {
       l.shin.getWorldPosition(_v1);                  // knee
       l.foot.getWorldPosition(_p0);                  // ankle
 
+      /* THE FOOT'S ORIENTATION IS THE ANIMATION'S, NOT THE IK's. Swinging
+         the thigh and the shin to correct a height also rotates
+         everything below them, and on a foot that is mid-roll that
+         quietly drags the heel or the toe several centimetres along the
+         ground — a slide bought by a millimetre of terrain. Held here
+         and restored after the solve, so the authored heel strike and
+         toe-off survive the conform. */
+      l.foot.getWorldQuaternion(_q4);
+
       _v3.set(_p0.x, l.targetY, _p0.z);
       _v3.lerpVectors(_p0, _v3, this.ikBlend);
+      /* nothing to solve when the clip already put the foot there — and
+         on flat ground that is EVERY frame, which is how the walk cycle
+         survives this pass intact */
+      if (Math.abs(_v3.y - _p0.y) < 2e-4) continue;
 
       const L1 = _v0.distanceTo(_v1);
       const L2 = _v1.distanceTo(_p0);
@@ -710,11 +756,19 @@ export class Secondary {
       this._applyWorldRot(l.shin, _q0);
       l.shin.updateMatrixWorld(true);
 
-      /* roll the foot onto the slope */
-      if (l.normal.y < 0.9995) {
+      /* put the foot back the way the clip left it ... */
+      l.foot.getWorldQuaternion(_q5);
+      _q0.copy(_q4).multiply(_q5.invert());
+      this._applyWorldRot(l.foot, _q0);
+
+      /* ... and only then roll it on to the slope, weighted by how
+         PLANTED it is. A swing foot tilted by the ground it is passing
+         over is the tell that the conform is running open-loop. */
+      const pw = this.ikBlend * (l.plant ?? 1);
+      if (l.normal.y < 0.9995 && pw > 0.02) {
         _p2.set(0, 1, 0);
         _q0.setFromUnitVectors(_p2, l.normal);
-        _q1.identity().slerp(_q0, this.ikBlend * 0.85);
+        _q1.identity().slerp(_q0, pw * 0.85);
         this._applyWorldRot(l.foot, _q1);
       }
     }

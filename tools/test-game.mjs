@@ -39,7 +39,7 @@ import DATA, {
   NEWS_POOL, QUESTS, SIDE_QUESTS, MILESTONES, TIPS, MORNING_NOTES,
   OPENING_MESSAGE, byTicker, assetLabel, searchAssets, normTicker,
   RIDES, RIDE_LIST, RIDE_ORDER, SIDE_QUEST_BY_ID, QUEST_BY_ID,
-  REP_TITLES, RACE, PRODUCERS, SLATE_MEAL, NPC_POSTS, ORDER_FAIL,
+  REP_TITLES, RACE, PRODUCERS, SLATE_MEAL, NPC_POSTS, ORDER_FAIL, HAPPY_ENDING, EMPLOYEE_BY_ID,
   repProgress, orderFailRep,
   hops, fare, rideFare, worldDistance,
 } from '../src/game/data.js';
@@ -166,7 +166,11 @@ for (const j of Object.keys(JOBS)) {
 }
 for (const e of EMPLOYEE_POOL) ok(Number.isFinite(e.salary) && e.salary > 0, `employee ${e.id} has a salary`);
 for (const h of HOMES) ok(Number.isFinite(h.rent) && Number.isFinite(h.rest), `home ${h.id} has rent and rest`);
-for (const o of OFFICE_STAGES) ok(o.slots >= 1 && o.invCap >= 1, `office ${o.n} has slots and capacity`);
+for (const o of OFFICE_STAGES) {
+  ok(o.slots >= 1 && o.invCap >= 1, `office ${o.n} has slots and capacity`);
+  ok(Number.isFinite(o.seats) && o.seats >= 1, `office ${o.n} declares its seats`, o.seats);
+  ok(Number.isFinite(o.fundCap) && o.fundCap >= 0, `office ${o.n} declares its fund capacity`, o.fundCap);
+}
 for (const n of NEWS_POOL) ok(!!ASSET_BY_ID[n.a], `news "${n.h}" points at a real asset`, n.a);
 for (const q of QUESTS) {
   ok(typeof q.check === 'function', `quest ${q.id} has a check()`);
@@ -2522,6 +2526,403 @@ T('the farm and mine upgrades do something you can point at');
   ok(/only while/i.test(DATA.producers.farm.daily), 'which is honest about the employee condition',
     DATA.producers.farm.daily);
   ok(!g.actions.producer('nonsense'), 'an unknown producer is null, not a crash');
+}
+
+/* ============================================================
+   THE TOP OFFICE RUNS EVERY UPGRADE AT ONCE
+
+   The complaint this block exists to keep answered: at the top of the
+   game the player was still choosing between upgrades he had already
+   bought — ten specialists, six chairs. These tests hold the ceiling
+   open, and the block after them holds the CLIMB open, so nobody
+   "fixes" this again by handing stage 0 the keys to Wally Tower.
+   ============================================================ */
+const TOP = OFFICE_STAGES.length - 1;
+
+/* A game standing at the top of every ladder, with the money, the
+   classes and the venues to actually use it. Home stays the leaking
+   flat on purpose: THE OFFICE ALONE must be enough. */
+function topOfficeGame(seed = 4242) {
+  const g = createGame({ seed, autosave: false });
+  const st = g.state;
+  st.office = TOP;
+  st.rep = 120;
+  st.money = 5000000;
+  st.energy = 100;
+  st.hunger = 0;
+  st.time = 12 * 60;
+  st.flags.dispatchShift = true;
+  for (const c of COURSES) st.skills[c.id] = true;
+  for (const k of ['exchange', 'treasury', 'farmcoop', 'mineral', 'stadiumoffice', 'wallet', 'remote', 'swap']) st.unlocks[k] = true;
+  return g;
+}
+
+T('the top office seats every upgrade in the game at once');
+{
+  const g = topOfficeGame();
+  const st = g.state;
+
+  /* 1. SEATS. This is the one that was broken: hire() read the literal
+     `state.office + 1`, so the top office had six chairs for ten
+     specialists. Every hire below goes through the real door. */
+  eq(OFFICE_STAGES[TOP].seats, EMPLOYEE_POOL.length,
+    'the top stage has a seat for every specialist in the pool');
+  ok(OFFICE_STAGES[TOP].seats > TOP + 1,
+    'and seats no longer come from the old office+1 rule',
+    `${OFFICE_STAGES[TOP].seats} vs ${TOP + 1}`);
+  for (const e of EMPLOYEE_POOL) {
+    const r = g.actions.hire(e.id);
+    ok(r.ok, `${e.n} the ${e.role.toLowerCase()} can be hired at the top office`, r.why);
+  }
+  eq(st.employees.length, EMPLOYEE_POOL.length, 'all ten are on the payroll simultaneously');
+  eq(g.economy.teamFree(), 0, 'which is exactly a full house, not an infinite one');
+
+  /* 2. AND EVERY PERK IS LIVE AT THE SAME TIME. A seat is only worth
+     having if the thing sitting in it works, so measure them. */
+  ok(g.economy.orderSlots() > OFFICE_STAGES[TOP].slots, "Pim's extra order slot is live");
+  ok(g.economy.fundCap() > OFFICE_STAGES[TOP].fundCap, "Mattie's extra fund is live");
+  const plain = createGame({ seed: 9, autosave: false });
+  plain.state.money = 500000;
+  plain.economy.add('gold', 1, 100);
+  g.economy.add('gold', 1, 100);
+  ok(g.economy.tokenizeCost('gold') < plain.economy.tokenizeCost('gold'),
+    "Orla's cheaper filing is live at the same time",
+    `${g.economy.tokenizeCost('gold')} vs ${plain.economy.tokenizeCost('gold')}`);
+  st.farm.owned = true; st.farm.lvl = 2;
+  st.mine.owned = true; st.mine.lvl = 2;
+  ok(g.economy.overnightIncome() > 0,
+    'and the farm, the mine and the property book all pay overnight together',
+    g.economy.overnightIncome());
+  ok(st.employees.includes('kite') && st.employees.includes('tilda') && st.employees.includes('bruno')
+    && st.employees.includes('sable') && st.employees.includes('reg') && st.employees.includes('orla'),
+    'Wally Swap, both producers, the property book, the driver and the lawyer share the floor');
+
+  /* 3. SLOTS. clients.candidates() refuses anyone who already has a
+     live order, so the true ceiling is one job per client. */
+  ok(g.economy.orderSlots() >= CONFIG.totalClients,
+    'the top office holds an open job from every client in the city',
+    `${g.economy.orderSlots()} slots vs ${CONFIG.totalClients} clients`);
+  let accepted = 0;
+  for (const c of CLIENTS) {
+    const o = g.clients.makeOrder(c.id);
+    if (!o) continue;
+    const r = g.economy.acceptOrder(o);
+    if (!r.ok) { ok(false, `order ${accepted + 1} from ${c.n} was refused`, r.why); break; }
+    accepted++;
+  }
+  eq(accepted, CLIENTS.length, 'every one of the 24 clients has a live job at once');
+  eq(st.orders.length, CLIENTS.length, 'and all 24 are in the order book together');
+
+  /* 4. FUNDS. Same ceiling, same reason. */
+  ok(g.economy.fundCap() >= CONFIG.totalClients,
+    'the top office runs a fund for every client too',
+    `${g.economy.fundCap()} funds vs ${CONFIG.totalClients} clients`);
+
+  /* 5. INVENTORY. One of all 69 assets — quest q_all — plus a
+     completely full order book at its worst case. */
+  ok(OFFICE_STAGES[TOP].invCap >= CONFIG.totalAssets + CONFIG.totalClients * 2 * 3,
+    'the shelf holds all 69 assets plus a worst-case full order book',
+    `${OFFICE_STAGES[TOP].invCap} vs ${CONFIG.totalAssets + CONFIG.totalClients * 2 * 3}`);
+
+  /* 6. THE ONE-LINE ANSWER the UI can read. */
+  const off = g.office();
+  ok(off.everythingAtOnce, 'game.office().everythingAtOnce is true at Wally Tower');
+  eq(off.name, 'Wally Tower', 'and it names the stage');
+  eq(off.seats.used, EMPLOYEE_POOL.length, 'with every seat filled');
+  eq(badNumbers(st).length, 0, 'a fully staffed, fully booked office has no NaNs');
+}
+
+T('and every asset in the city fits on the shelf with room for the book');
+{
+  const g = topOfficeGame(77);
+  for (const a of ASSETS) {
+    if (!g.economy.add(a.id, 1, a.v)) {
+      ok(false, `no room for ${a.tick} at the top office`, g.economy.invCount() + '/' + g.economy.invCap());
+      break;
+    }
+  }
+  eq(g.economy.distinctOwned(), CONFIG.totalAssets, 'all 69 assets owned at once');
+  ok(g.economy.invCount() <= g.economy.invCap(), 'inside the shelf, not over it',
+    `${g.economy.invCount()}/${g.economy.invCap()}`);
+  ok(g.economy.invCap() - g.economy.invCount() >= CONFIG.totalClients * 2 * 3,
+    'with room left for a worst-case full order book on top',
+    `${g.economy.invCap() - g.economy.invCount()} spare`);
+  g.quests.check();
+  ok(g.state.quests.q_all, 'and quest q_all — own all 69 assets — closes on it');
+}
+
+T('funds live in the fund, not on the office shelf');
+{
+  const g = topOfficeGame(78);
+  const cap = g.economy.invCap();
+  g.economy.add('gold', 10, 1000);
+  eq(g.economy.invCount(), 10, 'ten units on the shelf');
+  /* lock six into a client fund, the way completeOrder() does */
+  g.state.inv.gold.locked = 6;
+  eq(g.economy.invCount(), 4, 'six locked into a fund leave four on the shelf');
+  eq(g.economy.invLocked(), 6, 'invLocked() reports the six');
+  eq(g.economy.invHeld(), 10, 'invHeld() still reports all ten on paper');
+  eq(g.economy.free('gold'), 4, 'free() agrees — locked units cannot be sold');
+  eq(g.economy.invCap(), cap, 'the cap itself has not moved');
+  ok(g.economy.add('gold', cap - 4, 1000),
+    'so the fund has not stolen shelf space from the next purchase');
+}
+
+T('the office stages are still a climb, not six copies of the top');
+{
+  for (const k of ['seats', 'slots', 'invCap', 'fundCap']) {
+    for (let i = 1; i < OFFICE_STAGES.length; i++) {
+      ok(OFFICE_STAGES[i][k] > OFFICE_STAGES[i - 1][k],
+        `${k} strictly increases from ${OFFICE_STAGES[i - 1].n} to ${OFFICE_STAGES[i].n}`,
+        `${OFFICE_STAGES[i - 1][k]} -> ${OFFICE_STAGES[i][k]}`);
+    }
+    for (let i = 0; i < TOP; i++) {
+      ok(OFFICE_STAGES[i][k] < OFFICE_STAGES[TOP][k],
+        `${OFFICE_STAGES[i].n} is genuinely smaller than Wally Tower on ${k}`);
+    }
+  }
+  for (let i = 1; i < OFFICE_STAGES.length; i++) {
+    ok(OFFICE_STAGES[i].cost > OFFICE_STAGES[i - 1].cost, `stage ${i} costs more than stage ${i - 1}`);
+    ok(OFFICE_STAGES[i].rep >= OFFICE_STAGES[i - 1].rep, `stage ${i} asks for at least as much reputation`);
+  }
+  /* the opening is untouched: one seat, one slot, no funds */
+  eq(OFFICE_STAGES[0].seats, 1, 'the folding table still seats exactly Wally');
+  eq(OFFICE_STAGES[0].slots, 1, 'and holds exactly one job');
+  eq(OFFICE_STAGES[0].fundCap, 0, 'and cannot run a fund at all');
+  /* nothing below the top may claim it can run everything */
+  for (let i = 0; i < OFFICE_STAGES.length; i++) {
+    const g = createGame({ seed: 300 + i, autosave: false });
+    g.state.office = i;
+    eq(g.office().everythingAtOnce, i === TOP,
+      `everythingAtOnce is ${i === TOP} at ${OFFICE_STAGES[i].n}`);
+  }
+  /* and a mid-stage office still says no, in the same words */
+  const mid = createGame({ seed: 301, autosave: false });
+  mid.state.office = 1; mid.state.money = 500000; mid.state.hunger = 0;
+  for (const e of EMPLOYEE_POOL) mid.actions.hire(e.id);
+  eq(mid.state.employees.length, OFFICE_STAGES[1].seats, 'the Shared Desk still seats only two');
+  const refused = mid.actions.hire('kite');
+  ok(!refused.ok && /free seat/i.test(refused.why), 'and refuses the third by name', refused.why);
+}
+
+/* ============================================================
+   THE TWO ENDINGS
+
+   'city:tokenized'  all 69 assets tokenized -> the minute of fireworks
+   'game:complete'   the whole game finished -> Happy's last line
+
+   Both are latched by a flag IN THE SAVE, so a reload cannot replay
+   them, and both have a debug door so neither needs a playthrough.
+   ============================================================ */
+
+/* Tokenize the whole city through the real economy door. */
+function tokenizeWholeCity(g) {
+  g.state.money = 5000000;
+  for (const c of COURSES) g.state.skills[c.id] = true;
+  for (const a of ASSETS) {
+    if (g.economy.owned(a.id) < 1) g.economy.add(a.id, 1, a.v);
+    g.economy.tokenize(a.id);
+  }
+  return g.economy.cityPct();
+}
+
+T('100% tokenized fires city:tokenized once, and only once');
+{
+  const g = createGame({ seed: 501, autosave: false });
+  const seen = [];
+  const legacy = [];
+  g.bus.on('city:tokenized', (p) => seen.push(p));
+  g.bus.on('endgame', (p) => legacy.push(p));
+
+  /* 68 of 69 must NOT fire it */
+  g.state.money = 5000000;
+  for (const c of COURSES) g.state.skills[c.id] = true;
+  const last = ASSETS[ASSETS.length - 1];
+  for (const a of ASSETS.slice(0, -1)) { g.economy.add(a.id, 1, a.v); g.economy.tokenize(a.id); }
+  eq(g.quests.tokenizedCount(), CONFIG.totalAssets - 1, 'sixty-eight assets tokenized');
+  eq(seen.length, 0, 'and the city event has not fired at 68 of 69');
+  ok(!g.quests.cityTokenized(), 'quests.cityTokenized() is false one short');
+  ok(!g.quests.hasFiredCity(), 'and the latch is not set');
+
+  /* the sixty-ninth fires it */
+  g.economy.add(last.id, 1, last.v);
+  g.economy.tokenize(last.id);
+  eq(seen.length, 1, 'the sixty-ninth fires city:tokenized exactly once');
+  const p = seen[0];
+  eq(p.pct, 100, 'payload.pct is 100');
+  eq(p.tokenized, CONFIG.totalAssets, 'payload.tokenized is 69');
+  eq(p.total, CONFIG.totalAssets, 'payload.total is 69');
+  eq(p.durationMs, CONFIG.fireworksMs, 'payload.durationMs is the length of the show');
+  eq(p.durationMs, 60000, 'which is a minute, in milliseconds');
+  eq(p.forced, false, 'and it is not a forced rehearsal');
+  num(p.day, 'payload.day is a number');
+  num(p.netWorth, 'payload.netWorth is a number');
+  ok(legacy.length >= 1, "the legacy 'endgame' event still fires alongside it");
+  ok(g.quests.hasFiredCity(), 'the latch is set');
+  eq(g.state.flags.cityTokenized100, true, 'as state.flags.cityTokenized100, which is in the save');
+
+  /* nothing can make it fire twice */
+  g.quests.check();
+  g.quests.milestones();
+  g.economy.tokenize(last.id);
+  eq(seen.length, 1, 'checking, milestoning and re-tokenizing cannot fire it again');
+
+  /* AND IT SURVIVES A SAVE/LOAD */
+  const json = g.exportSave();
+  const g2 = createGame({ seed: 502, autosave: false });
+  const seen2 = [];
+  g2.bus.on('city:tokenized', (x) => seen2.push(x));
+  ok(!!g2.importSave(json), 'the fully tokenized save loads');
+  eq(seen2.length, 0, 'and loading it does NOT replay the fireworks');
+  eq(g2.quests.cityPct(), 100, 'though the loaded city is still 100% tokenized');
+  ok(g2.quests.hasFiredCity(), 'and the latch came across with the save');
+
+  /* a save written BEFORE the latch existed must not replay either */
+  const older = JSON.parse(json);
+  delete older.flags.cityTokenized100;
+  delete older.flags.gameComplete;
+  const g3 = createGame({ seed: 503, autosave: false });
+  const seen3 = [];
+  g3.bus.on('city:tokenized', (x) => seen3.push(x));
+  ok(!!g3.importSave(JSON.stringify(older)), 'a pre-latch finished save loads');
+  eq(seen3.length, 0, 'and syncLatches() stops it replaying the fireworks at the door');
+  ok(g3.quests.hasFiredCity(), 'the latch is armed silently instead');
+}
+
+T('the city fireworks have a debug door');
+{
+  const g = createGame({ seed: 504, autosave: false });
+  const seen = [];
+  g.bus.on('city:tokenized', (p) => seen.push(p));
+  ok(typeof g.debug.tokenizeCity === 'function', 'game.debug.tokenizeCity() exists');
+  ok(typeof g.debug.fireCity === 'function', 'game.debug.fireCity() exists');
+  eq(g.debug.tokenizeCity().pct, 100, 'tokenizeCity() takes the city to 100%');
+  eq(seen.length, 1, 'and fires the event once');
+  eq(g.debug.fireCity(), false, 'fireCity() refuses to fire a second time');
+  eq(seen.length, 1, 'so nothing fired again');
+  const forced = g.debug.fireCity(true);
+  ok(forced && forced.forced === true, 'fireCity(true) re-fires as an explicit rehearsal');
+  eq(seen.length, 2, 'which is the only way to see it twice');
+  eq(seen[1].durationMs, CONFIG.fireworksMs, 'and the rehearsal is the same minute long');
+}
+
+T('game:complete fires only when the real completion set is satisfied');
+{
+  /* (a) 100% tokenized ALONE is not completion */
+  const a = createGame({ seed: 601, autosave: false });
+  const doneA = [];
+  a.bus.on('game:complete', (p) => doneA.push(p));
+  tokenizeWholeCity(a);
+  a.quests.check();
+  eq(doneA.length, 0, 'a fully tokenized city with quests open does NOT finish the game');
+  ok(!a.quests.completion().complete, 'and completion() says so');
+  ok(a.quests.completion().missing.length > 0, 'with a list of what is left',
+    a.quests.completion().missing.length);
+
+  /* (b) the whole main chain WITHOUT the side quests is not completion */
+  const b = createGame({ seed: 602, autosave: false });
+  const doneB = [];
+  b.bus.on('game:complete', (p) => doneB.push(p));
+  tokenizeWholeCity(b);
+  for (const q of QUESTS) b.quests.complete(q);
+  b.state.sides = {};
+  b.quests.check();
+  eq(b.quests.completion().side.done, 0, 'no side quests done');
+  eq(doneB.length, 0, 'the main chain alone does NOT finish the game');
+  ok(b.quests.completion().missing.some((m) => m.kind === 'side'),
+    'and the side quests are named as missing');
+
+  /* (c) main + side WITHOUT the city is not completion either — the
+     tokenization clause is asserted directly, not trusted to q_city */
+  const c = createGame({ seed: 603, autosave: false });
+  const doneC = [];
+  c.bus.on('game:complete', (p) => doneC.push(p));
+  for (const q of QUESTS) c.quests.complete(q);
+  for (const q of SIDE_QUESTS) c.quests.completeSide(q);
+  c.state.tokenized = {};
+  c.quests.check();
+  eq(doneC.length, 0, 'every quest closed but an untokenized city does NOT finish the game');
+  ok(!c.quests.completion().tokenized.ok, 'the tokenization clause is what fails',
+    JSON.stringify(c.quests.completion().tokenized));
+
+  /* (d) the whole set, and it fires exactly once */
+  const d = createGame({ seed: 604, autosave: false });
+  const doneD = [];
+  d.bus.on('game:complete', (p) => doneD.push(p));
+  const report = d.debug.completeGame();
+  ok(report.complete, 'the full completion set is satisfiable');
+  eq(report.main.done, QUESTS.length, `all ${QUESTS.length} main quests done`);
+  eq(report.side.done, SIDE_QUESTS.length, `all ${SIDE_QUESTS.length} side quests done`);
+  eq(report.tokenized.done, CONFIG.totalAssets, 'all 69 assets tokenized');
+  ok(report.assets.ok, 'and q_all — own all 69 assets — is closed');
+  eq(doneD.length, 1, 'game:complete fired exactly once');
+  d.quests.check(); d.quests.milestones(); d.debug.completeGame();
+  eq(doneD.length, 1, 'and nothing can make it fire again');
+  eq(d.state.flags.gameComplete, true, 'the latch is state.flags.gameComplete');
+  eq(badNumbers(d.state).length, 0, 'a finished game has no NaNs');
+
+  /* (e) it survives a save/load */
+  const json = d.exportSave();
+  const e = createGame({ seed: 605, autosave: false });
+  const doneE = [];
+  e.bus.on('game:complete', (p) => doneE.push(p));
+  ok(!!e.importSave(json), 'the finished save loads');
+  eq(doneE.length, 0, 'and loading it does not replay Happy');
+  ok(e.quests.completion().complete, 'though it is still a finished game');
+  ok(e.quests.hasFiredComplete(), 'and the latch came across');
+
+  /* (f) the debug door */
+  const f = createGame({ seed: 606, autosave: false });
+  const doneF = [];
+  f.bus.on('game:complete', (p) => doneF.push(p));
+  ok(typeof f.debug.completeGame === 'function', 'game.debug.completeGame() exists');
+  ok(typeof f.debug.fireComplete === 'function', 'game.debug.fireComplete() exists');
+  ok(f.debug.fireComplete()?.text, 'fireComplete() fires it on demand');
+  eq(doneF.length, 1, 'once');
+  eq(f.debug.fireComplete(), false, 'and refuses a second time');
+  ok(f.debug.fireComplete(true).forced === true, 'unless forced, which says so in the payload');
+  eq(doneF.length, 2, 'and that is the only way to see it twice');
+}
+
+T("Happy's ending is verbatim, and both URLs are links");
+{
+  /* THE LINE, TYPED OUT HERE INDEPENDENTLY OF data.js. If these two
+     ever disagree, one of them was edited, and this is the test that
+     has to say so. */
+  const VERBATIM = "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAFx.xyz";
+
+  eq(DATA.happyEnding.text, VERBATIM, "Happy's speech is verbatim, character for character");
+  eq(HAPPY_ENDING.text, VERBATIM, 'and the exported constant agrees');
+  eq(HAPPY_ENDING.speaker, 'Happy', 'Happy is the one who says it');
+  ok(!/\n/.test(HAPPY_ENDING.text), 'it is one unbroken paragraph, not a reflowed array');
+
+  /* the two URLs, present and countable */
+  ok(HAPPY_ENDING.text.includes('RWAF.ai'), 'RWAF.ai survives in the text');
+  ok(HAPPY_ENDING.text.includes('RWAFx.xyz'), 'RWAFx.xyz survives in the text');
+  eq(HAPPY_ENDING.links.length, 2, 'and both are declared as links, not prose');
+  for (const l of HAPPY_ENDING.links) {
+    ok(HAPPY_ENDING.text.includes(l.label), `link label "${l.label}" appears in the speech`);
+    ok(/^https?:\/\/\S+$/.test(l.url), `link "${l.label}" has an absolute url`, l.url);
+    eq(HAPPY_ENDING.text.split(l.label).length - 1, 1,
+      `"${l.label}" appears exactly once, so a linkifier cannot mis-target it`);
+  }
+  eq(HAPPY_ENDING.links[0].label, 'RWAF.ai', 'the first link is RWAF.ai');
+  eq(HAPPY_ENDING.links[1].label, 'RWAFx.xyz', 'the second link is RWAFx.xyz');
+  ok(HAPPY_ENDING.links[0].url !== HAPPY_ENDING.links[1].url, 'and they point at different places');
+
+  /* AND IT RIDES ON THE EVENT, so the UI never retypes it */
+  const g = createGame({ seed: 701, autosave: false });
+  let payload = null;
+  g.bus.on('game:complete', (p) => { payload = p; });
+  g.debug.completeGame();
+  ok(payload, 'game:complete carried a payload');
+  eq(payload.speaker, 'Happy', 'the payload names Happy as the speaker');
+  eq(payload.text, VERBATIM, 'and carries the speech verbatim');
+  eq(payload.links.length, 2, 'and both links');
+  eq(payload.links.map((l) => l.label).join('|'), 'RWAF.ai|RWAFx.xyz', 'in order, labelled');
+  num(payload.netWorth, 'plus a net worth for the card');
+  eq(payload.main.total, QUESTS.length, 'and the main-chain tally');
+  eq(payload.side.total, SIDE_QUESTS.length, 'and the side-quest tally');
 }
 
 /* ============================================================

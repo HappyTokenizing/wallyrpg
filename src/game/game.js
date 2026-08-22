@@ -140,7 +140,7 @@
 
 import DATA, {
   CONFIG, LOC_BY_ID, ZONES, TRAVEL, BIKE, RIDES, RIDE_ORDER, JOBS, COURSE_BY_ID, OFFICE_STAGES,
-  HOME_BY_ID, HOMES, EMPLOYEE_BY_ID, IPOS, IPO_STEPS, STADIUM_STEPS,
+  HOME_BY_ID, HOMES, EMPLOYEE_BY_ID, EMPLOYEE_POOL, IPOS, IPO_STEPS, STADIUM_STEPS,
   ASSETS, ASSET_BY_ID, CLIENT_BY_ID, MORNING_NOTES, fare, worldDistance,
   RACE, PRODUCERS, SLATE_MEAL, repProgress, hops as hopsBetween,
 } from './data.js';
@@ -1734,7 +1734,12 @@ export function createGame(opts = {}) {
       const e = EMPLOYEE_BY_ID[id];
       if (!e) return { ok: false, why: 'No such person' };
       if (st.employees.includes(id)) return { ok: false, why: 'Already on the team' };
-      if (st.employees.length >= st.office + 1) return { ok: false, why: 'No free seat — upgrade the office' };
+      /* SEATS COME OUT OF THE OFFICE TABLE NOW. This used to be the
+         bare expression `st.office + 1`, which capped Wally Tower at
+         six chairs for ten specialists and forced the player to leave
+         four bought-and-paid-for upgrades unused for the whole
+         endgame. OFFICE_STAGES[5].seats is 10. See data.js. */
+      if (st.employees.length >= econ.teamSeats()) return { ok: false, why: 'No free seat — upgrade the office' };
       if (!econ.afford(e.salary * 3)) return { ok: false, why: 'You need three days of salary in hand' };
       st.employees.push(id);
       bus.emit('unlock', { key: 'employee', employee: id });
@@ -2213,6 +2218,11 @@ export function createGame(opts = {}) {
      ============================================================ */
   function bootState(fresh) {
     syncRides();
+    /* ARM THE ENDINGS BEFORE ANYTHING CAN CHECK THEM. A save that is
+       already at 100% tokenized, or already finished, must not replay
+       its fireworks or Happy's speech on the way through the door.
+       First line of boot, ahead of every quests.check() below. */
+    quests.syncLatches();
     quests.refreshKnown(true);
     if (fresh) clients.seedArrivals();
     else if (!S().arrivals.length) clients.seedArrivals();
@@ -2269,6 +2279,46 @@ export function createGame(opts = {}) {
     repTitles: () => DATA.repTitles,
     /* the Mayor's Dash */
     race,
+
+    /* ------------------------------------------------------------
+       THE OFFICE, AS ONE OBJECT.
+       What the current stage grants, what is in use, and — the point
+       of the whole thing — whether it can run every upgrade at once.
+       `everythingAtOnce` is true only when there is a seat for every
+       specialist in the game, a slot for every client and a fund for
+       every client. It is true at Wally Tower and nowhere else.
+       ------------------------------------------------------------ */
+    office() {
+      const st = env.state;
+      const stage = OFFICE_STAGES[st.office];
+      const seats = econ.teamSeats();
+      const slots = econ.orderSlots();
+      const funds = econ.fundCap();
+      return {
+        stage: st.office, name: stage.n, desc: stage.desc, top: st.office >= OFFICE_STAGES.length - 1,
+        seats: { used: st.employees.length, cap: seats, all: EMPLOYEE_POOL.length },
+        slots: { used: st.orders.length, cap: slots, all: CONFIG.totalClients },
+        funds: { used: st.funds.length, cap: funds, all: CONFIG.totalClients },
+        inventory: { used: econ.invCount(), cap: econ.invCap(), locked: econ.invLocked(), all: CONFIG.totalAssets },
+        everythingAtOnce: seats >= EMPLOYEE_POOL.length
+          && slots >= CONFIG.totalClients
+          && funds >= CONFIG.totalClients
+          && econ.invCap() >= CONFIG.totalAssets,
+      };
+    },
+
+    /* ------------------------------------------------------------
+       THE TWO ENDINGS. Detection lives in quests.js; this is the
+       reading end. Events: 'city:tokenized' and 'game:complete'.
+       ------------------------------------------------------------ */
+    endings: {
+      report: () => quests.completion(),
+      cityDone: () => quests.cityTokenized(),
+      cityFired: () => quests.hasFiredCity(),
+      completeFired: () => quests.hasFiredComplete(),
+      happy: () => DATA.happyEnding,
+    },
+
     /* who is standing here, including people who are waiting for you
        somewhere that is not their home (NPC_POSTS) */
     whoIsAt: (locId) => clients.at(locId),
@@ -2283,7 +2333,13 @@ export function createGame(opts = {}) {
         loc: st.loc, zone: LOC_BY_ID[st.loc] ? LOC_BY_ID[st.loc].z : null,
         cityPct: econ.cityPct(), netWorth: econ.netWorth(),
         owned: econ.distinctOwned(), invCount: econ.invCount(), invCap: econ.invCap(),
+        invHeld: econ.invHeld(), invLocked: econ.invLocked(),
         orders: st.orders.length, orderSlots: econ.orderSlots(),
+        /* THE OFFICE'S THREE CAPACITIES, so the UI can draw them side
+           by side and show that the top stage runs everything at once. */
+        team: st.employees.length, teamSeats: econ.teamSeats(),
+        fundsOpen: st.funds.length, fundCap: econ.fundCap(),
+        office: st.office, officeName: OFFICE_STAGES[st.office].n,
         arrivals: st.arrivals.length,
         /* THE OBJECTIVE STRIP READS THIS, and it is the main chain
            only. A side quest lives in `sideObjective` and has its own
@@ -2307,6 +2363,57 @@ export function createGame(opts = {}) {
         ride: rideHud(),
         rides: { owned: { ...(st.rides ? st.rides.owned : {}) }, equipped: st.rides ? st.rides.equipped : null },
       };
+    },
+
+    /* ------------------------------------------------------------
+       DEBUG DOORS — the rules layer's own, so they work in plain
+       node (tools/test-game.mjs) as well as behind window.WALLY.debug.
+       Nothing here is reachable from normal play.
+       ------------------------------------------------------------ */
+    debug: {
+      /* Take the whole office to the top: Wally Tower, the reputation
+         it needs, and every specialist in the pool on the payroll.
+         Returns what that stage actually grants. */
+      maxOffice(hire = true) {
+        const st = env.state;
+        st.office = OFFICE_STAGES.length - 1;
+        st.rep = Math.max(st.rep, OFFICE_STAGES[st.office].rep);
+        if (hire) {
+          st.money = Math.max(st.money, 20000);
+          for (const e of EMPLOYEE_POOL) if (!st.employees.includes(e.id)) actions.hire(e.id);
+        }
+        return api.office();
+      },
+      /* Tokenize all 69 assets and let the normal sweep fire
+         'city:tokenized'. Does NOT finish the game. */
+      tokenizeCity() {
+        const st = env.state;
+        for (const a of ASSETS) st.tokenized[a.id] = true;
+        st.stats.tokenized = ASSETS.length;
+        quests.milestones();
+        quests.check();
+        return { pct: econ.cityPct(), fired: quests.hasFiredCity() };
+      },
+      /* Fire the fireworks event by hand. force re-fires one that has
+         already happened (payload carries forced:true). */
+      fireCity: (force) => quests.fireCityTokenized(force),
+      /* Satisfy the ENTIRE completion set for real — every asset
+         tokenized, every main quest, every side quest — and let the
+         sweep fire 'game:complete'. */
+      completeGame() {
+        const st = env.state;
+        for (const a of ASSETS) st.tokenized[a.id] = true;
+        st.stats.tokenized = ASSETS.length;
+        for (const q of DATA.quests) quests.complete(q);
+        for (const q of DATA.sideQuests) quests.completeSide(q);
+        quests.milestones();
+        quests.check();
+        return quests.completion();
+      },
+      /* Fire Happy's ending by hand. */
+      fireComplete: (force) => quests.fireGameComplete(force),
+      completion: () => quests.completion(),
+      happy: () => DATA.happyEnding,
     },
 
     /* persistence */
@@ -2388,6 +2495,23 @@ export async function init(ctx) {
       return game.race.finish(Math.max(1, game.race.pace().mayorSeconds - 5));
     };
     d.clock = (on) => game.time.setLive(on !== false);
+    /* ---- THE OFFICE AND THE TWO ENDINGS ----
+       maxOffice()      Wally Tower with all ten specialists hired
+       office()         what the current stage grants vs what is used
+       tokenizeCity()   tokenize all 69 -> fires 'city:tokenized'
+       fireCity(force)  fire the fireworks event on demand
+       completeGame()   satisfy the whole completion set -> fires
+                        'game:complete' (Happy's ending)
+       fireComplete(f)  fire Happy's ending on demand
+       completion()     the checklist: what is still outstanding      */
+    d.maxOffice = (hire) => game.debug.maxOffice(hire !== false);
+    d.office = () => game.office();
+    d.tokenizeCity = () => game.debug.tokenizeCity();
+    d.fireCity = (force) => game.debug.fireCity(force);
+    d.completeGame = () => game.debug.completeGame();
+    d.fireComplete = (force) => game.debug.fireComplete(force);
+    d.completion = () => game.debug.completion();
+    d.happy = () => game.debug.happy();
     /* THE RIDES, for anyone posing a screenshot. */
     d.rides = () => game.actions.rides();
     d.giveRide = (id) => game.actions.grantRide(id) && game.actions.equipRide(id);

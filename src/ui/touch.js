@@ -353,6 +353,11 @@ export function createTouch(ctx, ui) {
       if (y !== toastY) {
         toastY = y;
         root.parentElement.style.setProperty('--w-toasty', y + 'px');
+        /* The notification layer is parented to <body> so that no
+           sheet can cover it (ui/notify.js), which also puts it
+           outside #ui and out of reach of the line above. Mirror the
+           measurement onto :root so the strip dock can read it. */
+        document.documentElement.style.setProperty('--w-toasty', y + 'px');
       }
     }
 

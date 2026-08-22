@@ -606,6 +606,12 @@ export function createHud(ctx, ui) {
   const live = [];
   function toast(text, kind = 'info', life = 3400) {
     if (!text) return;
+    /* THE TOASTS MOVED HOUSE. #ui is z-index 10 and the modal stack
+       is 20, so anything written here was drawn under the scrim and
+       timed out unseen behind it. ui/notify.js owns the tier now,
+       from a layer above the panels; this stays as the delegate so
+       any caller still holding hud.toast lands in the right place. */
+    if (ui.notify) return ui.notify.toast(text, kind, { life: life / 1000 });
     const col = TOAST_COLOUR[kind] || BRAND.info;
     const el = h('div.w-toast', null,
       h('span.bul', { style: { background: C(col), boxShadow: `0 0 10px ${rgba(col, 0.7)}` } }),

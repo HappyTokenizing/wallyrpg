@@ -33,8 +33,8 @@
    and take game.fares() down with it.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID } from './data.js';
-import { newState, clamp, round2 } from './state.js';
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID, OFFICE_STAGES } from './data.js';
+import { newState, clamp, round2, DEFAULT_SETTINGS } from './state.js';
 
 /* ---------- storage driver ---------- */
 function makeStore() {
@@ -152,6 +152,36 @@ export function createSave(env) {
     return m;
   }
 
+  /* ---------- SETTINGS ----------
+     Forward-filled and type-coerced on EVERY load, for the same
+     reason as the two repairs above: `settings` grows a key whenever
+     a comfort option ships, and a comfort option does not move
+     CONFIG.version — so migrate()'s forward-fill never runs for it
+     and a save written by yesterday's build arrives with the new key
+     simply missing. A missing boolean is not `false`, it is
+     `undefined`, and a switch bound to it reads as neither on nor
+     off. state.js DEFAULT_SETTINGS is the one list; anything not on
+     it is dropped, so a hand-edited file cannot smuggle a key in.
+
+     `landscape` is what made this necessary: it must be a real
+     `false` on every existing save, because portrait is the default
+     and ui/orient.js decides what to do at boot from this flag. */
+  function migrateSettings(m) {
+    if (!m.settings || typeof m.settings !== 'object' || Array.isArray(m.settings)) m.settings = {};
+    const s = m.settings;
+    for (const k of Object.keys(s)) if (!(k in DEFAULT_SETTINGS)) delete s[k];
+    for (const k of Object.keys(DEFAULT_SETTINGS)) {
+      const d = DEFAULT_SETTINGS[k];
+      if (typeof d === 'boolean') s[k] = k in s ? !!s[k] : d;
+      else s[k] = Number.isFinite(+s[k]) ? +s[k] : d;
+    }
+    s.music = clamp(s.music, 0, 1);
+    s.sfx = clamp(s.sfx, 0, 1);
+    s.speed = clamp(s.speed, 0.5, 2);
+    s.textSize = clamp(s.textSize, 0.8, 1.5);
+    return m;
+  }
+
   /* Never let a bad file produce NaN money or a negative holding. */
   function sanitize(m) {
     if (!Number.isFinite(m.money)) m.money = 0;
@@ -161,7 +191,8 @@ export function createSave(env) {
     m.rep = Math.max(0, Number(m.rep) || 0);
     m.day = Math.max(1, Math.floor(Number(m.day) || 1));
     m.time = Number.isFinite(m.time) ? m.time : CONFIG.dayStartMin;
-    m.office = clamp(Math.floor(Number(m.office) || 0), 0, 5);
+    /* the top stage, from the table rather than a literal 5 */
+    m.office = clamp(Math.floor(Number(m.office) || 0), 0, OFFICE_STAGES.length - 1);
 
     if (!m.inv || typeof m.inv !== 'object') m.inv = {};
     for (const id of Object.keys(m.inv)) {
@@ -180,6 +211,7 @@ export function createSave(env) {
     if (!LOC_BY_ID[m.loc]) m.loc = 'apartment';
     migrateRides(m);
     migrateRace(m);
+    migrateSettings(m);
     /* A v5 save's last mode was very often 'bike', from back when the
        bicycle was handed to you. It is not any more, so a loaded save
        that is "riding" a vehicle it does not own falls back to walking

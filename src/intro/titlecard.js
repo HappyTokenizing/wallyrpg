@@ -229,6 +229,15 @@ export function createTitleCard(ctx) {
 
   const svg = wordmarkSVG({ prefix: 'ic', paper, dawn, token, token2, sheen: true });
 
+  /* TOUCH DEVICES HAVE NO KEY TO PRESS — see the matching note in
+     src/main.js. Coarse pointer AND no fine pointer, so a touchscreen
+     laptop (which has both, and a keyboard) still reads "press any key". */
+  const SKIP_HINT = (typeof matchMedia === 'function'
+    && matchMedia('(pointer: coarse)').matches
+    && !matchMedia('(any-pointer: fine)').matches)
+    ? 'TAP THE SCREEN TO SKIP'
+    : 'PRESS ANY KEY TO SKIP';
+
   /* --- DOM ------------------------------------------------------- */
   const root = document.createElement('div');
   root.id = 'introOverlay';
@@ -239,7 +248,7 @@ export function createTitleCard(ctx) {
       svg +
       `<div class="ic-tag">TWO HUNDRED AND FIFTY DOLLARS &middot; ONE BICYCLE &middot; NO REPUTATION</div>` +
     `</div>` +
-    `<div class="ic-skip">PRESS ANY KEY TO SKIP</div>`;
+    `<div class="ic-skip">${SKIP_HINT}</div>`;
 
   const style = document.createElement('style');
   style.id = 'introOverlayCss';

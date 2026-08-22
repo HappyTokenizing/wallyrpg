@@ -232,6 +232,17 @@ async function boot() {
   const bootEl = document.getElementById('boot');
   const goEl = document.getElementById('bootGo');
 
+  /* TOUCH DEVICES HAVE NO KEY TO PRESS. "Press any key" is meaningless on
+     a phone, so the start chip and the intro's skip hint both say "tap"
+     there instead. A coarse pointer ALONE is not the test — a laptop with
+     a touchscreen has both, and its owner still has a keyboard — so this
+     asks for a coarse pointer AND the absence of any fine one. Kept in
+     sync with the same test in src/intro/titlecard.js. */
+  const touchOnly = typeof matchMedia === 'function'
+    && matchMedia('(pointer: coarse)').matches
+    && !matchMedia('(any-pointer: fine)').matches;
+  if (goEl) goEl.textContent = touchOnly ? 'Tap the screen to begin' : 'Press any key to begin';
+
   function reveal() {
     bootEl?.classList.remove('ask');
     bootEl?.classList.add('gone');

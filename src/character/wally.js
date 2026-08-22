@@ -112,6 +112,15 @@ const CAMS = {
   threequarter: { pos: [2.00, 1.28, 2.42], look: [0, 0.88, 0.02], fov: 34 },
   silhouette: { pos: [0.00, 0.82, 4.60], look: [0, 0.80, 0], fov: 22 },
   side: { pos: [3.30, 0.90, 0.10], look: [0, 0.86, 0], fov: 33 },
+  /* THE GAIT PAIR. A walk is judged on the feet and the pelvis, and every
+     preset above is framed on the head — a striding foot leaves the
+     bottom of the frame in all of them, which is exactly how a shuffle
+     goes unnoticed. These sit lower, pull back and narrow the lens so the
+     ground line and both feet stay in shot through the whole cycle, at
+     the two angles a stride reads from: dead profile, and the
+     three-quarter where the far leg separates. */
+  gait: { pos: [3.85, 0.74, 0.00], look: [0, 0.70, 0], fov: 30 },
+  gait34: { pos: [2.90, 0.82, 2.36], look: [0, 0.72, 0.02], fov: 31 },
   back: { pos: [0.00, 0.92, -3.30], look: [0, 0.86, 0], fov: 33 },
   ears: { pos: [0.00, 1.44, 2.10], look: [0, 1.36, 0], fov: 40 },
   /* The bicycle needs a LOWER, WIDER lens than any of the above: the
@@ -826,7 +835,12 @@ export async function init(ctx) {
       walkSpeed: 2.45,
       runSpeed: 5.90,
       jumpHeight: 1.15,
-      strideLength: 1.34,
+      /* metres per footstep EVENT. It is half a gait cycle, so one
+         sound per visible foot plant — and it is read off the clip
+         rather than typed in, because the stride is derived from the
+         ankle path now and any hand-copied number here would go stale
+         the moment the gait is re-tuned. */
+      strideLength: CLIPS.walk.cycle * 0.5,
       turnRate: 13,
     })
     : null;
@@ -1589,7 +1603,11 @@ export async function init(ctx) {
   function lateUpdate(dt) {
     if (!(dt > 0)) dt = 1e-4;
     else if (dt > 0.05) dt = 0.05;
-    secondary.lateUpdate(dt, { grounded: controller ? controller.grounded : true });
+    secondary.lateUpdate(dt, {
+      grounded: controller ? controller.grounded : true,
+      /* which feet the gait says are bearing weight this frame */
+      plant: anim.plant,
+    });
     root.updateMatrixWorld(true);
     contact.update();
     if (dbgCam) applyDebugCam();
@@ -1972,6 +1990,149 @@ export async function init(ctx) {
   dbg.express = (name) => { api.express(name, { instant: true }); return name; };
   dbg.release = () => { api.release(0.001); };
   dbg.locomotion = (s, t) => { api.setLocomotion(s, t); return [s, t]; };
+
+  /* ---- the gait rig -------------------------------------------------
+     A walk cycle can only be judged as a SEQUENCE, and `--wait` cannot be
+     trusted to land on the phase you meant. locoPhase() pins it, so a
+     strip of frames is a strip of exact phases. gaitTrace() steps the
+     whole animator — clip, blend, additive layers, foot IK, all of it —
+     round the cycle and reports the things a still cannot show: stride,
+     bob, knee range, and how far the PLANTED foot moves per frame
+     against the ground speed the phase integrator is actually using.
+     That last number is the one that decides whether this is a walk or a
+     shuffle, and it has to be measured on the real pipeline, not on the
+     clip function in isolation. */
+  dbg.footIK = (on) => { secondary.ikEnabled = on !== false; return secondary.ikEnabled; };
+  dbg.locoPhase = (p) => { anim.setPhaseLock(p == null ? null : p); return p == null ? 'free' : p; };
+  /* Walk the pinned phase to a new value over `frames` real frames rather
+     than jumping to it. The ear, trunk and tail chains are springs driven
+     by ACCELERATION: teleporting the phase by an eighth of a cycle
+     between two screenshots hands them an impulse the gait never
+     produces, and they photograph flung out sideways. This is slow
+     motion, not a freeze — the soft parts still lag, they just lag
+     something plausible. */
+  dbg.locoStep = (to, frames = 18) => new Promise((done) => {
+    const from = anim.phaseLock == null ? anim.locPhase : anim.phaseLock;
+    let d = to - from; d -= Math.round(d);          // shortest way round
+    let i = 0;
+    const tick = () => {
+      i++;
+      anim.setPhaseLock(from + d * (i / frames));
+      if (i >= frames) { anim.setPhaseLock(to); done(to); return; }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+
+  const _tv = new THREE.Vector3();
+  const GT_SOLE = PROP.foot.c[1] - PROP.foot.h[1] - PROP.foot.r;
+  const GT_ANKH = bindWorld('footL')[1] - GT_SOLE;
+  const GT_HEEL = PROP.foot.c[2] - PROP.foot.h[2] - PROP.foot.r - bindWorld('footL')[2];
+  const GT_TOE = PROP.foot.c[2] + PROP.foot.h[2] + PROP.foot.r - bindWorld('footL')[2];
+
+  /* `flat` swaps the terrain for a plane at his feet for the duration of
+     the measurement, and it is not cheating: "does the contact foot
+     slide" is a question about the GAIT, and it cannot be answered from a
+     spawn point that happens to have a 0.33 m kerb inside the stride —
+     the conform reaching down into that is correct behaviour and swamps
+     the signal. Pass false to measure the conform itself. */
+  dbg.gaitTrace = (speed = 2.45, n = 32, flat = true) => {
+    const wasManual = locoManual, wasS = locoSpeed, wasT = locoTurn, wasLock = anim.phaseLock;
+    const phys = ctx.phys;
+    const realGround = phys && phys.groundAt;
+    if (flat && realGround) {
+      const g0 = realGround.call(phys, root.position.x, root.position.z);
+      const flatN = { x: 0, y: 1, z: 0 };
+      phys.groundAt = () => ({ y: g0.y, normal: g0.normal ? flatN : flatN, slope: 0 });
+    }
+    api.setLocomotion(speed, 0);
+    /* two cycles of pre-roll: hipDrop, ikBlend and the spring chains are
+       all damped accumulators, and measuring them cold measures the
+       transient rather than the gait */
+    secondary.hipDrop = 0; secondary.ikBlend = 1;
+    for (let i = 0; i < n * 2; i++) {
+      anim.setPhaseLock(i / n);
+      update(1 / 60, i / 60);
+      lateUpdate(1 / 60);
+    }
+    const rows = [];
+    const at = (bone, ly, lz) => {
+      _tv.set(0, ly, lz).applyMatrix4(bone.matrixWorld);
+      return [_tv.z - root.position.z, _tv.y - root.position.y - GT_SOLE];
+    };
+    for (let i = 0; i < n; i++) {
+      anim.setPhaseLock(i / n);
+      update(1 / 60, i / 60);
+      lateUpdate(1 / 60);
+      root.updateMatrixWorld(true);
+      const r = { ph: +(i / n).toFixed(4) };
+      rig.byName.hips.getWorldPosition(_tv);
+      r.hipY = +(_tv.y - root.position.y - GT_SOLE).toFixed(4);
+      for (const sd of ['L', 'R']) {
+        const b = rig.byName['foot' + sd];
+        const m = b.matrixWorld.elements;
+        const heel = at(b, -GT_ANKH, GT_HEEL);
+        const toe = at(b, -GT_ANKH, GT_TOE);
+        b.getWorldPosition(_tv);
+        r['ank' + sd] = [+(_tv.z - root.position.z).toFixed(4), +(_tv.y - root.position.y - GT_SOLE).toFixed(4)];
+        r['pitch' + sd] = +(Math.atan2(m[6], m[5]) * 180 / Math.PI).toFixed(1);
+        r['knee' + sd] = +(rig.byName['leg' + sd + '1'].rotation.x * 180 / Math.PI).toFixed(1);
+        r['thigh' + sd] = +(rig.byName['leg' + sd + '0'].rotation.x * 180 / Math.PI).toFixed(1);
+        r['sole' + sd] = +Math.min(heel[1], toe[1]).toFixed(4);
+        r['heel' + sd] = +heel[0].toFixed(4); r['toe' + sd] = +toe[0].toFixed(4);
+      }
+      r.plant = [+anim.plant[0].toFixed(2), +anim.plant[1].toFixed(2)];
+      r.hipDrop = +secondary.hipDrop.toFixed(4);
+      r.sy = +(root.scale.y).toFixed(4);
+      rows.push(r);
+    }
+    anim.setPhaseLock(wasLock);
+    if (flat && realGround) phys.groundAt = realGround;
+    if (wasManual) api.setLocomotion(wasS, wasT); else api.setLocomotion(null);
+
+    const cycle = anim.locoCycle || 1;
+    const step = cycle / n;
+    /* slip: over the planted frames the contact point must travel
+       backward at exactly one `step` per frame. The pivot changes
+       identity at the heel-to-toe handover, so those frames are skipped
+       rather than counted as a metre of slide. */
+    let tot = 0, cnt = 0, worst = 0;
+    for (let i = 1; i < n; i++) {
+      const a = rows[i - 1], b = rows[i];
+      if (a.soleL > 0.004 || b.soleL > 0.004) continue;
+      let d;
+      if (Math.abs(a.pitchL) < 1.2 && Math.abs(b.pitchL) < 1.2) d = b.ankL[0] - a.ankL[0];
+      else if (a.pitchL < -1.2 && b.pitchL < -1.2) d = b.heelL - a.heelL;
+      else if (a.pitchL > 1.2 && b.pitchL > 1.2) d = b.toeL - a.toeL;
+      else continue;
+      const e = Math.abs(d + step);
+      tot += e; cnt++; worst = Math.max(worst, e);
+    }
+    const rng = (k, j) => {
+      const v = rows.map((r) => (j === undefined ? r[k] : r[k][j]));
+      return +(Math.max(...v) - Math.min(...v)).toFixed(4);
+    };
+    return {
+      speed, cycle: +cycle.toFixed(4),
+      cadenceStepsPerSec: +(2 * speed / cycle).toFixed(2),
+      hipBob: rng('hipY'),
+      thighRangeDeg: rng('thighL'),
+      kneeRangeDeg: rng('kneeL'),
+      footPitchDeg: rng('pitchL'),
+      ankleTravel: rng('ankL', 0),
+      footLift: +Math.max(...rows.map((r) => r.soleL)).toFixed(4),
+      soleSink: +Math.min(...rows.map((r) => r.soleL)).toFixed(4),
+      rootY: +root.position.y.toFixed(4),
+      groundY: +(ctx.phys?.groundAt ? ctx.phys.groundAt(root.position.x, root.position.z).y : 0).toFixed(4),
+      hipDropRange: rng('hipDrop'),
+      syRange: rng('sy'),
+      plantedFrames: cnt,
+      slipPerFrame: +(tot / Math.max(cnt, 1)).toFixed(5),
+      slipPctOfGroundSpeed: +(100 * (tot / Math.max(cnt, 1)) / step).toFixed(1),
+      worstSlip: +worst.toFixed(5),
+      rows,
+    };
+  };
 
   /* The reference renders in §1 are studio product shots: one large soft
      key from upper-left, a weak fill from lower-right, no rim, pure white

@@ -786,6 +786,13 @@ export function createMenus(ctx, ui) {
       ui.setTouch(on);
       ui.toast(on ? 'Thumbstick on' : 'Thumbstick off', 'info');
     }));
+    /* LANDSCAPE PLAY. A phone row, under Comfort with the other
+       device choices rather than up in its own headline section:
+       portrait is the game, this is the option somebody goes
+       looking for. Absent entirely on a desktop, and on a browser
+       that cannot rotate anything it arrives WITHOUT a switch —
+       see landscapeRow(). */
+    if (ui.orient?.handheld) body.append(landscapeRow());
 
     /* ---- saves ---- */
     body.append(label('Your game'));
@@ -874,6 +881,80 @@ export function createMenus(ctx, ui) {
     });
     return h('div.w-kv', null, h('span', { text: name }), sw);
   }
+  /* ============================================================
+     LANDSCAPE PLAY — the row, and the two shapes it takes
+
+     ui/orient.js decides which. Where the browser can genuinely hold
+     the phone sideways (`mode: 'lock'`) this is a switch like any
+     other. Where it cannot — iOS Safari has no orientation lock and
+     no element fullscreen — the switch is REMOVED rather than left
+     to do nothing, and the row becomes the honest instruction: turn
+     the phone yourself, the game is laid out for it. That second
+     sentence is only true because the landscape layout in style.js
+     triggers on the viewport rather than on this preference.
+
+     The line underneath reports what is ACTUALLY happening, not what
+     was asked for, and repaints on every change — a lock dies when
+     fullscreen closes or the tab is backgrounded, and the row must
+     never keep claiming a state the page is not in.
+     ============================================================ */
+  function landscapeRow() {
+    const or = ui.orient;
+    const note = h('div.sub');
+    let sw = null;
+
+    const head = h('div.w-kv', null, h('span', { text: 'Landscape play' }));
+    if (or.mode === 'lock') {
+      sw = h('button.w-switch.w-pe', {
+        type: 'button', role: 'switch', 'aria-label': 'Landscape play',
+      });
+      sw.addEventListener('click', () => {
+        const next = !sw.classList.contains('on');
+        sw.classList.toggle('on', next);
+        /* STRAIGHT OUT OF THE GESTURE, first thing. requestFullscreen
+           and screen.orientation.lock are both gated on user
+           activation; anything that yields in front of this call
+           loses the lock and the row would then have to explain a
+           failure we caused ourselves. The click sound comes after. */
+        ui.setLandscape(next);
+        ui.click();
+      });
+      head.append(sw);
+    } else {
+      head.append(h('span.w-tagoff', { text: 'Not on this browser' }));
+    }
+
+    const wrap = h('div.w-lsrow', null, head, note);
+    const paint = (s) => {
+      s = s || or.status();
+      if (sw) sw.classList.toggle('on', s.want);
+      note.textContent = landscapeNote(s);
+      wrap.classList.toggle('warn', s.why === 'refused' || s.why === 'nofullscreen');
+    };
+    /* Self-cancelling: a sheet body is rebuilt on every refresh and
+       there is no teardown hook on a row, so the subscription drops
+       itself the first time it fires after the node left the tree. */
+    const stop = or.onChange((s) => {
+      if (!wrap.isConnected) { stop(); return; }
+      paint(s);
+    });
+    paint();
+    return wrap;
+  }
+
+  function landscapeNote(s) {
+    if (s.mode !== 'lock') {
+      return s.landscape
+        ? 'This browser will not turn the screen for you — but you are sideways already, and the game is laid out for it.'
+        : 'This browser will not turn the screen for you. Turn the phone sideways yourself and the game lays itself out for landscape.';
+    }
+    if (!s.want) return 'Goes fullscreen and holds the game sideways. Portrait stays the default.';
+    if (s.locked) return 'Held sideways. Switch it off here to go back to portrait.';
+    if (s.why === 'refused') return 'Your phone would not turn — check its own rotation lock, then tap this again.';
+    if (s.why === 'nofullscreen') return 'This browser refused fullscreen, which is where the lock lives. Turning the phone by hand still works.';
+    return 'Waiting for a tap — touch the screen to hold it sideways again.';
+  }
+
   function chips(name, values, active, onPick, labels) {
     const bar = h('div.w-chipbar');
     values.forEach((v, i) => {
