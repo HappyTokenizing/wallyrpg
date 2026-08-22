@@ -214,10 +214,54 @@ export function createScatter(ctx, env) {
   /* ------------------------------------------------------------
      Shared layer factory: build → InstancedMesh, lod → count.
      ------------------------------------------------------------ */
-  function makeLayer({ name, geo, mat, range, lod, density, pick, dress, minCount = 3 }) {
+  /* ------------------------------------------------------------
+     SOLID SCATTER.
+
+     Grass, flowers, litter and reeds are things you walk THROUGH — the
+     grass shader parts around Wally precisely to say so — and giving a
+     cornflower a collider would be both absurd and thousands of boxes.
+     Boulders are the one scattered layer you walk INTO: they run to 2 m
+     across and a metre tall.
+
+     They are also the one layer that streams, so their boxes stream
+     with them: registered when a chunk builds, dropped when it is
+     evicted or rebuilt at a new band. That holds the live count to the
+     few dozen inside the rock layer's own range instead of carrying
+     every boulder on a 970 m island in the grid forever.
+
+     A rock standing less than the controller's 0.35 m step offset proud
+     of the ground is skipped. He steps over those, and a box there
+     would only ever be a stumble.
+     ------------------------------------------------------------ */
+  const _sm = new THREE.Matrix4();
+  const _sq = new THREE.Quaternion();
+  const _sp2 = new THREE.Vector3();
+  const _ssc = new THREE.Vector3();
+  const _soff = new THREE.Matrix4();
+
+  function makeLayer({ name, geo, mat, range, lod, density, pick, dress, solid, minCount = 3 }) {
     const LOD = new THREE.Vector4(lod[0], lod[1], lod[2], lod[3]);
+    let sbb = null;
+    /** One oriented box per boulder, from that boulder's own matrix. */
+    function addSolids(mesh, n) {
+      if (!solid || !ctx.phys || !ctx.phys.addOBB) return;
+      if (!sbb) { geo.computeBoundingBox(); sbb = geo.boundingBox.clone(); }
+      const cx = (sbb.max.x + sbb.min.x) * 0.5, cz = (sbb.max.z + sbb.min.z) * 0.5;
+      const sx = (sbb.max.x - sbb.min.x) * solid.shrink;
+      const sz = (sbb.max.z - sbb.min.z) * solid.shrink;
+      const top = sbb.max.y, base = sbb.min.y - 0.6;
+      const ids = [];
+      for (let i = 0; i < n; i++) {
+        mesh.getMatrixAt(i, _sm);
+        _sm.decompose(_sp2, _sq, _ssc);
+        if (_sp2.y + top * _ssc.y - W.heightAt(_sp2.x, _sp2.z) < solid.minRise) continue;
+        _sm.multiply(_soff.makeTranslation(cx, (top + base) * 0.5, cz));
+        ids.push(ctx.phys.addOBB(sx, top - base, sz, _sm, { name: `scatter.${name}`, prop: true }));
+      }
+      if (ids.length) mesh.userData.colIds = ids;
+    }
     return {
-      name, range, material: mat, LOD,
+      name, range, material: mat, LOD, solid: !!solid,
       build(ci, cj) {
         const ox = ci * CHUNK, oz = cj * CHUNK;
         const want = Math.round(CHUNK * CHUNK * density * DENS.value);
@@ -247,6 +291,7 @@ export function createScatter(ctx, env) {
         mesh.instanceMatrix.needsUpdate = true;
         if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
         mesh.computeBoundingSphere();
+        addSolids(mesh, n);
         return mesh;
       },
       lod(mesh, d) {
@@ -256,7 +301,12 @@ export function createScatter(ctx, env) {
         mesh.count = n;
         mesh.visible = n > 0;
       },
-      release() {},
+      release(mesh) {
+        const ids = mesh?.userData?.colIds;
+        if (!ids) return;
+        ctx.phys?.remove(ids);
+        mesh.userData.colIds = null;
+      },
     };
   }
 
@@ -438,6 +488,9 @@ export function createScatter(ctx, env) {
     name: 'rock', geo: ROCK, mat: rockMat, range: rockRange,
     lod: [rockRange * 0.5, rockRange * 0.8, rockRange, 0.35],
     density: 0.009,
+    /* 0.66 of a lumpy dome's bounding box: a boulder is round on plan
+       and its box has to sit inside the silhouette, not around it. */
+    solid: { shrink: 0.66, minRise: 0.35 },
     pick(x, z) {
       const h = W.heightAt(x, z);
       if (h < 0.6) return 0;

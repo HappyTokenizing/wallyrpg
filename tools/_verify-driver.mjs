@@ -104,6 +104,15 @@ const ctl = createServer(async (req, res) => {
       return send({ ok: true, w: W, h: H, touch: wantTouch, mobile: mob });
     }
     if (u.pathname === '/wait') { await page.waitForTimeout(+(u.searchParams.get('ms') || 500)); return send({ ok: true }); }
+    /* A TRUE MID-RUN RESIZE — same context, same page, no reload, so the
+       page sees exactly the resize/orientationchange burst a phone
+       rotation delivers. /viewport rebuilds the context and reboots,
+       which by construction cannot test that path. */
+    if (u.pathname === '/resize') {
+      W = +u.searchParams.get('w'); H = +u.searchParams.get('h');
+      await page.setViewportSize({ width: W, height: H });
+      return send({ ok: true, w: W, h: H });
+    }
     if (u.pathname === '/reload') { await boot(u.searchParams.get('qs') ?? undefined); return send({ ok: true }); }
     if (u.pathname === '/quit') { send({ ok: true }); await browser.close(); fileServer.close(); process.exit(0); }
     res.writeHead(404).end('nf');

@@ -51,6 +51,11 @@ export const DEFAULT_SETTINGS = Object.freeze({
   music: 0.16, sfx: 0.35, speed: 1, relaxed: false,
   contrast: false, reduced: false, textSize: 1, touch: false,
   landscape: false,
+  /* HIDE UI. Fades out the two top clusters only — the stat pills,
+     the objective card and the money row. The thumbstick, the
+     bottom-right pad, every toast, banner, prompt and notification
+     stay: this is a clean view of the city, not a mute switch. */
+  hideUI: false,
 });
 
 /* ------------------------------------------------------------
@@ -87,8 +92,22 @@ export function newState(rng = mulberry32(0x5eed1e)) {
        v6 save and a v6-era tool both still work. */
     bike: { owned: false, equipped: false },
     arrivals: [],
+    /* FOUR MAPS, FOUR DIFFERENT QUESTIONS. There used to be three, and
+       `known` was quietly doing the work of two of them.
+         seen[id]    you have been inside
+         known[id]   it is on your map — because a `see` rule came
+                     true, OR because you walked past the building
+         found[id]   …and walking past it is HOW it got on the map
+         access[id]  its `see` rule has been satisfied, so the door
+                     opens and its quests can start. LATCHED, because
+                     reputation can go down and a place you have
+                     earned must never un-earn itself.
+       Discovery and access are deliberately separable now: see
+       DISCOVER in data.js, quests.access() and game.sense(). */
     seen: { apartment: true },
     known: {},
+    found: {},
+    access: {},
     visited: { rustyrow: true },
 
     inv: {}, tokenized: {}, prices: {}, hist: {}, trend: {},

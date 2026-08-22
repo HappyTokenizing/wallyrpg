@@ -421,10 +421,20 @@ export function createCrowd(ctx, host) {
      finds nothing and returns. npc.js supplies the list — it is the
      module that has ctx.city and the location table.
      ================================================================== */
-  const DOOR_R = 2.30;        // keep-clear disc centred on the door
-  const DOOR_LEN = 3.60;      // how far the approach corridor reaches out
-  const DOOR_HALF = 1.25;     // corridor half-width
-  const DCELL = 8;
+  /* ROUND 2. The complaint came back — "still too close to the
+     apartment where he interferes with easy access" — and the audit
+     that said otherwise was measuring a lane narrower than the elephant
+     walking down it. The volume now matches npc.js's own keep-clear to
+     the millimetre; if the two ever disagree, one of them is placing
+     people the other thinks are in the way. */
+  const DOOR_R = 3.20;        // keep-clear disc centred on the door
+  const DOOR_LEN = 5.60;      // how far the approach corridor reaches out
+  const DOOR_HALF = 2.30;     // corridor half-width
+  /* The bucket has to reach as far as the influence does: at 8 m cells
+     and a 5.60 m corridor the nine-cell write no longer covers a door
+     the agent can still feel, and a wanderer would pop when it crossed
+     a cell line. 10 m puts the whole volume inside the 3x3. */
+  const DCELL = 10;
   const doors = host?.doors || [];
   const doorGrid = new Map();
   const dkey = (i, j) => ((i * 83492791) ^ (j * 29418343)) | 0;
@@ -442,9 +452,9 @@ export function createCrowd(ctx, host) {
 
   /* Where a point is being pushed, and how hard. 0 means "not in
      anybody's doorway", which is the answer nearly every time. */
-  const _push = { x: 0, z: 0 };
+  const _push = { x: 0, z: 0, d: null };
   function doorPush(x, z) {
-    _push.x = 0; _push.z = 0;
+    _push.x = 0; _push.z = 0; _push.d = null;
     if (!doors.length) return 0;
     const b = doorGrid.get(dkey(Math.floor(x / DCELL), Math.floor(z / DCELL)));
     if (!b) return 0;
@@ -483,12 +493,92 @@ export function createCrowd(ctx, host) {
       }
       if (k > best) {
         best = k;
+        _push.d = d;
         const l = Math.hypot(px, pz) || 1;
         _push.x = px / l; _push.z = pz / l;
       }
     }
     return best;
   }
+
+  /* ==================================================================
+     HOW LONG DOES ANYBODY ACTUALLY STAND THERE?
+
+     Transiting a threshold is by design — the keep-clear is a force,
+     not a wall, and a pedestrian who walked around every doorway would
+     look like the street was full of invisible furniture. What is NOT
+     by design is dwelling: round 3 measured 1-7 agents inside a volume
+     at any snapshot, of which a couple PERSISTED for 6-9 s, and six
+     seconds in a doorway is a person standing in your doorway.
+
+     So the module measures its own defect rather than asserting the
+     fix. Every agent carries two clocks, and the difference between
+     them is the whole point:
+
+       DWELL — continuous seconds inside ONE door's volume, moving or
+         not. Per door, not per any-door: the shops on Main Street stand
+         shoulder to shoulder and their corridors overlap across the
+         street, so an any-door clock counts a pedestrian walking a row
+         of frontages as one nine-second "dwell" when he never once
+         stopped. That artefact is what made the first version of this
+         audit unable to see its own fix.
+       PARK — the subset of that time with the agent essentially
+         stationary (under 0.35 m/s). THIS is the complaint: a person
+         standing in your doorway. Transit is by design and is left
+         alone; parking is what must never happen.
+
+     `doorStats()` reports both distributions and both longest-singles.
+     ================================================================== */
+  const DWELL_IN = 0.02;          // k above this counts as "inside"
+  /* The round-3 anti-parking behaviour, switchable — and unlike the
+     A/B this project shipped last round, this one really does restore
+     the old code path: the drift floor, the eviction and the
+     don't-loiter-on-a-doorstep roll all read it, so `{evict:false}`
+     re-measures the crowd that dwelled 6-9 s. */
+  const EV = { on: true };
+  const PARK_SPEED = 0.35;        // slower than this is not walking past
+  const DWELL_BUCKETS = [0.5, 1, 2, 3, 4, 6, 9];
+  const nBucket = () => new Array(DWELL_BUCKETS.length + 1).fill(0);
+  const blank = () => ({ n: 0, total: 0, longest: 0, hist: nBucket() });
+  const stats = {
+    t: 0, snaps: 0, snapSum: 0, snapMax: 0, parkSum: 0, parkMax: 0,
+    evictions: 0, dwell: blank(), park: blank(),
+  };
+  function record(bin, d) {
+    bin.n++; bin.total += d;
+    if (d > bin.longest) bin.longest = d;
+    let i = 0;
+    while (i < DWELL_BUCKETS.length && d > DWELL_BUCKETS[i]) i++;
+    bin.hist[i]++;
+  }
+  /** One agent, one frame. `d` is the door whose volume he is in. */
+  function tallyDwell(a, k, dt, door) {
+    const inside = k > DWELL_IN && door;
+    if (!inside || door !== a.doorAt) {
+      if (a.doorDwell > 0) record(stats.dwell, a.doorDwell);
+      if (a.parkDwell > 0) record(stats.park, a.parkDwell);
+      a.doorDwell = 0; a.parkDwell = 0;
+      a.doorAt = inside ? door : null;
+    }
+    if (!inside) return;
+    a.doorDwell += dt;
+    if (a.speed < PARK_SPEED) a.parkDwell += dt;
+    else {
+      if (a.parkDwell > 0) record(stats.park, a.parkDwell);
+      a.parkDwell = 0;
+    }
+  }
+
+  /* THE PROBE. The natural crowd hardly ever parks in a doorway — road
+     nodes mostly sit off the keep-clear, so a 60 s window can pass with
+     nothing to see, and "no parking observed" is not the same claim as
+     "parking is now impossible". So the module can be made to produce
+     the defect on demand: drop somebody on a threshold, tell him to
+     loiter, and time how long he takes to get clear. That number is the
+     fix, and it is comparable between `{evict:false}` and `{evict:true}`
+     on the same doors — an A/B that cannot return the same answer twice
+     by accident, because the two branches take different code. */
+  const probes = [];
 
   /* ---- the walkable graph, straight off the road network ---- */
   const nodes = world?.paths?.nodes || [];
@@ -534,6 +624,11 @@ export function createCrowd(ctx, host) {
       mode: 'walk',
       timer: 0,
       pause: 0,
+      /* the door clock: seconds continuously inside a keep-clear, the
+         sampled push at the top of this frame, and how long the
+         eviction force stays raised after one fires */
+      doorDwell: 0, parkDwell: 0, doorAt: null, probe: null,
+      dk: 0, dkx: 0, dkz: 0, evict: 0, noPause: 0,
       active: true,
       lift: 0, liftT: rng() * 0.5,
     };
@@ -563,14 +658,35 @@ export function createCrowd(ctx, host) {
       /* LOITERING IS WHERE THE DEFECT ACTUALLY LIVES. A wanderer
          crossing a threshold is traffic; a wanderer who stops in one is
          a door that cannot be used. So a paused agent keeps drifting —
-         slowly, 0.55 m/s, under the same force — until he is out of the
-         corridor, and then stops. It reads as somebody shuffling aside,
-         which is what a person standing in a doorway does. */
-      const k = doorPush(a.pos.x, a.pos.z);
-      if (k > 0.02) {
-        const v = 0.55 * Math.min(1, k * 2.2);
-        a.pos.x += _push.x * v * dt;
-        a.pos.z += _push.z * v * dt;
+         slowly, under the same force — until he is out of the corridor,
+         and then stops. It reads as somebody shuffling aside, which is
+         what a person standing in a doorway does.
+
+         ROUND 3: THE SHUFFLE DID NOT FINISH. The drift speed was scaled
+         by k, and k falls to zero AT the boundary — so the closer he
+         got to being clear the slower he moved, an asymptote dressed up
+         as a force. Measured, that is a couple of agents dwelling 6-9 s
+         in a doorway. Two changes, both still forces:
+
+         1. a FLOOR under the drift (never below ~0.28 m/s however
+            shallow he is in the volume), so leaving actually completes;
+         2. an EVICTION at 1.2 s of continuous dwell — the loiter is cut
+            short and he walks off under a raised door weight for the
+            next 2.5 s, with a cooldown so he does not re-park at the
+            same forecourt. He walks out on his own legs rather than
+            sliding out in an idle pose, which is the difference between
+            somebody moving aside and a body on a conveyor. */
+      const k = a.dk;
+      if (k > DWELL_IN) {
+        if (EV.on && a.parkDwell > 1.2) {
+          a.pause = 0; a.mode = 'walk';
+          a.evict = 2.5; a.noPause = 8;
+          stats.evictions++;
+          return;
+        }
+        const v = 0.55 * (EV.on ? Math.max(0.5, Math.min(1, k * 2.2)) : Math.min(1, k * 2.2));
+        a.pos.x += a.dkx * v * dt;
+        a.pos.z += a.dkz * v * dt;
       }
       return;
     }
@@ -591,10 +707,19 @@ export function createCrowd(ctx, host) {
         const n = nodes[a.node];
         const loc = n && n.kind === 'loc' ? n.ref : null;
         const open = loc && ctx.game?.isOpen ? ctx.game.isOpen(loc.id) : true;
-        if (loc && open && rng() < 0.42) {
+        /* NOBODY CHOOSES TO STOP ON A DOORSTEP. A location node often
+           sits on the forecourt, so the loiter roll is skipped outright
+           while he is standing in the keep-clear or is still walking one
+           off. He carries on down the road and stops somewhere he is
+           not in the way — no teleport, no jitter, just a decision not
+           taken. The eviction above handles the ones already there. */
+        /* the draws happen either way so the shared stream does not
+           shift under a decision that depends on where somebody stands */
+        const blocked = EV.on && (a.dk > 0.15 || a.noPause > 0);
+        if (loc && open && rng() < 0.42 && !blocked) {
           a.pause = 4 + rng() * 14;
           a.mode = rng() < 0.35 ? 'talk' : (rng() < 0.25 ? 'work' : 'idle');
-        } else if (rng() < 0.10) {
+        } else if (rng() < 0.10 && !blocked) {
           a.pause = 2 + rng() * 6;
           a.mode = 'idle';
         }
@@ -641,8 +766,14 @@ export function createCrowd(ctx, host) {
     /* and out of anybody's doorway. Weighted a shade under the
        separation term: it must be enough to bend a path around a
        threshold and never enough to stop somebody walking past one. */
-    const dk = doorPush(a.pos.x, a.pos.z);
-    if (dk > 0) { ux += _push.x * dk * 0.85; uz += _push.z * dk * 0.85; }
+    const dk = a.dk;
+    if (dk > 0) {
+      /* the weight triples for a couple of seconds after an eviction:
+         enough to beat the road he is following back through the
+         threshold, and it decays, so the path bends rather than snaps */
+      const w = a.evict > 0 ? 0.85 + 1.75 * Math.min(1, a.evict / 2.5) : 0.85;
+      ux += a.dkx * dk * w; uz += a.dkz * dk * w;
+    }
     const ul = Math.hypot(ux, uz) || 1;
     ux /= ul; uz /= ul;
 
@@ -686,6 +817,89 @@ export function createCrowd(ctx, host) {
       return { k, out: { x: _push.x, z: _push.z } };
     },
 
+    /** Stand `n` wanderers squarely in `n` different doorways and tell
+        them to loiter there; `doorProbeState()` then reports how many
+        seconds each one took to get clear. Debug only — it teleports
+        people, which nothing in the game does. */
+    doorProbe(opts = {}) {
+      if (opts.evict !== undefined) EV.on = !!opts.evict;
+      for (const a of probes) a.probe = null;
+      probes.length = 0;
+      const n = opts.n ?? 6;
+      const step = Math.max(1, Math.floor(doors.length / n));
+      let ai = 0;
+      for (let i = 0; i < doors.length && probes.length < n; i += step) {
+        const d = doors[i];
+        while (ai < agents.length && (agents[ai].human.asleep || agents[ai].probe)) ai++;
+        if (ai >= agents.length) break;
+        const a = agents[ai++];
+        /* half a metre out from the threshold: k ~ 0.85, which is the
+           worst the complaint has ever described */
+        a.pos.x = d.x + d.ax * 0.5; a.pos.z = d.z + d.az * 0.5;
+        a.speed = 0; a.vel.set(0, 0, 0);
+        a.pause = opts.pause ?? 12; a.mode = 'idle';
+        a.doorDwell = 0; a.parkDwell = 0; a.doorAt = null;
+        a.evict = 0; a.noPause = 0;
+        a.probe = { door: d.id, t: 0, clear: -1, k0: -1 };
+        probes.push(a);
+      }
+      return { probes: probes.length, evict: EV.on };
+    },
+
+    /** Seconds to clear per probe; -1 means still in the doorway. */
+    doorProbeState() {
+      return {
+        evict: EV.on,
+        rows: probes.map((a) => ({
+          door: a.probe.door, k0: +Math.max(0, a.probe.k0).toFixed(2),
+          k: +a.dk.toFixed(2), t: +a.probe.t.toFixed(2),
+          clear: a.probe.clear < 0 ? -1 : +a.probe.clear.toFixed(2),
+        })),
+      };
+    },
+
+    /** The dwell distribution inside doorway keep-clears, accumulated
+        live since the last reset. `longest` is the headline: transits
+        are fine, standing there is not. Ongoing dwells are reported
+        separately so a long one in flight cannot hide behind a reset. */
+    doorStats(opts = {}) {
+      if (opts.evict !== undefined) EV.on = !!opts.evict;
+      if (opts.reset) {
+        stats.t = 0; stats.snaps = 0; stats.evictions = 0;
+        stats.snapSum = 0; stats.snapMax = 0;
+        stats.parkSum = 0; stats.parkMax = 0;
+        stats.dwell = blank(); stats.park = blank();
+        for (const a of agents) { a.doorDwell = 0; a.parkDwell = 0; a.doorAt = null; }
+      }
+      const shape = (bin, live) => {
+        const hist = {};
+        for (let i = 0; i <= DWELL_BUCKETS.length; i++) {
+          const lo = i === 0 ? 0 : DWELL_BUCKETS[i - 1], hi = DWELL_BUCKETS[i];
+          hist[hi ? `${lo}-${hi}s` : `>${lo}s`] = bin.hist[i];
+        }
+        return {
+          n: bin.n, longest: +bin.longest.toFixed(2),
+          mean: bin.n ? +(bin.total / bin.n).toFixed(2) : 0,
+          hist, longestInFlight: +live.toFixed(2),
+        };
+      };
+      let liveD = 0, liveP = 0;
+      for (const a of agents) {
+        if (a.doorDwell > liveD) liveD = a.doorDwell;
+        if (a.parkDwell > liveP) liveP = a.parkDwell;
+      }
+      return {
+        window: +stats.t.toFixed(1), evict: EV.on, evictions: stats.evictions,
+        agents: agents.length, doors: doors.length,
+        park: shape(stats.park, liveP),
+        transit: shape(stats.dwell, liveD),
+        insideMean: stats.snaps ? +(stats.snapSum / stats.snaps).toFixed(2) : 0,
+        insideMax: stats.snapMax,
+        parkedMean: stats.snaps ? +(stats.parkSum / stats.snaps).toFixed(2) : 0,
+        parkedMax: stats.parkMax,
+      };
+    },
+
     /** Somewhere sensible to put a new wanderer. */
     randomNode() {
       if (!walkable.length) return -1;
@@ -725,6 +939,30 @@ export function createCrowd(ctx, host) {
         if (!b) { b = []; grid.set(k, b); }
         b.push(a);
       }
+      /* ONE door sample per agent per frame, at the top: steer reads it
+         instead of calling doorPush again (the _push scratch vector is
+         shared, so a second call from anywhere would clobber it), and
+         the dwell clock is fed from the same number the force uses —
+         the audit cannot disagree with the behaviour it is auditing. */
+      let inside = 0, parked = 0;
+      for (const a of agents) {
+        if (a.frozen || a.human.asleep) { a.dk = 0; tallyDwell(a, 0, dt, null); continue; }
+        a.dk = doorPush(a.pos.x, a.pos.z);
+        a.dkx = _push.x; a.dkz = _push.z; a.dkd = _push.d;
+        if (a.dk > DWELL_IN) { inside++; if (a.speed < PARK_SPEED) parked++; }
+        tallyDwell(a, a.dk, dt, a.dkd);
+        if (a.probe && a.probe.clear < 0) {
+          a.probe.t += dt;
+          if (a.probe.k0 < 0) a.probe.k0 = a.dk;
+          if (a.dk <= DWELL_IN) a.probe.clear = a.probe.t;
+        }
+        if (a.evict > 0) a.evict = Math.max(0, a.evict - dt);
+        if (a.noPause > 0) a.noPause = Math.max(0, a.noPause - dt);
+      }
+      stats.t += dt; stats.snaps++;
+      stats.snapSum += inside; stats.parkSum += parked;
+      if (inside > stats.snapMax) stats.snapMax = inside;
+      if (parked > stats.parkMax) stats.parkMax = parked;
       for (const a of agents) {
         if (a.frozen || a.human.asleep) continue;
         a.active = a.human.active;

@@ -445,3 +445,48 @@ float wLinearDepth( float d, vec2 nf ) {
   return ( 2.0 * nf.x * nf.y ) / ( nf.y + nf.x - z * ( nf.y - nf.x ) );
 }
 `;
+
+/* ------------------------------------------------------------------
+   THE FIREWALL. wFinite() — a value, or the fallback if it is not a
+   number a frame can survive.
+
+   ONE non-finite texel in the linear scene buffer is not one bad
+   pixel. bloomPreMat divides by max(br, 1e-5) where br is already
+   Inf, the 13-tap Karis downsample carries the result into every mip,
+   and the tent upsample carries it back out again — so a single bad
+   texel arrives at the composite as a solid block roughly
+   2^MIPS pixels on a side, and a non-finite value written to the
+   UnsignedByte LDR target lands as zero. That is the "random black
+   square", and it is square because the mip pyramid is.
+
+   MEASURED, with WALLY.debug.nanWatch(1) over a 34 s intro at
+   1600x900 (probe quarter-res, 4x4 taps, so one probe cell is 16
+   screen pixels):
+
+     scene buffer      1 cell bad      ~1 texel
+     bloom mip 0    2704 cells bad     ~208 x 208 screen pixels
+     bloom mip N    1024 cells bad
+     -> amplification of a single texel: about 2700x
+
+   So the pyramid is an amplifier and it must not be fed garbage.
+
+   WHY THREE TESTS. Any one of them is legal for a compiler that
+   assumes no NaN to fold away, and this project's own probe measured
+   exactly that: on ANGLE -> Metal, `uZero / uZero` compiles to a
+   constant 1.0. The magnitude test is the one that cannot be folded
+   for +-Inf, because Inf comparisons stay well defined even under
+   fast math; the other two catch NaN wherever the driver keeps it.
+   Cost is a handful of ALU on passes that are bandwidth-bound.
+
+   Verify with WALLY.debug.nanSelfTest() on any new driver before
+   trusting a clean result — see postfx.js section 7.
+   ------------------------------------------------------------------ */
+export const GLSL_FINITE = /* glsl */`
+bool wIsBad( float v ) {
+  return !( v <= 1e30 && v >= -1e30 ) || ( v != v ) || !( ( v * 0.0 ) == 0.0 );
+}
+float wFinite1( float v, float fb ) { return wIsBad( v ) ? fb : v; }
+vec3 wFinite( vec3 c, float fb ) {
+  return vec3( wFinite1( c.r, fb ), wFinite1( c.g, fb ), wFinite1( c.b, fb ) );
+}
+`;

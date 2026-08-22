@@ -2272,6 +2272,111 @@ export function smoothWeights(index, count, skinIndex, skinWeight, passes = 3, w
   return { skinIndex, skinWeight };
 }
 
+/* ==================================================================
+   THE EAR MAY NOT DRAG THE SKULL
+   ==================================================================
+
+   "His sunglasses in the back of his ears sometimes stick out when he is
+   moving/running." The previous pass tucked the temple HOOK into the
+   ear's root wedge (see the note in the temple-arm block below), and
+   that fix is real: the hook ends are provably occluded from a rear
+   camera on every free-run frame. The SYMPTOM survived it, and this is
+   why.
+
+   MEASURED, not reasoned. Rear studio camera, free run at 6.2-6.8 m/s
+   with sweeping turns and gusts, flood-filling the head band for
+   near-black clusters (luma < 80 on a 211-luma clay), then raycasting
+   the cluster's own pixels back into the scene:
+
+     the ray misses `wally.body` ENTIRELY — front faces and back faces,
+     tested double-sided — and lands on the glasses' front assembly at
+     z +0.40, i.e. it goes PAST the cheek and out the other side.
+     Hiding wally.frame alone leaves the wedge (the two lens panels are
+     separate meshes and just as black); hiding frame + both lenses +
+     grooves + tusks takes it to 0 of 20. The black IS the glasses, seen
+     from behind, THROUGH the skull.
+
+   And the skull is open there because the ear chain is dragging it.
+   rig.js's earL0 capture cone runs down to y 1.240 on a 60 mm radius,
+   TAU is 55 mm, and five Laplacian passes spread what that captures:
+   cheek vertices whose BIND positions sit 40-70 mm OUTSIDE the ear blob
+   — (0.23, 1.19, -0.03), (0.24, 1.22, +0.05) and their neighbours —
+   carry 0.25-0.52 of earL0/earR0. A 27-49 degree root swing then walks
+   that patch of cranium off with the fan, the flank goes hollow behind
+   it, and the black glasses corner — proud of the skull at brow height,
+   normally well inside its silhouette — is uncovered.
+
+   So the fix is not more ear and not less swing: an ear bone may only
+   move skin that is actually ON the ear. The mask below is the ear
+   blob's own signed field — the exact volume `earBlob` sculpts, buried
+   root wedge included — tapered over the first 48 mm outside it, which
+   is ~3 mesher cells and therefore a gradient rather than a seam. Skin
+   on the fan and in the root fillet (dEar -3 to -62 mm) keeps every bit
+   of ear it had, so the flap §4 calls "the most visible piece of polish
+   in the game" is bit-for-bit unchanged; skin on the cheek and the
+   crown (dEar +44 to +130 mm) loses it and stays with the skull.
+
+   Paired A/B, alternating the weights frame by frame down ONE driven
+   run so both conditions see the same stride, the same gusts and the
+   same spring state, 50 pairs:
+
+     near-black clusters in the head band   8 / 50  ->  0 / 50
+     worst cluster                          17x38 px (383 px) -> none
+
+   NOTE FOR THE NEXT PASS: do NOT "help" this by growing the buried root
+   wedge. The wedge is the mask's own definition of what counts as ear,
+   so a bigger wedge hands MORE cranium back to the ear chain — which is
+   the defect. If that notch ever needs more mass it belongs on the head
+   blob, where it cannot swing.
+   ------------------------------------------------------------------ */
+
+/* metres outside the ear blob: inside EAR_MASK_IN the ear owns the skin
+   outright, past EAR_MASK_OUT it owns none of it. */
+const EAR_MASK_IN = 0.000;
+const EAR_MASK_OUT = 0.048;
+
+export function clampEarWeights(pos, count, skinIndex, skinWeight) {
+  const ears = [earBlob(1), earBlob(-1)];
+  const isEar = new Uint8Array(BONES.length);
+  for (const n of ['earL0', 'earL1', 'earL2', 'earR0', 'earR1', 'earR2']) {
+    isEar[BONE_INDEX[n]] = 1;
+  }
+  const span = EAR_MASK_OUT - EAR_MASK_IN;
+  for (let v = 0; v < count; v++) {
+    let ear = 0, rest = 0;
+    for (let k = 0; k < 4; k++) {
+      const w = skinWeight[v * 4 + k];
+      if (isEar[skinIndex[v * 4 + k]]) ear += w; else rest += w;
+    }
+    /* nothing to move, or nowhere to move it to — a vertex with no
+       non-ear influence at all is fan skin and keeps what it has */
+    if (ear <= 1e-4 || rest <= 1e-4) continue;
+
+    const x = pos[v * 3], y = pos[v * 3 + 1], z = pos[v * 3 + 2];
+    let d = Infinity;
+    for (let e = 0; e < 2; e++) {
+      const b = ears[e];
+      let db = primDist(b.prims[0], x, y, z);
+      for (let i = 1; i < b.prims.length; i++) {
+        db = smin(db, primDist(b.prims[i], x, y, z), b.k);
+      }
+      if (db < d) d = db;
+    }
+    if (d <= EAR_MASK_IN) continue;
+
+    let t = (d - EAR_MASK_IN) / span;
+    if (t > 1) t = 1;
+    const m = 1 - t * t * (3 - 2 * t);          // inverted smoothstep
+    const total = ear * m + rest;
+    if (!(total > 1e-6)) continue;
+    const ke = m / total, kr = 1 / total;
+    for (let k = 0; k < 4; k++) {
+      skinWeight[v * 4 + k] *= isEar[skinIndex[v * 4 + k]] ? ke : kr;
+    }
+  }
+  return { skinIndex, skinWeight };
+}
+
 /**
  * Analytic redistribution of the TRUNK weights by arc length.
  *
@@ -2902,6 +3007,12 @@ export function buildBodyGeometry(quality = 'high') {
      1.17, while leaving the bulk weights untouched — the ear tip is still
      0.96 earL2 and the trunk tip still 0.88 trunk4. */
   smoothWeights(mesh.index, mesh.count, skinIndex, skinWeight, 5, 0.55);
+  /* AFTER the Laplacian pass, because the Laplacian is HOW the ear
+     reaches the cheek: the capture pass alone leaves the bleed at
+     ~0.2 and five passes of one-ring averaging take it to 0.5 on skin
+     70 mm outside the fan. Clamping before the smoothing would simply
+     be undone by it. See the block on clampEarWeights. */
+  clampEarWeights(mesh.position, mesh.count, skinIndex, skinWeight);
   /* AFTER the Laplacian pass: the trunk's inter-bone bands are re-derived
      analytically in arc length (see blendTrunkWeights) so a straightened
      hang bends over 84 mm per joint instead of pinching a ring at every
@@ -3313,6 +3424,33 @@ export function buildFrameGeometry(quality = 'high') {
      head: mid-path x 0.292-0.300 keeps the whole 11 mm section proud of
      the skin all the way to the ear root, then the hook drops behind
      the ear fan. */
+  /* THE HOOK CURLS IN, NOT DOWN AND BACK — arithmetic, not taste. "His
+     sunglasses in the back of his ears sometimes stick out when he is
+     moving/running": the arm is rigid on the head, the ear is a spring
+     chain pivoting about its root at (0.285, 1.432, -0.052), and the old
+     hook ended at (0.286, 1.329, -0.096) — 112 mm out on that pivot's
+     radius. What covers it is the ear's buried root wedge, the lobe at
+     (0.252, 1.408, -0.030) with half-axes 0.076 x 0.150 x 0.074 about
+     the plate normal (0.220, 0.200, 0.955). Put the old end point in
+     that lobe's frame and the ellipsoid test comes out 1.52: it was
+     OUTSIDE the wedge at bind, before the ear had moved at all, and
+     only the fan's bulk hid it in a still frame. A stride swung the
+     root, the gap opened, and the black hook sat in it — visible in
+     shots/c0-back.png at the right ear and absent from the same shot
+     standing still.
+
+     The new end is (0.278, 1.382, -0.074): 55 mm on the pivot radius
+     instead of 112, and the same test gives 0.54 against 1.52 — well
+     inside the wedge, which is what it has to be, because the wedge
+     ROTATES with the ear and a bind-space pass only tells you where
+     the margin starts. 0.88 (the first cut, at 73 mm) still printed a
+     17x34 px black sliver in the ear-root notch on three of eight
+     back-camera run frames; 0.54 prints none on any of them. It is
+     still 14.7 mm proud of the 0.278 head ball, so §1.4's
+     "visible in side view... hooked ends peek past the head silhouette
+     from behind" survives; the hook curls in toward the skull instead
+     of dropping off the back of it. Nothing else about the assembly
+     moves. */
   const anchor = shellPoint(g.barEndS - 0.010, 0.068, -g.depth * 0.5);
   const yArm = anchor[1];
   const tPts = [
@@ -3320,7 +3458,7 @@ export function buildFrameGeometry(quality = 'high') {
     new THREE.Vector3(0.272, yArm + 0.004, 0.116),
     new THREE.Vector3(0.292, yArm + 0.008, 0.004),
     new THREE.Vector3(0.300, yArm + 0.020, -0.066),   // under the ear root
-    new THREE.Vector3(0.286, yArm - 0.040, -0.096),   // the hook, down and back
+    new THREE.Vector3(0.278, yArm + 0.013, -0.074),   // the hook, down and IN
   ];
   const temple = sweptBar(new THREE.CatmullRomCurve3(tPts), 0.0110, 0.0280,
     quality === 'low' ? 12 : 22, 0.0042);

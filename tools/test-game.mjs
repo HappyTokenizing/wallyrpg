@@ -25,8 +25,12 @@
    quest-only door and the motorcycle's price, one-at-a-time
    equipping and the v6 -> v7 migration); the guarantee that a broke,
    exhausted player is never hard-locked; that no player-visible
-   string says Uber; refusals; and the world queries the 3D builder
-   needs.
+   string says Uber; refusals; the world queries the 3D builder
+   needs; DISCOVERY BY WALKING (a radius that can never reach a
+   neighbour, a dwell that a teleport cannot bank, and the proof that
+   finding a building opens not one of its gates); and THE FIRST
+   CLIENT ORDER, which is CRUMB at the Business Broker down both
+   routes in and across sixty seeds each.
 
    Exits non-zero on the first hard failure summary.
    ============================================================ */
@@ -40,6 +44,7 @@ import DATA, {
   OPENING_MESSAGE, byTicker, assetLabel, searchAssets, normTicker,
   RIDES, RIDE_LIST, RIDE_ORDER, SIDE_QUEST_BY_ID, QUEST_BY_ID,
   REP_TITLES, RACE, PRODUCERS, SLATE_MEAL, NPC_POSTS, ORDER_FAIL, HAPPY_ENDING, EMPLOYEE_BY_ID,
+  DISCOVER, FIRST_ORDER, ruleLabel,
   repProgress, orderFailRep,
   hops, fare, rideFare, worldDistance,
 } from '../src/game/data.js';
@@ -1051,15 +1056,30 @@ T('the opening story beats');
   eq(g.quests.sideStatus('q_side_otto'), 'active', 'and state.sides records it as active');
   ok(g.state.arrivals.some((o) => o.client === 'otto'), 'and he left an order on the desk');
   {
-    /* A FRIEND'S FIRST ORDER MUST BE AFFORDABLE. Rolled normally,
-       Otto's ceiling reaches a $480 gallery collection on day one —
-       which a player holding $250 and one shift's pay cannot buy. */
+    /* A FRIEND'S FIRST ORDER IS ONE THING, IT IS CRUMB, AND IT IS
+       SOLD AT THE BROKER. Rolled normally, Otto's ceiling reaches a
+       $480 gallery collection on day one. The old hand-built version
+       fixed that by taking the CHEAPEST of a four-asset shortlist —
+       which is SNEAK at $210, sold at the Culture Bazaar — while the
+       objective this very order triggers says "Go and see the Business
+       Broker". The shopping list and the arrow now point at the same
+       counter. See FIRST_ORDER in data.js, and section 24 below, which
+       proves it across every route in and a hundred seeds. */
     const oo = g.state.arrivals.find((x) => x.client === 'otto');
     eq(oo.items.length, 1, 'it is one thing, not a basket');
     eq(oo.items[0].q, 1, 'and one of it');
+    eq(oo.items[0].t, 'CRUMB', 'and the one thing is CRUMB');
+    eq(ASSET_BY_ID[oo.items[0].a].ven, 'broker', 'sold at the Business Broker and nowhere else');
     const outlay = g.economy.buyPrice(oo.items[0].a);
-    ok(outlay <= CONFIG.startMoney + 130, 'and it is buyable on day one money',
-      `$${outlay} vs $${CONFIG.startMoney} + a shift`);
+    /* NOT "buyable straight out of the wallet". CRUMB is deliberately
+       a few shifts' work — data.js says so in the JOBS table, which is
+       balanced around exactly this asset — and the deadline is sized
+       to that. What has to be true is that the two shifts open to a
+       nobody on day one cover it well inside the deadline. */
+    const perShift = JOBS.drive.base + 0.5 * JOBS.drive.mult;
+    const shiftsNeeded = Math.max(0, outlay - CONFIG.startMoney) / perShift;
+    ok(shiftsNeeded <= (oo.deadline - g.state.day) * 3, 'day-one shifts cover it inside the deadline',
+      `$${outlay} = ${shiftsNeeded.toFixed(1)} Dispatch shifts across ${oo.deadline - g.state.day} days`);
     ok(oo.budget + oo.fee > outlay, 'he pays more than it costs you', `$${oo.budget + oo.fee} for $${outlay}`);
     ok(oo.deadline - g.state.day >= 4, 'and he is in no hurry', oo.deadline - g.state.day);
   }
@@ -2314,6 +2334,13 @@ T('the motorcycle is priced in client orders');
   g.state.rep = RIDES.motorcycle.unlock.rep;
   g.state.money = 5e6;
   g.state.time = 12 * 60;
+  /* THIS SECTION MEASURES THE STEADY STATE, NOT THE TUTORIAL. Every
+     order in the game before the first one is ACCEPTED is forced to
+     the CRUMB basket (data.js FIRST_ORDER), and a $77 fee on a single
+     croissant is not what the motorcycle is priced against. The flag
+     is what acceptOrder() sets; a fabricated rep-95 broker who has
+     never touched the desk has to set it himself. */
+  g.state.flags.firstOrderTaken = true;
   for (const c of COURSES) g.state.skills[c.id] = true;
   for (const k of ['exchange', 'treasury', 'farmcoop', 'mineral', 'stadiumoffice']) g.state.unlocks[k] = true;
   for (const cid of Object.keys(g.state.clients)) { g.state.clients[cid].met = true; g.state.clients[cid].trust = 3; }
@@ -2923,6 +2950,398 @@ T("Happy's ending is verbatim, and both URLs are links");
   num(payload.netWorth, 'plus a net worth for the card');
   eq(payload.main.total, QUESTS.length, 'and the main-chain tally');
   eq(payload.side.total, SIDE_QUESTS.length, 'and the side-quest tally');
+}
+
+/* ============================================================
+   23. DISCOVERY BY WALKING — found is not the same as allowed in
+
+   "You can discover all places yourself by also walking nearby them
+   and discovering them on the map by traveling there manually,
+   however it doesn't always mean you can use or start the quests
+   right away."
+
+   So this section has to prove BOTH halves. Walking up to a building
+   puts it on the map — which is what stops Dispatch from being the
+   only road forward — and putting it on the map grants NOTHING. Every
+   gate that stood before it still stands after it, and the refusal
+   says which one.
+   ============================================================ */
+T('walking near a building discovers it');
+{
+  const g = createGame({ seed: 401, autosave: false });
+  const ex = LOC_BY_ID.exchange;
+
+  /* --- the radius is a real, sane number, per building --- */
+  ok(DISCOVER.dwell > 0 && DISCOVER.dwell < 3, 'the dwell is a fraction of a second, not a stakeout', DISCOVER.dwell);
+  for (const l of LOCATIONS) {
+    num(l.findRadius, `${l.id} has a discovery radius`);
+    ok(l.findRadius >= DISCOVER.min, `${l.id}'s radius is at least the floor`, l.findRadius);
+    ok(l.findRadius > l.radius, `${l.id} is noticed from further than its own footprint`,
+      `${l.findRadius} vs ${l.radius}`);
+    /* it must also be WIDER than hud.js's door-prompt reach, so a place
+       lands on the map before you can press E at it */
+    const doorReach = Math.max(9, Math.hypot(l.size.w, l.size.d) * 0.5 + 5.5);
+    ok(l.findRadius > doorReach, `${l.id} is discovered before its door prompts`,
+      `${l.findRadius} vs ${doorReach.toFixed(1)}`);
+  }
+  /* THE ASSERTION THAT KEEPS THE RADIUS HONEST: no circle may ever
+     reach a neighbour, or walking to one door would discover two. */
+  let worst = Infinity, worstPair = '';
+  for (const a of LOCATIONS) {
+    for (const b of LOCATIONS) {
+      if (a === b) continue;
+      const d = Math.hypot(a.world.x - b.world.x, a.world.z - b.world.z);
+      const slack = d - a.findRadius;
+      if (slack < worst) { worst = slack; worstPair = `${a.id} -> ${b.id}`; }
+    }
+  }
+  ok(worst > 10, 'no discovery radius reaches another building', `${worstPair} clears by ${worst.toFixed(1)} m`);
+
+  /* EVERY GATED PLACE CAN EXPLAIN ITSELF. This is the content check
+     behind "never a dead entry": if a location carries a `see` rule
+     that ruleLabel() cannot put into words, a player who walks up to
+     it gets a locked door and no sentence. */
+  for (const l of LOCATIONS) {
+    if (l.see === 0 || l.see == null) continue;
+    const label = ruleLabel(l.see);
+    ok(!!label && label.length > 3, `${l.id}'s see-rule reads as English`, JSON.stringify(l.see) + ' -> ' + label);
+    ok(!/undefined|null|\[object|NaN/.test(String(label)), `${l.id}'s label has no leaked internals`, label);
+  }
+
+  /* --- out of range discovers nothing --- */
+  eq(g.sense(ex.world.x + 400, ex.world.z, 5).length, 0, 'standing 400 m away finds nothing');
+  ok(!g.known('exchange'), 'and the Exchange is still off the map');
+
+  /* --- and inside the radius you have to actually linger --- */
+  g.resetSense();
+  eq(g.sense(ex.world.x + 4, ex.world.z, DISCOVER.dwell * 0.4).length, 0, 'brushing past for a moment is not enough');
+  ok(!g.known('exchange'), 'still nothing on the map');
+  const found = g.sense(ex.world.x + 4, ex.world.z, DISCOVER.dwell);
+  eq(found.length, 1, 'staying put for the dwell finds it');
+  eq(found[0].id, 'exchange', 'and it is the building you are standing at');
+  ok(g.known('exchange'), 'the Stock Exchange is on the map');
+  ok(g.foundNear('exchange'), 'and marked as found on foot, not earned');
+  ok(g.state.found.exchange, 'state.found records it');
+  eq(g.sense(ex.world.x + 4, ex.world.z, 5).length, 0, 'and it is not discovered twice');
+
+  /* ONE BUILDING AT A TIME. Golden Heights has four; standing at the
+     Exchange must not hand over the Treasury and the penthouse. */
+  eq(LOCATIONS.filter((l) => g.known(l.id) && l.z === 'goldenheights').length, 1,
+    'only the building you walked to, not its whole district');
+
+  /* --- FOUND IS NOT ALLOWED IN. Every gate still refuses. --- */
+  ok(!g.access('exchange'), 'discovering it did not satisfy its `see` rule');
+  const door = g.canEnter('exchange');
+  ok(!door.ok, 'the door refuses');
+  eq(door.kind, 'locked', 'and it refuses as locked, not as unknown');
+  ok(/Market Fundamentals/i.test(door.why), 'and it names the gate that is shut', door.why);
+  ok(!!door.need, 'with a `need` string the UI can print on its own', door.need);
+  const warp = g.travel('exchange', 'walk');
+  ok(!warp.ok, 'fast travel refuses it too');
+  eq(warp.kind, 'locked', 'with the same kind');
+  const ent = g.enter('exchange');
+  ok(!ent.ok, 'and so does walking through the door');
+  ok(g.state.loc !== 'exchange', 'he is not inside it');
+
+  /* --- NEVER A DEAD ENTRY: every fare row carries the reason --- */
+  const rows = g.fares('exchange');
+  ok(rows.length >= 3, 'the fare board still lists every mode');
+  for (const r of rows) {
+    ok(!r.ok, `the ${r.mode} row is refused`);
+    ok(!!r.why && r.why.length > 12, `the ${r.mode} row says why in a sentence`, r.why);
+    ok(/Market Fundamentals/i.test(r.why), `the ${r.mode} row names the gate`, r.why);
+  }
+  /* …and placeInfo() says the same thing in one object */
+  const info = g.placeInfo('exchange');
+  eq(info.status, 'locked', 'placeInfo() calls it locked');
+  ok(info.known, 'known');
+  ok(info.found, 'found on foot');
+  ok(!info.access, 'not accessible');
+  ok(!!info.statusLabel, 'with a label to print', info.statusLabel);
+  ok(!!info.why, 'and the reason', info.why);
+  ok(g.places().some((p) => p.id === 'exchange'), 'it appears in the Places list');
+  ok(g.placeProgress().locked >= 1, 'and the Places headline counts it as not-yet-open');
+
+  /* --- AND WHEN THE GATE FINALLY FALLS, THE CITY SAYS SO ---
+     the payoff for having found it early: it is already on your map,
+     so the moment the last rule comes true it has to announce itself
+     rather than silently becoming clickable. */
+  {
+    const notes = [];
+    g.bus.on('note', (n) => notes.push(n.text));
+    g.state.skills.fundamentals = true;
+    /* a read-only query FIRST, because a fare board or a Places card
+       may well latch the access before check() ever runs — the
+       announcement must survive that */
+    eq(g.placeInfo('exchange').status, 'closed', 'the query sees it open now (just shut for the night)');
+    g.quests.check();
+    ok(notes.some((t) => /Bull Bear Stock Exchange will see you now/.test(t)),
+      'the place you walked past announces that it will see you now', notes.join(' | '));
+  }
+
+  /* --- THE GATE IS THE SAME GATE IT ALWAYS WAS --- */
+  ok(g.access('exchange'), 'passing Market Fundamentals opens it, exactly as before');
+  eq(g.canEnter('exchange').kind, 'hours', 'and the next refusal is the clock, not the rule');
+  g.state.time = 11 * 60;
+  ok(g.canEnter('exchange').ok, 'inside opening hours the door opens');
+  /* AND THE EXCHANGE ITSELF IS UNTOUCHED: finding it early does not
+     buy a single one of the four membership steps. */
+  const xg = g.actions.exchangeGate();
+  ok(!xg.ok, 'membership still refuses');
+  ok(xg.steps.filter((s) => s.done).length < xg.steps.length, 'the checklist is not silently ticked',
+    xg.steps.map((s) => s.key + ':' + (s.done ? 'y' : 'n')).join(' '));
+}
+
+T('every gate still refuses a place you only walked past');
+{
+  /* WALK THE WHOLE ISLAND. Stand at all 28 doors, discover everything,
+     and then assert that the city is exactly as shut as it was. */
+  const g = createGame({ seed: 402, autosave: false });
+  const before = LOCATIONS.filter((l) => g.access(l.id)).map((l) => l.id).sort().join(',');
+  for (const l of LOCATIONS) {
+    g.resetSense();
+    g.sense(l.world.x, l.world.z, 1);
+  }
+  eq(LOCATIONS.filter((l) => g.known(l.id)).length, LOCATIONS.length, 'every place is on the map');
+  eq(g.placeProgress().known, LOCATIONS.length, 'placeProgress() agrees');
+  const after = LOCATIONS.filter((l) => g.access(l.id)).map((l) => l.id).sort().join(',');
+  eq(after, before, 'and NOT ONE new door opened');
+
+  /* every still-gated place refuses with a reason, and none of them
+     refuses with a shrug */
+  let locked = 0;
+  for (const l of LOCATIONS) {
+    if (g.access(l.id)) continue;
+    locked++;
+    const p = g.placeInfo(l.id);
+    eq(p.status, 'locked', `${l.id} reads as locked`);
+    ok(!!p.why && p.why.length > 12, `${l.id} gives a real reason`, p.why);
+    ok(!!p.need, `${l.id} names what it wants`, p.need);
+    ok(!/undefined|null|\[object/.test(p.why + p.need), `${l.id}'s reason is English, not a stringified object`, p.why);
+    ok(!g.travel(l.id, 'walk').ok, `${l.id} refuses fast travel`);
+    ok(!g.enter(l.id).ok, `${l.id} refuses the door`);
+  }
+  ok(locked >= 15, 'most of the city is still shut behind its own rules', locked);
+
+  /* THE QUESTS DO NOT MOVE EITHER. Discovery must not tick a single
+     objective — that is the whole "you cannot start the quests right
+     away" half of the brief. */
+  eq(Object.keys(g.state.quests).length, 0, 'no quest completed itself');
+  eq(g.quests.current().id, 'q_wake', 'the objective is still the first one');
+  eq(g.state.stats.ordersDone, 0, 'and nothing was delivered by walking about');
+
+  /* A TELEPORT IS NOT A WALK. Fast travel does not feed sense(), and a
+     position that jumps further than a motorcycle could have gone
+     drops the dwell timers rather than banking the journey. */
+  const h = createGame({ seed: 403, autosave: false });
+  const bank = LOC_BY_ID.bank, mine = LOC_BY_ID.mine;
+  h.resetSense();
+  h.sense(bank.world.x, bank.world.z, DISCOVER.dwell * 0.8);   // nearly there…
+  h.sense(mine.world.x, mine.world.z, 0.05);                   // …then 400 m away in one frame
+  ok(!h.known('bank'), 'the half-finished dwell at the bank did not carry over');
+  ok(!h.known('mine'), 'and the teleport arrival did not instantly count either');
+  /* standing still afterwards is a walk again */
+  h.sense(mine.world.x, mine.world.z, DISCOVER.dwell);
+  ok(h.known('mine'), 'but standing there for the dwell does discover it');
+
+  /* nonsense in, nothing out */
+  eq(h.sense(NaN, 0, 1).length, 0, 'a NaN position discovers nothing');
+  eq(h.sense(0, Infinity, 1).length, 0, 'nor an infinite one');
+}
+
+T('a discovered place survives a save, and an old save keeps its doors');
+{
+  const g = createGame({ seed: 404, autosave: false });
+  g.resetSense();
+  g.sense(LOC_BY_ID.exchange.world.x, LOC_BY_ID.exchange.world.z, 1);
+  g.state.rep = 30;
+  g.quests.refreshKnown(true);                       // earns the library, bank, …
+  const text = g.exportSave();
+  const back = g.importSave(text);
+  ok(back, 'the save round-trips');
+  ok(back.known.exchange, 'the Exchange is still on the map');
+  ok(back.found.exchange, 'still marked found-on-foot');
+  ok(!back.access.exchange, 'and still not accessible');
+  ok(back.access.library, 'while a place earned by reputation kept its access');
+
+  /* A SAVE FROM BEFORE THE SPLIT. `known` was the only bit, and it
+     could only ever mean "earned" — so every known place must come
+     back accessible or a returning player is locked out of buildings
+     he already paid for. */
+  const old = JSON.parse(g.exportSave());
+  delete old.access;
+  delete old.found;
+  const fixed = g.importSave(JSON.stringify(old));
+  ok(fixed, 'a pre-split save still loads');
+  for (const id of Object.keys(fixed.known)) {
+    ok(fixed.access[id], `${id} kept its access across the migration`);
+  }
+  eq(Object.keys(fixed.found).length, 0, 'and nothing is retroactively claimed as found on foot');
+
+  /* REP CAN GO DOWN. A place you were let into never un-lets you in. */
+  const h = createGame({ seed: 405, autosave: false });
+  h.state.rep = 30;
+  h.quests.refreshKnown(true);
+  ok(h.access('library'), 'the library opened at reputation 30');
+  h.state.rep = 0;
+  ok(h.access('library'), 'and a ruined reputation does not shut it again');
+  ok(h.canEnter('library').kind !== 'locked', 'the door still is not "locked"');
+}
+
+/* ============================================================
+   24. THE FIRST CLIENT ALWAYS ASKS FOR CRUMB, AT THE BROKER
+
+   "A bug in the game with the business broker order objective is that
+   the first client may not need the business broker."
+
+   Taking an order at the desk sets flags.orderTaken, which makes
+   q_broker — "Go and see the Business Broker" — the live objective.
+   The order itself used to be rolled from all 69 assets across twelve
+   venues, so four times out of five the objective sent the player to a
+   counter that did not stock the thing he needed.
+
+   Two routes reach the first order (Otto in the cafe, and the first
+   arrival after a Dispatch shift) and both are checked here, across
+   many seeds, because "it worked on my seed" is exactly how this
+   regressed the first time.
+   ============================================================ */
+T('the first client order is always CRUMB at the Business Broker');
+{
+  /* the content this rests on */
+  const crumb = ASSET_BY_ID[FIRST_ORDER.asset];
+  ok(!!crumb, 'FIRST_ORDER names a real asset', FIRST_ORDER.asset);
+  eq(crumb.tick, 'CRUMB', 'and its ticker is CRUMB');
+  eq(crumb.tick, FIRST_ORDER.ticker, 'the constant agrees with the asset table');
+  eq(crumb.ven, 'broker', 'CRUMB is sold at the broker');
+  eq(crumb.ven, FIRST_ORDER.venue, 'and the constant agrees about that too');
+  eq(VENUE_LOC[crumb.ven], 'broker', 'and that venue is the Business Broker building');
+  eq(LOC_BY_ID.broker.n, 'Business Broker', 'which is the place q_broker points at');
+  ok(ASSETS.filter((a) => a.tick === 'CRUMB').length === 1, 'exactly one CRUMB in the game');
+
+  /* --- ROUTE A: the cafe. Otto's authored order. --- */
+  let seeds = 0;
+  for (let seed = 1; seed <= 60; seed++) {
+    const g = createGame({ seed, autosave: false });
+    g.state.flags.readMentor = true;
+    g.enter('cafe');
+    const o = g.state.arrivals.find((x) => x.client === 'otto');
+    if (!ok(!!o, `seed ${seed}: Otto left an order`)) continue;
+    if (!ok(o.items.length === 1 && o.items[0].t === 'CRUMB',
+      `seed ${seed}: and it is one unit of CRUMB`,
+      o.items.map((i) => i.q + 'x' + i.t).join(','))) continue;
+    ok(ASSET_BY_ID[o.items[0].a].ven === 'broker', `seed ${seed}: bought at the broker`);
+    seeds++;
+  }
+  eq(seeds, 60, 'all sixty cafe seeds asked for CRUMB');
+
+  /* --- ROUTE B: a Dispatch shift, then whoever walks in. --- */
+  const clientsSeen = new Set();
+  let bseeds = 0;
+  for (let seed = 1; seed <= 60; seed++) {
+    const g = createGame({ seed: seed * 7 + 3, autosave: false });
+    g.state.flags.readMentor = true;
+    g.state.flags.metHappy = true;
+    g.enter('trunkdepot');
+    const w = g.actions.work('drive', 0.6);
+    if (!ok(w.ok, `seed ${seed}: the shift ran`, w.why)) continue;
+    ok(g.state.flags.dispatchShift, `seed ${seed}: the shift unlocked arrivals`);
+    const o = g.state.arrivals[0];
+    if (!ok(!!o, `seed ${seed}: somebody came to the desk`)) continue;
+    clientsSeen.add(o.client);
+    ok(o.items.length === 1 && o.items[0].t === 'CRUMB',
+      `seed ${seed}: the first arrival wants CRUMB`, o.items.map((i) => i.q + 'x' + i.t).join(','));
+    ok(o.first === true, `seed ${seed}: and it is flagged as the first order`);
+    /* ONE DESK, ONE FIRST ORDER: a second person must not turn up
+       asking for the same loaf while this one is untouched. */
+    g.clients.newArrival();
+    g.clients.dailyOffers();
+    eq(g.state.arrivals.length, 1, `seed ${seed}: no second first-order piles up`);
+    bseeds++;
+  }
+  eq(bseeds, 60, 'all sixty Dispatch seeds asked for CRUMB');
+  ok(clientsSeen.size > 1, 'and it was not always the same client', [...clientsSeen].join(','));
+
+  /* --- ACCEPTING IT IS WHAT MAKES THE OBJECTIVE MAKE SENSE --- */
+  {
+    const g = createGame({ seed: 909, autosave: false });
+    g.state.flags.readMentor = true;
+    g.state.flags.metHappy = true;
+    g.enter('trunkdepot');
+    g.actions.work('drive', 0.6);
+    g.enter('apartment');
+    const o = g.state.arrivals[0];
+    const r = g.economy.acceptOrder(o);
+    ok(r.ok, 'the order is accepted at the desk', r.why);
+    ok(g.state.flags.orderTaken, 'flags.orderTaken is set');
+    ok(g.state.flags[FIRST_ORDER.flag], 'and so is the first-order latch');
+    ok(g.known('broker'), 'the Business Broker is now on the map');
+    ok(g.access('broker'), 'and it will let him in');
+    eq(g.quests.current().id, 'q_broker', 'the objective is "go and see the Business Broker"');
+    eq(g.quests.questLoc('q_broker'), 'broker', 'pointing at the broker');
+    /* THE POINT OF THE WHOLE FIX: the objective's destination is where
+       the order's asset is actually bought. */
+    const item = g.state.orders[0].items[0];
+    eq(VENUE_LOC[ASSET_BY_ID[item.a].ven], g.quests.questLoc('q_broker'),
+      'and that is exactly where the thing he was asked for is sold');
+    /* and he can actually do it there */
+    g.state.time = 11 * 60;
+    g.state.money = 5000;
+    g.state.energy = 100;
+    ok(g.travel('broker', 'walk').ok, 'he can travel there');
+    const buy = g.economy.buy(item.a, 1);
+    ok(buy.ok, 'and buy the thing at that counter', buy.why);
+  }
+
+  /* --- AND EVERY ORDER AFTER IT IS ROLLED NORMALLY --- */
+  {
+    const g = createGame({ seed: 910, autosave: false });
+    g.state.flags.dispatchShift = true;
+    g.state.flags[FIRST_ORDER.flag] = true;           // the first one has been taken
+    g.state.rep = 40;
+    g.state.time = 12 * 60;
+    for (const cid of Object.keys(g.state.clients)) { g.state.clients[cid].met = true; g.state.clients[cid].trust = 3; }
+    const assets = new Set(), venues = new Set();
+    let rolled = 0, wasCrumb = 0;
+    for (let i = 0; i < 400; i++) {
+      const c = CLIENTS[i % CLIENTS.length];
+      const o = g.clients.makeOrder(c.id);
+      if (!o) continue;
+      rolled++;
+      if (o.first) wasCrumb++;
+      for (const it of o.items) { assets.add(it.a); venues.add(ASSET_BY_ID[it.a].ven); }
+    }
+    ok(rolled > 300, 'a big sample of post-tutorial orders', rolled);
+    eq(wasCrumb, 0, 'not one of them is the forced tutorial basket');
+    ok(assets.size > 20, 'later orders draw on the whole asset list', assets.size + ' assets');
+    ok(venues.size >= 3, 'across several venues, not just the broker', venues.size + ' venues');
+    ok(assets.size > 20, 'CRUMB is no longer the only thing anyone wants', assets.size);
+  }
+
+  /* --- A MID-CAREER SAVE FROM BEFORE THE LATCH SELF-HEALS --- */
+  {
+    const g = createGame({ seed: 911, autosave: false });
+    g.state.flags.dispatchShift = true;
+    g.state.stats.ordersDone = 6;                     // a career, but no latch
+    delete g.state.flags[FIRST_ORDER.flag];
+    g.state.rep = 40;
+    for (const cid of Object.keys(g.state.clients)) { g.state.clients[cid].met = true; g.state.clients[cid].trust = 3; }
+    const o = g.clients.makeOrder('rico');
+    ok(!!o, 'an order is still produced');
+    ok(!o.first, 'an established broker is not handed the tutorial basket again');
+    ok(g.state.flags[FIRST_ORDER.flag], 'and the latch healed itself on the way past');
+  }
+
+  /* --- IT IS DETERMINISTIC: same seed, same first order --- */
+  {
+    const mk = () => {
+      const g = createGame({ seed: 912, autosave: false });
+      g.state.flags.readMentor = true;
+      g.enter('cafe');
+      const o = g.state.arrivals.find((x) => x.client === 'otto');
+      return JSON.stringify({ items: o.items, budget: o.budget, fee: o.fee, deadline: o.deadline });
+    };
+    eq(mk(), mk(), 'two runs of the same seed produce the identical first order');
+  }
 }
 
 /* ============================================================

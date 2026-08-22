@@ -35,6 +35,7 @@
 import * as THREE from '../../vendor/three.module.js';
 import { LAND, BUILD, BRAND, SHADOW } from '../core/palette.js';
 import { clamp, lerp, smoothstep } from '../core/contracts.js';
+import { SOLID_TOP } from './props.js';
 
 /* ------------------------------------------------------------
    Geometry kit
@@ -415,8 +416,37 @@ function buildSpecies(kind, variant, hi, rng) {
     canopy: canopyParts.length ? bakeAO(mergeGeos(canopyParts), 0.56) : null,
     extra: extraParts.length ? mergeGeos(extraParts) : null,
     height,
+    solid: TRUNK_SOLID[kind],
   };
 }
+
+/* ------------------------------------------------------------------
+   WHAT A TREE STOPS YOU WITH.
+
+   A trunk is solid. A canopy is not, and it is worth being explicit
+   about why: a broadleaf crown here is a 4 m ball of geometry hanging
+   between 4 m and 7 m up, so a walking character can never reach it —
+   but its BOUNDING BOX reaches the ground, and the lazy move (hand the
+   tree mesh to addStatic) would wall off a 4 m circle of grass under
+   every one of 782 trees and turn the woods into a maze of invisible
+   pillars. Only the trunk gets a box, and only up to 2 m: the exact
+   part of the tree a 1.62 m capsule can touch.
+
+   `r` is the half-extent of a square box inside the round trunk,
+   measured at the trunk's mid-collider height rather than at its flared
+   base, so you can put your shoulder against the bark. The topiary is
+   the exception — what stops you there is its stone planter, which is
+   both wider and shorter than the little trunk standing in it.
+   ------------------------------------------------------------------ */
+const TRUNK_SOLID = {
+  broadleaf: { r: 0.42, top: SOLID_TOP },
+  orchard: { r: 0.33, top: SOLID_TOP },
+  palm: { r: 0.24, top: SOLID_TOP },
+  pine: { r: 0.33, top: SOLID_TOP },
+  topiary: { r: 0.52, top: 0.86 },
+};
+/* below the ground line, so a trunk on a hillside never floats its box */
+const TRUNK_BASE = -0.9;
 
 /* ------------------------------------------------------------ */
 export function createTrees(ctx, env) {
@@ -559,12 +589,40 @@ export function createTrees(ctx, env) {
     t.m.compose(_pv, tilt, _sv);
     const cv = 0.80 + rng() * 0.40;
     t.c.setRGB(cv * (0.94 + rng() * 0.12), cv, cv * (0.92 + rng() * 0.16));
+    t.solid = sh.hi.solid || null;
     trees.push(t);
+    if (physWired) addTrunkCollider(t);
     const k = skey(x, z);
     let a = cell.get(k);
     if (!a) cell.set(k, a = []);
     a.push(t);
     return t;
+  }
+
+  /* ---------------- trunk collision ----------------
+     Trees are placed at foliage-init time, which is BEFORE the physics
+     stage boots, so the boxes are handed over on the first update
+     instead — and plant() / clear() keep them in step after that. */
+  let physWired = false;
+  const _colM = new THREE.Matrix4();
+  const _colT = new THREE.Matrix4();
+  function addTrunkCollider(t) {
+    const s = t.solid;
+    if (!s || t.dead || t.colId != null) return;
+    _colM.copy(t.m).multiply(_colT.makeTranslation(0, (s.top + TRUNK_BASE) * 0.5, 0));
+    t.colId = ctx.phys.addOBB(s.r * 2, s.top - TRUNK_BASE, s.r * 2, _colM,
+      { name: `tree.${t.kind}`, prop: true });
+  }
+  function dropTrunkCollider(t) {
+    if (t.colId == null) return;
+    ctx.phys?.remove(t.colId);
+    t.colId = null;
+  }
+  function wirePhysics() {
+    if (physWired || !ctx.phys?.addOBB) return 0;
+    physWired = true;
+    for (const t of trees) addTrunkCollider(t);
+    return trees.length;
   }
 
   function plantable(x, z, minTurf = 0.35, pad = 1.5) {
@@ -785,11 +843,15 @@ export function createTrees(ctx, env) {
       let n = 0;
       for (const t of trees) {
         if (t.dead) continue;
-        if (Math.hypot(t.x - x, t.z - z) < r + 1.2) { t.dead = true; n++; }
+        if (Math.hypot(t.x - x, t.z - z) < r + 1.2) { t.dead = true; dropTrunkCollider(t); n++; }
       }
       if (n) acc = 99;
       return n;
     },
+
+    /** Hand every trunk to ctx.phys. Called once, from foliage.update. */
+    wirePhysics,
+    get solidCount() { let n = 0; for (const t of trees) if (t.colId != null) n++; return n; },
 
     setWind(k) {
       for (const [m, base] of windBase) m.uniforms.uWindWeight.value = base * k;

@@ -923,6 +923,11 @@ export async function init(ctx) {
         const p = ctx.wally?.root?.position || ctx.phys?.player?.position;
         if (p) uPlayer.value.set(p.x, p.y, p.z, PART_R);
       }
+      /* Trunks are solid, canopies are not (trees.js TRUNK_SOLID). The
+         trees were planted in the world stage, before ctx.phys existed,
+         so the boxes are handed over on the first frame that has one.
+         Idempotent — it early-returns for the rest of the game. */
+      trees.wirePhysics();
       streamChunks();
       trees.update(dt, elapsed);
       scatter.update(dt, elapsed);

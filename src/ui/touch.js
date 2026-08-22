@@ -98,16 +98,32 @@ export function createTouch(ctx, ui) {
     shortcuts.append(b);
   }
 
-  /* interact sits up and left of jump — the same diagonal a thumb
-     travels, and it keeps the two apart at speed */
-  const actBtn = h('button.w-abtn.mid.act.off', {
-    type: 'button', 'aria-label': 'Interact',
-  }, icon('door', 24), h('span.cap', { text: 'Enter' }));
-  const jumpBtn = h('button.w-abtn.big.jump', {
-    type: 'button', 'aria-label': 'Jump',
-  }, icon('back', 26, { class: 'w-up' }), h('span.cap', { text: 'Jump' }));
+  /* THE PAD, AND WHICH THUMB POSITION EACH BUTTON EARNS.
 
-  const acts = h('div.w-acts', null, shortcuts, h('div.pad', null, actBtn, jumpBtn));
+     The corner-most slot — bottom-right, where the thumb rests without
+     reaching — belongs to ENTER, because Enter is what this game is
+     made of: every door, desk, client, NPC and shop runs through it,
+     and the whole prompt system exists to feed it. It is the big one.
+
+     Jump sits UP AND LEFT of it, smaller: the same diagonal a thumb
+     sweeps, so the two never share a landing zone at speed, and the
+     one you press by accident is the incidental one. (This used to be
+     the other way round — jump big in the corner — which put the
+     game's main verb in the harder-to-reach seat.) */
+  const actCap = h('span.cap.long', { text: 'Enter / Talk' });
+  const actBtn = h('button.w-abtn.big.act.off', {
+    type: 'button', 'aria-label': 'Enter or talk',
+  }, icon('door', 27), actCap);
+  const jumpBtn = h('button.w-abtn.mid.jump', {
+    type: 'button', 'aria-label': 'Jump',
+    /* NOT `w-up`: that class is the producer upgrade CARD (a 70% white
+       slab with 12 px of padding, style.js), and the jump chevron has
+       been quietly wearing it — which is why the arrow rendered as a
+       pale filled disc. `w-rot90` belongs to nothing else. */
+  }, icon('back', 24, { class: 'w-rot90' }), h('span.cap', { text: 'Jump' }));
+
+  /* jump first => jump is the left/raised one, Enter holds the corner */
+  const acts = h('div.w-acts', null, shortcuts, h('div.pad', null, jumpBtn, actBtn));
   root.append(zone, acts);
 
   /* ------------------------------------------------------------
@@ -349,7 +365,13 @@ export function createTouch(ctx, ui) {
        grows a line whenever the quest name is long */
     const bar = root.parentElement?.querySelector('.w-bar.left');
     if (bar) {
-      const y = Math.round(bar.getBoundingClientRect().bottom) + 10;
+      /* HIDE UI keeps the bar in the layout (visibility, not display —
+         see the note in style.js), so this measurement never returns
+         zero. But with the strip invisible the toasts should take the
+         top-left corner it vacated rather than float below a hole, so
+         we dock to the bar's TOP instead of its bottom. */
+      const r = bar.getBoundingClientRect();
+      const y = Math.round(ui.hideUI ? r.top : r.bottom) + 10;
       if (y !== toastY) {
         toastY = y;
         root.parentElement.style.setProperty('--w-toasty', y + 'px');
@@ -368,7 +390,13 @@ export function createTouch(ctx, ui) {
       actWas = live;
       actBtn.classList.toggle('on', live);
       actBtn.classList.toggle('off', !live);
-      actBtn.lastChild.textContent = talking ? 'More' : 'Enter';
+      /* An EXPLICIT reference to the caption span, never lastChild:
+         the caption is one of several children and reordering them
+         (which is exactly what the Enter/Jump swap did) would have
+         silently started writing 'More' into the icon. */
+      actCap.textContent = talking ? 'More' : 'Enter / Talk';
+      /* 'More' is short; only the resting caption overhangs the button */
+      actCap.classList.toggle('long', !talking);
     }
   }
 

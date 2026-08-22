@@ -7,6 +7,19 @@
    the map — and the world module gets an 'unlock' event so it can
    light the building up.
 
+   AND THERE IS A SECOND WAY IN, WHICH GRANTS NOTHING. Walking up to a
+   building in the 3D city discovers it: game.sense() calls discover()
+   and the place lands on the map and in Places. It does NOT satisfy
+   its `see` rule. So `see` is now read twice, for two questions:
+
+     knows(id)       is it on the map           (rule OR walked past)
+     access(id)      will the door open         (rule only, latched)
+     accessInfo(id)  …and if not, WHY not, in a sentence
+
+   Dispatch is therefore no longer the only road forward — you can go
+   and find the Exchange on day one — and finding it buys you exactly
+   one thing: knowing where it is.
+
    Rule grammar (all optional, all AND-ed):
      0 | null           always known
      { rep: n }         reputation at least n
@@ -51,7 +64,7 @@
    Events: 'quest' {kind:'side:start'|'side:complete', quest, title}.
    ============================================================ */
 
-import { QUESTS, SIDE_QUESTS, SIDE_QUEST_BY_ID, LOCATIONS, MILESTONES, ZONES, CONFIG, HAPPY_ENDING } from './data.js';
+import { QUESTS, SIDE_QUESTS, SIDE_QUEST_BY_ID, LOCATIONS, LOC_BY_ID, MILESTONES, ZONES, CONFIG, HAPPY_ENDING, ruleLabel } from './data.js';
 
 /* ============================================================
    THE TWO ENDINGS, AND THE LATCHES THAT KEEP THEM ONE-SHOT
@@ -104,14 +117,105 @@ export function createQuests(env) {
   }
 
   const knows = (locId) => !!S().known[locId];
+  /* did it get onto the map by walking, rather than by earning it? */
+  const foundNear = (locId) => !!S().found[locId];
+
+  /* ============================================================
+     ACCESS — the other half of `see`.
+
+     Until proximity discovery existed, `known` and "may use" were the
+     same bit: the only way a place got on your map was its `see` rule
+     coming true, so anything you could see you could walk into. Now
+     you can find a building by standing in front of it, and the two
+     have to come apart:
+
+       knows(id)   it is on the map and in Places
+       access(id)  its `see` rule is satisfied — the door opens, its
+                   quests can start, its counter will serve you
+
+     LATCHED IN THE SAVE, because `see` rules are not all monotonic:
+     `{ rep: 20 }` goes false again the moment a missed deadline costs
+     you reputation, and a Harbour Residences you were let into on
+     Monday must not lock itself on Tuesday. Once true, always true.
+     ------------------------------------------------------------ */
+  /* Places found on foot whose gate has just fallen, waiting for
+     refreshKnown() to say so. access() is called from read-only
+     queries — a fare board, a door prompt, a Places card — and a query
+     must never raise a toast, so the latch happens here and the
+     announcement happens on the next check(). */
+  const justOpened = [];
+
+  function access(locId) {
+    const st = S();
+    const l = LOC_BY_ID[locId];
+    if (!l) return false;
+    if (st.access[locId]) return true;
+    if (ruleMet(l.see)) {                                           // latch
+      st.access[locId] = true;
+      if (st.found[locId] && !justOpened.includes(locId)) justOpened.push(locId);
+      return true;
+    }
+    /* ON THE MAP, BUT NOT BY WALKING, AND NOT BY ITS RULE EITHER.
+       Something outside this module put it in `known` directly — an
+       old save repaired by save.js, raceOffer() opening the route, or
+       a harness setting up a scenario. Before discovery and access
+       were two ideas, `known` could ONLY mean "earned", so that is
+       what it still means here. Every in-game path is explicit:
+       refreshKnown() sets access, discover() sets found. So this
+       clause can never hand the player a door — only honour one that
+       was already open. */
+    if (st.known[locId] && !st.found[locId]) { st.access[locId] = true; return true; }
+    return false;
+  }
+
+  /* The refusal, in the words the fare board and the door both quote.
+     Never a bare "no": a place you have FOUND but cannot use has to
+     say which gate is shut. */
+  function accessInfo(locId) {
+    const l = LOC_BY_ID[locId];
+    if (!l) return { ok: false, kind: 'place', why: 'No such place', need: null };
+    if (access(locId)) return { ok: true, kind: null, why: null, need: null };
+    const need = ruleLabel(l.see);
+    return {
+      ok: false,
+      kind: 'locked',
+      need,
+      why: need
+        ? l.n + ' will not deal with you yet — you need ' + need + '.'
+        : l.n + ' is not open to you yet.',
+    };
+  }
+
+  /* ---------- discovery ----------
+     Two doors into `known`, and only one of them grants anything.
+
+       refreshKnown()  the `see` rule came true. Grants access too.
+       discover(id)    you walked up to the building (game.sense()).
+                       Puts it on the map and NOTHING ELSE.
+     ------------------------------------------------------------ */
 
   /* Recompute what the player has heard of. Returns newly found places. */
   function refreshKnown(quiet) {
     const st = S();
     const found = [];
+    const opened = [];
     for (const l of LOCATIONS) {
-      if (st.known[l.id]) continue;
-      if (ruleMet(l.see)) { st.known[l.id] = true; found.push(l); }
+      if (!ruleMet(l.see)) continue;
+      const wasKnown = !!st.known[l.id];
+      const hadAccess = !!st.access[l.id];
+      st.access[l.id] = true;
+      if (!wasKnown) { st.known[l.id] = true; found.push(l); }
+      /* ALREADY ON THE MAP, NOW ACTUALLY USABLE. This is the payoff
+         for finding the Exchange early: the day the last gate falls,
+         the place you have been walking past says so. */
+      else if (!hadAccess && st.found[l.id]) opened.push(l);
+    }
+    /* …and the same transition when a read-only query got there first
+       and latched it (see justOpened above) */
+    while (justOpened.length) {
+      const id = justOpened.shift();
+      const l = LOC_BY_ID[id];
+      if (l && !opened.includes(l)) opened.push(l);
     }
     if (found.length && !quiet) {
       for (const l of found) {
@@ -122,8 +226,45 @@ export function createQuests(env) {
     } else {
       for (const l of found) bus.emit('unlock', { key: 'location', location: l.id, zone: l.z, quiet: true });
     }
+    for (const l of opened) {
+      if (!quiet) {
+        M().note('good', l.n + ' will see you now');
+        M().msg('City Guide', 'You found ' + l.n + ' the hard way, on foot. It is open to you now.');
+      }
+      bus.emit('unlock', { key: 'location', location: l.id, zone: l.z, opened: true, quiet: !!quiet });
+    }
     return found;
   }
+
+  /* WALKED PAST IT. Puts a building on the map and in Places, grants
+     nothing, and is loud about it in a small way — a place found by
+     walking is the reward for walking. Returns the location record if
+     this call is what found it, else null. */
+  function discover(locId, how = 'proximity') {
+    const st = S();
+    const l = LOC_BY_ID[locId];
+    if (!l || st.known[l.id]) return null;
+    st.known[l.id] = true;
+    st.found[l.id] = true;
+    const acc = accessInfo(l.id);
+    M().note('token', 'Discovered ' + l.n);
+    M().msg('City Guide', 'You found ' + l.n + ' in ' + ZONES[l.z].n + ' by walking past it. '
+      + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why)));
+    /* THE SMALL REWARD. Its own sound and its own sting rather than
+       the generic 'unlock' chime, so finding a place on foot does not
+       sound like buying a wallet upgrade. The unlock event still goes
+       out for the world module (it lights the building up) but marked
+       quiet, so ui.js does not layer its chime on top. */
+    bus.emit('sfx', { name: 'discover' });
+    bus.emit('audio:sting', 'discover');
+    bus.emit('discover', {
+      location: l.id, name: l.n, zone: l.z, zoneName: ZONES[l.z].n,
+      how, access: acc.ok, why: acc.ok ? null : acc.why, need: acc.need,
+    });
+    bus.emit('unlock', { key: 'location', location: l.id, zone: l.z, how, quiet: true });
+    return l;
+  }
+  const lower = (s) => (s ? s.charAt(0).toLowerCase() + s.slice(1) : s);
 
   /* ---------- objectives ---------- */
   const list = () => QUESTS;
@@ -442,8 +583,9 @@ export function createQuests(env) {
     /* side quests, alongside and quieter */
     sideList: () => SIDE_QUESTS, sides, sideActive, sideCurrent, sideProgress,
     startSide, completeSide, isSideActive, isSideDone, sideStatus,
-    /* discovery, milestones, tips */
-    knows, refreshKnown, ruleMet, milestones, cityPct, tip,
+    /* discovery (map) vs access (door) — two questions, two answers */
+    knows, foundNear, discover, access, accessInfo, ruleLabel,
+    refreshKnown, ruleMet, milestones, cityPct, tip,
     /* THE TWO ENDINGS — 'city:tokenized' and 'game:complete' */
     tokenizedCount, cityTokenized, completion, checkEndings, syncLatches,
     fireCityTokenized, fireGameComplete, hasFiredCity, hasFiredComplete,

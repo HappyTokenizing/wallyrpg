@@ -143,6 +143,7 @@ import DATA, {
   HOME_BY_ID, HOMES, EMPLOYEE_BY_ID, EMPLOYEE_POOL, IPOS, IPO_STEPS, STADIUM_STEPS,
   ASSETS, ASSET_BY_ID, CLIENT_BY_ID, MORNING_NOTES, fare, worldDistance,
   RACE, PRODUCERS, SLATE_MEAL, repProgress, hops as hopsBetween,
+  DISCOVER, FIRST_ORDER,
 } from './data.js';
 import { newState, createState, mulberry32, hashStr, clamp, round2 } from './state.js';
 import { createEconomy } from './economy.js';
@@ -607,11 +608,25 @@ export function createGame(opts = {}) {
   env.closedLine = closedLine;
 
   /* May he go in? The one answer travel(), enter() and the HUD door
-     prompt all share. */
+     prompt all share.
+
+     FOUR REFUSALS, IN THIS ORDER, and the second one is new:
+       place   there is no such building
+       place   you have never heard of it        (not on the map)
+       locked  you have found it and it will not have you YET — the
+               `see` rule is the gate and accessInfo() names it. This
+               is what stops proximity discovery from becoming a
+               skeleton key: walking up to the Stock Exchange puts it
+               on your map and leaves every one of its gates standing.
+       hours   the door is shut until 09:00
+       hunger  he is not going anywhere but a bowl of noodles
+     ------------------------------------------------------------ */
   function canEnter(locId) {
     const st = S();
     if (!LOC_BY_ID[locId]) return { ok: false, kind: 'place', why: 'No such place' };
     if (!quests.knows(locId)) return { ok: false, kind: 'place', why: 'You have not heard of this place yet' };
+    const acc = quests.accessInfo(locId);
+    if (!acc.ok) return { ok: false, kind: 'locked', why: acc.why, need: acc.need, found: quests.foundNear(locId) };
     if (!isOpen(locId)) return { ok: false, kind: 'hours', why: closedLine(locId), opens: opensAt(locId) };
     if (starving(st) && !isFoodLoc(locId) && !isBedLoc(locId)) {
       const f = nearestFood(st);
@@ -872,6 +887,147 @@ export function createGame(opts = {}) {
     return null;
   }
 
+  /* ============================================================
+     DISCOVERY BY WALKING.
+
+     "You can discover all places yourself by also walking nearby them
+     and discovering them on the map — however it doesn't always mean
+     you can use or start the quests right away."
+
+     So Dispatch is no longer the only road forward. Wally's 3D
+     position is fed in here every frame; anything he stands next to
+     for DISCOVER.dwell seconds goes on his map. Nothing else changes:
+     canEnter() still asks quests.accessInfo(), every `see` rule still
+     stands, every shop still refuses him by name and by reason.
+
+     WHY IT IS A DWELL AND NOT A DISTANCE TEST. "Near the building" has
+     to mean near the BUILDING, not near the route. Fast travel never
+     calls this at all — it teleports, so there is no position stream
+     to sample — and a motorcycle clipping the far edge of a circle
+     for two frames is not a discovery either. Seven tenths of a second
+     inside the radius is. `hysteresis` gives the timer a few metres of
+     slack so jitter at the boundary does not keep resetting it.
+
+     PURE ENOUGH TO TEST. sense(x, z, dt) takes a position and a
+     timestep and returns the locations it just found — no ctx, no
+     Three.js, no renderer. tools/test-game.mjs walks a fake elephant
+     around the island with it.
+     ============================================================ */
+  const dwell = new Map();          // locId -> seconds spent inside its radius
+  let lastSense = { x: 0, z: 0, has: false };
+
+  function findRadius(l) {
+    return l.findRadius || Math.max(DISCOVER.min, Math.hypot(l.size.w, l.size.d) * 0.5 + DISCOVER.pad);
+  }
+  /* Everything within its own discovery radius of this point, nearest
+     first. Read-only — the HUD can use it to hint. */
+  function nearbyPlaces(x, z) {
+    const out = [];
+    for (const l of DATA.locations) {
+      const d = Math.hypot(l.world.x - x, l.world.z - z);
+      const r = findRadius(l);
+      if (d <= r) out.push({ loc: l, id: l.id, dist: round2(d), radius: r, known: quests.knows(l.id) });
+    }
+    return out.sort((a, b) => a.dist - b.dist);
+  }
+
+  /* THE FEED. Called with Wally's world position every frame (see
+     init() below), or once with a big dt from a test. Returns the
+     array of locations discovered by THIS call — usually empty. */
+  function sense(x, z, dt = 1) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return [];
+    /* A TELEPORT IS NOT A WALK. If the position jumped further than a
+       motorcycle could have travelled in this frame, the player was
+       moved by fast travel or by a debug hook — drop every dwell timer
+       and start counting again from where he now stands. He can still
+       discover what he is standing next to; he just cannot bank the
+       journey he did not make. */
+    const step = lastSense.has ? Math.hypot(x - lastSense.x, z - lastSense.z) : 0;
+    if (lastSense.has && step > Math.max(40, dt * 120)) dwell.clear();
+    lastSense = { x, z, has: true };
+
+    const found = [];
+    for (const l of DATA.locations) {
+      if (quests.knows(l.id)) { if (dwell.has(l.id)) dwell.delete(l.id); continue; }
+      const d = Math.hypot(l.world.x - x, l.world.z - z);
+      const r = findRadius(l);
+      if (d > r + DISCOVER.hysteresis) { if (dwell.has(l.id)) dwell.delete(l.id); continue; }
+      if (d > r) continue;                              // in the slack band: hold, do not count
+      const t = (dwell.get(l.id) || 0) + Math.max(0, dt);
+      if (t < DISCOVER.dwell) { dwell.set(l.id, t); continue; }
+      dwell.delete(l.id);
+      const hit = quests.discover(l.id, 'proximity');
+      if (hit) found.push(hit);
+    }
+    if (found.length) { quests.check(); storyBeats(); }
+    return found;
+  }
+  /* the world/UI may want to reset the timers (respawn, new game) */
+  function resetSense() { dwell.clear(); lastSense = { x: 0, z: 0, has: false }; }
+
+  /* ------------------------------------------------------------
+     ONE PLACE, AS THE UI SHOULD DRAW IT.
+
+     "Make sure a discovered-but-not-yet-usable place reads clearly as
+     exactly that, with the reason. Never a dead entry."
+
+     `status` is one of four words and `statusLabel` is the line to
+     print under the name:
+       here     you are standing in it
+       open     found, allowed in, and the door is unlocked right now
+       closed   found, allowed in, wrong time of day
+       locked   found — on your map, in your Places list — and a gate
+                is still shut. `why` and `need` say which one.
+     ------------------------------------------------------------ */
+  function placeInfo(locId) {
+    const st = S();
+    const l = LOC_BY_ID[locId];
+    if (!l) return null;
+    const known = quests.knows(l.id);
+    const acc = quests.accessInfo(l.id);
+    const oi = openInfo(l.id);
+    const here = st.loc === l.id;
+    let status = 'locked';
+    if (here) status = 'here';
+    else if (!known) status = 'unknown';
+    else if (!acc.ok) status = 'locked';
+    else if (oi.open) status = 'open';
+    else status = 'closed';
+    const statusLabel = status === 'here' ? 'You are here'
+      : status === 'unknown' ? 'You have not heard of it'
+        : status === 'locked' ? 'Found — not open to you yet'
+          : status === 'open' ? oi.label
+            : oi.label;
+    return {
+      id: l.id, n: l.n, ico: l.ico, desc: l.desc,
+      zone: l.z, zoneName: ZONES[l.z].n,
+      known, found: quests.foundNear(l.id), seen: !!st.seen[l.id],
+      access: acc.ok, why: acc.ok ? null : acc.why, need: acc.need,
+      hours: l.hours.slice(), open: oi.open, hoursLabel: oi.label, hoursSpan: oi.span,
+      status, statusLabel,
+      canEnter: canEnter(l.id),
+      acts: l.acts.slice(),
+      world: { ...l.world }, findRadius: findRadius(l),
+    };
+  }
+  /* Every place on the player's map, with its status. The Places app
+     and the pause map both want exactly this list. */
+  function places(opts = {}) {
+    return DATA.locations
+      .filter((l) => (opts.all ? true : quests.knows(l.id)))
+      .map((l) => placeInfo(l.id));
+  }
+  /* the headline for the Places screen: "12 of 28 found · 3 not yet open" */
+  function placeProgress() {
+    let known = 0, found = 0, locked = 0;
+    for (const l of DATA.locations) {
+      if (!quests.knows(l.id)) continue;
+      known++;
+      if (quests.foundNear(l.id)) found++;
+      if (!quests.accessInfo(l.id).ok) locked++;
+    }
+    return { known, byWalking: found, locked, total: DATA.locations.length };
+  }
 
   /* ============================================================
      THE MAYOR'S DASH — the race that gates the Stock Exchange.
@@ -1003,7 +1159,10 @@ export function createGame(opts = {}) {
     if (rs.status === 'won') return { ok: false, why: 'You already beat him' };
     const first = rs.status === 'locked';
     if (first) rs.status = 'offered';
-    for (const id of RACE.route) st.known[id] = true;
+    /* KNOWN *AND* ACCESSIBLE. A checkpoint you cannot walk into is not
+       a checkpoint, so the route grants both bits — it always did,
+       back when they were one bit. */
+    for (const id of RACE.route) { st.known[id] = true; st.access[id] = true; }
     if (first) {
       clients.meet(RACE.mayor);
       M.banner('MAYOR KEN JONES', RACE.n);
@@ -1305,38 +1464,38 @@ export function createGame(opts = {}) {
     return { ok: true, order };
   }
 
-  /* OTTO'S ORDER — hand-built, not rolled.
+  /* OTTO'S ORDER — hand-built, not rolled, and it is CRUMB.
 
      clients.makeOrder() prices against a client's ceiling, and Otto's
      ceiling on day one reaches as far as a $480 gallery collection —
      which a player holding $250 and one shift's pay cannot buy, and
      which is not what "a friend asks you for a small thing over
-     coffee" should feel like. So the very first order is the cheapest
-     thing he could plausibly want for the arcade, one unit, with a
-     long deadline and a friend's margin on top. Everything after this
-     one is rolled normally. */
-  function firstOrder() {
-    const st = S();
-    const shortlist = ['sneaks', 'card', 'arcade', 'bakery']
-      .map((id) => ASSET_BY_ID[id])
-      .filter((a) => a && econ.venueOpen(a.ven));
-    const pick = shortlist.sort((a, b) => econ.price(a.id) - econ.price(b.id))[0];
-    if (!pick) return clients.makeOrder('otto');       // fallback: the normal roll
-    const cost = econ.buyPrice(pick.id);
-    return {
-      id: 'o_otto_first',
-      client: 'otto',
-      type: 'deliver',
-      name: null,
-      items: [{ a: pick.id, q: 1, t: pick.tick }],
-      budget: Math.round(cost * 1.18),                 // he is not haggling with you
-      fee: Math.round(cost * 0.12) + 30,
-      deadline: st.day + 5,                            // and he is not in a hurry
-      made: st.day,
-      warned: false,
-      keep: true,                                      // survives the nightly desk wipe
-      line: 'One thing. For the display case. You buy it, I pay you back and a bit more, and we both pretend that was complicated.',
-    };
+     coffee" should feel like. So the first order has always been
+     hand-built: one unit, a long deadline, a friend's margin on top.
+
+     WHAT WAS WRONG WITH IT. It picked the CHEAPEST of a four-asset
+     shortlist, and the cheapest is SNEAK at $210 — sold at the
+     Culture Bazaar. Meanwhile picking an order up at the desk sets
+     flags.orderTaken and makes "Go and see the Business Broker" the
+     live objective. The game pointed at Market Square and the
+     shopping list pointed at the Bazaar.
+
+     It is CRUMB now, unconditionally — data.js FIRST_ORDER, one unit
+     of Crumb & Co. Bakery, which is sold at the Business Broker and
+     nowhere else. clients.makeOrder() forces the same basket for
+     whichever client turns up first through the Dispatch route, so
+     both roads into the first order lead to the same counter. */
+  function firstOrder(clientId = 'otto') {
+    return clients.crumbOrder(clientId, {
+      id: clientId === 'otto' ? 'o_otto_first' : undefined,
+      keep: true,
+      line: clientId === 'otto'
+        ? 'One thing. Crumb & Co., the bakery — I want a piece of it for the '
+          + 'display case and for my old age. You buy it off the Business Broker '
+          + 'on Market Square, I pay you back and a bit more, and we both pretend '
+          + 'that was complicated.'
+        : null,
+    });
   }
 
   /* HAPPY — the NPC beat right after the phone. */
@@ -2224,6 +2383,9 @@ export function createGame(opts = {}) {
        First line of boot, ahead of every quests.check() below. */
     quests.syncLatches();
     quests.refreshKnown(true);
+    /* a loaded save is not mid-stride outside a building it was never
+       standing at: drop the proximity dwell timers on every boot */
+    resetSense();
     if (fresh) clients.seedArrivals();
     else if (!S().arrivals.length) clients.seedArrivals();
     lastHour = -1;
@@ -2270,6 +2432,22 @@ export function createGame(opts = {}) {
     here, officeLoc, isOpen, known, visibleLocations, fares, travel, enter,
     nearest, zoneAt,
     zoneOf: (locId) => (LOC_BY_ID[locId] ? ZONES[LOC_BY_ID[locId].z] : null),
+
+    /* DISCOVERY BY WALKING — see sense() above.
+         sense(x, z, dt)   feed Wally's position; returns what it found
+         nearbyPlaces(x,z) what is within discovery range right now
+         resetSense()      drop the dwell timers
+         placeInfo(id)     one place, with its status and the REASON
+                           it is not usable if it is not
+         places({all})     every place on the map, same shape
+         placeProgress()   found / by walking / still locked / total
+         access(id)        will the door open — the `see` rule, latched
+         accessInfo(id)    …and if not, why not, in one sentence */
+    sense, nearbyPlaces, resetSense, placeInfo, places, placeProgress,
+    access: (id) => quests.access(id),
+    accessInfo: (id) => quests.accessInfo(id),
+    foundNear: (id) => quests.foundNear(id),
+    discoverRadius: (id) => (LOC_BY_ID[id] ? findRadius(LOC_BY_ID[id]) : 0),
 
     /* THE RULES LAYER, as the UI reads it */
     gate, canEnter, openInfo, opensAt, closedLine, needs,
@@ -2453,6 +2631,34 @@ export async function init(ctx) {
     seed: 0x5eed1e,
   });
 
+  /* ------------------------------------------------------------
+     THE POSITION FEED — proximity discovery, wired to the elephant.
+
+     game.sense() is pure (a point, a timestep, a list of what it
+     found), so the ONLY place in the codebase that knows where Wally
+     actually is is right here. Sampled at 8 Hz rather than every
+     frame: the dwell is 0.7 s and the smallest radius is 16 m, so a
+     125 ms sample cannot miss a circle even on the motorcycle, and
+     28 distance tests eight times a second costs nothing.
+
+     boot order is `… wally → cam → game …`, so ctx.wally is already
+     there. It is still read defensively — a headless harness may not
+     have built him.
+     ------------------------------------------------------------ */
+  const SENSE_HZ = 8;
+  let senseAcc = 0;
+  const baseUpdate = game.update.bind(game);
+  game.update = (dt, elapsed) => {
+    baseUpdate(dt, elapsed);
+    senseAcc += dt;
+    if (senseAcc < 1 / SENSE_HZ) return;
+    const step = senseAcc;
+    senseAcc = 0;
+    const p = ctx.wally && ctx.wally.position;
+    if (!p) return;
+    game.sense(p.x, p.z, step);
+  };
+
   /* Continue an existing run when there is one, unless we are taking
      a screenshot — shots must be reproducible from a fresh state. */
   /* SCREENSHOTS ARE POSED FRAMES. A clock ticking under a --wait would
@@ -2482,6 +2688,30 @@ export async function init(ctx) {
       return Object.keys(game.state.known).length;
     };
     d.hud = () => game.hud();
+    /* ---- DISCOVERY BY WALKING, for posing and for the harnesses ----
+       sense(x, z)    feed a position by hand
+       findPlace(id)  stand at a building's door for a second and see
+                      what the city tells you — the whole proximity
+                      path without having to steer an elephant
+       places()       every place on the map with its status and, for
+                      anything found-but-shut, the reason
+       nearby()       what is inside a discovery radius right now      */
+    d.sense = (x, z, dt) => game.sense(x, z, dt ?? 1).map((l) => l.id);
+    d.findPlace = (id) => {
+      const l = game.data.locationById[id];
+      if (!l) return null;
+      game.resetSense();
+      game.sense(l.world.x, l.world.z, 1);
+      return game.placeInfo(id);
+    };
+    d.places = (all) => game.places({ all: !!all }).map((p) => ({
+      id: p.id, status: p.status, label: p.statusLabel, why: p.why,
+    }));
+    d.nearby = () => {
+      const p = ctx.wally && ctx.wally.position;
+      return p ? game.nearbyPlaces(p.x, p.z).map((n) => ({ id: n.id, dist: n.dist, r: n.radius, known: n.known })) : [];
+    };
+    d.placeProgress = () => game.placeProgress();
     /* THE MAYOR'S DASH, for anyone posing or testing it. */
     d.race = () => game.race.view();
     d.raceOffer = () => game.race.offer();

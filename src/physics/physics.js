@@ -45,6 +45,7 @@
    World
      addStatic(mesh|group|geometry|box3, opts) -> id | id[]  bakes world matrices
      addAABB(box3, opts)                       -> id         12-tri proxy, cheap
+     addOBB(sx, sy, sz, matrix, opts)          -> id         12-tri ORIENTED box
      addTriangles(positions, indices, opts)    -> id
      remove(id | id[])                         -> bool
      clearStatics()
@@ -101,6 +102,35 @@ const MAX_STEPS_PER_FRAME = 5;      // 83 ms of catch-up, then we drop time
 const _wv = new THREE.Vector3();
 const _imp = new THREE.Vector3();
 const _zero = Object.freeze({ x: 0, y: 0, z: 0 });
+
+/* ------------------------------------------------------------------
+   THE UNIT BOX, for addOBB.
+
+   An AABB cannot describe a bench. A 1.85 m bench yawed 45 deg has a
+   1.7 x 1.7 m axis-aligned box, so half of what the player bumps into
+   is empty air — and the city yaws every single prop it places. An
+   ORIENTED box costs exactly the same twelve triangles: hand
+   addTriangles a unit cube and the instance matrix, and it bakes the
+   rotation into the vertices at registration. Same narrowphase, same
+   grid, no new code path, nothing transformed per frame.
+
+   Vertex order and winding are addBox()'s, verbatim — outward normals,
+   quad diagonals coplanar so _markInternalEdges flags them as seams.
+   ------------------------------------------------------------------ */
+const UNIT_BOX_POS = new Float32Array([
+  -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, -0.5, 0.5, -0.5, -0.5, 0.5,
+  -0.5, 0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
+]);
+const UNIT_BOX_IDX = new Uint16Array([
+  0, 2, 1, 0, 3, 2,
+  4, 5, 6, 4, 6, 7,
+  0, 1, 5, 0, 5, 4,
+  1, 2, 6, 1, 6, 5,
+  2, 3, 7, 2, 7, 6,
+  3, 0, 4, 3, 4, 7,
+]);
+const _obbScale = new THREE.Matrix4();
+const _obbM = new THREE.Matrix4();
 
 export async function init(ctx = {}) {
   const world = new CollisionWorld({
@@ -307,6 +337,21 @@ export async function init(ctx = {}) {
     },
     /** Cheap 12-triangle proxy. Buildings, crates, kerbs, invisible walls. */
     addAABB(box, opts) { return world.addBox(box, opts); },
+    /**
+     * ORIENTED 12-triangle box proxy. `matrix` places the box's CENTRE
+     * and orientation in world space (compose it from the prop's own
+     * instance matrix); sx/sy/sz are the box's FULL extents in that
+     * matrix's local frame, before its scale.
+     *
+     * This is the primitive every yawed prop in the city uses. It costs
+     * the same as addAABB and, unlike addAABB, it is actually the shape
+     * of the thing you can see.
+     */
+    addOBB(sx, sy, sz, matrix, opts) {
+      _obbScale.makeScale(sx, sy, sz);
+      _obbM.copy(matrix).multiply(_obbScale);
+      return world.addTriangles(UNIT_BOX_POS, UNIT_BOX_IDX, { ...opts, matrix: _obbM, proxy: true });
+    },
     addTriangles(positions, indices, opts) { return world.addTriangles(positions, indices, opts); },
     remove(id) {
       if (Array.isArray(id)) { let ok = true; for (const i of id) ok = world.remove(i) && ok; return ok; }
@@ -498,6 +543,35 @@ export async function init(ctx = {}) {
       return chains.length;
     };
     dbg.physSetPlane = (y) => api.setGroundPlane(y);
+    /* BROADPHASE LOAD. Thousands of prop proxies are only free if the
+       grid stays sparse, and "triangle count" does not tell you that —
+       a cell list is what every capsule query actually walks. This
+       reports the occupied cell count, the mean and worst list length,
+       and the length of the lists a capsule at the player would touch,
+       which is the number that decides the frame. */
+    dbg.physGrid = () => {
+      const g = world.grid;
+      let total = 0, worst = 0;
+      for (const list of g.values()) { total += list.length; if (list.length > worst) worst = list.length; }
+      const p = api.player?.simPosition;
+      let local = 0, cells = 0;
+      if (p) {
+        const r = api.player.radius, inv = world.inv;
+        const i0 = Math.floor((p.x - r) * inv), i1 = Math.floor((p.x + r) * inv);
+        const j0 = Math.floor((p.y) * inv), j1 = Math.floor((p.y + api.player.height) * inv);
+        const k0 = Math.floor((p.z - r) * inv), k1 = Math.floor((p.z + r) * inv);
+        for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) for (let k = k0; k <= k1; k++) {
+          cells++;
+          const l = g.get(((i + 1024) * 2048 + (j + 1024)) * 2048 + (k + 1024));
+          if (l) local += l.length;
+        }
+      }
+      return {
+        tris: world.count, bodies: world.bodies.size, cells: g.size,
+        meanList: +(total / Math.max(1, g.size)).toFixed(1), worstList: worst,
+        capsuleCells: cells, capsuleTris: local, cellSize: world.cellSize,
+      };
+    };
     /* Per-cloth LOD census: tier, distance, and whether it is alive. */
     dbg.physClothCensus = (all = false) => {
       const cam = ctx.camera?.position;

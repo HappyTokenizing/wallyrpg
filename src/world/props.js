@@ -293,6 +293,97 @@ const CATALOGUE = {
 };
 
 /* ------------------------------------------------------------------
+   SOLIDITY.
+
+   Every prop above is a thing you can see and therefore a thing you
+   must not walk through — the shipped bug was that not one of them was
+   registered with ctx.phys, so the whole catalogue was scenery you
+   could stand inside. A bin. A bench. A shipping container.
+
+   THE FOOTPRINT IS MEASURED, NOT TYPED IN. The default collider is the
+   bounding box of the prop's OWN merged geometry, taken once per type
+   at build time, so it can never drift away from the art the way a
+   hand-copied table does. Only two kinds of prop need an override:
+
+     * ones whose silhouette is mostly soft — a lamp's lantern head, a
+       potted plant's leaves, a market crate's heap of veg. You should
+       be able to brush the greenery and be stopped by the pot.
+     * ones that are round. A square box circumscribing a barrel stops
+       you 40% of a radius short of it at the corners, which reads as an
+       invisible wall; inscribing it lets you stand inside the staves.
+       0.90 of the radius splits the difference: at most 3 cm of overlap
+       on the flats, 9 cm of air at the corners, neither of them visible.
+
+   `top` clamps the collider's height, and every collider is capped at
+   SOLID_TOP again on top of that.
+
+   THE CAP IS NOT ONLY A SAVING. Nothing above the capsule's 1.62 m
+   crown can ever be touched by the character, so a 4.3 m lamp post
+   that collides to 1.7 m is identical to play — but the collision world
+   is not read only by the character. core/camera.js scores its resting
+   azimuth by raycasting ctx.phys from the subject's chest to the boom,
+   and the first version of this pass, which collided lamps to 1.9 m and
+   containers to their full 2.5 m, silently moved that azimuth 40
+   degrees and broke tools/drifttest.mjs. A collider taller than the
+   thing that has to walk around it is not describing collision, it is
+   editing somebody else's camera.
+
+   `base` is pushed below zero so a prop standing on a slope never
+   leaves a gap between its box and the ground under it.
+   ------------------------------------------------------------------ */
+const SOLID_BASE = -0.22;
+/* the controller capsule is 1.62 m; 0.10 of slack for the solver skin */
+export const SOLID_TOP = 1.72;
+const SOLID = {
+  crate: {},
+  barrel: { round: 1 },
+  bench: {},
+  /* the post and its base plate — the lantern is out of reach */
+  lamp: { hx: 0.21, hz: 0.21 },
+  bin: { round: 1 },
+  /* body and bed. The draught shafts are a 5 cm pole 2 m out in front,
+     and colliding them would lay a tripwire across the market. */
+  cart: { hx: 0.82, hz: 1.14, top: 1.40 },
+  bike: { hx: 0.28, hz: 0.92, top: 1.05 },
+  /* the crate. The heap of produce on top of it is soft. */
+  produce: { hx: 0.43, hz: 0.43, top: 0.66 },
+  /* the pot. The foliage above it is soft. */
+  plant: { hx: 0.38, hz: 0.38, top: 0.60 },
+  hedge: {},
+  fence: { hz: 0.12 },
+  bollard: { round: 1 },
+  hay: { round: 1 },
+  container: {},
+  orecart: { hx: 0.66, hz: 0.82, top: 1.08 },
+};
+
+/**
+ * Local-space collider for one prop type: measure the built geometry,
+ * then apply the type's override. Returns FULL extents plus the centre
+ * offset in the prop's own frame, so the instance matrix can carry the
+ * yaw and the scale jitter untouched.
+ */
+function solidFor(type, meshes) {
+  const o = SOLID[type];
+  if (!o) return null;
+  const bb = new THREE.Box3();
+  const tmp = new THREE.Box3();
+  for (const m of meshes) {
+    m.geometry.computeBoundingBox();
+    if (m.geometry.boundingBox) bb.union(tmp.copy(m.geometry.boundingBox));
+  }
+  if (bb.isEmpty() || !Number.isFinite(bb.min.x)) return null;
+  const k = o.round ? 0.90 : 1;
+  const hx = o.hx ?? ((bb.max.x - bb.min.x) * 0.5 * k);
+  const hz = o.hz ?? ((bb.max.z - bb.min.z) * 0.5 * k);
+  const cx = o.hx != null ? 0 : (bb.max.x + bb.min.x) * 0.5;
+  const cz = o.hz != null ? 0 : (bb.max.z + bb.min.z) * 0.5;
+  const top = Math.min(o.top ?? Infinity, bb.max.y, SOLID_TOP);
+  if (!(top > 0.12) || hx < 0.02 || hz < 0.02) return null;
+  return { sx: hx * 2, sz: hz * 2, sy: top - SOLID_BASE, cx, cy: (top + SOLID_BASE) * 0.5, cz };
+}
+
+/* ------------------------------------------------------------------
    Contact shadow — one instanced multiply decal for the whole city.
 
    The geometry is a shallow dome: a centre vertex lifted, two rings,
@@ -409,6 +500,7 @@ function contactShadowMaterial(ctx) {
    triangles that buys back are inside the noise. */
 const CELL = 144;
 const cellKey = (m) => `${Math.floor(m.elements[12] / CELL)},${Math.floor(m.elements[14] / CELL)}`;
+const _offM = new THREE.Matrix4();
 
 export function createProps(ctx, lib, rng) {
   const group = new THREE.Group();
@@ -418,6 +510,9 @@ export function createProps(ctx, lib, rng) {
   const shadowList = [];
   let shadowMesh = null;
   const lampMeshes = [];
+  /* one record per INSTANCE — never one per batch. See registerColliders. */
+  const colliders = [];
+  const colliderIds = [];
 
   function add(type, m4, opt = {}) {
     if (!CATALOGUE[type]) return;
@@ -476,6 +571,26 @@ export function createProps(ctx, lib, rng) {
            geometry from here on */
         proto.geometry.userData.shared = true;
       }
+      /* ONE COLLIDER PER INSTANCE, NOT ONE PER BATCH.
+
+         The instances above are bucketed into shared InstancedMeshes,
+         and the tempting shortcut — hand phys the batch and let it take
+         a bounding volume — is the same mistake that once gave a single
+         crate mesh a 424 m bounding sphere. A batch's bounds are the
+         hull of everything in it and describe nothing you can touch. So
+         the collider is built from each instance's own matrix, and the
+         only thing shared is the twelve-triangle unit box inside phys.  */
+      const solid = solidFor(type, meshes);
+      if (solid) {
+        for (const it of list) {
+          const m = new THREE.Matrix4().copy(it.m);
+          if (solid.cx || solid.cy || solid.cz) {
+            m.multiply(_offM.makeTranslation(solid.cx, solid.cy, solid.cz));
+          }
+          colliders.push({ type, sx: solid.sx, sy: solid.sy, sz: solid.sz, m });
+        }
+      }
+
       /* one contact decal per instance, sized to the footprint */
       for (const it of list) {
         if (!it.shadow) continue;
@@ -543,8 +658,28 @@ export function createProps(ctx, lib, rng) {
     }
   }
 
+  /**
+   * Hand every instance's oriented box to ctx.phys.
+   *
+   * Called once, from city.js's wirePhysics, because the world stage
+   * boots BEFORE the physics stage and ctx.phys does not exist while
+   * build() is running. `skip(x, z, type)` lets the caller veto a
+   * collider — city.js uses it to keep doorway approaches clear.
+   */
+  function registerColliders(phys, skip) {
+    if (!phys || !phys.addOBB || colliderIds.length) return 0;
+    for (const c of colliders) {
+      const e = c.m.elements;
+      if (skip && skip(e[12], e[14], c.type)) continue;
+      colliderIds.push(phys.addOBB(c.sx, c.sy, c.sz, c.m, { name: `prop.${c.type}`, prop: true }));
+    }
+    return colliderIds.length;
+  }
+
   return {
-    group, add, build, cullShadows,
+    group, add, build, cullShadows, registerColliders,
+    get colliders() { return colliders; },
+    get colliderCount() { return colliderIds.length; },
     get count() { return built.reduce((a, m) => a + m.count, 0); },
     get meshes() { return built; },
     dispose() {
@@ -558,3 +693,20 @@ export function createProps(ctx, lib, rng) {
 }
 
 export const PROP_TYPES = Object.keys(CATALOGUE);
+
+/**
+ * Plan-view radius of each prop, for callers that have to decide WHERE
+ * to put one before anything has been built. It mirrors the `r` each
+ * CATALOGUE factory reports; the factories cannot be asked for it at
+ * placement time because running one builds its geometry.
+ *
+ * city.js uses this to keep prop bodies out of doorway approaches. That
+ * has to be a placement decision rather than a collision one: refusing
+ * a container its collider would leave a 5 m box you can walk through,
+ * which is the exact bug this whole pass exists to kill.
+ */
+export const PROP_FOOTPRINT = {
+  crate: 0.69, barrel: 0.41, bench: 1.00, lamp: 0.42, bin: 0.37,
+  cart: 1.30, bike: 0.62, produce: 0.64, plant: 0.50, hedge: 1.38,
+  fence: 1.32, bollard: 0.32, hay: 0.80, container: 2.86, orecart: 0.95,
+};

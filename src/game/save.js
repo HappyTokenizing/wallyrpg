@@ -31,6 +31,12 @@
    sanitize() repairs the same fields on EVERY load, version or not,
    so a save written mid-upgrade cannot arrive without a rides record
    and take game.fares() down with it.
+
+   THREE REPAIRS RUN ON EVERY LOAD for exactly that reason, because
+   each of them landed inside v7 rather than at a version boundary:
+   migrateRides(), migrateRace() and migrateDiscovery() — the last of
+   which seeds `state.access` from `state.known` for any file written
+   before discovery and access were separate ideas.
    ============================================================ */
 
 import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID, OFFICE_STAGES } from './data.js';
@@ -152,6 +158,43 @@ export function createSave(env) {
     return m;
   }
 
+  /* ---------- DISCOVERY vs ACCESS ----------
+     `state.found` and `state.access` arrived after v7 shipped, so a
+     save written by an earlier v7 build has neither and migrate()'s
+     forward-fill will not run for it (the version has not moved).
+     Repaired here on EVERY load, exactly like rides and the race
+     above — and this one MATTERS, because getting it wrong locks a
+     returning player out of buildings he already earned.
+
+     THE MIGRATION, AND WHY IT IS SAFE. Before proximity discovery,
+     `known[id]` could only ever be set by the `see` rule coming true
+     (quests.refreshKnown) or by raceOffer() forcing the route open.
+     So on an old save "known" and "access" were the same set, and
+     seeding access from known is not a guess — it is the identity
+     that held when the file was written. A NEW save is left alone: it
+     has its own access map and its own found map, and a place found
+     by walking must stay found-but-shut.
+     ------------------------------------------------------------ */
+  function migrateDiscovery(m) {
+    const fresh = !m.access || typeof m.access !== 'object' || Array.isArray(m.access);
+    if (!m.found || typeof m.found !== 'object' || Array.isArray(m.found)) m.found = {};
+    if (fresh) {
+      m.access = {};
+      for (const id of Object.keys(m.known)) if (LOC_BY_ID[id]) m.access[id] = true;
+    }
+    /* a place that no longer exists in the content tables is dropped
+       from all three, so a hand-edited file cannot put a ghost pin on
+       the map */
+    for (const map of [m.known, m.found, m.access]) {
+      for (const id of Object.keys(map)) { if (!LOC_BY_ID[id]) delete map[id]; else map[id] = !!map[id] || undefined; }
+      for (const id of Object.keys(map)) if (!map[id]) delete map[id];
+    }
+    /* found implies known: you cannot have walked past something that
+       is not on your map */
+    for (const id of Object.keys(m.found)) m.known[id] = true;
+    return m;
+  }
+
   /* ---------- SETTINGS ----------
      Forward-filled and type-coerced on EVERY load, for the same
      reason as the two repairs above: `settings` grows a key whenever
@@ -233,6 +276,7 @@ export function createSave(env) {
     if (!m.seen) m.seen = {};
     if (!m.known) m.known = {};
     if (!m.visited) m.visited = {};
+    migrateDiscovery(m);
     if (!m.flags) m.flags = {};
     if (!m.skills) m.skills = {};
     if (!m.unlocks) m.unlocks = {};
@@ -310,5 +354,5 @@ export function createSave(env) {
     return migrate(data);
   }
 
-  return { save, load, has, wipe, migrate, sanitize, migrateRides, migrateRace, exportJSON, importJSON, download, filename, driver: store.kind };
+  return { save, load, has, wipe, migrate, sanitize, migrateRides, migrateRace, migrateDiscovery, exportJSON, importJSON, download, filename, driver: store.kind };
 }

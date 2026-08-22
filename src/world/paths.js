@@ -295,6 +295,26 @@ export function createPaths(ctx, terrain) {
     .lerp(new THREE.Color().setHex(LAND.grassShade, THREE.SRGBColorSpace), 0.22);
   const _cc = new THREE.Color();
 
+  /**
+   * Resample a polyline so no segment is longer than `step`, keeping
+   * every original vertex. XZ only — the ribbon looks the height up per
+   * vertex, which is the whole point of doing this.
+   */
+  function densify(pts, step) {
+    if (pts.length < 2) return pts;
+    const out = [pts[0]];
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      const d = Math.hypot(b.x - a.x, b.z - a.z);
+      const n = Math.max(1, Math.ceil(d / step));
+      for (let k = 1; k <= n; k++) {
+        const t = k / n;
+        out.push({ x: a.x + (b.x - a.x) * t, z: a.z + (b.z - a.z) * t });
+      }
+    }
+    return out;
+  }
+
   function buildRibbons() {
     /* One merged mesh per district keeps the draw calls in single
        figures while still letting the frustum throw most of them
@@ -310,7 +330,26 @@ export function createPaths(ctx, terrain) {
       const pos = [], nrm = [], col = [], uv = [], idx = [];
       let base = 0;
       for (const e of list) {
-        const pts = e.points;
+        /* A 6 m CHORD OVER A 2 m HEIGHTFIELD IS A BRIDGE.
+
+           The centreline is resampled to a fixed 6 m so that the carve
+           is even (see relax()), and the ribbon used to take one vertex
+           ring per centreline point. Every quad was therefore a flat
+           6 m plank laid across ground that turns every 2 m: over a dip
+           it spans the dip, and the drawn tarmac floats above the
+           collision surface. Measured with tools/surfacetest.mjs on the
+           Iron Hills lane, the road was drawn up to 0.50 m over the
+           ground the controller actually stands on — Wally walking a
+           road with his ankles in it, which is exactly what the user
+           photographed on a bench and a bin.
+
+           The heightfield's own resolution is CELL = 2 m and the
+           collision tiles are built from it vertex for vertex, so a
+           ribbon sampled every 1.5 m cannot disagree with the collider
+           by more than the raster disagrees with itself. It costs about
+           four times the road vertices, which across the whole island
+           is a few thousand — under a tenth of one building. */
+        const pts = densify(e.points, 1.5);
         const half = e.width * 0.38;   // the ribbon rides INSIDE the carve
         const ring = [];
         for (let i = 0; i < pts.length; i++) {
@@ -326,7 +365,11 @@ export function createPaths(ctx, terrain) {
           for (let s = -1; s <= 1; s++) {
             const w = half * s * (s === 0 ? 0 : 1);
             const x = r.x + r.px * w, z = r.z + r.pz * w;
-            const y = terrain.heightAt(x, z) + 0.09;
+            /* 0.09 m was a z-fighting guard from before the material
+               carried a polygon offset. It is now belt AND braces, and
+               nine centimetres is a step the player can see himself
+               standing in. Three is under the noise. */
+            const y = terrain.heightAt(x, z) + 0.03;
             const n = terrain.normalAt(x, z);
             pos.push(x, y, z);
             nrm.push(n.x, n.y, n.z);

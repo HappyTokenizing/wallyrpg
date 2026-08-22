@@ -269,9 +269,13 @@ async function boot() {
   }
 
   function ask() {
-    const coarse = typeof matchMedia === 'function'
-      && matchMedia('(hover: none) and (pointer: coarse)').matches;
-    if (goEl) goEl.textContent = coarse ? 'Tap to begin' : 'Press any key to begin';
+    /* The chip's wording is set ONCE, above, from `touchOnly`. This used to
+       re-derive it here with a THIRD capability test — (hover: none) and
+       (pointer: coarse) — and overwrite it with a shorter string. That was
+       invisible in the headless rig, which auto-allows audio so ask() never
+       runs; on a real phone the AudioContext is always suspended until a
+       gesture, so ask() is the path that ALWAYS runs and its wording was the
+       only one anyone ever saw. One test, one assignment, no second opinion. */
     bootEl?.classList.add('ask');
     goEl?.focus?.({ preventScroll: true });
 

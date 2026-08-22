@@ -776,6 +776,16 @@ export function createMenus(ctx, ui) {
     }, ['S', 'M', 'L', 'XL']));
     body.append(toggle('Reduced motion', !!S.reduced, (on) => { S.reduced = on; ui.setReducedMotion(on); }));
     body.append(toggle('High contrast', !!S.contrast, (on) => { S.contrast = on; ui.setHighContrast(on); }));
+    /* HIDE UI — the clean view of the city. Fades out the two top
+       clusters (stat pills, objective card, money row) and nothing
+       else: on a phone the thumbstick and the bottom-right pad stay,
+       and every toast, banner, prompt and notification keeps coming.
+       The toast names the way back, because with the top gone this
+       switch is the only route out and it is two taps deep. */
+    body.append(toggle('Hide UI', !!S.hideUI, (on) => {
+      ui.setHideUI(on);
+      ui.toast(on ? 'Top HUD hidden · Settings brings it back' : 'HUD back', 'info');
+    }));
     body.append(toggle('Relaxed pace', !!S.relaxed, (on) => {
       S.relaxed = on;
       ui.toast(on ? 'Everything takes 30% less time' : 'Normal pace', 'info');

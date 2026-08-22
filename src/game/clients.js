@@ -15,7 +15,7 @@
    minutes between 08:00 and 20:00.
    ============================================================ */
 
-import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID, NPC_POSTS, tickerQty } from './data.js';
+import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID, NPC_POSTS, FIRST_ORDER, tickerQty } from './data.js';
 
 const FUND_NAMES = {
   Stocks: 'Growth', Bonds: 'Safe City', Farm: 'Farm & Food', Minerals: 'Deep Earth',
@@ -109,10 +109,77 @@ export function createClients(env) {
     return c.fav.includes(a.cat) ? 1 : 0;
   }
 
+  /* ============================================================
+     THE FIRST ORDER IN THE GAME IS ALWAYS CRUMB.
+
+     See data.js FIRST_ORDER for the full why. The short version:
+     taking an order at the desk is what sends the player to the
+     Business Broker (q_broker), so the order had better be for
+     something the Business Broker actually sells. A rolled basket is
+     not, four times out of five — the pool is all 69 assets across
+     twelve venues.
+
+     THE LATCH IS ON ACCEPTANCE, NOT ON CREATION. economy.acceptOrder()
+     sets flags.firstOrderTaken. Until then EVERY order this module
+     builds is the CRUMB one, so it does not matter how many arrivals
+     came and went overnight, which client walked in, or whether the
+     player met Otto in the cafe before ever working a shift — the
+     order he picks up is the one the objective is about. After it,
+     makeOrder() rolls exactly as it always did and the variety of the
+     other 68 assets is completely untouched.
+
+     Deterministic: it consumes no rng, so a seeded run produces the
+     same first order every time. tools/test-game.mjs checks that
+     across a hundred seeds and both routes in.
+     ============================================================ */
+  function firstOrderPending() {
+    const st = S();
+    if (st.flags[FIRST_ORDER.flag]) return false;
+    /* SELF-HEALING, for a save written before this flag existed and
+       for anything that fabricates a player mid-career. A book with
+       orders in it, or a career with orders behind it, is not somebody
+       waiting for their first client — latch and get out of the way,
+       or an established broker's next basket would arrive as a single
+       croissant. */
+    if (st.stats.ordersDone > 0 || st.orders.length > 0) { st.flags[FIRST_ORDER.flag] = true; return false; }
+    return true;
+  }
+  const crumbAsset = () => ASSET_BY_ID[FIRST_ORDER.asset];
+
+  /* The authored basket. One unit, a friend's margin, a long fuse. */
+  function crumbOrder(clientId, opts = {}) {
+    const st = S();
+    const c = CLIENT_BY_ID[clientId];
+    const a = crumbAsset();
+    if (!c || !a) return null;
+    const cost = E().buyPrice(a.id);
+    return {
+      id: opts.id || ('o_first_' + clientId),
+      client: clientId,
+      type: 'deliver',
+      name: null,
+      items: [{ a: a.id, q: FIRST_ORDER.qty, t: a.tick }],
+      budget: Math.round(cost * FIRST_ORDER.margin),
+      fee: Math.round(cost * FIRST_ORDER.feeRate) + FIRST_ORDER.feeFlat,
+      deadline: st.day + FIRST_ORDER.days,
+      made: st.day,
+      warned: false,
+      first: true,                              // the tests and the UI both ask
+      keep: !!opts.keep,                        // survives the nightly desk wipe
+      line: opts.line || FIRST_ORDER.line,
+    };
+  }
+
   function makeOrder(clientId) {
     const st = S();
     const c = CLIENT_BY_ID[clientId], cs = st.clients[clientId];
     if (!c || !cs) return null;
+    /* THE ONE FORCED BASKET, ahead of every roll below. The hate check
+       is belt and braces — only Mr. Ledger hates Business and he is a
+       budget-4 client who cannot possibly be the first through the
+       door — but a content edit should not be able to hand somebody an
+       order they would refuse on sight. */
+    if (firstOrderPending() && !c.hate.includes(crumbAsset().cat)) return crumbOrder(clientId);
     const ceiling = ceilingFor(c, cs);
     const pool = E().sourceable().filter((a) => !c.hate.includes(a.cat) && E().price(a.id) <= ceiling);
     if (!pool.length) return null;
@@ -191,11 +258,16 @@ export function createClients(env) {
 
   function candidates() {
     const st = S();
+    const first = firstOrderPending();
     return CLIENTS.filter((c) => {
       const cs = st.clients[c.id];
       if (hasArrival(c.id)) return false;
       if (st.orders.some((o) => o.client === c.id)) return false;
       if (c.id === 'vance') return false;                 // only via his own office
+      /* while the CRUMB order is the only order this game will build,
+         somebody who would not touch a bakery cannot be the one to
+         ask for it */
+      if (first && c.hate.includes(crumbAsset().cat)) return false;
       if (c.budget === 1) return true;
       if (c.budget === 2) return st.rep >= 8 || cs.met;
       if (c.budget === 3) return st.rep >= 22;
@@ -204,9 +276,17 @@ export function createClients(env) {
     });
   }
 
+  /* is the forced first order already sitting on the desk, unclaimed? */
+  const pendingFirst = () => S().arrivals.find((o) => o && o.first) || null;
+
   function newArrival() {
     const st = S();
     if (!ordersUnlocked()) return null;
+    /* ONE FIRST ORDER, NOT THREE. While the CRUMB basket is forced,
+       a second arrival would be a second person asking for the same
+       loaf, which reads as a bug even though it is not one. The desk
+       stays a one-item desk until that order is taken. */
+    if (firstOrderPending() && pendingFirst()) return null;
     const pool = candidates();
     if (!pool.length || st.arrivals.length >= 4) return null;
     const c = pool[Math.floor(env.rng() * pool.length)];
@@ -245,8 +325,13 @@ export function createClients(env) {
   function dailyOffers() {
     const st = S();
     if (!ordersUnlocked()) return;
-    const metIds = CLIENTS.filter((c) => st.clients[c.id].met || c.budget === 1).map((c) => c.id);
-    const offers = 1 + Math.floor(st.rep / 28);
+    /* same one-desk rule as newArrival(): the morning does not pile a
+       second CRUMB request on top of the untouched one */
+    if (firstOrderPending() && pendingFirst()) return;
+    const crumbCat = crumbAsset().cat;
+    const metIds = CLIENTS.filter((c) => (st.clients[c.id].met || c.budget === 1)
+      && !(firstOrderPending() && c.hate.includes(crumbCat))).map((c) => c.id);
+    const offers = firstOrderPending() ? 1 : 1 + Math.floor(st.rep / 28);
     for (let i = 0; i < offers; i++) {
       const cid = metIds[Math.floor(env.rng() * metIds.length)];
       if (!cid) break;
@@ -261,6 +346,8 @@ export function createClients(env) {
   return {
     all, get, stateOf, trust, met, meet, addTrust, trustedCount, at, postsAt, waitingAt,
     likes, ceilingFor, makeOrder, ticket,
+    /* the forced opening order — see FIRST_ORDER in data.js */
+    crumbOrder, firstOrderPending, pendingFirst,
     arrivals, hasArrival, addArrival, removeArrival, candidates, ordersUnlocked,
     newArrival, seedArrivals, dailyOffers, tick, resetClock,
   };

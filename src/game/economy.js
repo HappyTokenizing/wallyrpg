@@ -16,6 +16,7 @@ import {
   CONFIG, ASSETS, ASSET_BY_ID, ASSET_BY_TICK, VENUES, VENUE_LOC, CLIENT_BY_ID, OFFICE_STAGES,
   HOME_BY_ID, EMPLOYEE_BY_ID, NEWS_POOL, WALLYNET_GOOD, WALLYNET_BAD, LOC_BY_ID,
   byTicker, assetIdOf, assetLabel, tickerQty, searchAssets, normTicker, orderFailRep,
+  FIRST_ORDER,
 } from './data.js';
 import { round2, clamp } from './state.js';
 
@@ -281,6 +282,13 @@ export function createEconomy(env) {
        q_broker — the next objective — sends him there. One flag, set
        in the one place an order is ever taken. */
     st.flags.orderTaken = true;
+    /* AND THE SECOND LATCH, in the same one place. Until an order has
+       been ACCEPTED, clients.makeOrder() forces the CRUMB basket so
+       that the objective above ("go and see the Business Broker") and
+       the shopping list agree. This is the line that releases it —
+       every order after this one rolls normally. See FIRST_ORDER in
+       data.js. */
+    st.flags[FIRST_ORDER.flag] = true;
     bus.emit('client', { kind: 'accept', client: o.client, order: o });
     M().note('good', 'Order accepted from ' + CLIENT_BY_ID[o.client].n);
     env.quests?.check();

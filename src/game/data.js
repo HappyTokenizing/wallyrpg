@@ -570,6 +570,104 @@ export function orderFailRep(order) {
   return Math.round(Math.min(ORDER_FAIL.cap, raw * mult) * 10) / 10;
 }
 
+/* ============================================================
+   THE FIRST ORDER IS ALWAYS CRUMB, AND IT IS ALWAYS AT THE BROKER.
+
+   THE BUG. Picking an order up at the desk sets flags.orderTaken,
+   which puts the Business Broker on the map and makes q_broker — "Go
+   and see the Business Broker" — the live objective. But the order
+   itself was ROLLED: clients.makeOrder() draws from the whole
+   sourceable list against that client's taste and ceiling, so the
+   very first client could perfectly well ask for a pair of sneakers
+   sold at the Culture Bazaar, and the game would then send the player
+   to a broker who does not stock the one thing he needs. The tutorial
+   pointed one way and the shopping list pointed another.
+
+   THE RULE. Until an order has actually been ACCEPTED, every order
+   this game generates is this one: one unit of CRUMB (Crumb & Co.
+   Bakery, ticker CRUMB), which is sold at the Business Broker and
+   nowhere else. Latched on ACCEPT rather than on creation, so the
+   order the player picks up is the forced one no matter how many
+   arrivals came and went overnight. Everything after it rolls
+   normally and the variety is untouched.
+
+   The asset is not a new invention — JOBS above already documents
+   "the first asset from CRUMB … five café shifts or four at
+   Dispatch". This is the table finally agreeing with that note.
+   ============================================================ */
+export const FIRST_ORDER = Object.freeze({
+  asset: 'bakery',
+  ticker: 'CRUMB',
+  venue: 'broker',
+  loc: 'broker',
+  qty: 1,
+  days: 5,              // he is not in a hurry: four shifts' pay is four days
+  margin: 1.18,         // what the client pays over what it costs you
+  feeRate: 0.12,
+  feeFlat: 30,
+  flag: 'firstOrderTaken',
+  line: 'One thing, and it is the only thing. Crumb & Co. — the bakery on '
+    + 'the corner. The Business Broker on Market Square is the only desk in '
+    + 'this city that sells a whole business, so that is where you are going.',
+});
+
+/* ============================================================
+   A DISCOVERY / ARM RULE, IN ENGLISH.
+
+   quests.ruleMet() answers "is this true"; this answers "and what
+   would make it true", which is the sentence a place the player has
+   FOUND but cannot yet USE has to be able to show. Pure: it reads the
+   content tables and nothing else, so the UI, the fare board and the
+   door refusal all quote the same words.
+   ============================================================ */
+export function ruleLabel(rule) {
+  if (rule === 0 || rule == null) return null;
+  if (Array.isArray(rule)) return rule.map(ruleLabel).filter(Boolean).join(' and ');
+  const bits = [];
+  if (rule.any != null) {
+    const alts = rule.any.map(ruleLabel).filter(Boolean);
+    if (alts.length) bits.push(alts.join(' or '));
+  }
+  /* the rung's name only when the bar IS a rung — "reputation 8
+     (Errand Elephant)" is useful, "reputation 5 (A Little Calf)" is
+     the rung he is already standing on and reads as nonsense */
+  if (rule.rep != null) {
+    const rung = repTitle(rule.rep);
+    bits.push('reputation ' + rule.rep + (rung && rung.rep === rule.rep ? ' (' + rung.t + ')' : ''));
+  }
+  if (rule.office != null) bits.push('the ' + (OFFICE_STAGES[rule.office] ? OFFICE_STAGES[rule.office].n : 'office stage ' + rule.office));
+  if (rule.skill != null) bits.push('the ' + (COURSE_BY_ID[rule.skill] ? COURSE_BY_ID[rule.skill].n : rule.skill) + ' course');
+  if (rule.ride != null) bits.push('a ' + (RIDES[rule.ride] ? RIDES[rule.ride].short.toLowerCase() : rule.ride));
+  if (rule.farm) bits.push('a stake in Maple Farm');
+  if (rule.mine) bits.push('the Old Bull Bear Mine');
+  if (rule.stadium != null) bits.push('step ' + rule.stadium + ' of the stadium restoration');
+  if (rule.flag != null) bits.push(FLAG_LABEL[rule.flag] || 'a story beat you have not reached');
+  if (rule.stat != null) {
+    const w = STAT_LABEL[rule.stat];
+    bits.push(rule.n + ' ' + (w ? w[rule.n === 1 ? 0 : 1] : rule.stat));
+  }
+  return bits.length ? bits.join(' and ') : null;
+}
+/* the handful of flags a `see` rule is ever written against */
+const FLAG_LABEL = Object.freeze({
+  orderTaken: 'a client order in your hand',
+  dispatchShift: 'a shift worked at Dispatch',
+  readMentor: "your friend's message read",
+  metFriend: 'a coffee with Otto',
+  metHappy: 'a word with Happy',
+});
+/* [singular, plural] — "1 shifts worked" is the kind of seam a player
+   notices and a writer never forgives */
+const STAT_LABEL = Object.freeze({
+  jobsDone:  Object.freeze(['shift worked', 'shifts worked']),
+  ordersDone: Object.freeze(['order completed', 'orders completed']),
+  tokenized: Object.freeze(['asset tokenized', 'assets tokenized']),
+  ipos:      Object.freeze(['listing', 'listings']),
+  trips:     Object.freeze(['journey', 'journeys']),
+  minigames: Object.freeze(['job played', 'jobs played']),
+  classes:   Object.freeze(['class taken', 'classes taken']),
+});
+
 /* ---------------- 10 ZONES ----------------
    x/y are 2D-map coords on the original 1000x660 board.
    `elev` is the district's base ground height in metres.
@@ -588,8 +686,53 @@ export const ZONES = {
   goldenheights: { id: 'goldenheights', n: 'Golden Heights',      x: 806, y: 126, kit: 'gold',    unlock: 0, elev: 58, tint: '#8A7448', blurb: 'Where the money already lives.' },
 };
 
+/* ============================================================
+   DISCOVERY BY WALKING — the radius rule.
+
+   `see` is the ACCESS rule and always has been. What changed is that
+   it is no longer the ONLY way a building gets onto the map: walking
+   up to one in the 3D city puts it there too (game.sense()). The two
+   are deliberately different questions —
+
+     FOUND    it is on the map and in Places, because you have stood
+              in front of it. `state.found[id]`, with `state.known[id]`
+              set alongside it.
+     ACCESS   the `see` rule is satisfied, so the door will open and
+              its quests can start. `state.access[id]` latches it.
+
+   so finding the Stock Exchange on day one is a genuine alternative
+   to grinding Dispatch shifts, and changes nothing whatsoever about
+   what it takes to trade there.
+
+   THE RADIUS. Per building, from its own footprint, so a stadium is
+   noticed from further away than a noodle cart:
+
+       r = max(min, hypot(w, d) * 0.5 + pad)
+
+   16 m for the smallest, 51.5 m for the stadium. The closest two
+   buildings on the island are 59 m apart (office <-> bank), so no
+   radius can ever reach a neighbour — walking to a door discovers
+   THAT door and nothing else. It is also comfortably wider than
+   hud.js's door-prompt reach (hypot*0.5 + 5.5), so a place lands on
+   the map a step or two before you can press E at it, which is the
+   order those two things should happen in.
+
+   `dwell` is what keeps it honest: you must be inside the radius for
+   that many seconds of continuous walking. Clipping the edge of the
+   circle at motorcycle speed is not "being near the building", and
+   fast travel never feeds this at all — game.sense() is driven by
+   Wally's 3D position and by nothing else.
+------------------------------------------------------------ */
+export const DISCOVER = Object.freeze({
+  pad: 11,          // metres added to the building's half-diagonal
+  min: 16,          // …and the floor, for the noodle cart
+  dwell: 0.7,       // seconds inside the radius before it counts
+  hysteresis: 4,    // metres of slack before the dwell timer resets
+});
+
 /* ---------------- 28 LOCATIONS ----------------
-   kind is implied by `acts`. `see` is the discovery rule.
+   kind is implied by `acts`. `see` is the ACCESS rule (and, until the
+   place is walked past, its discovery rule too — see DISCOVER above).
    `dy` nudges the ground height off the zone base.
 --------------------------------------------- */
 export const LOCATIONS = [
@@ -807,6 +950,8 @@ for (const l of LOCATIONS) {
   const s = SIZE_OVERRIDE[l.id] || KIT_SIZE[l.kit] || KIT_SIZE.interior;
   l.size = { w: s.w, d: s.d, h: s.h };
   l.radius = r3(Math.hypot(s.w, s.d) * 0.5 + 4);
+  /* how close you have to walk before the city puts it on your map */
+  l.findRadius = r3(Math.max(DISCOVER.min, Math.hypot(s.w, s.d) * 0.5 + DISCOVER.pad));
 }
 
 /* --- zone bounds from their members --- */
@@ -1551,6 +1696,8 @@ export const DATA = deepFreeze({
   homes: HOMES, homeById: HOME_BY_ID,
   repTitles: REP_TITLES, repTitle, repNextTitle, repProgress, repTitleIndex,
   orderFail: ORDER_FAIL, orderFailRep,
+  firstOrder: FIRST_ORDER,
+  discover: DISCOVER, ruleLabel,
   race: RACE, npcPosts: NPC_POSTS, slate: SLATE_MEAL, producers: PRODUCERS,
   zones: ZONES,
   locations: LOCATIONS, locationById: LOC_BY_ID,

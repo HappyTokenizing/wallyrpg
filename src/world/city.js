@@ -33,7 +33,7 @@ import {
 } from './kits.js';
 import { buildLocation, silhouette } from './buildings.js';
 import { createSign } from './signs.js';
-import { createProps } from './props.js';
+import { createProps, PROP_FOOTPRINT } from './props.js';
 import { createFireworks } from './fireworks.js';
 import { HOME_TIERS, homeTierIndex, buildHomeTier } from './home.js';
 
@@ -299,6 +299,64 @@ function bermBand(world, loc, groundY, pts, a, b, wob, hn) {
   return g;
 }
 
+/** The berm's TOP SURFACE as one continuous strip, for ctx.phys.
+
+    THE BERM IS THE GROUND AT EVERY DOOR IN THE CITY and nothing knew
+    it. The drawn band climbs from a metre inside the hillside to
+    0.44 m up the plinth; the collision world was still the raw 2 m
+    heightfield underneath it, so surfacetest measured him walking
+    0.41-0.44 m INSIDE the earth he is standing on all the way round
+    every founded building on the island — the single worst surface
+    disagreement in the game.
+
+    So the same rings that draw it also register it. One strip rather
+    than four separate bands: consecutive bands share their boundary
+    exactly (that is what `wob` is for), and re-emitting the shared ring
+    would give every seam four coincident faces, which defeats
+    _markInternalEdges and doubles the contacts along it.
+
+    Only the rings that can ever be ABOVE the terrain are worth
+    registering — past ring 3 the profile is a third of a metre down
+    inside the hill and the heightfield wins every query anyway. */
+const BERM_COL_RINGS = 4;
+
+function bermCollision(world, loc, groundY, pts, rings, wob, hn) {
+  const P = pts.length, R = Math.min(BERM_COL_RINGS, rings.length);
+  const pos = new Float32Array(P * R * 3);
+  const idx = new Uint32Array((P - 1) * (R - 1) * 6);
+  let v = 0;
+  for (let r = 0; r < R; r++) {
+    const ring = rings[r];
+    for (let i = 0; i < P; i++) {
+      const p = pts[i];
+      const k = ring.e * (1 + wob[i % wob.length] * 0.5);
+      const x = p.x + p.nx * k, z = p.z + p.nz * k;
+      toWorldXZ(loc, x, z, _wp);
+      pos[v++] = x;
+      pos[v++] = world.heightAt(_wp.x, _wp.z) - groundY + ring.dy + hn[i % hn.length] * ring.n;
+      pos[v++] = z;
+    }
+  }
+  let f = 0;
+  for (let r = 0; r < R - 1; r++) {
+    const a0 = r * P, b0 = (r + 1) * P;
+    for (let i = 0; i < P - 1; i++) {
+      idx[f++] = a0 + i; idx[f++] = a0 + i + 1; idx[f++] = b0 + i;
+      idx[f++] = a0 + i + 1; idx[f++] = b0 + i + 1; idx[f++] = b0 + i;
+    }
+  }
+  /* same winding proof the drawn band makes: phys derives its contact
+     direction radially, but groundAt() and the slope test both read the
+     stored face normal, and a berm wound face-down reports a ceiling. */
+  const ax = pos[idx[0] * 3], az = pos[idx[0] * 3 + 2];
+  const bx = pos[idx[1] * 3], bz = pos[idx[1] * 3 + 2];
+  const cx = pos[idx[2] * 3], cz = pos[idx[2] * 3 + 2];
+  if ((bx - ax) * (cz - az) - (bz - az) * (cx - ax) > 0) {
+    for (let i = 0; i < idx.length; i += 3) { const t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t; }
+  }
+  return { positions: pos, indices: idx };
+}
+
 /** The founding berm: trodden earth banked against the wall, with
     VOLUME, so it cannot float and cannot be buried. */
 function groundBerm(K, world, loc, groundY, o) {
@@ -367,6 +425,8 @@ function groundBerm(K, world, loc, groundY, o) {
     K.add('skirt', g, null, bands[i], { ao });
     g.dispose();
   }
+  /* the same surface, once, for ctx.phys */
+  if (o.collide) o.collide.push(bermCollision(world, loc, groundY, pts, rings, wob, hn));
 
   /* Rubble at the foot of the wall. The seam judges keep naming is a
      STRAIGHT LINE as much as it is a missing shadow — a dozen stones
@@ -417,6 +477,7 @@ export async function init(ctx) {
   const records = new Map();
   const clothQueue = [];
   const collideQueue = [];
+  const bermQueue = [];
   const signs = [];
   const ropeKit = new Kit(makeAO({ ground: 1, groundH: 0.01, under: 0.8 }));
 
@@ -430,6 +491,7 @@ export async function init(ctx) {
     try { built = buildLocation(ctx, loc, S, rng); }
     catch (e) { console.error(`[city] ${loc.id} failed to build:`, e); continue; }
     const { K, meta } = built;
+    const bermSurfaces = [];
 
     /* A pier stands on its own piles over water and the stadium is a
        bowl, not a box: neither is founded in a hillside, so both keep
@@ -466,6 +528,7 @@ export async function init(ctx) {
       groundBerm(K, world, loc, groundY, {
         w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
         reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
+        collide: bermSurfaces,
       });
       footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d });
     }
@@ -541,6 +604,9 @@ export async function init(ctx) {
     for (const b of meta.collide) {
       collideQueue.push({ box: b, matrix: group.matrixWorld.clone() });
     }
+    for (const s of bermSurfaces) {
+      bermQueue.push({ ...s, matrix: group.matrixWorld.clone(), id: loc.id });
+    }
 
     const box = new THREE.Box3().setFromObject(full);
     records.set(loc.id, {
@@ -561,6 +627,56 @@ export async function init(ctx) {
     const rm = lib.meshes(ropeKit, 'city.ropes');
     for (const m of rm) { root.add(m); ctx.mat.register(m, { color: BUILD.woodDark }); }
   }
+
+  /* THE DOORWAY IS NOT NEGOTIABLE.
+
+     Now that every prop is solid, a barrel dropped in front of a shop
+     is not clutter, it is a locked door for the rest of the game — and
+     the three passes below place against building CLEARANCE CIRCLES,
+     which say nothing about where the handle is. So the corridor the
+     player has to walk down, 0.5 m to 3.2 m straight out of each door
+     and 1.05 m either side, refuses a prop.
+
+     THE CORRIDOR IS AS NARROW AS IT CAN HONESTLY BE. Wally is a 0.34 m
+     capsule, so a metre of half-width is three times the clearance he
+     needs — and every centimetre wider strips another authored lamp or
+     bench off a doorstep, or (worse) keeps it drawn and takes its
+     collider away. tools/cliptest.mjs walks the centre of every one of
+     the 28 corridors with the real capsule and is the thing that says
+     this number is big enough.
+
+     Tested against the prop's own footprint, not its centre: the two
+     real offenders found by tools/cliptest.mjs were a 5.2 m shipping
+     container and an ore cart whose middles were politely outside the
+     corridor while their ends sat across the doorstep.
+
+     This removes the prop rather than just its collider. A container
+     you can walk through is the exact bug this pass exists to kill, so
+     "keep it and un-solid it" is not an option. */
+  const doorGuards = [];
+  function collectDoorGuards() {
+    doorGuards.length = 0;
+    for (const rec of records.values()) {
+      if (!rec.door) continue;
+      doorGuards.push({
+        x: rec.door.x, z: rec.door.z,
+        ax: Math.sin(rec.loc.yaw), az: Math.cos(rec.loc.yaw),
+      });
+    }
+  }
+  function doorBlocked(x, z, reach = 0) {
+    for (let i = 0; i < doorGuards.length; i++) {
+      const g = doorGuards[i];
+      const dx = x - g.x, dz = z - g.z;
+      const along = dx * g.ax + dz * g.az;
+      if (along < 0.5 - reach || along > 3.2 + reach) continue;
+      if (Math.abs(-dx * g.az + dz * g.ax) < 1.05 + reach) return true;
+    }
+    return false;
+  }
+  const reachOf = (kind) => PROP_FOOTPRINT[kind] ?? 0.7;
+  collectDoorGuards();
+  let doorVetoed = 0;
 
   /* ================================================================
      1b. THE REST OF THE DISTRICT.
@@ -696,6 +812,7 @@ export async function init(ctx) {
       for (const b of out.meta.collide) collideQueue.push({ box: b, matrix: m.clone() });
       for (const p of out.meta.props.slice(0, 3)) {
         const wp = new THREE.Vector3(p.x, 0, p.z).applyMatrix4(m);
+        if (doorBlocked(wp.x, wp.z, reachOf(p.type))) { doorVetoed++; continue; }
         props.add(p.type, new THREE.Matrix4().compose(
           new THREE.Vector3(wp.x, world.heightAt(wp.x, wp.z), wp.z),
           new THREE.Quaternion().setFromEuler(new THREE.Euler(0, fake.yaw + (p.ry || 0), 0)),
@@ -747,6 +864,8 @@ export async function init(ctx) {
   /* ================================================================
      2. District dressing — props along the lanes between buildings.
      ================================================================ */
+
+
   const srng = ctx.makeRng('wally.city.scatter');
   const KIND_BY_ZONE = {
     rustyrow: ['bin', 'crate', 'barrel', 'bike', 'bollard', 'plant'],
@@ -813,6 +932,7 @@ export async function init(ctx) {
         new THREE.Quaternion().setFromEuler(new THREE.Euler(0, srng() * PI * 2, 0)),
         new THREE.Vector3(1, 1, 1).multiplyScalar(0.9 + srng() * 0.22),
       );
+      if (doorBlocked(x, zz, reachOf(kind))) { doorVetoed++; continue; }
       props.add(kind, m);
       placed++;
     }
@@ -865,6 +985,7 @@ export async function init(ctx) {
         : r < 0.77 ? 'crate'
         : r < 0.89 ? 'barrel'
         : (zid === 'greenedge' || zid === 'ironhills' ? 'fence' : 'bike');
+      if (doorBlocked(x, z, reachOf(kind))) { doorVetoed++; continue; }
       const yaw = Math.atan2(-tz * side, tx * side) + (kind === 'bench' ? PI / 2 : 0);
       props.add(kind, new THREE.Matrix4().compose(
         new THREE.Vector3(x, world.heightAt(x, z), z),
@@ -921,6 +1042,7 @@ export async function init(ctx) {
         toWorldXZ(loc, lx, lz, _wp);
         if (world.shoreDistAt(_wp.x, _wp.z) < 6) continue;
         const kind = kinds[Math.floor(hrng() * kinds.length) % kinds.length];
+        if (doorBlocked(_wp.x, _wp.z, reachOf(kind))) { doorVetoed++; continue; }
         /* square up to the wall, then knock it a few degrees off — a
            crate pushed against a wall is never quite parallel to it */
         const yaw = loc.yaw + (face === 0 ? 0 : PI) + (hrng() - 0.5) * 0.7;
@@ -933,6 +1055,7 @@ export async function init(ctx) {
     }
   }
 
+  if (doorVetoed) console.log(`[city] ${doorVetoed} props refused a doorway approach`);
   props.build();
 
   /* ================================================================
@@ -1008,6 +1131,41 @@ export async function init(ctx) {
       catch (e) { console.warn('[city] collision registration failed', e); }
     }
 
+    /* --- the founding berms: the ground at every door ---
+       One strip per building, baked into world space by its own group
+       matrix. They sit ON the heightfield rather than replacing it —
+       groundAt() takes the highest surface under a point, so the berm
+       only answers where it is genuinely proud of the terrain, which is
+       exactly the band that was 0.44 m out. */
+    let bermTris = 0;
+    for (const b of bermQueue) {
+      try {
+        ctx.phys.addTriangles(b.positions, b.indices, { matrix: b.matrix, name: 'city.berm', walkable: true });
+        bermTris += b.indices.length / 3;
+      } catch (e) { console.warn('[city] berm collision failed', b.id, e); }
+    }
+
+    /* --- the nameboards ---
+       A board hung over a shopfront is a solid object and the collision
+       census had none of them. signs.js has already solved each one to
+       hang clear of the doorway it names (see the headroom contract
+       there); this makes the ones that still sit at chest height on a
+       low frontage stop him instead of letting him walk through the
+       painted face. */
+    let signCols = 0;
+    for (const s of signs) {
+      try { if (s.registerCollider(ctx.phys)) signCols++; }
+      catch (e) { console.warn('[city] sign collision failed', e); }
+    }
+
+    /* --- street furniture: one oriented box per instance ---
+       The doorway corridors were enforced at PLACEMENT time (section 2)
+       so there is nothing standing in one to veto here; the same guard
+       is passed again as a backstop, and its count is logged. */
+    let propCols = 0;
+    try { propCols = props.registerColliders(ctx.phys, (x, z, kind) => doorBlocked(x, z, reachOf(kind))); }
+    catch (e) { console.warn('[city] prop collision failed', e); }
+
     /* --- cloth: awnings, canopies, banners, laundry --- */
     /* §6: something moving in every frame. 40 cloths over a 970 m
        island is one every other building — raise the ceiling so the
@@ -1020,7 +1178,9 @@ export async function init(ctx) {
       if (n >= MAX) break;
       if (makeCloth(c, n)) n++;
     }
-    console.log(`[city] wired ${collideQueue.length} collision volumes, ${cloths.length} cloths`);
+    console.log(`[city] wired ${collideQueue.length} collision volumes, ` +
+      `${propCols}/${props.colliders.length} prop colliders ` +
+      `(${props.colliders.length - propCols} vetoed at doorways), ${cloths.length} cloths`);
   }
 
   /* ONE CLOTH. Lifted out of wirePhysics because the player's home is

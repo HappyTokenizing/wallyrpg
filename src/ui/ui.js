@@ -708,6 +708,26 @@ export async function init(ctx) {
     film.style.display = on ? 'none' : '';
     vignette.style.display = on ? 'none' : '';
   };
+  /* HIDE UI — the two top clusters fade out and nothing else does.
+     See the .w-hide-ui block in style.js for what stays and why; the
+     short version is that anything which is a RESPONSE to the player
+     (toasts, banners, notifications, the race box, the world prompt)
+     keeps drawing, and on touch the thumbstick and the whole
+     bottom-right cluster keep drawing too.
+
+     A class on the roots, not a teardown: hud.js still writes the
+     objective and still steers the compass arrow every frame, and
+     touch.js still measures the strip's box to dock the toasts. The
+     way back out is Settings, which the pause menu opens — Esc on a
+     keyboard, the gear on the pad, both untouched by this. */
+  let hideUI = false;
+  const setHideUI = (on) => {
+    hideUI = !!on;
+    uiRoot.classList.toggle('w-hide-ui', hideUI);
+    ovRoot.classList.toggle('w-hide-ui', hideUI);
+    const s = ctx.game?.state?.settings;
+    if (s) s.hideUI = hideUI;
+  };
 
   /* ------------------------------------------------------------
      SAYING SOMETHING TO THE PLAYER
@@ -846,6 +866,8 @@ export async function init(ctx) {
 
     /* --- accessibility --- */
     setTextSize, setReducedMotion, setHighContrast,
+    /** Fade the top HUD clusters out (and back). Persists in settings. */
+    setHideUI,
 
     /* --- touch --- */
     touch,
@@ -912,6 +934,8 @@ export async function init(ctx) {
     modal: { get: () => stack.length > 0, enumerable: true },
     visible: { get: () => visible, enumerable: true },
     near: { get: () => hud.nearLocation, enumerable: true },
+    /* touch.js reads this to decide where the toasts dock */
+    hideUI: { get: () => hideUI, enumerable: true },
     dialogueOpen: { get: () => dlg.isOpen, enumerable: true },
     panels: { get: () => stack.map((s) => s.name), enumerable: true },
   });
@@ -1098,6 +1122,7 @@ export async function init(ctx) {
     setTextSize(S.textSize || 1);
     setReducedMotion(!!S.reduced);
     setHighContrast(!!S.contrast);
+    setHideUI(!!S.hideUI);
   }
   /* Thumbstick + action pad, on a phone only. touch.js also arms a
      one-shot touchstart listener, so a hybrid laptop grows controls
@@ -1199,6 +1224,32 @@ export async function init(ctx) {
       return touch.demo(nx, ny);
     };
     d.touchState = () => ({ enabled: touch.enabled, active: touch.active, ...touch.axes });
+    /** Hide UI, for the screenshots and tools/touchtest.mjs. */
+    d.hideUI = (on = true) => { setHideUI(!!on); return hideUI; };
+    /** What the top clusters and the kept layers are actually doing. */
+    d.uiLayers = () => {
+      const box = (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        return {
+          x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height),
+          vis: cs.visibility, op: +(+cs.opacity).toFixed(2), disp: cs.display,
+          /* the honest question: could a finger reach it? */
+          hit: cs.visibility === 'visible' && cs.display !== 'none' && +cs.opacity > 0.02
+            && r.width > 0 && r.height > 0,
+        };
+      };
+      return {
+        hideUI,
+        barLeft: box('.w-bar.left'), barRight: box('.w-bar.right'),
+        stick: box('.w-stickzone'), acts: box('.w-acts'),
+        act: box('.w-abtn.act'), jump: box('.w-abtn.jump'),
+        toasts: box('.w-toasts'), prompt: box('.w-promptlayer'),
+        hints: box('.w-hints'), race: box('.w-race'),
+      };
+    };
     /* --- landscape play, for the verifier and tools/shot.mjs ---
        Drives exactly the path the switch drives, minus the finger.
        Returns the PROMISE so the harness sees the real outcome:

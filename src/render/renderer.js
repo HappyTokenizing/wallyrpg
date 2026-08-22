@@ -219,11 +219,21 @@ export async function init(ctx) {
      that cannot give us a depth texture. */
   let geoPrepass = false;
   let lastDt = 1 / 60;
+  /* Non-finite watch. 0 = off; N = run postfx's probe every Nth frame.
+     Debug only — each probe is a synchronous GPU readback. postfx §7. */
+  let nanEvery = 0;
+  let nanOnHit = null;
+  let nanBusy = false;
+  const nanLog = [];
   const api = {};
 
   function render() {
     const cam = ctx.camera;
     if (!cam) return;
+    /* Is the drawing buffer still the shape of the canvas? See the
+       viewport reconciler below — this is the backstop for a rotation
+       or a fullscreen change that arrived without a usable event. */
+    tickViewport();
     /* SANITISE dt BEFORE IT REACHES THE POST CHAIN.
        main.js seeds its clock after the boot loop, so the first
        requestAnimationFrame timestamp predates that call by however
@@ -284,7 +294,201 @@ export async function init(ctx) {
     /* ---- 4..10. post ---- */
     post.render(rtScene, rtND, cam, dt);
 
+    /* ---- 11. the non-finite watch, when it is armed ---- */
+    /* nanBusy: the hit callback is allowed to re-render the frame with
+       objects hidden, to bisect which material produced the value —
+       so the watch must not re-enter itself when it does. */
+    if (nanEvery > 0 && !nanBusy && (ctx.frame % nanEvery) === 0) {
+      nanBusy = true;
+      const p = post.probe(rtScene, rtND);
+      if (p.any) {
+        /* The callback runs INSIDE the offending frame, before
+           anything animates on, which is the only moment a tool can
+           still ask what was under that texel. Kept out of this file
+           deliberately: raycasting the scene graph is not the render
+           layer's business, but handing a tool the exact frame is. */
+        let extra;
+        if (nanOnHit) { try { extra = nanOnHit(p, cam); } catch (e) { extra = { err: String(e && e.message) }; } }
+        if (nanLog.length < 64) {
+          nanLog.push({ frame: ctx.frame, t: +ctx.elapsed.toFixed(2), ...p, extra });
+        }
+      }
+      nanBusy = false;
+    }
+
     renderer.setRenderTarget(null);
+  }
+
+  /* ================================================================
+     THE VIEWPORT RECONCILER — the landscape hard edge.
+
+     THE BUG. A user's sideways screenshot showed the world ending at a
+     hard vertical line with dark blue beyond it. That is the drawing
+     buffer keeping the shape it had before the rotation while the CSS
+     box already has the new one: the canvas is stretched over a box it
+     was not drawn for, and everything the frame was composed against —
+     camera aspect, every post target, the vignette's own aspect — is
+     fitted to the old rectangle.
+
+     WHY IT HAPPENS. main.js drives the resize off ONE signal, the
+     window's `resize` event, and reads innerWidth/innerHeight when it
+     fires. Both halves of that are unreliable on a handheld, and
+     ui/orient.js now pushes the game through exactly the sequence
+     where they fail:
+
+       * requestFullscreen() and screen.orientation.lock() land in the
+         same activation, so the viewport changes twice in a few
+         frames and some engines coalesce the events;
+       * `orientationchange` fires BEFORE layout on several mobile
+         engines, and a `resize` delivered alongside it reports the
+         PREVIOUS orientation's innerWidth/innerHeight;
+       * leaving fullscreen by a system gesture resizes without
+         necessarily notifying the page at all;
+       * iOS Safari has no element fullscreen, so the whole flip
+         arrives as a rotation the page only learns about late.
+
+     A missed or stale event is therefore not an edge case here, it is
+     the normal path, and nothing downstream ever re-checks.
+
+     THE FIX IS TO STOP TRUSTING EVENTS AND ASSERT AN INVARIANT:
+
+         canvas.width  === round( canvas.clientWidth  * pixelRatio )
+         canvas.height === round( canvas.clientHeight * pixelRatio )
+
+     The canvas' own box is measured after layout and cannot be stale;
+     innerWidth can be, and is. A ResizeObserver reports every change
+     to that box (including ones no `resize` event accompanies), the
+     fullscreen and orientation events poke it for the frames right
+     after a transition, and a slow poll in the frame loop is the
+     backstop for an engine that fires nothing at all. When the
+     invariant breaks, this rebuilds the whole chain — renderer size,
+     camera aspect, every post target, and every other module's
+     resize hook — from the measured box.
+
+     It is idempotent and cheap: when main.js has already got it right,
+     the comparison matches and nothing happens.
+     ================================================================ */
+  const canvasEl = ctx.canvas || renderer.domElement;
+  let appliedW = 0, appliedH = 0;
+  let syncFrames = 0;          // frames of eager checking after an event
+  let vpAuto = true;           // debug: turn the reconciler off to A/B it
+  let pollPhase = 0;
+
+  /* The drawing buffer cannot exceed what the context will allocate.
+     A phone in landscape fullscreen at devicePixelRatio 3 is the case
+     that finds this, and a render target that fails to allocate is
+     black — the other way this bug reports itself. */
+  const GL_LIMIT = (() => {
+    try {
+      const gl = renderer.getContext();
+      return Math.min(
+        gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096,
+        gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 4096,
+      );
+    } catch (e) { return 4096; }   // conservative, and true of every ES3 device
+  })();
+  function maxPixelRatio(cssW, cssH) {
+    return Math.max(0.5, Math.min(q.pixelRatio, GL_LIMIT / Math.max(cssW, cssH)));
+  }
+
+  /* The measured truth. Falls back to the window only when the canvas
+     has no box at all (display:none, or a detached canvas). */
+  function measure() {
+    let w = canvasEl ? canvasEl.clientWidth : 0;
+    let h = canvasEl ? canvasEl.clientHeight : 0;
+    if (!w || !h) {
+      const vv = typeof visualViewport !== 'undefined' ? visualViewport : null;
+      w = Math.round((vv && vv.width) || window.innerWidth || 1);
+      h = Math.round((vv && vv.height) || window.innerHeight || 1);
+    }
+    return [Math.max(1, Math.round(w)), Math.max(1, Math.round(h))];
+  }
+
+  function viewportState() {
+    const [cw, ch] = measure();
+    const pr = renderer.getPixelRatio();
+    return {
+      css: [cw, ch],
+      buffer: canvasEl ? [canvasEl.width, canvasEl.height] : null,
+      want: [Math.round(cw * pr), Math.round(ch * pr)],
+      pixelRatio: pr,
+      camAspect: ctx.camera ? +ctx.camera.aspect.toFixed(4) : null,
+      sceneRT: [rtScene.width, rtScene.height],
+      inSync: !!canvasEl
+        && canvasEl.width === Math.round(cw * pr)
+        && canvasEl.height === Math.round(ch * pr)
+        && rtScene.width === canvasEl.width && rtScene.height === canvasEl.height,
+    };
+  }
+
+  function syncViewport(force) {
+    /* The ResizeObserver is installed during init(), so this can be
+       reached before the api object is finished. */
+    if (!canvasEl || typeof api.resize !== 'function') return false;
+    const [cw, ch] = measure();
+    const pr = maxPixelRatio(cw, ch);
+    if (pr !== renderer.getPixelRatio()) renderer.setPixelRatio(pr);
+    const wantW = Math.round(cw * pr);
+    const wantH = Math.round(ch * pr);
+    if (!force
+      && cw === appliedW && ch === appliedH
+      && canvasEl.width === wantW && canvasEl.height === wantH
+      && rtScene.width === wantW && rtScene.height === wantH) return false;
+
+    appliedW = cw; appliedH = ch;
+
+    const cam = ctx.camera;
+    if (cam && cam.isPerspectiveCamera) {
+      const a = cw / ch;
+      if (Math.abs(cam.aspect - a) > 1e-6) { cam.aspect = a; cam.updateProjectionMatrix(); }
+    }
+    renderer.setSize(cw, ch, false);
+    api.resize(cw, ch);
+    /* Everyone else's resize hook, exactly as main.js fans it out —
+       the UI, the touch layer and the intro all size themselves off
+       this and would otherwise stay fitted to the old rectangle. */
+    const hs = ctx._handles || [];
+    for (let i = 0; i < hs.length; i++) {
+      const h = hs[i];
+      if (h && h !== api && typeof h.resize === 'function') {
+        try { h.resize(cw, ch); } catch (e) { /* one module must not block the rest */ }
+      }
+    }
+    try { ctx.bus?.emit?.('render:viewport', { w: cw, h: ch, pixelRatio: pr }); } catch (e) {}
+    return true;
+  }
+
+  /* Called from render(). Eager for a moment after any transition,
+     then a slow poll — reading clientWidth forces layout, so it is not
+     something to do sixty times a second forever. */
+  function tickViewport() {
+    if (!vpAuto) return;
+    if (syncFrames > 0) { syncFrames--; syncViewport(false); return; }
+    if ((++pollPhase & 31) === 0) syncViewport(false);
+  }
+
+  const bump = () => { if (vpAuto) syncFrames = 12; };
+  const vpOff = [];
+  function bindVP(target, type) {
+    if (!target || !target.addEventListener) return;
+    target.addEventListener(type, bump);
+    vpOff.push(() => target.removeEventListener(type, bump));
+  }
+  bindVP(window, 'resize');
+  bindVP(window, 'orientationchange');
+  bindVP(document, 'fullscreenchange');
+  bindVP(document, 'webkitfullscreenchange');
+  bindVP(typeof screen !== 'undefined' ? screen.orientation : null, 'change');
+  bindVP(typeof visualViewport !== 'undefined' ? visualViewport : null, 'resize');
+
+  let ro = null;
+  if (typeof ResizeObserver === 'function' && canvasEl) {
+    ro = new ResizeObserver(() => {
+      if (!vpAuto) return;
+      syncFrames = Math.max(syncFrames, 4);
+      syncViewport(false);
+    });
+    try { ro.observe(canvasEl); } catch (e) { ro = null; }
   }
 
   /* ================================================================
@@ -377,7 +581,15 @@ export async function init(ctx) {
       post.resize(W, H);
     },
 
+    /* Force the whole chain back into agreement with the canvas' real
+       box. See syncViewport() below. Returns true if anything moved. */
+    syncViewport(force) { return syncViewport(force); },
+    viewportState,
+
     dispose() {
+      if (ro) { try { ro.disconnect(); } catch (e) {} ro = null; }
+      for (const f of vpOff) f();
+      vpOff.length = 0;
       composer.dispose();
       post.dispose();
       csm.dispose();
@@ -399,6 +611,26 @@ export async function init(ctx) {
   dbg.buffer = (n) => api.setDebugBuffer(n || null);
   /* A/B the two ways of filling main.nd. See `geoPrepass` above. */
   dbg.prepass = (on) => { geoPrepass = !!on; return { geoPrepass, needND }; };
+  /* THE BLACK-SQUARE HUNT. `nanWatch(1)` probes every buffer in the
+     post chain every frame for NaN/Inf and records the first 64 bad
+     frames; `nanProbe()` answers for this frame only; `nanSelfTest()`
+     proves the probe can see a NaN on this driver at all. postfx §7. */
+  dbg.nanWatch = (every, onHit) => {
+    nanEvery = Math.max(0, every | 0);
+    nanOnHit = typeof onHit === 'function' ? onHit : null;
+    nanLog.length = 0;
+    return nanEvery;
+  };
+  dbg.nanLog = () => nanLog.slice();
+  dbg.nanProbe = () => post.probe(rtScene, rtND);
+  dbg.nanSelfTest = (mode) => post.probeSelfTest(mode);
+  /* THE LANDSCAPE CHECK. `viewport()` is the whole sizing chain in one
+     object; `inSync:false` is the hard-edged frame the user shot. */
+  dbg.viewport = () => viewportState();
+  dbg.syncViewport = (force) => syncViewport(force !== false);
+  /* Off, the frame goes back to trusting main.js's single resize
+     event — which is the state the landscape bug was reported in. */
+  dbg.viewportAuto = (on) => { vpAuto = on !== false; return vpAuto; };
   dbg.sun = (x, y, z) => csm.setSun(new THREE.Vector3(x, y, z).normalize());
   dbg.renderInfo = () => ({
     calls: renderer.info.render.calls,

@@ -174,6 +174,187 @@ if (jumpBox) {
     `vy ${air.vy}, grounded ${air.grounded}`);
 }
 
+/* ================= the action pad's pecking order =================
+   ENTER is the game's main verb — every door, desk, client and shop
+   goes through it — so it holds the corner-most, largest seat and
+   JUMP is the smaller one offset up-and-left. This block exists
+   because that used to be the other way round, and because the
+   caption is written from JS (touch.js) where a DOM reorder can
+   silently retarget it. */
+const padBoxes = () => page.evaluate(() => {
+  const box = (s) => {
+    const e = document.querySelector(s);
+    if (!e) return null;
+    const r = e.getBoundingClientRect();
+    return {
+      l: Math.round(r.left), t: Math.round(r.top), r: Math.round(r.right),
+      b: Math.round(r.bottom), w: Math.round(r.width), h: Math.round(r.height),
+    };
+  };
+  return {
+    act: box('.w-abtn.act'), jump: box('.w-abtn.jump'),
+    actCap: box('.w-abtn.act .cap'), jumpCap: box('.w-abtn.jump .cap'),
+    badge: box('.w-abtn .badge'), badgeHost: box('.w-abtn.sm'),
+    cap: document.querySelector('.w-abtn.act .cap')?.textContent ?? null,
+    vw: innerWidth, vh: innerHeight,
+  };
+});
+const pad = await padBoxes();
+ok(pad.act && pad.jump, 'both pad buttons are in the document');
+ok(pad.act.w > pad.jump.w, 'ENTER is the larger of the two',
+  `enter ${pad.act.w}px vs jump ${pad.jump.w}px`);
+ok(pad.act.w >= 44 && pad.jump.w >= 44, 'both pad buttons clear 44 px',
+  `${pad.act.w} / ${pad.jump.w}`);
+ok(pad.act.l > pad.jump.l && pad.act.b > pad.jump.b,
+  'ENTER sits LOWER-RIGHT of JUMP (the thumb\'s resting corner)',
+  `enter l${pad.act.l} b${pad.act.b} vs jump l${pad.jump.l} b${pad.jump.b}`);
+ok(pad.cap === 'Enter / Talk', 'the resting caption says what the button does',
+  JSON.stringify(pad.cap));
+/* The caption is absolutely positioned at left:50% under a 66 px
+   button whose right edge is 12 px off the screen. */
+ok(pad.actCap.r <= pad.vw - 4 && pad.actCap.l >= 0,
+  '"Enter / Talk" stays inside the frame', `${pad.actCap.l}..${pad.actCap.r} of ${pad.vw}`);
+const capsClear = pad.actCap.l > pad.jumpCap.r || pad.actCap.t > pad.jumpCap.b
+  || pad.jumpCap.t > pad.actCap.b;
+ok(capsClear, 'the two captions never overlap each other',
+  `enter ${pad.actCap.l}..${pad.actCap.r}@${pad.actCap.t}, jump ${pad.jumpCap.l}..${pad.jumpCap.r}@${pad.jumpCap.t}`);
+/* the unread badge rides the Phone shortcut, not the pad */
+ok(pad.badge && pad.badgeHost
+  && Math.abs(pad.badge.r - pad.badgeHost.r) < 8 && Math.abs(pad.badge.t - pad.badgeHost.t) < 8,
+  'the badge still lands on the corner of the button that carries it',
+  JSON.stringify(pad.badge));
+
+/* --- LANDSCAPE, where the pad lies down in one row along the bottom
+       edge. Same order, same sizes, and the long caption still has to
+       fit: in portrait it clears the right edge by 14 px, and here the
+       bar is only 390 px tall so the caption is also the lowest thing
+       on screen. This is ALSO where the Enter tap is tested, because
+       landscape is the layout that lifts the dialogue card clear of
+       the pad — in portrait the card lies on the floor over both
+       buttons and a tap there would be answered by the card. --- */
+await page.setViewportSize({ width: 844, height: 390 });
+await page.waitForTimeout(900);
+const land = await padBoxes();
+ok(land.act.w > land.jump.w && land.act.l > land.jump.l && land.act.b > land.jump.b,
+  'landscape: ENTER is still the bigger, lower-right button',
+  `enter ${land.act.w}px @${land.act.l},${land.act.b}  jump ${land.jump.w}px @${land.jump.l},${land.jump.b}`);
+ok(land.actCap.r <= land.vw - 4 && land.actCap.b <= land.vh - 4,
+  'landscape: "Enter / Talk" clears the right and bottom edges',
+  `cap r${land.actCap.r}/${land.vw}, b${land.actCap.b}/${land.vh}`);
+ok(land.actCap.l > land.jumpCap.r || land.actCap.t > land.jumpCap.b,
+  'landscape: the captions still do not overlap');
+
+/* --- tapping ENTER interacts. A dialogue is the observable proof:
+       the card advances, which is the same ui.interact() a door uses. --- */
+await page.evaluate(() => WALLY.debug.ui('dialogue'));
+await page.waitForTimeout(900);
+const talkCap = await page.evaluate(() => document.querySelector('.w-abtn.act .cap').textContent);
+ok(talkCap === 'More', 'mid-dialogue the caption becomes "More"', JSON.stringify(talkCap));
+const actC = { x: (land.act.l + land.act.r) / 2, y: (land.act.t + land.act.b) / 2 };
+/* THE TAP MUST LAND ON THE BUTTON. The dialogue card also advances on
+   click, so without this the whole check passes through a card that
+   happens to be covering the pad. */
+const onTop = await page.evaluate(([x, y]) => {
+  const b = document.querySelector('.w-abtn.act');
+  const t = document.elementFromPoint(x, y);
+  return !!t && (t === b || b.contains(t));
+}, [actC.x, actC.y]);
+ok(onTop, 'the dialogue card leaves ENTER reachable, so the tap is really the button\'s');
+/* Wait out the typewriter, then prove the line has SETTLED — otherwise
+   "the text changed" could just be the next character arriving and the
+   tap would never have had to do anything. */
+const dlgTx = () => page.evaluate(() => document.querySelector('.w-dlg-tx')?.textContent || '');
+await page.waitForTimeout(3200);
+const settled0 = await dlgTx();
+await page.waitForTimeout(600);
+const line0 = await dlgTx();
+ok(settled0 === line0 && line0.length > 0, 'the dialogue line has finished typing before we tap',
+  `${line0.length} chars`);
+await touch('touchStart', actC.x, actC.y);
+await page.waitForTimeout(90);
+await touch('touchEnd', actC.x, actC.y);
+await page.waitForTimeout(900);
+const line1 = await dlgTx();
+ok(line1 !== line0 && line1.length > 0, 'tapping ENTER advances the dialogue — it still interacts',
+  `"${line0.slice(0, 28)}…" -> "${line1.slice(0, 28)}…"`);
+await page.evaluate(() => { WALLY.ctx.ui.hide('dialogue'); WALLY.ctx.ui.closeAll(); });
+await page.waitForTimeout(800);
+const restCap = await page.evaluate(() => document.querySelector('.w-abtn.act .cap').textContent);
+ok(restCap === 'Enter / Talk', 'and the caption goes back to "Enter / Talk"', JSON.stringify(restCap));
+
+await page.setViewportSize({ width: 390, height: 844 });
+await page.waitForTimeout(900);
+
+/* --- tapping JUMP still jumps, now that it is the smaller one --- */
+const jc = { x: (pad.jump.l + pad.jump.r) / 2, y: (pad.jump.t + pad.jump.b) / 2 };
+await touch('touchStart', jc.x, jc.y);
+await page.waitForTimeout(220);
+const air2 = await page.evaluate(() => {
+  const ct = WALLY.ctx.wally.controller;
+  return { vy: +ct.velocity.y.toFixed(2), grounded: ct.grounded };
+});
+await touch('touchEnd', jc.x, jc.y);
+await page.waitForTimeout(900);
+ok(air2.vy > 0.5 || !air2.grounded, 'tapping JUMP in its new seat still jumps',
+  `vy ${air2.vy}, grounded ${air2.grounded}`);
+
+/* ================= HIDE UI =================
+   Settings › Comfort. The two TOP clusters go; the thumbstick and
+   the whole bottom-right cluster stay, and so does every layer that
+   is a RESPONSE to the player. A finger must still reach the pad. */
+const layers = () => page.evaluate(() => WALLY.debug.uiLayers());
+const shown = await layers();
+ok(shown.barLeft.hit && shown.barRight.hit, 'HUD: the top bars start visible');
+
+await page.evaluate(() => WALLY.debug.hideUI(true));
+await page.waitForTimeout(700);
+const hid = await layers();
+ok(!hid.barLeft.hit, 'Hide UI: the day/clock/energy/objective cluster is gone',
+  `vis ${hid.barLeft.vis} op ${hid.barLeft.op}`);
+ok(!hid.barRight.hit, 'Hide UI: the money/ticker/rep/city cluster is gone',
+  `vis ${hid.barRight.vis} op ${hid.barRight.op}`);
+ok(hid.stick.hit && hid.acts.hit, 'Hide UI: the thumbstick and the bottom-right cluster stay');
+ok(hid.act.hit && hid.jump.hit, 'Hide UI: Enter and Jump are still drawn');
+ok(hid.barLeft.w > 0 && hid.barLeft.h > 0,
+  'Hide UI: the objective strip keeps its BOX — the pointer maths and the toast dock still measure it',
+  `${hid.barLeft.w}x${hid.barLeft.h}`);
+ok(hid.toasts !== null && hid.prompt !== null,
+  'Hide UI: the toast and world-prompt layers are still in the document');
+
+/* the buttons are not merely painted — a real finger reaches them */
+const hitAt = (sel) => page.evaluate((s) => {
+  const e = document.querySelector(s);
+  const r = e.getBoundingClientRect();
+  const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  return !!top && (top === e || e.contains(top));
+}, sel);
+ok(await hitAt('.w-abtn.act'), 'Hide UI: Enter is still hit-testable');
+ok(await hitAt('.w-abtn.jump'), 'Hide UI: Jump is still hit-testable');
+ok(await hitAt('.w-stickzone'), 'Hide UI: the thumbstick zone is still hit-testable');
+
+/* the way back out: the gear on the pad opens the pause menu */
+const gear = await page.evaluate(() => {
+  const b = [...document.querySelectorAll('.w-acts .shortcuts .w-abtn')].pop();
+  const r = b.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, label: b.getAttribute('aria-label') };
+});
+await touch('touchStart', gear.x, gear.y);
+await page.waitForTimeout(80);
+await touch('touchEnd', gear.x, gear.y);
+await page.waitForTimeout(800);
+const paused = await page.evaluate(() => WALLY.ctx.ui.panels);
+ok(paused.includes('pause'), 'Hide UI: the pause menu is still reachable from the pad',
+  `${gear.label} -> ${JSON.stringify(paused)}`);
+await page.evaluate(() => WALLY.ctx.ui.closeAll());
+await page.waitForTimeout(500);
+
+/* and it comes back */
+await page.evaluate(() => WALLY.debug.hideUI(false));
+await page.waitForTimeout(700);
+const restored = await layers();
+ok(restored.barLeft.hit && restored.barRight.hit, 'Hide UI off: both top clusters come back',
+  `left op ${restored.barLeft.op}, right op ${restored.barRight.op}`);
+
 /* --- a drag OUTSIDE the stick zone orbits instead of moving --- */
 const yaw0 = await page.evaluate(() => WALLY.ctx.cam.yaw);
 await touch('touchStart', 300, 300);

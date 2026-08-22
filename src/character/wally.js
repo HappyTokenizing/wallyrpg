@@ -2003,6 +2003,15 @@ export async function init(ctx) {
      shuffle, and it has to be measured on the real pipeline, not on the
      clip function in isolation. */
   dbg.footIK = (on) => { secondary.ikEnabled = on !== false; return secondary.ikEnabled; };
+  /* "His trunk goes through his body sometimes." The fix is a body
+     proxy in secondary.js; these make it measurable rather than
+     claimed. trunkClear() is the rendered clearance in metres —
+     negative is inside him, and a green frame is >= 0. bodyProxy(false)
+     switches the constraint off so a before/after is one session. */
+  dbg.trunkClear = () => secondary.trunkClearance();
+  dbg.bodyProxy = (on) => { secondary.bodyProxyOn = on !== false; return secondary.bodyProxyOn; };
+  /* 0 restores the untrimmed run flap; 1 is the shipped trim. */
+  dbg.earTrim = (v) => { secondary.earTrim = v == null ? 1 : +v; return secondary.earTrim; };
   dbg.locoPhase = (p) => { anim.setPhaseLock(p == null ? null : p); return p == null ? 'free' : p; };
   /* Walk the pinned phase to a new value over `frames` real frames rather
      than jumping to it. The ear, trunk and tail chains are springs driven

@@ -16,7 +16,8 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import {
-  GLSL_NOISE, GLSL_COLOR, GLSL_POISSON, GLSL_VIEWPOS, GLSL_DEPTH, spiralTaps,
+  GLSL_NOISE, GLSL_COLOR, GLSL_POISSON, GLSL_VIEWPOS, GLSL_DEPTH, GLSL_FINITE,
+  spiralTaps,
 } from './shaders.js';
 import { damp } from '../core/contracts.js';
 
@@ -378,10 +379,20 @@ export function createPostFX(ctx, { composer }) {
     uniform sampler2D tSrc;
     uniform float uThreshold;
     uniform float uKnee;
+    uniform float uCeil;
     varying vec2 vUv;
     ${GLSL_COLOR}
+    ${GLSL_FINITE}
     void main() {
-      vec3 c = texture2D( tSrc, vUv ).rgb;
+      /* THE GATE INTO THE PYRAMID — see wFinite() in shaders.js.
+         Everything past this line is smeared over 2^MIPS pixels, so
+         this is the one place in the frame where a single rogue texel
+         is worth six ALU to stop. A non-finite sample contributes
+         nothing; a merely enormous one (a firefly on a specular
+         catch, an emissive with a bad exponent) is capped rather than
+         zeroed, so a genuinely bright highlight still blooms. */
+      vec3 c = wFinite( texture2D( tSrc, vUv ).rgb, 0.0 );
+      c = clamp( c, vec3( 0.0 ), vec3( uCeil ) );
       float br = max( c.r, max( c.g, c.b ) );
       float knee = uThreshold * uKnee + 1e-5;
       float soft = clamp( br - uThreshold + knee, 0.0, 2.0 * knee );
@@ -389,7 +400,14 @@ export function createPostFX(ctx, { composer }) {
       float contrib = max( soft, br - uThreshold ) / max( br, 1e-5 );
       gl_FragColor = vec4( c * contrib, 1.0 );
     }
-  `, { tSrc: { value: null }, uThreshold: { value: 1.70 }, uKnee: { value: 0.50 } });
+  `, {
+    tSrc: { value: null }, uThreshold: { value: 1.70 }, uKnee: { value: 0.50 },
+    /* The sun disc and blown speculars sit in the low tens of linear
+       units; 64 is far above anything the lighting rig produces and
+       far below the 65504 a half-float can carry, so it only ever
+       bites on a value that is already wrong. */
+    uCeil: { value: 64.0 },
+  });
 
   /* 13-tap Karis-weighted downsample: no fireflies, no shimmer. */
   const bloomDownMat = composer.makeMaterial(/* glsl */`
@@ -547,8 +565,16 @@ export function createPostFX(ctx, { composer }) {
     varying vec2 vUv;
     ${GLSL_NOISE}
     ${GLSL_COLOR}
+    ${GLSL_FINITE}
     void main() {
-      vec3 c = texture2D( tScene, vUv ).rgb;
+      /* THE BACKSTOP. bloomPreMat keeps the pyramid clean, but this is
+         the last pass before an UnsignedByte target, and a non-finite
+         value written there is a black pixel with no way back. Each of
+         the three inputs is scrubbed on its own so a bad one degrades
+         to "that contribution is missing" rather than to "this pixel
+         is void": no bloom halo, or no defocus, in a patch that still
+         carries its own colour. */
+      vec3 c = wFinite( texture2D( tScene, vUv ).rgb, 0.0 );
 
       // --- depth of field blend ---
       // must match cocOf() in dofMat exactly, gain and clamp included
@@ -558,10 +584,16 @@ export function createPostFX(ctx, { composer }) {
       if ( coc > 0.0 ) coc *= uFarGain;
       coc = clamp( coc, - uNearClamp, uFarClamp );
       float k = smoothstep( 0.04, 0.42, abs( coc ) ) * uDofMix;
-      c = mix( c, texture2D( tDof, vUv ).rgb, k );
+      /* A poisoned DOF gather falls back to the sharp pixel, which is
+         what this pass does with dof off anyway. Note the VALUE has to
+         be scrubbed as well as the weight zeroed: mix( c, NaN, 0.0 )
+         is still NaN, because 0.0 * NaN is NaN. */
+      vec3 dofC = texture2D( tDof, vUv ).rgb;
+      float dofOk = ( wIsBad( dofC.r ) || wIsBad( dofC.g ) || wIsBad( dofC.b ) ) ? 0.0 : 1.0;
+      c = mix( c, wFinite( dofC, 0.0 ), k * dofOk );
 
       // --- bloom ---
-      c += texture2D( tBloom, vUv ).rgb * uBloom * uBloomTint;
+      c += wFinite( texture2D( tBloom, vUv ).rgb, 0.0 ) * uBloom * uBloomTint;
 
       // --- tone map ---
       c *= uExposure;
@@ -616,7 +648,9 @@ export function createPostFX(ctx, { composer }) {
       float g = wHash12( vUv * uResolution + vec2( uTime * 137.13, uTime * 91.7 ) ) - 0.5;
       srgb += g * uGrain * 2.0 * ( 0.88 + 0.24 * ( 1.0 - wLuma( srgb ) ) );
 
-      gl_FragColor = vec4( max( srgb, vec3( 0.0 ) ), 1.0 );
+      /* max() with a NaN operand is implementation-defined, so the
+         clamp below is not on its own a guarantee. One last scrub. */
+      gl_FragColor = vec4( wFinite( max( srgb, vec3( 0.0 ) ), 0.0 ), 1.0 );
     }
   `, {
     tScene: { value: null }, tBloom: { value: null }, tDof: { value: null }, tND: { value: null },
@@ -695,6 +729,101 @@ export function createPostFX(ctx, { composer }) {
       gl_FragColor = vec4( c, 1.0 );
     }
   `, { tSrc: { value: null }, uMode: { value: 0 } });
+
+  /* ================================================================
+     7. THE NON-FINITE PROBE — how the black squares were caught.
+
+     A single NaN or Inf pixel anywhere in the linear scene buffer does
+     not stay a pixel. bloomPreMat divides by max(br,1e-5) where br is
+     already NaN, the 13-tap downsample carries it into every mip, and
+     the tent upsample carries it back — so one bad texel at mip 4 is a
+     32x32 SCREEN-pixel block by the time the composite adds it, and a
+     NaN through the composite is written to the LDR target as zero.
+     That is the "random black square", and it is square because the
+     mip pyramid is.
+
+     A visual hunt cannot find the cause of that, only the symptom, and
+     only once it is already big. This pass answers the actual
+     question — "is any value in this buffer non-finite, and where" —
+     by rendering a 1-bit map of the offending texels into a quarter-
+     res byte target and reading it back.
+
+     THE TEST HAS TO SURVIVE THE OPTIMISER. `v != v` and `!(v <= B)`
+     are both legal for a compiler to fold away under a no-NaN
+     assumption, so this uses THREE independent formulations OR'd
+     together and ships a self-test (probeSelfTest below) that fills a
+     buffer with a genuine runtime NaN — uK/uK from a uniform, which
+     cannot be constant-folded — and asserts the probe sees it. If the
+     self-test fails, the probe is lying and its zeroes mean nothing.
+     ================================================================ */
+  const nonFiniteMat = composer.makeMaterial(/* glsl */`
+    uniform sampler2D tSrc;
+    uniform vec2 uTexel;
+    varying vec2 vUv;
+    bool wBad( float v ) {
+      /* NaN fails every comparison; +-Inf fails exactly one. Half
+         float tops out at 65504 so 1e30 cannot flag a real value. */
+      bool a = !( v <= 1e30 && v >= -1e30 );
+      bool b = ( v != v );
+      /* NaN*0 and Inf*0 are both NaN; finite*0 is exactly zero. */
+      bool c = !( ( v * 0.0 ) == 0.0 );
+      return a || b || c;
+    }
+    /* +-Inf still answers a magnitude comparison; NaN answers nothing.
+       So bad-minus-inf is a NaN count, and the two have different
+       causes — Inf is a divide by zero or an overflow, NaN is 0/0,
+       Inf-Inf, or normalize() of a zero-length vector. */
+    bool wInf( float v ) { return ( v > 1e30 ) || ( v < -1e30 ); }
+    void main() {
+      float hit = 0.0, inf = 0.0;
+      for ( int y = 0; y < 4; y ++ ) {
+        for ( int x = 0; x < 4; x ++ ) {
+          vec2 o = ( vec2( float( x ), float( y ) ) - 1.5 ) * uTexel;
+          vec4 s = texture2D( tSrc, vUv + o );
+          if ( wBad( s.r ) || wBad( s.g ) || wBad( s.b ) || wBad( s.a ) ) hit = 1.0;
+          if ( wInf( s.r ) || wInf( s.g ) || wInf( s.b ) || wInf( s.a ) ) inf = 1.0;
+        }
+      }
+      gl_FragColor = vec4( hit, inf, 0.0, 1.0 );
+    }
+  `, { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } });
+
+  /* A runtime non-finite value, for the self-test. Everything here
+     comes out of a uniform so none of it can be constant-folded, and
+     three different producers are offered because which of them
+     survives is a property of the driver, not of the language:
+
+       0  uZero / uZero   -> NaN   (division by zero is UNDEFINED in
+                                    GLSL ES; ANGLE/Metal compiles with
+                                    fast math and may fold it to 0)
+       1  1.0 / uZero     -> +Inf  (same caveat)
+       2  uBig            -> +Inf  once the half-float target rounds
+                                    1e30 up past 65504 on write, which
+                                    is plain IEEE conversion and does
+                                    not depend on shader fast math
+
+     MEASURED, headless Chrome on Apple silicon (ANGLE -> Metal):
+
+       mode 0  uZero / uZero  -> half bits 0x3c00 == 1.0    FOLDED
+       mode 1  1.0  / uZero   -> half bits 0x7c00 == +Inf   SURVIVES
+       mode 2  uBig (1e30)    -> half bits 0x7bff == 65504  CLAMPED
+
+     So this driver both fast-maths 0/0 away AND clamps rather than
+     overflowing to Inf on a half-float write — which is why mode 1 is
+     the default. Re-run probeSelfTest(0..2) on any new machine before
+     trusting a zero from the probe: which producer survives is a
+     property of the driver, not of this file. */
+  const nanFillMat = composer.makeMaterial(/* glsl */`
+    uniform float uZero;
+    uniform float uBig;
+    uniform int uMode;
+    varying vec2 vUv;
+    void main() {
+      float n = uMode == 0 ? ( uZero / uZero )
+              : ( uMode == 1 ? ( 1.0 / uZero ) : uBig );
+      gl_FragColor = vUv.x > 0.5 ? vec4( n ) : vec4( 0.25 );
+    }
+  `, { uZero: { value: 0 }, uBig: { value: 1e30 }, uMode: { value: 1 } });
 
   /* ---------------- targets ---------------- */
   const aoScale = 0.5;
@@ -906,6 +1035,41 @@ export function createPostFX(ctx, { composer }) {
   }
 
   /* ================================================================
+     probe readback. Quarter res, one byte target, 4x4 taps per output
+     texel so coverage is complete whatever the source size is.
+     ================================================================ */
+  let probeBuf = null;
+  function probeRT() {
+    return composer.target('post.probe', 0.25, {
+      type: THREE.UnsignedByteType,
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    });
+  }
+  /* Returns { bad, cells, at:[u,v] } for one texture. A GPU stall —
+     debug only, never on a shipping frame. */
+  function scanBuffer(tex, tw, th) {
+    if (!tex) return null;
+    const rt = probeRT();
+    nonFiniteMat.uniforms.tSrc.value = tex;
+    nonFiniteMat.uniforms.uTexel.value.set(1 / Math.max(1, tw), 1 / Math.max(1, th));
+    composer.draw(nonFiniteMat, rt);
+    const n = rt.width * rt.height * 4;
+    if (!probeBuf || probeBuf.length !== n) probeBuf = new Uint8Array(n);
+    renderer.readRenderTargetPixels(rt, 0, 0, rt.width, rt.height, probeBuf);
+    let bad = 0, inf = 0, fi = -1;
+    for (let i = 0, p = 0; p < n; i++, p += 4) {
+      if (probeBuf[p] > 127) { bad++; if (fi < 0) fi = i; if (probeBuf[p + 1] > 127) inf++; }
+    }
+    return {
+      bad, inf, nan: bad - inf, cells: rt.width * rt.height,
+      /* uv, with v measured from the BOTTOM — readRenderTargetPixels
+         returns GL rows, so v 0.96 is four per cent from the top. */
+      at: fi < 0 ? null : [+((fi % rt.width) / rt.width).toFixed(3),
+        +(((fi / rt.width) | 0) / rt.height).toFixed(3)],
+    };
+  }
+
+  /* ================================================================
      public surface
      ================================================================ */
   const api = {
@@ -966,10 +1130,57 @@ export function createPostFX(ctx, { composer }) {
     /* Put an intermediate buffer on screen. null restores the frame. */
     setDebug(name) { params.debug = name || null; },
 
+    /* ---- the non-finite probe (see section 7) ----
+       Every buffer in the chain, in the order the frame builds them,
+       so the FIRST one that reports `bad` is the one that made the
+       NaN and everything after it merely inherited it. */
+    probe(sceneRT, ndRT) {
+      const r = {
+        scene: scanBuffer(sceneRT.texture, sceneRT.width, sceneRT.height),
+        nd: (params.ssao || params.dof) ? scanBuffer(ndRT.texture, ndRT.width, ndRT.height) : null,
+        ao: params.ssao ? scanBuffer(T.ao.texture, T.ao.width, T.ao.height) : null,
+        bloom0: params.bloom ? scanBuffer(mips[0].texture, mips[0].width, mips[0].height) : null,
+        bloomN: params.bloom
+          ? scanBuffer(mips[MIPS - 1].texture, mips[MIPS - 1].width, mips[MIPS - 1].height) : null,
+        dof: params.dof ? scanBuffer(T.dof.texture, T.dof.width, T.dof.height) : null,
+        ldr: params.fxaa ? scanBuffer(T.ldr.texture, T.ldr.width, T.ldr.height) : null,
+      };
+      r.any = Object.keys(r).some((k) => r[k] && r[k].bad > 0);
+      return r;
+    },
+
+    /* Does the probe actually see a non-finite value on THIS driver?
+       Fills the right-hand half of a HalfFloat buffer with one, reads
+       the raw half-float bits back to prove it really landed, then
+       asks the probe about the same buffer. `ok:false` means every
+       other probe result on this machine is meaningless and must not
+       be reported as "no NaNs found". */
+    probeSelfTest(mode = 1) {
+      nanFillMat.uniforms.uMode.value = mode;
+      composer.draw(nanFillMat, T.a);
+      /* Raw bits, right of centre. Half-float non-finite is
+         exponent == 0x1F, i.e. (bits & 0x7C00) === 0x7C00. */
+      const bits = new Uint16Array(4);
+      let raw = null, landed = false;
+      try {
+        renderer.readRenderTargetPixels(
+          T.a, Math.min(T.a.width - 1, (T.a.width * 0.75) | 0),
+          (T.a.height * 0.5) | 0, 1, 1, bits);
+        raw = '0x' + bits[0].toString(16);
+        landed = (bits[0] & 0x7C00) === 0x7C00;
+      } catch (e) { raw = 'readback failed: ' + e.message; }
+      const r = scanBuffer(T.a.texture, T.a.width, T.a.height);
+      const frac = r ? r.bad / r.cells : 0;
+      return {
+        ok: landed && frac > 0.3 && frac < 0.7,
+        mode, landed, raw, frac: +frac.toFixed(3), ...r,
+      };
+    },
+
     dispose() {
       for (const m of Object.values(api.materials)) m.dispose();
       aoBlurMat.dispose(); bloomDownMat.dispose(); bloomUpMat.dispose();
-      debugMat.dispose();
+      debugMat.dispose(); nonFiniteMat.dispose(); nanFillMat.dispose();
     },
   };
 

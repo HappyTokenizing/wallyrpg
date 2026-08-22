@@ -53,6 +53,15 @@ const _q3 = new THREE.Quaternion();
 /* the foot's authored world orientation, held across the leg solve */
 const _q4 = new THREE.Quaternion();
 const _q5 = new THREE.Quaternion();
+/* dedicated scratch for the body-proxy pass — it runs between the pose
+   accents and the foot IK, both of which own the pool above */
+const _b0 = new THREE.Vector3();
+const _b1 = new THREE.Vector3();
+const _b2 = new THREE.Vector3();
+const _b3 = new THREE.Vector3();
+const _bq0 = new THREE.Quaternion();
+const _bq1 = new THREE.Quaternion();
+const _bq2 = new THREE.Quaternion();
 
 /** Rotate `v` about a unit `axis` by `ang`, into `out`. */
 function rotAxis(v, axis, ang, out) {
@@ -84,12 +93,85 @@ function rotAxis(v, axis, ang, out) {
    shorten toward the tip): segment angles from straight down toward +z
    run 35.5 / 24.6 / 14.0 / 8.3 / 4.5 degrees — mean step -7.8 deg. */
 const TRUNK_BASE_CURL = 0.135;
+const DEG = Math.PI / 180;
 
 /* Bone-name lists for the rest-convergence pass. */
 const TRUNK_BONES = ['trunk0', 'trunk1', 'trunk2', 'trunk3', 'trunk4'];
 const EARL_BONES = ['earL0', 'earL1', 'earL2'];
 const EARR_BONES = ['earR0', 'earR1', 'earR2'];
 const TAIL_BONES = ['tail0', 'tail1', 'tail2'];
+
+/* ------------------------------------------------------------------
+   THE BODY PROXY — "his trunk goes through his body sometimes".
+
+   MEASURED FIRST. Driving the real game (run, hard turns both ways,
+   stops, a jump) and sampling every frame, the trunk's nub reached
+   235 mm INSIDE the torso and was inside it on 58% of frames. The
+   cause is structural: springs.js constrains a chain by segment length
+   and by per-joint angle, and neither of those knows the chest exists.
+   A stiffer chain would only slow the trip through the sternum down.
+
+   So the chain gets something to hit. Five spheres down the torso,
+   derived from the same tables model.js meshes the body from, so the
+   proxy cannot drift away from the surface when the pear is re-tuned:
+   at each sample height the lathe's front face and the belly
+   ellipsoid's front face are both evaluated, the proxy takes the
+   frontmost, and the sphere is seated so its front sits 6 mm INSIDE
+   the skin and its flank 4% inside the widest row. A proxy that stands
+   proud of the surface would hold the trunk off the belly in a still
+   frame, which is a worse defect than the one being fixed.
+
+   THE FLOOR IS ON DEPTH, NOT ON MOVEMENT. Nothing here damps the
+   chain: it is a position constraint, resolved after the solver, that
+   lets the trunk slide across the belly instead of entering it. §4's
+   swing is untouched — the deviation numbers either side of this
+   change are in the report.
+   ------------------------------------------------------------------ */
+/* Sample heights, and the bone each sphere rides (the torso bends: a
+   proxy pinned in bind space would let the trunk through the chest the
+   moment he leans into a turn, which is exactly when it happens). */
+const PROXY_ROWS = [
+  [0.640, 'spine'], [0.720, 'spine'], [0.820, 'spine'],
+  [0.930, 'chest'], [1.050, 'chest'],
+];
+/* Only the free tube collides. Stations 0-1 are inside the cranium and
+   fuse with the face (§1.5's crease); pushing them would unseat the
+   trunk from the head. The tube's own radius is the contact margin,
+   plus 18 mm for the blob smoothing model.js meshes it with. */
+const PROXY_FIRST_NODE = 2;
+const PROXY_SKIN = 0.018;
+
+/** The torso lathe's (halfWidth, zCentre, halfDepth) at height y. */
+function torsoAt(y) {
+  const T = PROP.torso;
+  let i = 0;
+  while (i < T.length - 2 && T[i + 1][0] < y) i++;
+  const a = T[i], b = T[i + 1];
+  const t = clamp((y - a[0]) / Math.max(1e-6, b[0] - a[0]), 0, 1);
+  const hw = a[1] + (b[1] - a[1]) * t;
+  const zc = a[2] + (b[2] - a[2]) * t;
+  const dm = (a[3] ?? 1) + ((b[3] ?? 1) - (a[3] ?? 1)) * t;
+  return [hw, zc, hw * PROP.torsoDepth * dm];
+}
+
+/** Build the proxy in bind space: [boneName, cx, cy, cz, r] per sphere. */
+function buildBodyProxy() {
+  const B = PROP.belly;
+  const out = [];
+  for (const [y, bone] of PROXY_ROWS) {
+    const [hw, zc, hd] = torsoAt(y);
+    let front = zc + hd, wide = hw;
+    const k = (y - B.c[1]) / B.r[1];
+    if (Math.abs(k) < 1) {
+      const s = Math.sqrt(1 - k * k);
+      front = Math.max(front, B.c[2] + B.r[2] * s);
+      wide = Math.max(wide, B.r[0] * s);
+    }
+    const r = wide * 0.96;
+    out.push([bone, 0, y, front - r - 0.006, r]);
+  }
+  return out;
+}
 
 export class Secondary {
   constructor(ctx, opts) {
@@ -112,6 +194,10 @@ export class Secondary {
 
     const phys = ctx.phys;
     this.chains = {};
+    /* the torso spheres the trunk may not enter, and the per-node
+       contact radii that go with them (built with the chains below) */
+    this.proxy = null;
+    this.trunkR = null;
 
     if (phys && phys.createChain) {
       /* ---- ears: 3 bones each, phased so they never move in lockstep ----
@@ -205,7 +291,47 @@ export class Secondary {
         phase: 3.4,
         follow: opts.controller || undefined,
       });
+
+      /* ---- the body proxy the trunk resolves against (see the block
+         above PROXY_ROWS). Bone-local offsets are the bind centre minus
+         the bone's own bind position: every bind rotation in rig.js is
+         identity, so a bone's local frame IS bind space translated. ---- */
+      this.proxy = [];
+      for (const [bone, cx, cy, cz, r] of buildBodyProxy()) {
+        const b = this.bones[bone];
+        if (!b) continue;
+        const bw = bindWorld(bone);
+        this.proxy.push({
+          bone: b,
+          local: new THREE.Vector3(cx - bw[0], cy - bw[1], cz - bw[2]),
+          world: new THREE.Vector3(),
+          rl: new THREE.Vector3(),
+          r,
+        });
+      }
+      /* Per-node contact radius: the tube's own radius plus the skin. */
+      this.trunkR = [];
+      for (let i = 0; i < 6; i++) this.trunkR.push(T[i][3] + PROXY_SKIN);
+
+      /* THE SOLVER HAS TO KNOW, NOT JUST THE RENDER. Resolving only the
+         bones (below) would leave the chain's particles free to keep
+         accelerating into the chest, so the moment the clamp released
+         they would spring out with all the energy they had banked. The
+         solve is wrapped instead: the points come out of the body every
+         fixed step and the velocity is re-derived from the corrected
+         positions, exactly the way springs.js recovers it after its own
+         PBD pass. Only the public step() is touched. */
+      const tr = this.chains.trunk;
+      if (tr) {
+        const baseStep = tr.step.bind(tr);
+        tr.step = (dt) => {
+          baseStep(dt);
+          if (dt > 0 && this.bodyProxyOn) this._resolveChainBody(tr, dt);
+          return tr;
+        };
+      }
     }
+    this.bodyProxyOn = true;
 
     /* ---- belly: a light soft-body offset (§4, 0.03 m) ---- */
     this.belly = ctx.phys?.createSpringVec3
@@ -237,6 +363,7 @@ export class Secondary {
     }
 
     /* ---- live targets ---- */
+    this.earTrim = 1;                 // 0 = the untrimmed run flap (A/B)
     this.earPerk = 0; this.earSpread = 0;
     this.trunkCurl = 0; this.trunkSide = 0; this.trunkTip = 0;
     this._perk = 0; this._spread = 0;
@@ -361,12 +488,66 @@ export class Secondary {
     this._stiffTarget = stiff;
     this._stiff = clamp(damp(this._stiff, this._stiffTarget, 4, dt), 40, 2400);
 
-    /* ---- ears ---- */
+    /* ---- ears ----
+       THE RUN FLAP IS TRIMMED, NOT DAMPED. "Tone it down slightly on the
+       ear flapiness but not too much." The two tempting knobs are the
+       two that would cost the character: the 'ear' preset is
+       deliberately under-damped (zeta 0.36) and that is where §4's
+       overshoot-and-settle lives. Stiffness and damping are left exactly
+       as they were.
+
+       What moves instead is how hard the RUN drives the chain and how
+       far it is allowed to get. Measured over a real driven session
+       (run, hard turns both ways, stops, a jump), the ear's root segment
+       sat pinned against its 48-degree limit and node travel peaked at
+       515 mm: the chain was hitting the wall every stride, and a chain
+       against its wall reads as flapping rather than as flap.
+
+       inertiaScale 1.15 -> 0.83, the two angle limits 48/62 -> 37/50
+       degrees, and drag 0.050 -> 0.070 (air resistance on a big moving
+       fan, which is a real force and not a spring term), all ramped in
+       over the gait — so a standing, walking or gusted Wally is
+       bit-for-bit the ear he was, and the trim exists only at speed.
+       windScale is untouched: a gust must still take them.
+
+       MEASURED AFTER, A/B interleaved in ONE driven session (trim off,
+       on, off, on) so the route, the terrain and the wind phase are
+       shared, over 8,734 frames, sampling only above 4.6 m/s and
+       measuring the ear TIP IN HEAD SPACE — the chain's own `deviation`
+       is taken against a rest that this method moves every frame, so it
+       cannot tell flap from pose:
+
+         ear-tip RMS travel       230.4 mm -> 208.2 mm   -9.6%
+         peak-to-peak, across     544.8    -> 483.5     -11.3%
+         peak-to-peak, vertical   538.8    -> 516.0      -4.2%
+
+       Ten per cent off the swing and a quarter off the ceiling it was
+       banging into. That is a trim; past it the cost starts landing on
+       the flap itself, and the flap is the polish.
+
+       The root limit does a second job. "His sunglasses in the back of
+       his ears stick out when he is moving/running": the temple hook is
+       rigid on the head and the ear root swings past it, so how far the
+       root may swing IS how much of the hook can be uncovered. The hook
+       is also re-tucked into the ear's root wedge in model.js; this is
+       the other half of that fix. */
     const E = PROP.ear;
+    /* earTrim is the A/B handle: 0 restores the untrimmed ear exactly,
+       so the before/after can be a measurement in one driven session
+       rather than two builds. Nothing in the game writes it. */
+    const gTrim = gait * this.earTrim;
+    const earIn = 1.15 - gTrim * 0.35;
+    const earRootDeg = 48 - gTrim * 12;
+    const earSegDeg = 62 - gTrim * 13;
+    const earDrag = 0.05 + gTrim * 0.022;
     for (const [key, sgn] of [['earL', 1], ['earR', -1]]) {
       const c = this.chains[key];
       if (!c) continue;
       c.setCurl(this._perk);
+      c.inertiaScale = earIn;
+      c.drag = earDrag;
+      c.rootMaxAngle = earRootDeg * DEG;
+      c.maxAngle = earSegDeg * DEG;
       /* spread lifts the tip and swings it away from the skull */
       const dx = E.dir[0] * sgn;
       const dy = E.dir[1] + this._spread * 1.15;
@@ -435,7 +616,184 @@ export class Secondary {
   lateUpdate(dt, s) {
     this._convergeChains(dt);
     this._applyPoseAccents();
+    /* AFTER the accents, because the accents are the last thing that
+       moves the trunk: `cool`'s curl and side sweep are written onto
+       the bones here, not into the solver, so a proxy pass that ran
+       before them would be guaranteeing a pose nobody renders. */
+    this._trunkBodyPass();
     if (this.ikEnabled && this.ctx.phys?.groundAt) this._footIK(dt, s);
+  }
+
+  /* ---------------- the body proxy ---------------- */
+
+  /* EVERYTHING BELOW WORKS IN ROOT-LOCAL SPACE, and that is a
+     correctness requirement rather than a convenience. The model root
+     carries the squash scale (x/z 1.077 against y 0.86 on a landing),
+     so in WORLD space a proxy sphere is an ellipsoid and a world-space
+     "rotate this bone by q" is not a rotation at all. Under the root
+     every bone matrix is a pure translate-rotate, so a sphere stays a
+     sphere and the CCD step is exact. */
+  _syncProxy() {
+    if (!this.proxy) return false;
+    const inv = this._rootInv || (this._rootInv = new THREE.Matrix4());
+    inv.copy(this.root.matrixWorld).invert();
+    for (let i = 0; i < this.proxy.length; i++) {
+      const s = this.proxy[i];
+      s.world.copy(s.local).applyMatrix4(s.bone.matrixWorld);
+      s.rl.copy(s.world).applyMatrix4(inv);
+    }
+    return true;
+  }
+
+  /**
+   * Push one point out of the proxy. Returns the depth it was pushed by
+   * (0 if it was already clear); the corrected point is left in `out`.
+   * `key` picks the space: 'world' for the solver, 'rl' for the bones.
+   */
+  _pushOut(p, radius, out, key) {
+    out.copy(p);
+    let depth = 0;
+    for (let i = 0; i < this.proxy.length; i++) {
+      const s = this.proxy[i];
+      const c = s[key];
+      const want = s.r + radius;
+      _b0.copy(out).sub(c);
+      const d = _b0.length();
+      if (d >= want) continue;
+      if (d < 1e-5) _b0.set(0, 0, 1); else _b0.divideScalar(d);
+      out.copy(c).addScaledVector(_b0, want);
+      depth = Math.max(depth, want - d);
+    }
+    return depth;
+  }
+
+  /**
+   * Solver-side: keep the chain's own particles out of the torso, then
+   * re-derive velocity from the corrected positions so no energy is
+   * banked inside the chest — without this the clamp below would let go
+   * of a trunk that had been accelerating into the sternum for half a
+   * second, and it would leave like a catapult. Two passes of (push
+   * out, re-fix lengths), which is springs.js's own PBD loop.
+   */
+  _resolveChainBody(chain, dt) {
+    if (!this._syncProxy()) return;
+    const n = chain.n;
+    let touched = false;
+    for (let it = 0; it < 2; it++) {
+      let hit = false;
+      for (let i = PROXY_FIRST_NODE; i <= n; i++) {
+        if (this._pushOut(chain.points[i], this.trunkR[i], _b3, 'world') > 0) {
+          chain.points[i].copy(_b3);
+          hit = true;
+        }
+      }
+      if (!hit) break;
+      touched = true;
+      /* lengths again, root outward — points[0] is the anchor */
+      for (let i = 1; i <= n; i++) {
+        _b1.copy(chain.points[i]).sub(chain.points[i - 1]);
+        const d = _b1.length();
+        if (d < 1e-8) continue;
+        chain.points[i].copy(chain.points[i - 1])
+          .addScaledVector(_b1.divideScalar(d), chain.length[i - 1]);
+      }
+    }
+    if (!touched) return;
+    /* `prev` is the pose at the top of the LAST substep, so the divisor
+       is the substep, not the frame — springs.js recovers velocity the
+       same way and would disagree with us by a factor of `substeps`. */
+    const h = dt / Math.max(1, chain.substeps | 0);
+    for (let i = 1; i <= n; i++) {
+      chain.vel[i].copy(chain.points[i]).sub(chain.prev[i]).divideScalar(h);
+    }
+  }
+
+  /**
+   * How close the rendered trunk currently is to the body, in metres —
+   * negative is inside it. The screenshot harness and any regression
+   * test can read this instead of trusting a claim; a green frame is
+   * `min` >= 0.
+   */
+  trunkClearance() {
+    const B = this.bones;
+    if (!this.proxy || !B.trunk0 || !this._fk) return null;
+    this._syncProxy();
+    const { pts } = this._fk;
+    let min = Infinity, at = -1;
+    for (let j = PROXY_FIRST_NODE; j <= 5; j++) {
+      for (let i = 0; i < this.proxy.length; i++) {
+        const s = this.proxy[i];
+        const d = pts[j].distanceTo(s.rl) - (s.r + this.trunkR[j]);
+        if (d < min) { min = d; at = j; }
+      }
+    }
+    return { min: +min.toFixed(4), station: at, spheres: this.proxy.length };
+  }
+
+  /**
+   * Render-side guarantee. Forward-kinematics the trunk off the head in
+   * root-local space, find any joint still inside the torso and rotate
+   * that joint's PARENT bone by exactly enough to lift it onto the
+   * surface — CCD, two sweeps, root to tip. This is the floor: whatever
+   * the solver, the convergence pass and the pose accents between them
+   * produced, the tube ends the frame outside the body.
+   */
+  _trunkBodyPass() {
+    const B = this.bones;
+    if (!this.proxy || !B.trunk0 || !B.head) return;
+    if (!this._syncProxy()) return;
+    const T = PROP.trunk;
+    if (!this._fk) {
+      this._fk = {
+        pts: [0, 1, 2, 3, 4, 5].map(() => new THREE.Vector3()),
+        mats: [0, 1, 2, 3, 4].map(() => new THREE.Matrix4()),
+        head: new THREE.Matrix4(),
+        nub: new THREE.Vector3(T[5][0] - T[4][0], T[5][1] - T[4][1], T[5][2] - T[4][2]),
+      };
+    }
+    const { pts, mats, head, nub } = this._fk;
+    head.multiplyMatrices(this._rootInv, B.head.matrixWorld);
+
+    const fk = (from) => {
+      let m = from === 0 ? head : mats[from - 1];
+      for (let i = from; i < 5; i++) {
+        const b = B['trunk' + i];
+        b.updateMatrix();
+        mats[i].multiplyMatrices(m, b.matrix);
+        pts[i].setFromMatrixPosition(mats[i]);
+        m = mats[i];
+      }
+      pts[5].copy(nub).applyMatrix4(mats[4]);
+    };
+
+    fk(0);
+    /* the A/B still needs the FK, so the switch is here and not at the
+       top: trunkClearance() must report the UNCONSTRAINED number when
+       the constraint is off, or the before/after proves nothing */
+    let moved = false;
+    for (let sweep = 0; this.bodyProxyOn && sweep < 3; sweep++) {
+      let any = false;
+      for (let j = PROXY_FIRST_NODE; j <= 5; j++) {
+        if (this._pushOut(pts[j], this.trunkR[j], _b3, 'rl') <= 0.0005) continue;
+        const pi = j - 1;                       // the bone that aims joint j
+        const b = B['trunk' + pi];
+        if (!b) continue;
+        _b1.copy(pts[j]).sub(pts[pi]);
+        _b2.copy(_b3).sub(pts[pi]);
+        if (_b1.lengthSq() < 1e-10 || _b2.lengthSq() < 1e-10) continue;
+        _b1.normalize(); _b2.normalize();
+        /* the aim delta is root-local; express it in the bone's PARENT
+           frame, which is the frame its own quaternion lives in */
+        _bq0.setFromUnitVectors(_b1, _b2);
+        _bq1.setFromRotationMatrix(pi === 0 ? head : mats[pi - 1]);
+        _bq2.copy(_bq1).invert().multiply(_bq0).multiply(_bq1);
+        b.quaternion.premultiply(_bq2);
+        fk(pi);
+        any = true; moved = true;
+      }
+      if (!any) break;
+    }
+    if (moved) B.trunk0.updateMatrixWorld(true);
   }
 
   /* ------------------------------------------------------------------

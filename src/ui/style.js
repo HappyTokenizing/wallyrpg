@@ -255,6 +255,35 @@ export const iconNames = Object.keys(P);
    THE GLINT (a flattened lazy-Z, ART_DIRECTION §1.4). Readable at
    28 px. Used for the phone icon, the boot chip and his portrait.
    ============================================================ */
+/* The mark's inner markup on its own, in a 0 0 64 64 box, so it can be
+   dropped into someone else's SVG (the chart's "you are here" pawn) as
+   well as stand alone. `uid` suffixes the gradient id — two copies of the
+   mark in one document must not share it, or the second one silently
+   repaints the first. */
+export function wallyMarkup(uid = '') {
+  const clay = C(CLAY.body), lit = C(CLAY.bodyLit), ao = C(CLAY.bodyAO);
+  const inner = C(CLAY.earInner), frame = C(CLAY.frame), lens = C(CLAY.lens);
+  const gid = 'wmH' + uid;
+  return `<defs>
+      <radialGradient id="${gid}" cx="38%" cy="28%" r="76%">
+        <stop offset="0" stop-color="${lit}"/><stop offset="1" stop-color="${clay}"/>
+      </radialGradient>
+    </defs>
+    <ellipse cx="11.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(-11 11.5 30)"/>
+    <ellipse cx="52.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(11 52.5 30)"/>
+    <ellipse cx="12.4" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(-11 12.4 30.6)"/>
+    <ellipse cx="51.6" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(11 51.6 30.6)"/>
+    <ellipse cx="32" cy="28.5" rx="17.4" ry="17" fill="url(#${gid})"/>
+    <path d="M32 40c4.6 0 6.5 3 6.5 8.2 0 4.2-1.7 7.4-3.1 9.6-1 1.6-3.6 1.4-4.4-.2-1.2-2.4-2.6-5.2-2.6-9.4 0-5.2 1-8.2 3.6-8.2z" fill="${clay}"/>
+    <path d="M29.6 46.4h5.2M29.9 50.2h4.6" stroke="${ao}" stroke-width="1.1" stroke-linecap="round" opacity=".55"/>
+    <path d="M24.6 41.4c-1.9 1.1-3.6.6-4.6-.9M39.4 41.4c1.9 1.1 3.6.6 4.6-.9" stroke="${C(CLAY.tusk)}" stroke-width="3.1" stroke-linecap="round"/>
+    <path d="M13.6 25.6h36.8a2 2 0 012 2.1l-.5 3.2h-15l-1.1-2.5h-7.6l-1.1 2.5h-15l-.5-3.2a2 2 0 012-2.1z" fill="${frame}"/>
+    <path d="M15.9 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
+    <path d="M33.7 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
+    <path d="M18.4 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <path d="M36.2 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+}
+
 export function wallyMark(size = 48) {
   const clay = C(CLAY.body), lit = C(CLAY.bodyLit), ao = C(CLAY.bodyAO);
   const inner = C(CLAY.earInner), frame = C(CLAY.frame), lens = C(CLAY.lens);
@@ -487,6 +516,12 @@ export function stylesheet() {
   --w-inset:inset 0 1px 0 ${rgba(BRAND.paper, 0.14)};
   --w-font:ui-rounded,'SF Pro Rounded','Nunito','Quicksand',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   --w-mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  /* THE CHART FACE. The rounded UI face is a screen face; the map is a
+     printed object and needs a press face — an old-style serif with real
+     stroke contrast, so a place name on the chart reads as engraved
+     rather than as another button label. Falls back through the
+     Palatino/Georgia line, all of which are old-style. */
+  --w-serif:'Iowan Old Style','Palatino Linotype',Palatino,'Book Antiqua','Hoefler Text',Georgia,'Times New Roman',serif;
   --w-ease:cubic-bezier(.22,1,.36,1);
 }
 .w-root{
@@ -953,20 +988,74 @@ export function stylesheet() {
 .w-abtn .cap{position:absolute;left:50%;bottom:-13px;transform:translateX(-50%);
   font-size:8.5px;font-weight:800;letter-spacing:.13em;text-transform:uppercase;
   color:var(--w-dim2);white-space:nowrap;pointer-events:none}
+/* "ENTER / TALK" is twelve letters under a 66 px button whose right
+   edge is 12 px off the screen. At the default .13em tracking the
+   caption overhung the frame; tightened it clears by ~12 px at 360,
+   390 and 844 wide, and still never reaches JUMP's caption — that one
+   sits 26 px higher, on the raised button. */
+.w-abtn .cap.long{font-size:8px;letter-spacing:.045em}
 .w-abtn:active,.w-abtn.down{transform:scale(.9);border-color:${rgba(BRAND.token, 0.75)}}
 .w-abtn.big{width:66px;height:66px}
 .w-abtn.mid{width:57px;height:57px;margin-bottom:26px}
-.w-abtn.jump{background-image:var(--w-grain),linear-gradient(178deg,${rgba(BRAND.token, 0.92)},${rgba(BRAND.token2, 0.92)});
-  color:${C(BRAND.ink)};border-color:${rgba(BRAND.paper, 0.4)};
-  box-shadow:0 4px 0 ${rgba(BRAND.token2, 0.85)},var(--w-shadow)}
-.w-abtn.jump .cap{color:${rgba(BRAND.text, 0.66)}}
-.w-abtn .w-up{transform:rotate(90deg);transform-origin:50% 50%}
-.w-abtn.act{border-color:${rgba(BRAND.token, 0.5)}}
-.w-abtn.act.on{background-image:var(--w-grain),linear-gradient(178deg,${rgba(BRAND.good, 0.9)},${rgba(BRAND.good, 0.72)});
-  color:${C(BRAND.paper)};animation:wActPulse 1.9s ease-in-out infinite}
-.w-abtn.act.off{opacity:.46}
-@keyframes wActPulse{0%,100%{box-shadow:var(--w-shadow),0 0 0 0 ${rgba(BRAND.good, 0.45)}}
-  55%{box-shadow:var(--w-shadow),0 0 0 9px ${rgba(BRAND.good, 0)}}}
+/* the back-chevron, stood on end, becomes the jump arrow. This used
+   to be called w-up and collided head-on with the producer upgrade
+   card .w-up further down — a 70% white slab with 12px of padding,
+   which is exactly what the button drew instead of an arrow. */
+.w-abtn .w-rot90{transform:rotate(90deg);transform-origin:50% 50%}
+
+/* ---- ENTER: the primary. ----
+   The brand-token fill moved here from jump along with the size and
+   the corner, because the treatment has to follow the role or the
+   pad still points at the wrong button. Three states, and the hue is
+   the signal in all three — NOT element opacity, which over grass
+   just turns the button olive (see the key-hint note above):
+     .off  nothing in range — token burnt down into the ink. Still
+           unmistakably the big warm button, visibly not lit.
+     .on   a door/desk/person is in range — full green + the pulse.
+     talking — same .on, caption swaps to MORE (touch.js). */
+.w-abtn.act{
+  ${G(`linear-gradient(178deg,${rgba(BRAND.token, 0.94)},${rgba(BRAND.token2, 0.94)})`)}
+  color:${C(BRAND.ink)};border:1.5px solid ${rgba(BRAND.paper, 0.46)};
+  box-shadow:0 4px 0 ${rgba(BRAND.token2, 0.9)},var(--w-shadow)}
+.w-abtn.act .cap{color:var(--w-text);text-shadow:0 1px 3px ${rgba(0x05070c, 0.55)}}
+.w-abtn.act.off{
+  ${G(`linear-gradient(178deg,${C(mix(BRAND.token, BRAND.ink, 0.30))},${C(mix(BRAND.token2, BRAND.ink, 0.42))})`)}
+  color:${rgba(BRAND.paper, 0.88)};border-color:${rgba(BRAND.paper, 0.32)};
+  box-shadow:0 3px 0 ${C(mix(BRAND.token2, BRAND.ink, 0.56))},var(--w-shadow)}
+.w-abtn.act.off .cap{color:var(--w-dim2);text-shadow:none}
+.w-abtn.act.on{
+  ${G(`linear-gradient(178deg,${rgba(BRAND.good, 0.96)},${rgba(BRAND.good, 0.78)})`)}
+  color:${C(BRAND.paper)};border-color:${rgba(BRAND.paper, 0.62)};
+  animation:wActPulse 1.9s ease-in-out infinite}
+/* THE LIP IS DARK GREEN, NOT GREEN. This button turns green on a
+   game made of grass; a token-orange lip clashed and a same-green
+   one vanished, so the seat under it is the good colour driven half
+   way into the ink. That plus the pale rim is what holds the
+   silhouette when Wally is standing in a field.
+   The pulse rewrites box-shadow wholesale, so it has to carry the
+   lip too or the button flattens for a second every cycle. */
+@keyframes wActPulse{
+  0%,100%{box-shadow:0 4px 0 ${C(mix(BRAND.good, BRAND.ink, 0.5))},var(--w-shadow),0 0 0 0 ${rgba(BRAND.good, 0.5)}}
+  55%{box-shadow:0 4px 0 ${C(mix(BRAND.good, BRAND.ink, 0.5))},var(--w-shadow),0 0 0 10px ${rgba(BRAND.good, 0)}}}
+
+/* ---- JUMP: the secondary. ----
+   Demoted to the plain chrome every other control wears — it keeps
+   the inherited --w-chrome fill on purpose, because ANY paler wash
+   here (tried at 17% paper) turns the button into the brightest disc
+   on the screen and un-demotes it. It gets a shallower lip and a
+   slightly brighter rim, so it still reads as a key you press rather
+   than a pill. Smaller than Enter, larger than the shortcut row: the
+   pad is three tiers and each one is a SIZE, not a colour. */
+.w-abtn.jump{
+  color:var(--w-text);border-color:${rgba(BRAND.paper, 0.26)};
+  box-shadow:0 3px 0 ${rgba(0x05070c, 0.42)},var(--w-shadow),var(--w-inset)}
+.w-abtn.jump .cap{color:var(--w-dim2)}
+/* THE PRESS, RESTATED. The generic .w-abtn:active rule sits above the
+   two state blocks and loses its border-color to them on a tie, so the
+   two pad buttons say it again for themselves — and drop their lip, so
+   the button visibly sits down into its seat under a thumb. */
+.w-abtn.act:active,.w-abtn.act.down,.w-abtn.jump:active,.w-abtn.jump.down{
+  border-color:${rgba(BRAND.paper, 0.85)};box-shadow:var(--w-shadow)}
 .w-abtn .badge{
   position:absolute;top:-3px;right:-3px;min-width:16px;height:16px;border-radius:99px;
   background:var(--w-bad);color:#fff;font-size:9px;font-weight:800;
@@ -1003,6 +1092,35 @@ export function stylesheet() {
 .w-root.w-dlg-open .w-toasts{opacity:.3}
 .w-root.w-dlg-open .w-promptlayer{opacity:.22}
 .w-root.w-dlg-open .w-hint{opacity:1}
+
+/* ---------- HIDE UI — Settings › Comfort ----------
+   A screenshot / immersion mode, and ONLY the two top clusters go:
+   the day-clock-energy-hunger pills, the objective card with its
+   pointer, the lock strip parked underneath it, and the
+   money-ticker-rep-city row. Everything that is a RESPONSE to
+   something the player did stays up — toasts, notifications,
+   achievement plaques, the title banner, the live race box, the
+   world prompt, the key hints, and on touch the whole thumbstick +
+   bottom-right cluster. A comfort setting that swallowed "you were
+   paid" or "the Mayor is challenging you" would be a way to lose
+   progress, not a comfort.
+
+   VISIBILITY, NOT DISPLAY, and nothing torn down. The objective
+   strip keeps its box because its compass arrow is still written
+   every frame (hud.js) and touch.js measures that same box to dock
+   the toasts; a display:none here would hand it a zero rect and
+   drop the toasts on the floor.
+
+   The visibility flip waits out the fade on the way out and is
+   immediate on the way in, so this is a fade and not a pop. */
+.w-root .w-bar{transition:opacity .34s var(--w-ease),visibility 0s}
+.w-root.w-hide-ui .w-bar{
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .34s var(--w-ease),visibility 0s linear .34s;
+}
+/* reduced motion kills durations but not delays — without this the
+   bar would be invisible for a third of a second before it agreed */
+.w-rm.w-root.w-hide-ui .w-bar{transition-delay:0s}
 
 /* ---------- scrim + panels ---------- */
 .w-scrim{
@@ -1305,20 +1423,49 @@ button.w-stat:active{transform:scale(.97)}
 
 /* ============================================================
    THE MAP — ui/map.js
+
+   Not a panel: a printed sheet. The plate is paper stock, the whole
+   surface carries the game's own grain tile (so the chart is made of
+   the same material as the clay and the film layer rather than being
+   the one clean object in a grained frame), and the card sits on the
+   sheet below it with a real drop and a hairline plate mark.
    ============================================================ */
 .w-map{
-  position:relative;border-radius:calc(15px * var(--w-ts));overflow:hidden;
-  background:${C(mix(SEA.shallow, BRAND.paper, 0.42))};
-  box-shadow:inset 0 0 0 1.4px ${rgba(BRAND.ink, 0.16)},0 5px 16px ${rgba(BRAND.ink, 0.14)};
+  position:relative;border-radius:calc(5px * var(--w-ts));overflow:hidden;
+  background:
+    radial-gradient(120% 96% at 26% 16%,${rgba(0xffffff, 0.5)} 0%,transparent 62%),
+    linear-gradient(168deg,${C(mix(BRAND.paper, 0xffffff, 0.42))},${C(BRAND.paper)} 48%,${C(mix(BRAND.paper, LAND.dirt, 0.13))});
+  box-shadow:
+    inset 0 0 0 1px ${rgba(BRAND.ink, 0.30)},
+    inset 0 1px 0 ${rgba(0xffffff, 0.55)},
+    0 1px 2px ${rgba(BRAND.ink, 0.22)},
+    0 8px 22px ${rgba(mix(BRAND.ink, SHADOW.tint, 0.4), 0.26)};
   margin:calc(4px * var(--w-ts)) 0 calc(9px * var(--w-ts));
 }
-.w-map-svg{display:block;width:100%;height:auto;font-family:var(--w-font)}
+/* paper tooth — the same 128 px grain the HUD and the film layer use */
+.w-map::after{
+  content:'';position:absolute;inset:0;pointer-events:none;
+  background-image:var(--w-grain);background-repeat:repeat;background-size:118px 118px;
+  mix-blend-mode:overlay;opacity:.5;
+}
+.w-map-svg{display:block;width:100%;height:auto;font-family:var(--w-serif)}
 .w-map-svg text{user-select:none;-webkit-user-select:none}
+.w-map-svg .wm-ico{font-family:var(--w-font)}
+.w-map-svg [data-loc]{transition:opacity .16s var(--w-ease)}
+@media (hover:hover){.w-map-svg [data-loc].on:hover{opacity:.82}}
 .w-map .w-map-tools{
   position:absolute;right:calc(8px * var(--w-ts));bottom:calc(8px * var(--w-ts));
   display:flex;gap:calc(6px * var(--w-ts));
 }
 .w-map .wm-me circle:first-child{animation:wPing 2.6s ease-out infinite}
+/* Phone held sideways. The plate is 1.24:1, so across a 610 px sheet it
+   wants ~490 px of height inside a 390 px screen — the chart alone was
+   taller than the viewport and the fare board under it was two scrolls
+   away. Cap the height and let the plate letterbox on its own stock. */
+@media (orientation:landscape) and (max-height:560px){
+  .w-map.compact{height:min(66vh,272px);width:fit-content;max-width:100%;margin-inline:auto}
+  .w-map.compact .w-map-svg{height:100%;width:auto;max-width:100%;object-fit:contain}
+}
 @keyframes wPing{0%{opacity:.55;transform-box:fill-box;transform-origin:center;transform:scale(.6)}
   70%{opacity:0;transform:scale(1.25)}100%{opacity:0;transform:scale(1.25)}}
 .w-mapwrap{display:flex;flex-direction:column;height:100%;min-height:0}
@@ -2040,6 +2187,37 @@ button.w-stat:active{transform:scale(.97)}
   .w-endpaper{padding:calc(13px * var(--w-ts)) calc(18px * var(--w-ts)) calc(14px * var(--w-ts))}
   .w-endtx{font-size:calc(13.6px * var(--w-ts));line-height:1.5;margin-top:calc(9px * var(--w-ts))}
   .w-endlinks{margin-top:calc(11px * var(--w-ts))}
+
+  /* NARROW LANDSCAPE — the 44vw cap above is correct, but it is a
+     PERCENTAGE and the meters are not. energy + hunger need ~341 px of
+     pill, and 44vw only clears that above ~775 px of width. On an
+     iPhone SE/8 (667), a Galaxy S8 (740) or a 12 mini (780) they wrapped
+     to a third row: the left cluster ate 41% of a 375 px screen and
+     pushed the objective strip from y=80 to y=113.
+     The fix is to shrink the meters, NOT to raise the cap — 2 x 52vw of
+     667 is 694 and walks the money pill back into the clock, which is
+     exactly what the cap was introduced to stop. */
+  @media (max-width:790px){
+    .w-meter{width:calc(36px * var(--w-ts))}
+    .w-pill{padding:0 calc(7px * var(--w-ts));gap:calc(4px * var(--w-ts))}
+  }
+  /* 44vw of a 667 px phone is only 293 px, and energy + hunger still did
+     not fit at 36 px meters — measured: the bar stayed 3 rows and 39% of
+     the screen. This second tier is sized against 293, not against 326. */
+  @media (max-width:700px){
+    .w-meter{width:calc(26px * var(--w-ts))}
+    .w-pill{height:calc(24px * var(--w-ts));padding:0 calc(5px * var(--w-ts));
+      gap:calc(3px * var(--w-ts));font-size:calc(10.5px * var(--w-ts))}
+    .w-pill .w-lab{display:none}
+  }
+
+  /* The JUMP caption is the lowest thing on screen in landscape and sits
+     12 px off the floor in a rig where env(safe-area-inset-bottom) is 0.
+     On hardware with a real ~21 px home indicator that is not clearance. */
+  @media (max-height:400px){
+    .w-acts{bottom:calc(max(9px,env(safe-area-inset-bottom)) + 22px)}
+  }
+
 }
 `;
 }

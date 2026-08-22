@@ -146,14 +146,101 @@ export async function init(ctx) {
      disc at the door and a corridor reaching out along the way the
      facade faces, wide enough for an elephant.
      ------------------------------------------------------------------ */
-  const DOOR_CLEAR_R = 2.30;
-  const DOOR_CLEAR_LEN = 3.60;
-  const DOOR_CLEAR_HALF = 1.25;
+  /* ROUND 2, AND THE COMPLAINT CAME BACK: "the Barnaby NPC is still too
+     close to the apartment where he interferes with easy access." It
+     did, and the audit that was supposed to prove otherwise agreed with
+     him — it just was not asked the right question.
+
+     MEASURED BEFORE (ctx.npc.doorAudit + a per-client sweep over every
+     door in the city, not only the client's own anchor):
+
+       barnaby -> apartment      2.54 m   (along 0.51, side 2.49)
+       nadia   -> harbourhomes   3.17 m
+       bolt    -> devlab         3.56 m
+       pearl   -> docks          3.59 m
+       goldie  -> mineral        4.26 m   (side 0.03 — dead on the axis)
+
+     `blocking` was empty for every one of them, and that was true:
+     Barnaby is 2.49 m to the SIDE of the apartment door, which the old
+     1.25 m half-corridor calls clear. It is not clear. He is level with
+     the threshold, an elephant is wide, and the camera that frames the
+     entrance has him in it. Goldie is the same defect from the other
+     end — 4.26 m dead on the door's axis, past the old 3.60 m corridor
+     and therefore invisible to the test, standing in the middle of the
+     approach.
+
+     So the volume grows to the size of the thing it is protecting: a
+     3.20 m disc, and a corridor 5.60 m long and 2.30 m to a side, which
+     is a lane an elephant can walk down without brushing anybody.
+
+     AND IT IS SCORED AGAINST EVERY DOOR, NOT JUST THE ANCHOR'S. This is
+     the actual bug behind Barnaby. He is planned against a location in
+     Rusty Row and the apartment is its neighbour, so his own anchor's
+     doorway was the only one the score ever looked at and the apartment
+     door was, to the placer, not there. */
+  /* THE TWO REGIMES, WRITTEN OUT. `before:true` in doorAudit re-plans
+     the population under OLD in full — every constant of it, not a
+     convenient subset — which is the only way the A/B can be a
+     measurement instead of a claim.
+
+     ROUND 3 CAUGHT THIS TOOL LYING. The mode used to flip `doorPenalty`
+     and the arc alone while the search kept the NEW annulus
+     (near 3.4 m), so "before" could not physically produce the 2.54 m
+     spot the comment above reports, and both branches returned barnaby
+     at 4.16 m — a coincidence of geometry, (0.83, 4.07) against
+     (1.87, 3.71), which made the tool look consistent while proving
+     nothing. OLD below is transcribed from git 87d195a
+     src/character/npc.js lines 149-151 (the corridor), 190 (the arc)
+     and 1926 (the client annulus). */
+  const REGIME = {
+    now: { r: 3.20, len: 5.60, half: 2.30, arc: 1.55, spot: { near: 3.4, far: 9.0, tries: 34 } },
+    old: { r: 2.30, len: 3.60, half: 1.25, arc: 1.25, spot: { near: 2.0, far: 6.0 } },
+  };
+  let DOOR_CLEAR_R = REGIME.now.r;
+  let DOOR_CLEAR_LEN = REGIME.now.len;
+  let DOOR_CLEAR_HALF = REGIME.now.half;
+  let SPOT_ARC = REGIME.now.arc;
   /* Switched OFF only by doorAudit({before:true}), which re-plans the
      whole population on the same seeds with the old arc and the old
      score so the fix can be reported as a number rather than as a
      claim. Nothing else touches it. */
   let doorPenalty = true;
+
+  /** Run `fn` with the entire pre-fix placement regime installed, and
+      hand it the old client annulus. The MEASUREMENT afterwards is
+      deliberately not swapped: both branches are read with today's
+      ruler, only the placement differs. */
+  function withOldRegime(fn) {
+    const R = REGIME.old, N = REGIME.now;
+    DOOR_CLEAR_R = R.r; DOOR_CLEAR_LEN = R.len; DOOR_CLEAR_HALF = R.half;
+    SPOT_ARC = R.arc; doorPenalty = false;
+    try { return fn(R.spot); } finally {
+      DOOR_CLEAR_R = N.r; DOOR_CLEAR_LEN = N.len; DOOR_CLEAR_HALF = N.half;
+      SPOT_ARC = N.arc; doorPenalty = true;
+    }
+  }
+
+  /* The before-figures quoted in the comment above, checked in so a
+     later round can tell "the fix moved him" apart from "the tool
+     changed". doorAudit() returns them as `expectBefore`, and
+     doorAudit({before:true}) re-derives them and reports `matches`.
+
+     AS OF ROUND 3 THE REPLAY REPRODUCES barnaby 2.54, pearl 3.59 and
+     goldie 4.26 to the centimetre; nadia comes back 4.69 (was 3.17) and
+     bolt 5.41 (was 3.56). Those two are drift in the WORLD, not in this
+     tool: a standing spot is scored against ctx.world.heightAt /
+     slopeAt / distanceToRoad and ctx.city.doorPosition, and city.js has
+     moved ~500 lines since the figures were taken, harbourhomes and
+     devlab among them. Both still resolve to the same door as quoted.
+     Left as recorded rather than re-baselined to today's world — a
+     fixture that is edited whenever it disagrees is not a fixture. */
+  const BEFORE_FIXTURE = {
+    barnaby: { door: 'apartment', metres: 2.54 },
+    nadia: { door: 'harbourhomes', metres: 3.17 },
+    bolt: { door: 'devlab', metres: 3.56 },
+    pearl: { door: 'docks', metres: 3.59 },
+    goldie: { door: 'mineral', metres: 4.26 },
+  };
 
   /** 0 = clear of every doorway, 1 = standing in one. */
   function doorClearance(x, z, dx, dz, ax, az) {
@@ -168,6 +255,25 @@ export async function init(ctx) {
     if (r < DOOR_CLEAR_R) k = Math.max(k, 1 - r / DOOR_CLEAR_R);
     return k;
   }
+
+  /** The worst doorway this point is in the way of — ANY doorway. */
+  function doorClearanceAny(x, z, list) {
+    let k = 0;
+    for (let i = 0; i < list.length; i++) {
+      const d = list[i];
+      const c = doorClearance(x, z, d.x, d.z, d.ax, d.az);
+      if (c > k) { k = c; if (k >= 1) break; }
+    }
+    return k;
+  }
+
+  /* Named clients are permanent furniture — they never wander off the
+     spot the placer gave them — so their annulus starts OUTSIDE the
+     keep-clear disc rather than inside it (2.0 -> 3.4 m) and reaches
+     further round the frontage for somewhere to put them. It lives in
+     REGIME so that the A/B swaps the annulus along with everything
+     else instead of comparing two different searches. */
+  const CLIENT_SPOT = REGIME.now.spot;
 
   const _door = new THREE.Vector3();
   function standingSpot(loc, rng, opts = {}) {
@@ -187,12 +293,24 @@ export async function init(ctx) {
         /* 1.25 -> 1.55 rad. The corridor penalty below rules out the
            middle of this arc, so the arc has to reach far enough round
            the frontage to have somewhere left to put anybody. */
-        arc = doorPenalty ? 1.55 : 1.25;
+        arc = SPOT_ARC;
         hasDoor = true; nx = ox / ol; nz = oz / ol;
       }
     }
     const near = opts.near ?? 1.7;
     const far = opts.far ?? Math.max(near + 1.4, Math.min(7, (loc.radius || 9) * 0.7));
+    /* EVERY DOORWAY THIS SEARCH CAN REACH, not just the anchor's. Built
+       once per call and prefiltered by range, so the inner loop is over
+       one or two doors and the whole population still plans in the same
+       boot budget: at 28 doors the naive form is 300k clearance tests. */
+    const reach = far + DOOR_CLEAR_LEN + 1;
+    const nearDoors = [];
+    if (doorPenalty) {
+      for (let i = 0; i < DOORS.length; i++) {
+        const q = DOORS[i];
+        if ((q.x - ax) * (q.x - ax) + (q.z - az) * (q.z - az) < reach * reach) nearDoors.push(q);
+      }
+    }
     let best = null, bestScore = -1e9;
     const tries = opts.tries ?? 26;
     for (let i = 0; i < tries; i++) {
@@ -220,15 +338,16 @@ export async function init(ctx) {
          good ones. It is a ramp rather than a cliff so that a location
          with no clear frontage at all still degrades gracefully — it
          takes the least-bad spot instead of the fallback. */
-      if (hasDoor && doorPenalty) score -= doorClearance(x, z, ax, az, nx, nz) * 26;
+      if (doorPenalty && nearDoors.length) score -= doorClearanceAny(x, z, nearDoors) * 26;
+      else if (hasDoor && doorPenalty) score -= doorClearance(x, z, ax, az, nx, nz) * 26;
       if (score > bestScore) { bestScore = score; best = { x, y, z, a }; }
     }
     /* THE FALLBACK MAY NOT BE THE DOOR ITSELF. Nothing scored, so put
        them a stride to one side of the threshold rather than in it. */
     if (!best) {
       const s = rng() < 0.5 ? 1 : -1;
-      const sx = ax + (hasDoor ? nz * s * 2.0 : 0);
-      const sz = az - (hasDoor ? nx * s * 2.0 : 0);
+      const sx = ax + (hasDoor ? nz * s * DOOR_CLEAR_HALF + nx * 1.2 : 0);
+      const sz = az - (hasDoor ? nx * s * DOOR_CLEAR_HALF - nz * 1.2 : 0);
       best = { x: sx, y: ctx.world.heightAt(sx, sz), z: sz, a: outA };
     }
     best.y = groundY(best.x, best.z);
@@ -355,7 +474,7 @@ export async function init(ctx) {
         ? locs[Math.floor(rng() * locs.length) % locs.length]
         : null;
       const ref = anchor || { id: null, world: { x: z ? z.world.x : 0, z: z ? z.world.z : 0 }, radius: 16 };
-      p = standingSpot(ref, rng, { near: 2.0, far: 6.0 });
+      p = standingSpot(ref, rng, CLIENT_SPOT);
       homeLoc = anchor ? anchor.id : null;
       yaw = p.yaw;
     } else {
@@ -471,7 +590,7 @@ export async function init(ctx) {
         const spec = randomSpec(rng, 'res.' + l.id + '.' + i);
         const p = plaza
           ? standingSpot(l, rng, { want: 1.4 + rng() * 3.4, near: 3.0, far: 22 + rng() * 6, tries: 34 })
-          : standingSpot(l, rng, { want: 1.2 + rng() * 2.6, near: 1.8, far: 9.0 });
+          : standingSpot(l, rng, { want: 1.2 + rng() * 2.6, near: 3.0, far: 10.0, tries: 30 });
         const r = rng();
         const mode = r < 0.30 ? 'work' : r < 0.50 ? 'talk' : r < 0.60 ? 'sit' : 'idle';
         pending.push({
@@ -1914,18 +2033,18 @@ export async function init(ctx) {
       const rows = [];
       const spots = new Map();
       if (opts.before) {
-        doorPenalty = false;
-        for (const c of CLIENTS) {
-          const locs = LOCATIONS.filter((l) => l.z === c.home);
-          const rng = ctx.makeRng('npc.place.' + c.id);
-          /* the same three draws planClient makes, in the same order */
-          rng(); rng();
-          const anchor = locs.length
-            ? locs[Math.floor(rng() * locs.length) % locs.length] : null;
-          if (!anchor) continue;
-          spots.set(c.id, standingSpot(anchor, rng, { near: 2.0, far: 6.0 }));
-        }
-        doorPenalty = true;
+        withOldRegime((oldSpot) => {
+          for (const c of CLIENTS) {
+            const locs = LOCATIONS.filter((l) => l.z === c.home);
+            const rng = ctx.makeRng('npc.place.' + c.id);
+            /* the same three draws planClient makes, in the same order */
+            rng(); rng();
+            const anchor = locs.length
+              ? locs[Math.floor(rng() * locs.length) % locs.length] : null;
+            if (!anchor) continue;
+            spots.set(c.id, standingSpot(anchor, rng, oldSpot));
+          }
+        });
       }
       for (const h of all) {
         if (h.mayorDriven) continue;
@@ -1962,13 +2081,72 @@ export async function init(ctx) {
         near.push({ door: d.id, metres: +bd.toFixed(2), who });
       }
       near.sort((a, b) => a.metres - b.metres);
+      /* AND THE NAMED CLIENTS, AGAINST EVERY DOOR, AS RAW GEOMETRY.
+         This section exists because its absence is what let the last
+         round ship a green audit over a Barnaby standing 2.54 m off the
+         apartment threshold: `blocking` only reports corridor
+         membership, and `tightest` only reports the nearest body per
+         door — neither says how far the PERMANENT residents of the
+         frontage are from the entrance they are permanently beside.
+         along/side are metres out along the door normal and metres
+         across it, so a spot can be judged without re-deriving the
+         corridor. Clients are the ones that matter: a wanderer in the
+         way walks off, a client never does. */
+      const clients = [];
+      for (const h of all) {
+        if (!h.isClient || h.mayorDriven) continue;
+        const p = spots.get(h.id) || h.root.position;
+        let bd = Infinity, at = null, along = 0, side = 0;
+        for (const d of DOORS) {
+          const ox = p.x - d.x, oz = p.z - d.z;
+          const r = Math.hypot(ox, oz);
+          if (r >= bd) continue;
+          bd = r; at = d;
+          along = ox * d.ax + oz * d.az;
+          side = Math.abs(ox * d.az - oz * d.ax);
+        }
+        if (at) {
+          clients.push({
+            who: h.id, door: at.id, metres: +bd.toFixed(2),
+            along: +along.toFixed(2), side: +side.toFixed(2),
+          });
+        }
+      }
+      clients.sort((a, b) => a.metres - b.metres);
+      /* Does the replan still land where the checked-in figures say it
+         did? Within 0.05 m, since they were rounded to centimetres. */
+      let matches = null;
+      if (opts.before) {
+        matches = {};
+        for (const k in BEFORE_FIXTURE) {
+          const want = BEFORE_FIXTURE[k], got = clients.find((r) => r.who === k);
+          matches[k] = got
+            ? { want: want.metres, got: got.metres, door: got.door,
+                ok: got.door === want.door && Math.abs(got.metres - want.metres) <= 0.05 }
+            : { want: want.metres, got: null, ok: false };
+        }
+      }
       return {
         doors: DOORS.length, people: all.length,
+        mode: opts.before ? 'before (pre-fix regime, re-planned)' : 'now',
+        regime: opts.before ? REGIME.old : REGIME.now,
         blocking: rows.filter((r) => r.k > 0.25),
         grazing: rows.filter((r) => r.k <= 0.25).length,
         tightest: near.slice(0, 5),
+        clientsNearestDoor: clients.slice(0, opts.clients ?? 6),
+        expectBefore: BEFORE_FIXTURE,
+        ...(matches ? { matches } : {}),
       };
     },
+
+    /** Doorway dwell distribution for the wandering crowd, over time.
+        `{reset:true}` starts a fresh window; `{evict:false}` restores
+        the pre-round-3 loiter behaviour so the two can be compared on
+        the same run. See crowd.js doorStats. */
+    doorDwell(o) { return crowd.doorStats(o || {}); },
+    /** Force the defect and time the recovery — see crowd.doorProbe. */
+    doorProbe(o) { return crowd.doorProbe(o || {}); },
+    doorProbeState() { return crowd.doorProbeState(); },
 
     /* --- Happy, the opening encounter ---
        The TRIGGER belongs to ctx.game (bus 'story', beat 'happy'). This
@@ -2509,6 +2687,12 @@ export async function init(ctx) {
      worst first. A green run is an empty `blocking` list.
      ================================================================ */
   dbg.doorAudit = (o) => api.doorAudit(o || {});
+  /* The other half of the same question: doorAudit is a snapshot of the
+     standers, doorDwell is the crowd measured over time — how long a
+     wanderer stays in a doorway, which a snapshot cannot see. */
+  dbg.doorDwell = (o) => crowd.doorStats(o || {});
+  dbg.doorProbe = (o) => crowd.doorProbe(o || {});
+  dbg.doorProbeState = () => crowd.doorProbeState();
 
   const LOC = (id) => LOCATIONS.find((x) => x.id === id)
     || LOCATIONS.filter((x) => x.z === id)[0] || LOCATIONS[0];
