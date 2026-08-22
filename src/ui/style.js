@@ -1930,10 +1930,17 @@ button.w-stat:active{transform:scale(.97)}
    ============================================================ */
 @media (orientation:landscape) and (max-height:540px){
   /* ---------- the top bars: two rows, not three ---------- */
-  .w-bar{top:max(9px,env(safe-area-inset-top));max-width:52vw}
+  /* 44vw EACH, and the number is not arbitrary. The two clusters are
+     absolutely positioned against opposite edges, and on a notched
+     phone held sideways BOTH of those edges have already lost ~48 px
+     to the safe area — so two caps written against the full viewport
+     width can add up to more room than there is and walk the money
+     pill into the clock. 2 x 44vw fits inside 844 minus two insets;
+     52 did not. */
+  .w-bar{top:max(9px,env(safe-area-inset-top));max-width:44vw}
   .w-bar.left{left:max(12px,env(safe-area-inset-left))}
   .w-bar.right{right:max(12px,env(safe-area-inset-right))}
-  .w-pills{max-width:52vw}
+  .w-pills{max-width:44vw}
   .w-bar.right .w-pills{max-width:44vw;justify-content:flex-end}
   .w-pill{height:calc(27px * var(--w-ts));padding:0 calc(9px * var(--w-ts));
     gap:calc(5px * var(--w-ts));font-size:calc(11.5px * var(--w-ts))}

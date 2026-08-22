@@ -101,8 +101,15 @@ export function createOrient(ctx, ui) {
   const S = () => ctx.game?.state?.settings || null;
   const want = () => !!S()?.landscape;
 
+  /* THE VIEWPORT, NOT THE SCREEN. screen.orientation.type describes
+     the DISPLAY: on a desktop browser with a 390-wide window it
+     cheerfully answers 'landscape-primary', which had the row telling
+     a portrait phone-sized viewport it was already sideways. The
+     question this module is actually asked is "is the game laid out
+     for landscape right now", and the thing that decides that is the
+     media query in ui/style.js — so ask the same question it does. */
   function isLandscape() {
-    if (so && typeof so.type === 'string') return so.type.indexOf('landscape') === 0;
+    if (typeof matchMedia === 'function') return matchMedia('(orientation: landscape)').matches;
     return innerWidth >= innerHeight;
   }
   function fsEl() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
@@ -166,28 +173,34 @@ export function createOrient(ctx, ui) {
     let p;
     if (fsEl()) p = Promise.resolve();
     else { ourFS = true; p = requestFS(); }
-    return p.then(
-      () => lockLandscape(),
-      () => {
-        ourFS = false; locked = false; why = 'nofullscreen';
-        return emit();
-      },
-    );
+    return p.then(() => lockLandscape(), () => fail('nofullscreen'));
   }
 
   function lockLandscape() {
     return tryLock().then(
       () => { locked = true; why = ''; exits = 0; return emit(); },
-      () => {
-        /* The phone said no — its own rotation lock, or an engine
-           that has lock() but refuses 'landscape'. Do NOT leave
-           anyone stranded in a fullscreen we opened for a rotation
-           that never happened. */
-        locked = false; why = 'refused';
-        if (ourFS) { ourFS = false; exitFS(); }
-        return emit();
-      },
+      /* The phone said no — its own rotation lock, or an engine that
+         has lock() but will not take 'landscape'. */
+      () => fail('refused'),
     );
+  }
+
+  /* A REFUSAL PUTS THE SWITCH BACK. `on` has one meaning — the game
+     is being held sideways — so leaving it lit after the browser
+     said no is the dead toggle this whole file exists to avoid. The
+     preference goes back to false and does not persist as true; the
+     REASON survives in `why`, which is what the row prints, so the
+     player gets an explanation and an obvious second attempt rather
+     than a switch that sits there lying. And nobody is left stranded
+     in a fullscreen we opened for a rotation that never happened. */
+  function fail(reason) {
+    const s = S();
+    if (s) s.landscape = false;
+    locked = false;
+    why = reason;
+    disarm();
+    if (ourFS) { ourFS = false; exitFS(); }
+    return emit();
   }
 
   function release() {

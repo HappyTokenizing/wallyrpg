@@ -948,10 +948,14 @@ export function createMenus(ctx, ui) {
         ? 'This browser will not turn the screen for you — but you are sideways already, and the game is laid out for it.'
         : 'This browser will not turn the screen for you. Turn the phone sideways yourself and the game lays itself out for landscape.';
     }
-    if (!s.want) return 'Goes fullscreen and holds the game sideways. Portrait stays the default.';
-    if (s.locked) return 'Held sideways. Switch it off here to go back to portrait.';
+    /* The refusals are read BEFORE `want`, because orient.js puts the
+       switch back off when the browser says no — the explanation has
+       to outlive the revert or the row would flick back to its
+       resting description and the player would learn nothing. */
     if (s.why === 'refused') return 'Your phone would not turn — check its own rotation lock, then tap this again.';
     if (s.why === 'nofullscreen') return 'This browser refused fullscreen, which is where the lock lives. Turning the phone by hand still works.';
+    if (!s.want) return 'Goes fullscreen and holds the game sideways. Portrait stays the default.';
+    if (s.locked) return 'Held sideways. Switch it off here to go back to portrait.';
     return 'Waiting for a tap — touch the screen to hold it sideways again.';
   }
 
