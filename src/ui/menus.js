@@ -17,7 +17,7 @@
 import { BRAND, CATEGORY, BUILD, SEA, LAND, css } from '../core/palette.js';
 import { QUALITY_TIERS, clamp } from '../core/contracts.js';
 import {
-  h, clear, icon, money, money2, pad2, portrait, wallyMark, rgba, mix, C,
+  h, clear, icon, money, money2, pad2, portrait, glyphAvatar, wallyMark, rgba, mix, C,
   tickerTag, ticketLine,
 } from './style.js';
 import { cityMap } from './map.js';
@@ -43,10 +43,16 @@ export function createMenus(ctx, ui) {
           })
         : null,
       h('div.w-grow', null, titleEl, subEl),
+      /* THIS PANEL'S ✕ CLOSES THIS PANEL. It used to call
+         ui.popSheet(), which dismisses whatever is on TOP of the modal
+         stack — so with two boxes open (travel, open a second one, go
+         back to the first) the older box's ✕ shut the newer one.
+         ui.closeSheet(e.currentTarget) walks up to the panel the
+         button is actually printed on. */
       h('button.w-btn.sm.ghost.w-pe', {
         type: 'button', 'aria-label': 'Close',
         style: { minWidth: '34px', padding: '0 8px' },
-        onclick: () => { ui.sfx('ui.close'); ui.popSheet(); },
+        onclick: (e) => { ui.sfx('ui.close'); ui.closeSheet(e.currentTarget); },
       }, icon('close', 16)));
 
     const body = h('div.w-sheet-body');
@@ -56,6 +62,9 @@ export function createMenus(ctx, ui) {
       try { build(body, el); } catch (e) { console.error('[ui] sheet failed', e); }
     };
     el._setTitle = (t, s) => { titleEl.textContent = t; subEl.textContent = s || ''; };
+    /* anything inside this sheet that needs to dismiss it — a Travel
+       button, "work at the desk" — closes ITSELF, never the stack */
+    el._close = () => ui.closeSheet(el);
     el._rebuild();
     return el;
   }
@@ -68,16 +77,155 @@ export function createMenus(ctx, ui) {
     } else {
       ui.sfx('ui.error');
       ui.toast((r && r.why) || 'Not right now', 'bad');
+      /* A TOAST IS NOT ENOUGH FOR A LOCK. The engine now refuses
+         outright at maximum hunger and at a closed venue, and a
+         three-second line at the bottom of the screen that says no
+         and then disappears is a dead end. Those two refusals open
+         the card below instead: what is blocked, why, and the
+         shortest way out of it. */
+      if (r && (r.kind === 'hunger' || r.kind === 'hours')) blocked(r);
     }
     ui.refresh();
     return r;
+  }
+
+  /* ============================================================
+     BLOCKED — the two refusals that need a way out printed on them.
+
+     hunger  gate() returns {kind:'hunger', why, food} where food is
+             the nearest bowl: name, zone, hops, cost, whether it is
+             open and whether he can pay for it.
+     hours   {kind:'hours', why, loc, opens} — the venue is shut.
+
+     Never more than one of these on screen: it is pushed by name, so
+     a second refusal repaints the one that is already open.
+     ============================================================ */
+  function blocked(r) {
+    ui.hide('blocked');            // one at a time, always the newest reason
+    const el = blockedSheet(r);
+    if (!el) return null;
+    return ui.pushSheet(el, 'blocked');
+  }
+  function blockedSheet(r) {
+    const game = g();
+    const hunger = r.kind === 'hunger';
+    return sheet({
+      title: hunger ? 'Too hungry to do that' : 'Closed right now',
+      sub: hunger ? 'Eat first — everything else is locked'
+        : 'The doors are shut, not locked to you',
+      glyph: hunger ? '🍜' : '🕔', tint: hunger ? BRAND.bad : BRAND.warn,
+    }, (body, self) => {
+      const st = game.state;
+      body.append(h('div.w-warnbox' + (hunger ? '.bad' : ''), { text: r.why || 'Not right now' }));
+
+      if (hunger) {
+        const n = game.needs();
+        const f = r.food || n.food;
+        body.append(label('What is blocked'));
+        body.append(h('div.w-note', { text:
+          'At ' + Math.round(st.hunger) + ' hunger Wally will not work, trade, study, travel '
+          + 'anywhere that is not food or a bed, or race anyone. Eating clears it instantly.' }));
+        if (!f) return;
+        body.append(label('The nearest food'));
+        body.append(card({
+          glyph: f.ico, t: f.n,
+          d: [f.zone, f.here ? 'you are here' : f.hops + ' hop' + (f.hops === 1 ? '' : 's'),
+            f.open ? 'open now' : 'opens at ' + f.opens].join(' · '),
+          m: money(f.cost), ms: 'fills ' + f.fill,
+          mColor: f.afford ? BRAND.good : BRAND.warn,
+        }));
+        const bar = h('div.w-row', { style: { marginTop: 'calc(10px * var(--w-ts))' } });
+        if (f.here && f.open) {
+          bar.append(h('button.w-btn.prim.w-pe', {
+            type: 'button', style: { flex: '1' },
+            onclick: () => {
+              const e = game.actions.eatAct(f.act);
+              if (e.ok) { ui.sfx('coin'); ui.toast('That is better', 'good'); self._close(); ui.refresh(); ui.rebuildTop(); }
+              else res(e);
+            },
+          }, 'Eat here · ' + money(f.cost)));
+        } else if (f.open) {
+          bar.append(h('button.w-btn.prim.w-pe', {
+            type: 'button', style: { flex: '1' },
+            onclick: () => { self._close(); ui.goto(f.id, 'Eat at ' + f.n); },
+          }, icon('pin', 15), 'Go to ' + f.n));
+        } else {
+          bar.append(h('button.w-btn.w-pe', {
+            type: 'button', style: { flex: '1' },
+            onclick: () => { self._close(); ui.goto(f.id, 'Eat at ' + f.n); },
+          }, icon('pin', 15), 'Wait outside ' + f.n));
+        }
+        /* THE FLOOR. Broke and starving must never be terminal, and
+           the offer only exists when it is the only way out. */
+        if (n.slate && n.slate.ok) {
+          bar.append(h('button.w-btn.ghost.w-pe', {
+            type: 'button', title: 'They will put it on the slate',
+            onclick: () => {
+              const e = game.actions.slateMeal();
+              if (e.ok) { ui.sfx('coin'); self._close(); ui.refresh(); ui.rebuildTop(); } else res(e);
+            },
+          }, 'Ask for the slate'));
+        } else if (!f.afford) {
+          body.append(h('div.w-note', { text:
+            'You cannot pay for that yet. Get to ' + f.n
+            + ' anyway — at maximum hunger and out of cash they will feed you on the slate, once a day.' }));
+        }
+        body.append(bar);
+        return;
+      }
+
+      /* ---- closed ---- */
+      const locId = r.loc || st.loc;
+      const info = game.openInfo(locId);
+      const loc = game.data.locationById[locId];
+      body.append(label('When it opens'));
+      put(body,
+        kv('Hours', info ? info.span : '—'),
+        kv('Now', game.hud().clock.split(' · ')[0]),
+        kv('Opens in', info && info.opensInHours ? info.opensInHours + ' hour' + (info.opensInHours === 1 ? '' : 's') : 'it is open'),
+      );
+      body.append(label('Things to do until then'));
+      /* THE HOURS ARE A CLOCK PROBLEM, so every route out spends the
+         clock: sleep to the morning, work a shift, or go somewhere
+         that IS open right now. */
+      const bed = game.data.locations.find((l) => l.acts.includes('sleep') && game.known(l.id));
+      if (bed) {
+        body.append(card({
+          ic: 'bed', t: bed.id === st.loc ? 'Sleep until morning' : 'Sleep at ' + bed.n,
+          d: 'Ends the day. You wake in the morning with full energy, and it will be open.',
+          onclick: () => {
+            self._close();
+            if (bed.id === st.loc) { game.actions.sleep(); ui.closeAll(); ui.refresh(); }
+            else ui.goto(bed.id, 'Sleep');
+          },
+        }));
+      }
+      const openNow = game.data.locations
+        .filter((l) => l.id !== locId && game.known(l.id) && game.isOpen(l.id) && l.acts.length > 1)
+        .slice(0, 3);
+      for (const l of openNow) {
+        body.append(card({
+          glyph: l.ico, t: l.n, d: game.data.zones[l.z].n + ' · open now',
+          m: 'Go', mColor: BRAND.token2,
+          onclick: () => { self._close(); ui.goto(l.id, l.n); },
+        }));
+      }
+      if (loc) {
+        body.append(h('button.w-btn.ghost.w-pe', {
+          type: 'button', style: { width: '100%', marginTop: 'calc(9px * var(--w-ts))' },
+          onclick: () => { ui.click(); ui.setDestination(loc.id); ui.toast('Pointing you at ' + loc.n, 'token'); self._close(); },
+        }, icon('nav', 15, { fill: 'currentColor', w: 1 }), 'Come back to ' + loc.n + ' at ' + (info ? info.opens : '')));
+      }
+    });
   }
 
   function card(o) {
     const btn = h('button.w-card' + (o.onclick ? '.w-pe' : ''), {
       type: 'button',
       disabled: o.disabled,
-      onclick: o.onclick ? () => { ui.click(); o.onclick(); } : null,
+      /* the event is forwarded so a card can close the sheet it is
+         printed on rather than the top of the stack — ui.closeSheet() */
+      onclick: o.onclick ? (e) => { ui.click(); o.onclick(e); } : null,
     },
       o.node || h('div.ic', {
         style: o.glyph ? { fontSize: '17px' } : null,
@@ -101,6 +249,36 @@ export function createMenus(ctx, ui) {
       : open ? 'open until ' + pad2(loc.hours[1]) + ':00'
         : 'closed · ' + pad2(loc.hours[0]) + ':00–' + pad2(loc.hours[1]) + ':00');
   const hoursSpan = (hrs) => pad2(hrs[0]) + ':00–' + pad2(hrs[1]) + ':00';
+
+  /* ============================================================
+     THE ASK — the answer to "why is the buy button more than the
+     price?"
+
+     It is not a bug. economy.buyPrice() is price × (1 + venue
+     spread): the list quotes the MID, the button charges the ASK,
+     and nothing on screen ever said so. Every surface where a price
+     and a buy control sit together now leads with the ask and prints
+     the mid and the spread underneath it, in cash, so the difference
+     is a stated fee rather than a discrepancy.
+
+     askBlock  the headline, for a ticket
+     askSub    the same thing in one line, for a list row
+     ============================================================ */
+  function askBlock(a, vs, unit, mid) {
+    const each = Math.round((unit - mid) * 100) / 100;
+    const pct = Math.round((vs.v.spread || 0) * 100);
+    return h('div.w-ask', null,
+      h('div.row', null,
+        h('span.k', { text: 'Ask · what you pay' }),
+        h('b.v', { text: money2(unit) }),
+        h('span.u', { text: 'each' })),
+      h('div.brk', null,
+        h('span', null, 'mid ', h('b', { text: money2(mid) })),
+        h('span.op', { text: '+' }),
+        h('span', null, vs.v.name + ' spread ' + pct + '% ', h('b', { text: money2(each) }))));
+  }
+  /* one line for a list row: "ask · mid $410.00 + 7%" */
+  const askSub = (mid, pct) => 'mid ' + money2(mid) + ' + ' + pct + '% spread';
 
   /* ============================================================
      THE ASSET ROW — ticker first, everywhere.
@@ -202,6 +380,9 @@ export function createMenus(ctx, ui) {
     let query = '';
     let pickId = E.assetOf(preset) ? E.idOf(preset) : null;
     let qty = 1;
+    /* assigned at the bottom; the buttons that read it only fire long
+       after the sheet exists */
+    let sheetEl = null;
 
     const input = h('input.w-pe', {
       type: 'text', spellcheck: 'false', autocomplete: 'off',
@@ -268,7 +449,14 @@ export function createMenus(ctx, ui) {
       for (const { a, tag } of rows) {
         const vs = venueOf(a.id);
         const held = E.owned(a.id);
+        /* THE NUMBER ON A ROW WITH A BUY IN IT IS THE ASK. The venue,
+           whether it is open and whether you already hold some move
+           down to the subtitle so the money column can carry the mid
+           and the spread that explain the figure above it. */
+        const ask = E.buyPrice(a.id, vs.ven);
+        const mid = E.price(a.id);
         const sub = [tag, a.cat, vs.v.name + (vs.openNow ? '' : ' · closed'),
+          vs.canBuy ? 'buy here' : vs.openNow ? 'not sold here' : null,
           held ? 'you hold ' + held : null].filter(Boolean).join(' · ');
         const row = h('button.w-card.w-pe', {
           type: 'button',
@@ -280,9 +468,9 @@ export function createMenus(ctx, ui) {
           }),
           assetNode(a, { sub }),
           h('div.m', {
-            text: money2(E.buyPrice(a.id)),
+            text: money2(ask),
             style: { color: C(vs.canBuy ? BRAND.ink : BRAND.warn) },
-          }, h('small', { text: vs.canBuy ? 'buy here' : vs.openNow ? 'elsewhere' : 'closed' })));
+          }, h('small', { text: 'ask · ' + askSub(mid, Math.round(vs.v.spread * 100)) })));
         results.append(row);
       }
     }
@@ -337,6 +525,13 @@ export function createMenus(ctx, ui) {
         where.length ? ' · ' + where.join(' · ') : '',
         ' · ', hoursSpan(vs.v.hours)));
 
+      /* THE ASK, AS THE HEADLINE. "Why is the buy button more than the
+         price?" — because the price everyone quotes is the MID, and
+         you buy at the ASK, which is the mid plus the venue's spread.
+         Where a purchase is about to happen the ask leads and the mid
+         is the footnote, never the other way round. */
+      card.append(askBlock(a, vs, unit, mid));
+
       /* ---- quantity ---- */
       const num = h('span.n', { text: String(qty) });
       const set = (n) => { qty = clamp(Math.round(n), 1, Math.max(1, most)); renderTicket(); };
@@ -356,17 +551,23 @@ export function createMenus(ctx, ui) {
             onclick: () => { ui.click(); set(most); },
           }, 'MAX') : null)));
 
-      /* ---- the numbers, all of them, before the button ---- */
+      /* ---- THE SUM, AND IT HAS TO ADD UP ON SCREEN ----
+         Three lines that a player can check with their eyes: the mid
+         times the quantity, plus the spread in dollars, equals the
+         number printed on the button. Nothing is folded into anything
+         else and nothing is left implicit. */
       const signed = (n) => (n < 0 ? '−' + money2(-n) : money2(n));
+      const midTotal = Math.round(mid * qty * 100) / 100;
       put(card,
-        kv('Ask · ' + qty + ' × ' + money2(unit), money2(total)),
-        kv('Mid ' + money2(mid) + ' · spread ' + Math.round(vs.v.spread * 100) + '%',
-          fees > 0 ? money2(fees) + ' to the venue' : '—'),
+        kv('Mid price · ' + qty + ' × ' + money2(mid), money2(midTotal)),
+        kv('Venue spread · ' + Math.round(vs.v.spread * 100) + '% at ' + vs.v.name,
+          fees > 0 ? '+ ' + money2(fees) : '+ ' + money2(0)),
         kv('Inventory after', (Math.round((E.invCount() + qty) * 100) / 100) + ' / ' + E.invCap() + ' units'
           + (E.owned(a.id) ? ' · you hold ' + E.owned(a.id) : '')),
       );
       card.append(h('div.w-kv.tot', null,
-        h('span', { text: 'Total to pay' }), h('b', { text: money2(total) })));
+        h('span', { text: 'Total to pay · ' + qty + ' × ' + money2(unit) + ' ask' }),
+        h('b', { text: money2(total) })));
       card.append(h('div.w-kv', null,
         h('span', { text: 'Cash after' }),
         h('b', { text: signed(after), style: { color: C(after < 0 ? BRAND.bad : BRAND.ink) } })));
@@ -400,7 +601,7 @@ export function createMenus(ctx, ui) {
           const bar = h('div', { style: { display: 'flex', gap: '8px', marginTop: 'calc(10px * var(--w-ts))' } });
           bar.append(h('button.w-btn.prim.w-pe', {
             type: 'button', style: { flex: '1' },
-            onclick: () => { ui.click(); ui.popSheet(); ui.goto(vs.locId, 'Buy ' + a.tick); },
+            onclick: () => { ui.click(); if (sheetEl) sheetEl._close(); ui.goto(vs.locId, 'Buy ' + a.tick); },
           }, icon('pin', 15), 'Travel to ' + vs.loc.n));
           bar.append(h('button.w-btn.ghost.w-pe', {
             type: 'button', title: 'Point the HUD arrow at it',
@@ -427,7 +628,7 @@ export function createMenus(ctx, ui) {
       ticket.append(card);
     }
 
-    return sheet({
+    sheetEl = sheet({
       title: 'Buy an asset',
       sub: 'Every asset in Bull Bear City has a symbol. Type it.',
       glyph: '🧾', tint: BRAND.token,
@@ -448,6 +649,7 @@ export function createMenus(ctx, ui) {
       input.value = query;
       paint();
     });
+    return sheetEl;
   }
 
   /* ============================================================
@@ -463,7 +665,13 @@ export function createMenus(ctx, ui) {
       const detail = h('div');
       const map = cityMap(ctx, {
         selected: sel,
-        onPick: (id) => { sel = id; ui.sfx('ui.tab'); ui.setDestination(id); draw(); },
+        /* PICKING A PLACE IS NOT A JOURNEY, and it is not a waypoint
+           either: it opens that place's fare board below the map, and
+           the fare board travels. Aiming the HUD arrow is the "Point
+           me" button's job and nothing else's — this is what used to
+           make walk and bicycle feel like they "only moved the
+           arrow". */
+        onPick: (id) => { sel = id; ui.sfx('ui.tab'); draw(); },
       });
       body.append(map.el, detail);
       function draw() {
@@ -478,7 +686,7 @@ export function createMenus(ctx, ui) {
           mColor: game.isOpen(loc.id) ? BRAND.good : BRAND.bad,
           ms: hoursSpan(loc.hours),
         }));
-        travelModes(detail, sel, () => { ui.popSheet(); });
+        travelModes(detail, sel, () => el._close());
       }
       draw();
     });
@@ -694,13 +902,22 @@ export function createMenus(ctx, ui) {
      of its currencies — dollars, minutes and energy — and a mode
      that cannot be taken says why instead of vanishing.
 
-     THE BICYCLE IS NOT A MODE UNTIL IT IS YOURS. data.js gates it
-     on state.bike.owned/equipped, so a player who has never seen a
-     bicycle would otherwise meet a permanently grey row saying "you
-     do not own a bicycle" and no way to learn what to do about it.
-     Unowned, it shows as a thing for sale at $180 with the two
-     shops that stock it; owned but left at home, it shows an Equip
-     control; owned and equipped, it is just another fare.
+     THE MAP IS A TRAVEL SCREEN. Every row on this board TRAVELS,
+     and that is the whole contract: tap a mode, pay that mode's
+     time, money and energy, arrive. Nothing here plants a waypoint
+     and calls it a journey — the "Point me" button in the Places app
+     is the one control that aims the HUD arrow, and it says so.
+
+     THE RIDE ROW IS WHATEVER IS IN THE SHED. game.fares() prices the
+     'bike' row at the equipped ride, or failing that at the best one
+     owned, so a scooter's row says Scooter and quotes scooter
+     minutes. Owned but left at home used to be a dead row with an
+     Equip button beside it — two taps, and the first of them did not
+     travel. It now takes the ride WITH him and goes, in one tap,
+     because "get the bike and ride there" is one intention.
+     Unowned, the row is replaced by the garage offer below, which
+     lists everything sold at all: a price to save for, not a grey
+     line saying no.
      ============================================================ */
   const MODE_ICON = { walk: 'foot', bike: 'bike', train: 'train', trunk: 'car' };
 
@@ -714,7 +931,7 @@ export function createMenus(ctx, ui) {
       body.append(h('div.w-empty', { text: 'You are already here.' }));
       body.append(h('button.w-btn.prim.w-pe', {
         type: 'button', style: { width: '100%' },
-        onclick: () => { ui.popSheet(); ui.openPlace(locId); },
+        onclick: (e) => { ui.closeSheet(e.currentTarget); ui.openPlace(locId); },
       }, 'Look around'));
       return;
     }
@@ -722,51 +939,49 @@ export function createMenus(ctx, ui) {
     const bike = game.actions.bike();
     body.append(label('How do you want to get there'));
 
+    /* ONE PATH OUT OF THIS BOARD, so no mode can behave differently
+       from any other. Every row ends here. */
+    const go = (mode) => {
+      const r = game.travel(locId, mode);
+      if (!r.ok) { res(r); return; }
+      ui.sfx(mode === 'walk' ? 'step.dirt' : mode === 'train' ? 'train.horn' : 'ui.select');
+      ui.setDestination(null);
+      ui.refresh();
+      ui.rebuildTop();
+      ui.toast('Arrived at ' + loc.n, 'token');
+      onDone ? onDone() : ui.closeSheet(body);
+      ui.openPlace(locId);
+    };
+
     for (const f of game.fares(locId)) {
-      if (f.mode === 'bike' && !bike.owned) continue;      // its own row, below
+      if (f.mode === 'bike' && !bike.owned) continue;      // the garage, below
       const bits = [f.mins + ' min'];
       if (f.energy) bits.push(f.energy + ' energy');
       if (f.metres) bits.push(f.metres + ' m');
-      const detail = f.ok ? bits.join(' · ') + (f.warn ? ' · ' + f.warn : '') : f.why;
-      /* A row that carries its own fix must not be disabled: the
-         disabled style is pointer-events:none, and that would kill
-         the Equip button sitting inside it. */
-      const fixable = f.mode === 'bike' && bike.owned && !bike.equipped;
-      const row = card({
+      /* Left at home is not a refusal, it is a step this row will
+         take for you — say so rather than quoting the engine's why. */
+      const fetch = f.mode === 'bike' && bike.owned && !bike.equipped;
+      const detail = fetch ? bits.join(' · ') + ' · takes the ' + bike.short.toLowerCase() + ' with you'
+        : f.ok ? bits.join(' · ') + (f.warn ? ' · ' + f.warn : '') : f.why;
+      body.append(card({
         ic: MODE_ICON[f.mode] || 'foot',
         t: f.n,
         d: detail,
         m: f.cost ? money(f.cost) : 'Free',
-        mColor: !f.ok ? BRAND.bad : f.trudge ? BRAND.warn : f.cost ? BRAND.ink : BRAND.good,
+        mColor: !f.ok && !fetch ? BRAND.bad : f.trudge ? BRAND.warn : f.cost ? BRAND.ink : BRAND.good,
         ms: f.hops ? f.hops + (f.hops === 1 ? ' hop' : ' hops') : null,
-        disabled: !f.ok && !fixable,
-        onclick: !f.ok ? null : () => {
-          const r = game.travel(locId, f.mode);
-          if (!r.ok) { res(r); return; }
-          ui.sfx(f.mode === 'walk' ? 'step.dirt' : f.mode === 'train' ? 'train.horn' : 'ui.select');
-          ui.setDestination(null);
-          ui.refresh();
-          ui.toast('Arrived at ' + loc.n, 'token');
-          onDone ? onDone() : ui.popSheet();
-          ui.openPlace(locId);
+        disabled: !f.ok && !fetch,
+        onclick: (!f.ok && !fetch) ? null : () => {
+          if (fetch) {
+            const e = game.actions.equipRide(bike.id);
+            if (!e.ok) { res(e); return; }
+          }
+          go(f.mode);
         },
-      });
-      /* the bicycle is owned but at home — one tap fixes that */
-      if (fixable) {
-        row.append(h('button.w-btn.sm.prim.w-pe', {
-          type: 'button', style: { marginLeft: '8px' },
-          onclick: (e) => {
-            e.stopPropagation();
-            const r = game.actions.equipBike(true);
-            if (r.ok) { ui.sfx('ui.select'); ui.toast('Bicycle with you', 'good'); ui.rebuildTop(); }
-            else res(r);
-          },
-        }, 'Equip'));
-      }
-      body.append(row);
+      }));
     }
 
-    if (!bike.owned) body.append(bikeOffer());
+    if (!bike.owned) for (const el of rideOffers()) body.append(el);
 
     body.append(h('div', {
       style: { fontSize: '11px', opacity: '.55', marginTop: '10px', lineHeight: '1.5' },
@@ -774,87 +989,174 @@ export function createMenus(ctx, ui) {
     }));
   }
 
-  /* THE BICYCLE, in whichever of its three states it is in.
+  /* ============================================================
+     THE RIDES, AS ROWS — one function, three (and later more)
+     vehicles, all of them read out of data.js RIDES.
 
-     data.js sells it at Dispatch and at Vic's through a 'bike' act
-     string on those two locations, and until now nothing in the
-     interface read that string — so the item the game's own tips call
-     "the best money you will spend this week" could not be bought
-     anywhere, and the fare board showed it as a permanently grey row
-     reading "you do not own a bicycle". This one row is the whole of
-     it: buy it where it is sold, equip it anywhere, and see the price
-     while you are still saving up for it. */
-  function bikeOffer(opts = {}) {
+     This used to be bikeOffer(): one hard-coded bicycle in three
+     states. data.js now holds a TABLE — bicycle, scooter,
+     motorcycle, each with a speed, an effort and an unlock — and a
+     fourth vehicle should cost nobody a new card. So there is one
+     row builder, and every list that shows a ride (the fare board,
+     a shop's counter, the phone's garage) feeds it rows from
+     game.actions.rides() / ridesFor().
+
+     A LOCKED RIDE IS A GOAL, NOT A DEAD ROW. It quotes its speed
+     against the bicycle, and it says exactly how it is obtained: a
+     price and a shop, or the quest that hands it over.
+     ============================================================ */
+  const RIDE_ICON = { bike: 'bike', scooter: 'bike', motorcycle: 'bike' };
+
+  /* "×1.5 · 50% faster than the bicycle" — the one number that makes
+     the whole table legible, said in both registers. */
+  function speedLine(r) {
+    if (r.speed === 1) return 'The baseline · half the time of walking';
+    const pct = Math.round((1 - 1 / r.speed) * 100);
+    return '×' + r.speed + ' the bicycle · ' + pct + '% less time on the road';
+  }
+
+  /* How you get one, in the words the player needs. `buyable` is
+     canBuyRide()'s verdict: standing at the right counter with the
+     money in hand, the row should say "take it", not "sold at". */
+  function unlockLine(game, r, canBuy) {
+    if (canBuy) return 'They have one on the floor right now';
+    if (r.unlock === 'quest') {
+      const q = game.data.sideQuestById?.[r.questId] || game.data.questById?.[r.questId];
+      return 'Not for sale at any price · ' + (q ? q.t : 'a favour returned');
+    }
+    const shops = (r.locs || []).map((id) => game.data.locationById[id]).filter(Boolean);
+    const known = shops.filter((l) => game.known(l.id));
+    const where = (known.length ? known : shops).map((l) => l.n).join(' or ');
+    return (r.rep ? 'Reputation ' + r.rep + ' · ' : '') + (where ? 'sold at ' + where : 'sold in the city');
+  }
+
+  /* ONE RIDE, ONE ROW. `opts.onChange` is called after anything that
+     changes ownership or what is equipped, so the list can redraw. */
+  function rideRow(r, opts = {}) {
     const game = g();
-    const bike = game.actions.bike();
-    const chk = game.actions.canBuyBike();
+    const redraw = opts.onChange || (() => ui.rebuildTop());
 
-    if (bike.owned) {
-      const on = bike.equipped;
-      const owned = card({
-        ic: 'bike', t: bike.n,
-        d: on ? 'With you. Half the time of walking, a third of the energy.'
-          : 'Yours, but not with you. Free to run, forever.',
-        m: on ? 'Ready' : 'At home',
-        mColor: on ? BRAND.good : BRAND.warn,
+    if (r.owned) {
+      const on = r.equipped;
+      /* No status word AND a button that says the same thing: the
+         button is the status, and the row needs the width for the
+         speed line more than it needs to say "Riding" twice. */
+      const row = card({
+        glyph: r.ico,
+        t: r.n,
+        d: (on ? 'With you · ' : 'In the shed · ') + speedLine(r),
       });
-      owned.append(h('button.w-btn.sm.' + (on ? 'ghost' : 'prim') + '.w-pe', {
+      row.classList.toggle('on', on);
+      row.append(h('button.w-btn.sm.' + (on ? 'ghost' : 'prim') + '.w-pe', {
         type: 'button', style: { marginLeft: '8px' },
         onclick: (e) => {
           e.stopPropagation();
-          const r = game.actions.equipBike(!on);
-          if (!r.ok) { res(r); return; }
+          const res2 = game.actions.equipRide(on ? null : r.id);
+          if (!res2.ok) { res(res2); return; }
           ui.sfx('ui.select');
-          ui.toast(on ? 'Bicycle left behind' : 'Bicycle with you', on ? 'info' : 'good');
+          ui.toast(on ? r.short + ' left behind' : r.short + ' with you', on ? 'info' : 'good');
           ui.refresh();
-          (opts.onChange || ui.rebuildTop)();
+          redraw();
         },
-      }, on ? 'Leave it' : 'Equip'));
-      return owned;
+      }, on ? 'Unequip' : 'Equip'));
+      return row;
     }
 
-    const shops = bike.locs.map((id) => game.data.locationById[id])
-      .filter((l) => l && game.known(l.id));
-    const shopNames = shops.length ? shops.map((l) => l.n).join(' or ') : 'Dispatch';
+    /* ---- locked ---- */
+    const chk = r.buyable ? game.actions.canBuyRide(r.id) : { ok: false };
     const row = card({
-      ic: 'bike',
-      t: bike.n,
-      d: chk.ok ? 'Half the time of walking, a third of the energy, free forever after.'
-        : 'Sold at ' + shopNames + ' · half the time of walking, a third of the energy.',
-      m: money(bike.cost),
-      mColor: chk.ok ? BRAND.good : BRAND.warn,
-      ms: 'not owned',
+      glyph: r.ico,
+      t: r.n,
+      d: speedLine(r) + ' · ' + unlockLine(game, r, chk.ok),
+      m: r.buyable ? money(r.price) : 'Quest',
+      mColor: chk.ok ? BRAND.good : r.buyable ? BRAND.warn : BRAND.gem,
+      ms: r.buyable ? (chk.ok ? 'buy it here' : 'locked') : 'earned',
     });
+    row.classList.add('locked');
     if (chk.ok) {
       row.append(h('button.w-btn.sm.prim.w-pe', {
         type: 'button', style: { marginLeft: '8px' },
         onclick: (e) => {
           e.stopPropagation();
-          const r = game.actions.buyBike();
-          if (!r.ok) { res(r); return; }
+          const bought = game.actions.buyRide(r.id);
+          if (!bought.ok) { res(bought); return; }
           ui.sfx('levelup');
-          ui.toast('The bicycle is yours', 'money');
-          ui.refresh(); ui.rebuildTop();
+          ui.toast('The ' + r.short.toLowerCase() + ' is yours', 'money');
+          ui.refresh();
+          redraw();
         },
       }, 'Buy'));
-    } else if (shops.length) {
-      row.append(h('button.w-btn.sm.ghost.w-pe', {
-        type: 'button', style: { marginLeft: '8px' },
-        onclick: (e) => {
-          e.stopPropagation();
-          ui.setDestination(shops[0].id);
-          ui.toast('Pointing you at ' + shops[0].n, 'token');
-        },
-      }, icon('nav', 13, { fill: 'currentColor', w: 1 })));
+    } else {
+      /* Point at wherever it comes from — the shop, or the person
+         whose quest hands it over. A goal you cannot walk towards is
+         not a goal. */
+      const at = r.buyable
+        ? (r.locs || []).map((id) => game.data.locationById[id]).find((l) => l && game.known(l.id))
+        : (() => {
+          const q = game.data.sideQuestById?.[r.questId];
+          const l = q && q.loc ? game.data.locationById[q.loc] : null;
+          return l && game.known(l.id) ? l : null;
+        })();
+      /* Not when he is standing in it — an arrow pointing at your own
+         feet is noise. */
+      if (at && at.id !== game.state.loc) {
+        row.append(h('button.w-btn.sm.ghost.w-pe', {
+          type: 'button', style: { marginLeft: '8px' }, title: 'Point me at ' + at.n,
+          onclick: (e) => {
+            e.stopPropagation();
+            ui.setDestination(at.id);
+            ui.toast('Pointing you at ' + at.n, 'token');
+          },
+        }, icon('nav', 13, { fill: 'currentColor', w: 1 })));
+      }
     }
     return row;
+  }
+
+  /* Every ride, in one list — the phone's garage. */
+  function rideList(opts = {}) {
+    return g().actions.rides().filter(Boolean).map((r) => rideRow(r, opts));
+  }
+
+  /* The rides worth showing under a fare board he cannot ride: what
+     he owns but left behind, then the cheapest thing he could buy. */
+  function rideOffers(opts = {}) {
+    const all = g().actions.rides().filter(Boolean);
+    const owned = all.filter((r) => r.owned);
+    if (owned.length) return owned.map((r) => rideRow(r, opts));
+    const buyable = all.filter((r) => r.buyable).sort((a, b) => a.price - b.price);
+    return buyable.slice(0, 1).map((r) => rideRow(r, opts));
+  }
+
+  /* What this counter sells. data.js puts a 'bike' act on Dispatch
+     and Vic's; Dispatch also sells the motorcycle, and the list comes
+     straight off the table so a fourth vehicle needs no code here. */
+  function rideShop(locId, opts = {}) {
+    const game = g();
+    /* Cheapest first. A counter that opens with the $16,000 machine
+       is a counter that hides the $180 one he can actually buy. */
+    const forSale = game.actions.ridesFor(locId).filter((r) => !r.owned)
+      .sort((a, b) => a.price - b.price);
+    const out = [];
+    for (const r of forSale) out.push(rideRow(r, opts));
+    /* anything he already owns, so "equip it" is possible at a shop */
+    for (const r of game.actions.rides()) {
+      if (r && r.owned && !forSale.some((x) => x.id === r.id)) out.push(rideRow(r, opts));
+    }
+    return out;
+  }
+
+  /* Back-compat: menus.js published bikeOffer() and the place sheet
+     called it. It is now one row of the table. */
+  function bikeOffer(opts = {}) {
+    const rows = rideOffers(opts);
+    return rows[0] || h('div.w-empty', { text: 'Nothing on wheels yet.' });
   }
 
   function travel(locId, why) {
     const game = g();
     const loc = game.data.locationById[locId];
     if (!loc) return null;
-    ui.setDestination(locId);
     return sheet({
       title: loc.n,
       sub: why || (game.data.zones[loc.z].n + ' · ' + (game.isOpen(locId) ? 'open now' : 'closed')),
@@ -889,6 +1191,24 @@ export function createMenus(ctx, ui) {
         },
           h('div', { style: { fontWeight: '800', fontSize: '13px' }, text: q.t }),
           h('div', { style: { fontSize: '11.5px', opacity: '.7', marginTop: '2px' }, text: q.d })));
+      }
+
+      /* MAYOR KEN JONES IS STANDING IN THE DOORWAY. The race is not
+         one of the location's `acts` — it is a person blocking a
+         door — so it is offered here, at the start line, from the
+         moment he asks until the moment he is beaten. */
+      const rv = raceView();
+      if (rv && rv.offered && locId === rv.route[0].loc) {
+        body.append(label(game.data.race.n));
+        body.append(card({
+          glyph: '🏁',
+          t: rv.won ? 'You beat ' + game.race.mayor().n : 'Race ' + game.race.mayor().n,
+          d: rv.won ? 'Best ' + rv.best + 's, against his ' + rv.pace.mayorSeconds + 's.'
+            : rv.metres + ' m round the town · he does it in ' + rv.pace.mayorSeconds + 's'
+              + (rv.best ? ' · your best ' + rv.best + 's' : ''),
+          m: rv.won ? '✔' : 'Go', mColor: rv.won ? BRAND.good : BRAND.warn,
+          onclick: () => ui.pushSheet(raceCard(), 'race'),
+        }));
       }
 
       body.append(label('What you can do here'));
@@ -952,7 +1272,7 @@ export function createMenus(ctx, ui) {
         case 'desk': case 'hub':
           out.push({ ic: 'door', t: 'Work at the desk', d: 'Orders, clients, tokenizing, your office.',
             m: st.arrivals.length ? st.arrivals.length + ' waiting' : null, mColor: BRAND.token2,
-            onclick: () => { ui.popSheet(); ui.openDesk(); } });
+            onclick: (e) => { ui.closeSheet(e && e.currentTarget); ui.openDesk(); } });
           break;
         case 'poster':
           out.push({ glyph: '🖼️', t: 'Look at the poster', d: 'The Bull Bear Stampede, some year they would rather forget.',
@@ -990,9 +1310,12 @@ export function createMenus(ctx, ui) {
             onclick: () => ui.pushSheet(market(a)) });
           break;
         }
-        /* THE 'bike' ACT. data.js puts it on Dispatch and Vic's and
-           says so in its own comment; nothing used to read it. */
-        case 'bike': out.push({ el: bikeOffer() }); break;
+        /* THE 'bike' ACT — now the whole forecourt. data.js puts it on
+           Dispatch and Vic's; Dispatch also stocks the Thunderhead, so
+           the counter lists everything the table says is sold HERE
+           plus anything he already owns, and a fourth vehicle in the
+           table appears without a line of code changing. */
+        case 'bike': for (const el of rideShop(loc.id)) out.push({ el }); break;
         case 'bank':  out.push({ ic: 'cash', t: 'Bull Bear Mutual', d: 'Borrow against your reputation, repay when you can.', onclick: () => ui.pushSheet(bank()) }); break;
         case 'pawn':  out.push({ ic: 'bag', t: "Vic's stock", d: 'Four things a day, 14% under market.', onclick: () => ui.pushSheet(pawn()) }); break;
         case 'school':out.push({ ic: 'book', t: 'Enrol in a course', d: 'Ten courses. Each ends in an exam you can fail.', onclick: () => ui.pushSheet(school()) }); break;
@@ -1172,41 +1495,55 @@ export function createMenus(ctx, ui) {
       const st = game.state;
       body.append(kv('Cash', money2(st.money)));
       body.append(kv('Inventory', E.invCount() + ' / ' + E.invCap()));
+      /* THE HOUSE'S CUT, STATED ONCE, AT THE TOP. Every number below
+         is an ask or a bid rather than the mid, and this is the line
+         that says why the two are not the same. */
+      const pct = Math.round(v.spread * 100);
+      body.append(h('div.w-spread', null,
+        h('span.k', { text: 'How ' + v.name + ' is paid' }),
+        h('span.d', { text: 'A ' + pct + '% spread. You BUY at the ask — the mid price plus '
+          + pct + '% — and SELL at the bid, which is under it. On a ' + money(100)
+          + ' asset that is ' + money2(100 * v.spread) + ' either way.' })));
       /* the order book is a list of one-unit buttons; anything with a
          quantity, a total or a second thought goes through the ticket */
       body.append(card({
-        ic: 'search', t: 'Search by ticker', d: 'Quantity, fees and the total before you confirm.',
+        ic: 'search', t: 'Search by ticker', d: 'Quantity, spread and the total before you confirm.',
         m: 'B', mColor: BRAND.token2,
         onclick: () => ui.openQuickBuy(),
       }));
       const list = game.data.assets.filter((a) => a.ven === venue);
-      body.append(label(list.length + ' listed · buy / sell one unit'));
+      body.append(label(list.length + ' listed · ask / bid, one unit'));
       for (const a of list) {
         const owned = E.owned(a.id);
         const bp = E.buyPrice(a.id, venue), sp = E.sellPrice(a.id, venue);
         const tr = E.trend(a.id);
         const row = h('div.w-card', null,
           h('div.ic', { style: { fontSize: '17px', background: rgba(CATEGORY[a.cat] ?? BRAND.info, 0.16) }, text: a.ico }),
-          assetNode(a, { sub: a.cat + (owned ? ' · you hold ' + owned : '') }),
-          h('div.m', {
-            text: money2(E.price(a.id)),
-            style: { color: C(tr > 0.004 ? BRAND.good : tr < -0.004 ? BRAND.bad : BRAND.ink) },
-          }, h('small', { text: (tr > 0 ? '▲' : tr < 0 ? '▼' : '·') + ' ' + a.q + '/5 liq' })));
+          /* ONE PRICE COLUMN, AND IT IS THE BUTTONS. This row used to
+             print the MID in the money column and the ASK on the
+             button beside it, which is exactly what made the buy
+             button look more expensive than the price. The two
+             buttons now carry the only two numbers you can actually
+             transact at, and the mid and the spread that produce
+             them sit in the subtitle underneath the name. */
+          assetNode(a, { sub: (tr > 0.004 ? '▲ ' : tr < -0.004 ? '▼ ' : '')
+            + askSub(E.price(a.id), pct) + ' · ' + a.q + '/5 liq'
+            + (owned ? ' · you hold ' + owned : '') }));
         const buttons = h('div', { style: { display: 'flex', gap: '6px', marginLeft: '8px' } },
           h('button.w-btn.sm.prim.w-pe', {
-            type: 'button', title: 'Buy one ' + a.tick,
+            type: 'button', title: 'Buy one ' + a.tick + ' at the ask, ' + money2(bp),
             onclick: () => {
               const r = E.buy(a.id, 1, venue);
               if (r.ok) { ui.sfx('buy'); ui.refresh(); el._rebuild(); } else res(r);
             },
-          }, money(bp)),
+          }, 'Buy ' + money(bp)),
           h('button.w-btn.sm.ghost.w-pe', {
-            type: 'button', title: 'Sell one ' + a.tick, disabled: E.free(a.id) < 1,
+            type: 'button', title: 'Sell one ' + a.tick + ' at the bid, ' + money2(sp), disabled: E.free(a.id) < 1,
             onclick: () => {
               const r = E.sell(a.id, 1, venue);
               if (r.ok) { ui.sfx('sell'); ui.refresh(); el._rebuild(); } else res(r);
             },
-          }, money(sp)),
+          }, 'Sell ' + money(sp)),
           h('button.w-btn.sm.ghost.w-pe', {
             type: 'button', title: 'Buy several ' + a.tick,
             style: { minWidth: '32px', padding: '0 8px' },
@@ -1323,6 +1660,67 @@ export function createMenus(ctx, ui) {
   }
 
   /* ============================================================
+     PRODUCER UPGRADES, IN NUMBERS, BEFORE THE MONEY LEAVES.
+
+     "Upgrade the farm · $4,000 · Better crops appear" told the player
+     nothing they could weigh. game.actions.producer(which) computes
+     what a level is actually worth — the yield now and after, whether
+     a richer tier opens, and the overnight income, including the part
+     that pays nothing until the manager is hired. This prints all of
+     it on the card, and the last line is the one nobody could find:
+     an upgrade adds daily income ONLY with the manager on the payroll.
+     ============================================================ */
+  function producerUpgrade(which, onBuy) {
+    const game = g();
+    const p = game.actions.producer(which);
+    if (!p || !p.owned) return null;
+    const afford = game.state.money >= p.cost;
+    const dy = p.nextPerAction - p.perAction;
+
+    const wrap = h('div.w-up' + (afford ? '' : '.poor'));
+    wrap.append(h('div.hd', null,
+      h('div.ic', null, icon('tools', 17)),
+      h('div.w-grow', null,
+        h('div.t', { text: p.upgrade + ' · level ' + p.level + ' → ' + p.nextLevel }),
+        h('div.d', { text: p.n })),
+      h('div.m', { text: money(p.cost), style: { color: C(afford ? BRAND.ink : BRAND.bad) } },
+        h('small', { text: afford ? 'to buy' : 'you are ' + money(p.cost - game.state.money) + ' short' }))));
+
+    /* the three effects, each a number the player can check afterwards */
+    const eff = h('div.eff');
+    eff.append(effRow('spark',
+      p.act + ' yields ' + p.perAction + ' → ' + p.nextPerAction + ' ' + p.unit + (p.nextPerAction === 1 ? '' : 's'),
+      dy > 0 ? '+' + dy + ' every ' + p.act.toLowerCase() + ', for ever' : 'no change to the bucket', dy > 0));
+    eff.append(effRow('chart',
+      p.tierGrows ? 'Tier ' + p.tier + ' → tier ' + p.nextTier + ' ' + p.unit + 's unlock'
+        : 'Tier ' + p.tier + ' is already the richest here',
+      p.tierGrows ? 'the more valuable ones become findable at all' : 'no new material at this level',
+      p.tierGrows));
+    eff.append(effRow('cash',
+      p.managerHired
+        ? 'Overnight income ' + money(p.dailyIncome) + ' → ' + money(p.nextDailyIncome) + ' a day'
+        : 'Overnight income stays at ' + money(0) + ' a day',
+      p.managerHired
+        ? '+' + money(p.nextDailyIncome - p.dailyIncome) + ' a day while ' + p.managerName + ' runs it'
+        : 'this level pays nothing overnight until ' + p.managerName
+          + ' is on the payroll — with ' + p.managerName + ' it would pay ' + money(p.dailyIfHired) + ' a day',
+      p.managerHired));
+    wrap.append(eff);
+
+    wrap.append(h('button.w-btn.prim.w-pe', {
+      type: 'button', disabled: !afford,
+      style: { width: '100%', marginTop: 'calc(9px * var(--w-ts))' },
+      onclick: () => { ui.click(); onBuy(); },
+    }, 'Buy ' + p.upgrade + ' · ' + money(p.cost)));
+    return wrap;
+  }
+  function effRow(ic, t, d, good) {
+    return h('div.row' + (good ? '.on' : ''), null,
+      icon(good ? 'check' : ic, 13, { w: 2.2 }),
+      h('div.w-grow', null, h('b', { text: t }), h('span', { text: d })));
+  }
+
+  /* ============================================================
      FARM / MINE / DEV LAB / IPO / STADIUM
      ============================================================ */
   function farm() {
@@ -1341,9 +1739,11 @@ export function createMenus(ctx, ui) {
         if (f.owned) {
           step('Build the barn', 'One extra crate every harvest.', money(3200), () => A.farmBuild('barn'), f.barn);
           step('Build cold storage', 'Nothing spoils on the way to market.', money(6500), () => A.farmBuild('cold'), f.cold);
-          body.append(card({ ic: 'tools', t: 'Upgrade the farm', d: 'Level ' + f.lvl + ' → ' + (f.lvl + 1) + '. Better crops appear.',
-            m: money(2000 * (f.lvl + 1)),
-            onclick: () => { const r = A.farmUpgrade(); if (r.ok) { ui.sfx('levelup'); el._rebuild(); ui.refresh(); } else res(r); } }));
+          put(body, label('Field expansion'), producerUpgrade('farm', () => {
+            const r = A.farmUpgrade();
+            if (r.ok) { ui.sfx('levelup'); ui.toast('Field Expansion · level ' + r.level, 'good'); el._rebuild(); ui.refresh(); }
+            else res(r);
+          }));
           body.append(card({ ic: 'spark', t: 'Harvest', d: 'Three hours, 16 energy.', m: 'Go',
             onclick: () => {
               const r = A.farmHarvest();
@@ -1368,9 +1768,11 @@ export function createMenus(ctx, ui) {
         step('Certify the elevator', 'The inspector has opinions.', money(2600), () => A.mineCertifyLift(), m.elevator);
         step('Reopen the mine', 'Two and a half hours, 16 energy.', 'Open it', () => A.mineOpen(), m.owned);
         if (m.owned) {
-          body.append(card({ ic: 'tools', t: 'Upgrade the mine', d: 'Level ' + m.lvl + ' → ' + (m.lvl + 1) + '. Deeper seams.',
-            m: money(3600 * (m.lvl + 1)),
-            onclick: () => { const r = A.mineUpgrade(); if (r.ok) { ui.sfx('levelup'); el._rebuild(); ui.refresh(); } else res(r); } }));
+          put(body, label('Seam development'), producerUpgrade('mine', () => {
+            const r = A.mineUpgrade();
+            if (r.ok) { ui.sfx('levelup'); ui.toast('Seam Development · level ' + r.level, 'good'); el._rebuild(); ui.refresh(); }
+            else res(r);
+          }));
           body.append(card({ ic: 'spark', t: 'Work a seam', d: 'Three hours, 20 energy.', m: 'Dig',
             onclick: () => {
               const r = A.mineDig();
@@ -1473,6 +1875,197 @@ export function createMenus(ctx, ui) {
   }
 
   /* ============================================================
+     THE MAYOR'S DASH — the two cards.
+
+     game.race owns the rules; these two own the reading of them.
+     raceCard()   the start line: his route, his target, your best,
+                  and one button that is either Go or a way to Go.
+     raceResult() the finish: your clock against his, and — when you
+                  lost — WHERE it went. The result never tells the
+                  player to buy anything. It shows them the two
+                  average speeds side by side and lets the arithmetic
+                  do the nudging, because "he was going faster than
+                  you" is a fact about this race and "get a scooter"
+                  is the answer to a puzzle the game wants kept.
+     ============================================================ */
+  function raceView() {
+    try { return g().race ? g().race.view() : null; } catch (e) { return null; }
+  }
+  const secs = (s) => (s == null ? '—' : Math.round(s) + 's');
+  const mps = (metres, seconds) => (seconds > 0 ? (Math.round((metres / seconds) * 10) / 10) + ' m/s' : '—');
+
+  function raceCard() {
+    const game = g();
+    return sheet({
+      title: game.data.race.n,
+      sub: 'Once round the town. His route.',
+      glyph: '🏁', tint: BRAND.warn,
+    }, (body, self) => {
+      const v = game.race.view();
+      const mayor = game.race.mayor();
+      const can = v.canStart;
+
+      body.append(h('div.w-msg', null,
+        h('div.hd', null, portrait(mayor, 26), mayor.n,
+          h('span.when', { text: v.won ? 'beaten' : v.attempts ? 'attempt ' + (v.attempts + 1) : 'the challenge' })),
+        h('div.bd', { text: v.won ? game.data.race.lines.won : game.data.race.lines.start })));
+
+      body.append(label('The route'));
+      const track = h('div.w-route');
+      for (const r of v.route) {
+        track.append(h('div.leg' + (r.i <= v.cp && v.running ? '.done' : ''), null,
+          h('span.n', { text: r.start ? 'START' : r.finish ? 'FINISH' : String(r.i) }),
+          h('span.p', { text: r.ico + ' ' + r.n }),
+          h('span.m', { text: r.metres ? r.metres + ' m' : '' })));
+      }
+      body.append(track);
+
+      body.append(label('The numbers'));
+      put(body,
+        kv('Distance', v.metres + ' m · ' + (v.route.length - 1) + ' legs'),
+        /* HIS TARGET AGAINST YOUR OWN PROJECTED LAP, not against your
+           top speed. Top speed beside his average reads as "you are
+           already quicker than him", which is false: nobody holds a
+           top speed through five corners. pace.rideSeconds is what
+           this ride is realistically worth over this route, and
+           printing it beside his time is the honest comparison — and
+           the only nudge the player gets. */
+        kv('You are on', v.pace.rideName),
+        kv('A good lap on that', secs(v.pace.rideSeconds)
+          + ' · ' + (Math.round((v.metres / v.pace.rideSeconds) * 100) / 100) + ' m/s average'),
+        kv(mayor.n + ' will do it in', secs(v.pace.mayorSeconds)
+          + ' · ' + v.pace.mps + ' m/s average'),
+        kv('Your best so far', v.best ? secs(v.best) : 'you have not raced him'),
+        kv('It costs you', v.mins + ' minutes · ' + v.energy + ' energy'),
+      );
+
+      if (v.won) {
+        body.append(h('div.w-warnbox.good', { text: 'You beat him in ' + secs(v.best)
+          + '. The Stock Exchange door is open to you.' }));
+        return;
+      }
+
+      if (can.ok) {
+        body.append(h('button.w-btn.prim.w-pe', {
+          type: 'button', style: { width: '100%', marginTop: 'calc(10px * var(--w-ts))' },
+          onclick: () => {
+            ui.click();
+            const r = game.race.start();
+            if (!r.ok) { res(r); return; }
+            self._close();
+            ui.closeAll();
+          },
+        }, icon('play', 15, { fill: 'currentColor', w: 1 }), 'On your marks · ' + secs(v.pace.mayorSeconds) + ' to beat'));
+        body.append(h('div.w-note', { text:
+          'Touch each corner in order and get back to ' + v.route[0].n + '. He starts when you do.' }));
+        return;
+      }
+
+      /* refused — say why, and offer the fix rather than the wall */
+      body.append(h('div.w-warnbox', { text: can.why }));
+      if (can.kind === 'place' && can.loc) {
+        body.append(h('button.w-btn.prim.w-pe', {
+          type: 'button', style: { width: '100%', marginTop: 'calc(9px * var(--w-ts))' },
+          onclick: () => { ui.click(); self._close(); ui.goto(can.loc, 'The start line'); },
+        }, icon('pin', 15), 'Go to the start line'));
+      } else if (can.kind === 'hunger' || can.kind === 'hours') {
+        body.append(h('button.w-btn.prim.w-pe', {
+          type: 'button', style: { width: '100%', marginTop: 'calc(9px * var(--w-ts))' },
+          onclick: () => { ui.click(); self._close(); blocked(can); },
+        }, 'What can I do about it?'));
+      }
+    });
+  }
+
+  function raceResult(p) {
+    const game = g();
+    const v = game.race.view();
+    const mayor = game.race.mayor();
+    const won = !!p.won;
+    const gap = Math.abs(Math.round(p.seconds - p.mayorSeconds));
+    const splits = Array.isArray(p.splits) ? p.splits : [];
+    /* the leg that cost the most against his even pace */
+    let worst = null;
+    for (const s of splits) if (!worst || s.lost > worst.lost) worst = s;
+
+    return sheet({
+      title: won ? 'You beat the Mayor' : 'The Mayor got there first',
+      sub: secs(p.seconds) + ' against his ' + secs(p.mayorSeconds),
+      glyph: won ? '🏆' : '🏁', tint: won ? BRAND.good : BRAND.warn,
+    }, (body, self) => {
+      /* the two clocks, side by side, at a size you can read across
+         the room — this is the whole result */
+      body.append(h('div.w-versus', null,
+        h('div.side' + (won ? '.win' : ''), null,
+          h('span.k', { text: 'You' }), h('b', { text: secs(p.seconds) }),
+          h('span.d', { text: mps(v.metres, p.seconds) + ' average' })),
+        h('div.gap', null, h('b', { text: (won ? '−' : '+') + gap + 's' }),
+          h('span', { text: won ? 'clear' : 'behind' })),
+        h('div.side' + (won ? '' : '.win'), null,
+          h('span.k', { text: mayor.n.replace('Mayor ', '') }), h('b', { text: secs(p.mayorSeconds) }),
+          h('span.d', { text: v.pace.mps + ' m/s average' }))));
+
+      body.append(h('div.w-msg', null,
+        h('div.hd', null, portrait(mayor, 26), mayor.n),
+        h('div.bd', { text: p.line || '' })));
+
+      if (splits.length) {
+        body.append(label('Where the race went'));
+        const track = h('div.w-route');
+        for (const s of splits) {
+          const ahead = s.lost <= 0;
+          track.append(h('div.leg' + (ahead ? '.done' : '.lost'), null,
+            h('span.n', { text: String(s.i) }),
+            h('span.p', { text: s.n }),
+            h('span.m', { text: (ahead ? '−' : '+') + Math.abs(Math.round(s.lost)) + 's' })));
+        }
+        body.append(track);
+      }
+
+      if (won) {
+        body.append(h('div.w-warnbox.good', { text: 'The Stock Exchange will see you now.' }));
+        return;
+      }
+
+      /* THE NUDGE, AND IT IS ARITHMETIC, NOT ADVICE. Two average
+         speeds and the leg that cost the most. Nothing here says buy
+         anything; it says he was quicker, and where. */
+      const yourMps = p.seconds > 0 ? v.metres / p.seconds : 0;
+      const hisMps = v.pace.mps;
+      body.append(h('div.w-note', { text:
+        'You took the same corners he did' + (worst ? ', and lost most of it on the run to ' + worst.n : '')
+        + '. Over ' + v.metres + ' m he averaged ' + hisMps + ' m/s and you averaged '
+        + (Math.round(yourMps * 10) / 10) + ' m/s. Close the ' + gap
+        + '-second gap and the Exchange door is yours.' }));
+      if (p.hint) {
+        body.append(h('div.w-msg', { style: { marginTop: 'calc(9px * var(--w-ts))' } },
+          h('div.hd', null, glyphAvatar(p.hint.from[0], BRAND.token, 26), p.hint.from),
+          h('div.bd', { text: p.hint.text })));
+      }
+      put(body,
+        kv('Your best', v.best ? secs(v.best) : secs(p.seconds)),
+        kv('Attempts', String(v.attempts)),
+      );
+      const bar = h('div.w-row', { style: { marginTop: 'calc(10px * var(--w-ts))' } });
+      bar.append(h('button.w-btn.prim.w-pe', {
+        type: 'button', style: { flex: '1' },
+        onclick: () => {
+          ui.click();
+          self._close();
+          const chk = game.race.canStart();
+          if (chk.ok) { const r = game.race.start(); if (!r.ok) res(r); else ui.closeAll(); }
+          else ui.pushSheet(raceCard(), 'race');
+        },
+      }, icon('play', 15, { fill: 'currentColor', w: 1 }), 'Race him again'));
+      bar.append(h('button.w-btn.ghost.w-pe', {
+        type: 'button',
+        onclick: () => { ui.click(); self._close(); },
+      }, 'Later'));
+      body.append(bar);
+    });
+  }
+
+  /* ============================================================
      public
      ============================================================ */
   return {
@@ -1480,6 +2073,8 @@ export function createMenus(ctx, ui) {
     school, bank, pawn, homes, farm, mine, devlab, ipos, stadium,
     showOrder, talkTo, sheet, card, label,
     /* the buy path, the map, and the fare board the phone shares */
-    quickBuy, bigMap, travelModes, bikeOffer, venueOf, assetNode,
+    quickBuy, bigMap, travelModes, bikeOffer, rideRow, rideList, rideShop, venueOf, assetNode,
+    /* the Mayor's Dash and the two locked-out refusals */
+    raceCard, raceResult, blocked,
   };
 }

@@ -60,6 +60,11 @@ export function createPhone(ctx, ui) {
     { id: 'messages', n: 'Messages', ic: 'chat',   tint: BRAND.token,  render: renderMessages, badge: () => g().actions.unreadCount() },
     { id: 'places',   n: 'Places',   ic: 'map',    tint: BRAND.info,   render: renderPlaces },
     { id: 'clients',  n: 'Clients',  ic: 'people', tint: CATEGORY.Culture, render: renderClients, badge: () => g().state.arrivals.length },
+    /* THE GARAGE. It is not on the phone until there is something in
+       it — an app that only ever says "you own nothing" is furniture —
+       and from the moment the first ride is his it never leaves. */
+    { id: 'rides',    n: 'Rides',    ic: 'bike',   tint: CATEGORY.Transport, render: renderRides,
+      when: () => { try { return g().actions.rides().some((r) => r && r.owned); } catch (e) { return false; } } },
     { id: 'wallet',   n: 'Wallet',   ic: 'wallet', tint: BRAND.good,   render: renderWallet },
     { id: 'calendar', n: 'Calendar', ic: 'cal',    tint: BRAND.gem,    render: renderCalendar },
     { id: 'news',     n: 'News',     ic: 'news',   tint: CATEGORY.Business, render: renderNews },
@@ -69,6 +74,11 @@ export function createPhone(ctx, ui) {
   ];
   const APP_BY_ID = {};
   for (const a of APPS) APP_BY_ID[a.id] = a;
+  /* An app with a `when` is conditional; everything else is always
+     there. One predicate, read in both the grid and openApp, so the
+     tile and the route can never disagree. */
+  const appLive = (a) => !a.when || a.when();
+  const liveApps = () => APPS.filter(appLive);
 
   let current = null;
 
@@ -84,7 +94,7 @@ export function createPhone(ctx, ui) {
     clear(body);
     body.classList.add('home');
     const grid = h('div.w-apps');
-    for (const a of APPS) {
+    for (const a of liveApps()) {
       const tile = h('div.tile', {
         style: {
           background: `linear-gradient(160deg,${C(mix(a.tint, 0xffffff, 0.26))},${C(mix(a.tint, BRAND.ink, 0.22))})`,
@@ -115,7 +125,9 @@ export function createPhone(ctx, ui) {
         h('div.n', { text: here ? here.n : '—' }))));
     body.append(h('div.w-stats', null,
       stat('net', 'Net worth', money(d.netWorth)),
-      stat('star', 'Rep', String(Math.round(d.rep))),
+      /* the figure never travels without the title it earns, and the
+         tile opens the app that explains the ladder */
+      stat('star', d.title.title, String(Math.round(d.rep)), () => openApp('wallynet')),
       stat('city', 'City', d.cityPct + '%'),
     ));
 
@@ -159,7 +171,7 @@ export function createPhone(ctx, ui) {
 
   function openApp(id) {
     const a = APP_BY_ID[id];
-    if (!a) return home();
+    if (!a || !appLive(a)) return home();
     current = id;
     title.textContent = a.n;
     backBtn.style.display = '';
@@ -233,10 +245,14 @@ export function createPhone(ctx, ui) {
     const map = cityMap(ctx, {
       compact: true,
       selected: placeSel,
+      /* Picking a pin SHOWS that place and its fares — it does not
+         aim the HUD arrow at it. Travelling is what the fare board
+         below does; "Point me" is what aims the arrow. Doing both
+         from one tap is what made choosing "On foot" look like it had
+         only moved a marker. */
       onPick: (id) => {
         placeSel = id;
         ui.sfx('ui.tab');
-        ui.setDestination(id);
         drawDetail();
       },
     });
@@ -302,6 +318,112 @@ export function createPhone(ctx, ui) {
       }
       detail.append(bar);
     }
+  }
+
+  /* ============================================================
+     RIDES — the garage.
+
+     "The option to equip and unequip the bike should be an option in
+     the phone once the bike is unlocked, this section will include
+     improvements that can be unlocked later in the game for more
+     money or through a quest."
+
+     So: it appears the moment he owns anything (see APPS.when), it
+     equips and unequips, exactly ONE ride is under him at a time,
+     and the ones he does not own are here too — priced, or named
+     with the quest that hands them over — because a garage with a
+     locked door in it is a reason to come back.
+
+     NOTHING HERE IS HARD-CODED PER VEHICLE. The list is
+     game.actions.rides(), which is data.js's RIDES table in speed
+     order, and every row is built by menus.js rideRow(). A fourth
+     vehicle, or the upgrades this screen is the home for, is a row
+     in the table and nothing else.
+     ============================================================ */
+  function renderRides(b) {
+    const game = g();
+
+    const draw = () => {
+      clear(b);
+      const rides = game.actions.rides().filter(Boolean);
+      const on = rides.find((r) => r.equipped) || null;
+      /* Owned: fastest first, because that is the one he wants under
+         him. Locked: SLOWEST first, because that is the one he can
+         reach next, and a goal list should start at the near end. */
+      const owned = rides.filter((r) => r.owned).sort((a, b) => b.speed - a.speed);
+      const locked = rides.filter((r) => !r.owned).sort((a, b) => a.speed - b.speed);
+
+      /* THE HERO: what is under him right now, and what it is worth
+         in the only currency a ride is measured in — minutes. */
+      const tint = on ? BRAND.good : BRAND.warn;
+      b.append(h('div.w-hero', {
+        style: { boxShadow: `inset 0 0 0 1.4px ${rgba(tint, 0.34)}`, background: rgba(tint, 0.1) },
+      },
+        h('div.ic', { style: { fontSize: '20px', background: rgba(tint, 0.18) },
+          text: on ? on.ico : '🐘' },
+        ),
+        h('div.w-grow', null,
+          h('div.k', { text: on ? 'You are riding' : 'You are on foot' }),
+          h('div.v', { style: { fontSize: '17px' }, text: on ? on.short : 'Walking' })),
+        h('div.w', null,
+          h('div.k', { text: 'Across town' }),
+          h('div.n', { text: crossTown(on) }))));
+      /* The comparison is the whole point of owning one. */
+      if (on) {
+        b.append(h('div.w-kv', null,
+          h('span', { text: 'The same trip on foot' }),
+          h('b', { text: crossTown(null) })));
+      }
+
+      /* ---- the shed ---- */
+      b.append(h('div.w-label', {
+        text: owned.length + (owned.length === 1 ? ' ride owned' : ' rides owned') + ' · one at a time',
+      }));
+      if (!owned.length) b.append(h('div.w-empty', { text: 'The shed is empty. Your feet it is.' }));
+      for (const r of owned) b.append(ui.renderRide(r, { onChange: draw }));
+
+      /* ---- and the ones to want ---- */
+      if (locked.length) {
+        b.append(h('div.w-label', { text: 'In the window' }));
+        for (const r of locked) b.append(ui.renderRide(r, { onChange: draw }));
+      }
+
+      b.append(h('div', {
+        style: { fontSize: '11px', opacity: '.55', marginTop: '10px', lineHeight: '1.5' },
+        text: 'Whatever is equipped is what the Bicycle row on every fare board actually charges you — its speed, its energy. Upgrades and new machines turn up here as you earn them.',
+      }));
+    };
+    draw();
+  }
+
+  /* The one honest benchmark: the widest trip on the island, timed on
+     the thing under him. Two rides quoting "×3" mean nothing next to
+     each other; "41 min" and "14 min" mean everything. The pair is
+     found rather than named, so it stays true if the map grows.
+
+     CACHED: the island does not move, and this runs on every redraw
+     of the garage. */
+  let _wide = null;
+  function widestTrip() {
+    if (_wide) return _wide;
+    const L = g().data.locations;
+    let best = null, bh = -1;
+    for (let i = 0; i < L.length; i++) {
+      for (let j = i + 1; j < L.length; j++) {
+        const hp = g().data.hops(L[i].id, L[j].id);
+        if (hp > bh) { bh = hp; best = [L[i].id, L[j].id]; }
+      }
+    }
+    _wide = best || ['apartment', 'apartment'];
+    return _wide;
+  }
+  function crossTown(ride) {
+    const game = g();
+    try {
+      const [a, b2] = widestTrip();
+      const f = ride ? game.data.rideFare(ride.id, a, b2) : game.data.fare('walk', a, b2);
+      return f.mins + ' min';
+    } catch (e) { return '—'; }
   }
 
   /* ============================================================
@@ -537,7 +659,46 @@ export function createPhone(ctx, ui) {
   function renderWallyNet(b) {
     const game = g();
     const st = game.state;
-    b.append(bigNumber(String(Math.round(st.rep)), 'reputation', BRAND.token));
+
+    /* ---- WHO 42 REPUTATION MAKES YOU ----
+       WallyNet is the city talking about Wally, so the standing it is
+       talking about belongs at the top of it: the title he holds, the
+       rung, the one after it, and exactly how far away that is. The
+       HUD pill carries the same title and opens this app; this is
+       where the whole ladder is legible. */
+    const t = game.hud().title;
+    const hero = h('div.w-title');
+    hero.append(h('div.rung', { text: 'Rung ' + t.rung + ' of ' + t.total }));
+    hero.append(h('div.nm', { text: t.title }));
+    hero.append(h('div.ds', { text: t.desc }));
+    hero.append(h('div.fig', null,
+      h('b', { text: String(Math.round(st.rep)) }),
+      h('span', { text: 'reputation' })));
+
+    const bar = h('div.w-titlebar', null, h('i', { style: { width: t.pct + '%' } }));
+    hero.append(bar);
+    hero.append(h('div.nx', null,
+      h('span', { text: t.top ? 'The top of the ladder. There is nothing above this.'
+        : t.toNext + ' more reputation to' }),
+      t.top ? null : h('b', { text: t.next }),
+      t.top ? null : h('span.at', { text: 'at ' + t.nextAt })));
+    b.append(hero);
+    if (!t.top) {
+      b.append(h('div.w-note', { text: t.nextDesc }));
+    }
+
+    /* the whole ladder, so the climb has a shape */
+    b.append(h('div.w-label', { text: 'The ladder' }));
+    const ladder = h('div.w-ladder');
+    game.data.repTitles.forEach((row, i) => {
+      const held = i <= t.index;
+      ladder.append(h('div.rw' + (held ? '.on' : '') + (i === t.index ? '.now' : ''), null,
+        h('span.d', null, icon(held ? 'check' : 'star', 11, { w: 2.2 })),
+        h('span.t', { text: row.t }),
+        h('span.r', { text: String(row.rep) })));
+    });
+    b.append(ladder);
+
     if (!st.wallynet.length) {
       b.append(h('div.w-empty', { text: 'Nobody has posted about you. Yet.' }));
       return;
@@ -625,10 +786,12 @@ export function createPhone(ctx, ui) {
     return h('div.w-kv', null, h('span', { text: k }), h('b', { text: v }));
   }
   /* one small stat card: icon + tracked-caps name + figure */
-  function stat(ic, k, v) {
-    return h('div.w-stat', null,
+  function stat(ic, k, v, onclick) {
+    const el = h(onclick ? 'button.w-stat.w-pe' : 'div.w-stat',
+      onclick ? { type: 'button', onclick: () => { ui.sfx('ui.select'); onclick(); } } : null,
       h('div.k', null, icon(ic, 11, { w: 2 }), k),
       h('div.v', { text: v }));
+    return el;
   }
   /* Element.append() stringifies null — always go through this. */
   const put = (parent, ...nodes) => { for (const n of nodes) if (n) parent.append(n); return parent; };

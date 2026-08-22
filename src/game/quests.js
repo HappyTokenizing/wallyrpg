@@ -17,6 +17,9 @@
      { mine: true }     the mine is yours
      { stadium: n }     stadium questline at step n
      { stat: 'k', n: x} stats[k] >= x
+     { ride: 'id' }     that ride is owned
+     { any: [r, ...] }  the one OR in the grammar: true if ANY of the
+                        sub-rules is true. Everything else AND-s.
 
    ------------------------------------------------------------
    MAIN CHAIN vs SIDE QUESTS
@@ -38,6 +41,13 @@
      startSide(id)   arm one
      isSideActive/isSideDone(id)
 
+   A side quest may also carry `arm`, a rule in the grammar above.
+   check() starts it automatically the moment the rule is true, so a
+   quest that belongs to a point in the game rather than to a
+   conversation needs nobody to remember to fire it. And it may carry
+   `ride`, a RIDES id, which completing it hands over — that is the
+   only way the scooter is ever obtained.
+
    Events: 'quest' {kind:'side:start'|'side:complete', quest, title}.
    ============================================================ */
 
@@ -52,6 +62,9 @@ export function createQuests(env) {
   function ruleMet(rule) {
     const st = S();
     if (rule === 0 || rule == null) return true;
+    if (Array.isArray(rule)) return rule.every(ruleMet);
+    if (rule.any != null) { if (!rule.any.some(ruleMet)) return false; }
+    if (rule.ride != null && !(st.rides && st.rides.owned && st.rides.owned[rule.ride])) return false;
     if (rule.rep != null && st.rep < rule.rep) return false;
     if (rule.office != null && st.office < rule.office) return false;
     if (rule.skill != null && !st.skills[rule.skill]) return false;
@@ -138,6 +151,10 @@ export function createQuests(env) {
     st.sides[q.id] = 'done';
     if (q.rep) M().addRep(q.rep);
     if (q.money) M().pay(q.money, 'favour returned');
+    /* THE RIDE PAYOUT. A quest-unlocked vehicle (RIDES.scooter) has
+       no price and no shop; finishing the quest is the only door.
+       game.js supplies env.grantRide. */
+    if (q.ride) env.grantRide?.(q.ride, { from: q.id });
     M().note('good', '✔ ' + q.t);
     bus.emit('quest', { kind: 'side:complete', quest: q.id, title: q.t, from: q.from || null });
     return true;
@@ -168,6 +185,13 @@ export function createQuests(env) {
         if (!ok) continue;
         complete(q);
         moved = true;
+      }
+      /* AUTO-ARM. A side quest with an `arm` rule starts itself the
+         moment the rule is true — before the completion sweep below,
+         so a quest that arms already satisfied still pays out. */
+      for (const q of SIDE_QUESTS) {
+        if (!q.arm || sideStatus(q.id)) continue;
+        if (ruleMet(q.arm)) startSide(q.id);
       }
       /* Side quests are evaluated separately and NEVER set `moved`,
          so finishing an errand does not fire a main-chain 'advance'

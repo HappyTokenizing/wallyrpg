@@ -17,14 +17,23 @@
          and `state.travel` may now be 'walk'. A v5 file wakes up on
          foot with no bicycle, which is exactly right: it never bought
          one. Old saves keep their money, holdings and quest progress.
+     v7  RIDES. state.bike {owned,equipped} becomes
+           state.rides {owned:{bike,scooter,motorcycle}, equipped}
+         AN EXISTING SAVE WITH A BOUGHT BICYCLE KEEPS IT: migrateRides()
+         below reads state.bike and writes rides.owned.bike (and
+         equips it if it was equipped). state.bike is kept afterwards
+         as a mirror, written from rides on every load, so a v6-era
+         tool that poke-sets it still works. v7 also renames the taxi's
+         DISPLAY name to Yoober — no save field involved, the mode id
+         is still 'trunk'.
    migrate() forward-fills any field a newer version added, so a v4
-   file loads straight into v6 without losing a single asset — and
+   file loads straight into v7 without losing a single asset — and
    sanitize() repairs the same fields on EVERY load, version or not,
-   so a save written mid-upgrade cannot arrive without a bicycle
-   record and take game.fares() down with it.
+   so a save written mid-upgrade cannot arrive without a rides record
+   and take game.fares() down with it.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, SIDE_QUEST_BY_ID } from './data.js';
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID } from './data.js';
 import { newState, clamp, round2 } from './state.js';
 
 /* ---------- storage driver ---------- */
@@ -69,7 +78,7 @@ export function createSave(env) {
     if (data.version < CONFIG.version) {
       const fresh = newState(env.makeRng('migrate'));
       for (const k of Object.keys(fresh)) if (!(k in data)) data[k] = fresh[k];
-      for (const k of ['settings', 'stats', 'farm', 'mine', 'stadium', 'swap', 'bike']) {
+      for (const k of ['settings', 'stats', 'farm', 'mine', 'stadium', 'swap', 'bike', 'rides']) {
         if (!data[k] || typeof data[k] !== 'object') data[k] = fresh[k];
         else for (const kk of Object.keys(fresh[k])) if (!(kk in data[k])) data[k][kk] = fresh[k][kk];
       }
@@ -90,6 +99,57 @@ export function createSave(env) {
       data.version = CONFIG.version;
     }
     return sanitize(data);
+  }
+
+  /* ---------- RIDES: the v6 -> v7 migration, and the repair ----------
+     Run on EVERY load, not just on a version bump, so a save written
+     mid-upgrade cannot arrive without a rides record.
+
+       1  ensure state.rides exists, with a row per RIDES id
+       2  ADOPT state.bike. A v6 save that bought the bicycle has
+          {owned:true} there and nothing else; it must keep it. Also
+          catches a v6-era tool that sets state.bike directly.
+       3  at most ONE equipped, and only something owned
+       4  write state.bike back as the legacy mirror
+     ------------------------------------------------------------ */
+  function migrateRides(m) {
+    if (!m.rides || typeof m.rides !== 'object') m.rides = { owned: {}, equipped: null };
+    if (!m.rides.owned || typeof m.rides.owned !== 'object') m.rides.owned = {};
+    for (const id of Object.keys(RIDES)) m.rides.owned[id] = !!m.rides.owned[id];
+    for (const id of Object.keys(m.rides.owned)) if (!RIDES[id]) delete m.rides.owned[id];
+
+    if (m.bike && typeof m.bike === 'object' && m.bike.owned) {
+      m.rides.owned.bike = true;
+      if (!m.rides.equipped && m.bike.equipped) m.rides.equipped = 'bike';
+    }
+    if (!RIDES[m.rides.equipped] || !m.rides.owned[m.rides.equipped]) m.rides.equipped = null;
+
+    m.bike = { owned: !!m.rides.owned.bike, equipped: m.rides.equipped === 'bike' };
+    return m;
+  }
+
+  /* ---------- THE MAYOR'S DASH ----------
+     state.race arrived after v7 shipped, so a save written by an
+     earlier v7 build has no race record at all and migrate() will not
+     fill it (the version has not moved). Repaired here instead, on
+     every load, exactly like the rides table above: a missing record
+     is a locked race, a status that is not one of the five known ones
+     is a locked race, and the counters are coerced to numbers so a
+     hand-edited file cannot put a NaN on the results card. */
+  const RACE_STATES = ['locked', 'offered', 'running', 'lost', 'won'];
+  function migrateRace(m) {
+    const fresh = { status: 'locked', attempts: 0, losses: 0, wins: 0, best: 0, startedAt: 0, cp: 0, day: 0, hintDay: 0, hints: 0 };
+    if (!m.race || typeof m.race !== 'object' || Array.isArray(m.race)) m.race = { ...fresh };
+    for (const k of Object.keys(fresh)) {
+      if (k === 'status') continue;
+      m.race[k] = Number.isFinite(+m.race[k]) ? Math.max(0, Math.floor(+m.race[k])) : 0;
+    }
+    if (!RACE_STATES.includes(m.race.status)) m.race.status = 'locked';
+    /* a save caught mid-race resumes at the start line, not mid-lap */
+    if (m.race.status === 'running') { m.race.status = m.race.wins > 0 ? 'won' : 'offered'; m.race.cp = 0; }
+    if (m.race.wins > 0) m.race.status = 'won';
+    m.slateDay = Number.isFinite(+m.slateDay) ? Math.max(0, Math.floor(+m.slateDay)) : 0;
+    return m;
   }
 
   /* Never let a bad file produce NaN money or a negative holding. */
@@ -118,18 +178,13 @@ export function createSave(env) {
     for (const id of Object.keys(m.tokenized || {})) if (!ASSET_BY_ID[id]) delete m.tokenized[id];
 
     if (!LOC_BY_ID[m.loc]) m.loc = 'apartment';
-    /* THE BICYCLE. Repaired on every load, not just on a version
-       bump: two booleans, and `equipped` cannot be true without
-       `owned` — a save that claims to be riding a bicycle it does not
-       have would make fares() offer a mode the player cannot use. */
-    if (!m.bike || typeof m.bike !== 'object') m.bike = { owned: false, equipped: false };
-    m.bike.owned = !!m.bike.owned;
-    m.bike.equipped = !!m.bike.equipped && m.bike.owned;
+    migrateRides(m);
+    migrateRace(m);
     /* A v5 save's last mode was very often 'bike', from back when the
        bicycle was handed to you. It is not any more, so a loaded save
-       that is "riding" a bicycle it does not own falls back to walking
+       that is "riding" a vehicle it does not own falls back to walking
        — which is always available. */
-    if (!TRAVEL[m.travel] || (m.travel === 'bike' && !m.bike.owned)) m.travel = 'walk';
+    if (!TRAVEL[m.travel] || (m.travel === 'bike' && !m.rides.equipped)) m.travel = 'walk';
     /* SIDE QUESTS. Only the two known statuses survive, and only for
        side quests that still exist in the content tables. */
     if (!m.sides || typeof m.sides !== 'object') m.sides = {};
@@ -223,5 +278,5 @@ export function createSave(env) {
     return migrate(data);
   }
 
-  return { save, load, has, wipe, migrate, sanitize, exportJSON, importJSON, download, filename, driver: store.kind };
+  return { save, load, has, wipe, migrate, sanitize, migrateRides, migrateRace, exportJSON, importJSON, download, filename, driver: store.kind };
 }

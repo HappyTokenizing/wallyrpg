@@ -131,6 +131,12 @@ export async function init(ctx) {
   /* Wanted state, applied the moment the graph exists. Everything the game
      asks for before the first gesture is remembered, not dropped. */
   let wantContext = 'silence';
+  /* Does the game WANT a score right now? The watchdog restarts a
+     transport that stopped by accident, so it has to be able to tell that
+     from one the game stopped on purpose — stop() and stopMusic() must
+     stay stopped. Only the unlock and an explicit setContext turn this
+     back on. */
+  let wantPlaying = false;
   let wantWeather = 'clear';
   let autoNight = true;
   let hour = 10;
@@ -154,8 +160,14 @@ export async function init(ctx) {
     try {
       actx.onstatechange = () => {
         if (!actx) return;
-        if (actx.state === 'running') finish();
-        else nudge();
+        if (actx.state === 'running') {
+          finish();
+          /* finish() only starts the transport the FIRST time. Coming
+             back from a suspend it returns true and schedules nothing —
+             which is a running context with a dead scheduler, i.e.
+             silence. pump() is what re-arms the transport. */
+          pump('statechange');
+        } else nudge();
       };
     } catch {}
 
@@ -203,6 +215,15 @@ export async function init(ctx) {
     if (!built) return;
 
     music.setContext(name, { fade, immediate });
+
+    /* A stopped transport will not play the new context on its own, and
+       a zone change that produces silence is the same bug from the
+       player's side as a scheduler that starved. */
+    if (wantPlaying && unlocked && !music.running && name !== 'silence' && actx.state === 'running') {
+      music.start();
+      music.setContext(name, { fade, immediate: true });
+      music.tick();
+    }
 
     const mix = { ...(AMBIENCE[name] || {}) };
     const w = WEATHER[wantWeather] || WEATHER.clear;
@@ -316,6 +337,7 @@ export async function init(ctx) {
     if (!built || !actx || actx.state !== 'running') return false;
     if (!unlocked) {
       unlocked = true;
+      wantPlaying = wantContext !== 'silence';
       recreate = false;
       resumeAttempts = 0;
       if (watchdog) { clearTimeout(watchdog); watchdog = null; }
@@ -397,16 +419,89 @@ export async function init(ctx) {
     lastNudge = now;
     try {
       const p = actx.resume();
-      if (p && typeof p.then === 'function') p.then(() => { try { music.tick(); } catch {} }, () => {});
+      if (p && typeof p.then === 'function') p.then(() => pump('resumed'), () => {});
     } catch {}
+  }
+
+  /* ============================================================
+     THE TRANSPORT WATCHDOG.
+
+     Reported from the field: "my music cut off after playing for some
+     time, and then stayed off and came back after some time." Not a
+     crash, not a mute — an intermittent, self-healing silence. Web Audio
+     gives you four ways to produce exactly that, and the fix for each is
+     different, so all four are handled:
+
+       1  THE SCHEDULER STARVED. Covered in music.js: the look-ahead now
+          tracks how often tick() is really being called, because a
+          hidden tab clamps both of our clocks and 0.28 s of score is not
+          enough to bridge a 1 s timer.
+       2  THE CONTEXT WAS SUSPENDED and came back — nudge() above. But a
+          RESUMED CONTEXT WITH A DEAD SCHEDULER IS STILL SILENCE, and
+          that is the bug this function exists for: the old
+          visibilitychange path re-armed the context and nothing re-armed
+          the transport.
+       3  A MUTED BUS. music.heal() — a cross-fade interrupted by a
+          suspend leaves the score playing into a gain of zero.
+       4  SOMETHING WE HAVE NOT THOUGHT OF. Hence the last branch: if the
+          transport believes it is playing but the wire has been empty
+          for SILENT_LIMIT seconds, re-anchor regardless of the reason.
+          That turns any permanent dropout into a short gap.
+
+     Every path that could possibly wake us — frame loop, keep-alive
+     timer, statechange, visibilitychange, pageshow, focus — goes through
+     here. It is a handful of number comparisons; it may be called often.
+     ============================================================ */
+  const SILENT_LIMIT = 1.0;     // seconds of empty wire before we re-clock
+  const HIDDEN_HORIZON = 1.8;   // seconds of score to keep ahead when hidden
+  let recoveries = 0;
+  let lastStallLog = 0;
+
+  function pump(reason = 'frame') {
+    if (!built || !actx) return;
+    if (actx.state !== 'running') { nudge(); return; }
+    if (!unlocked) return;
+    try {
+      if (wantPlaying && !music.running && wantContext !== 'silence') {
+        /* The transport was stopped — by stop(), or by a graph rebuild —
+           and nothing was going to start it again. */
+        music.start();
+        applyContext(wantContext, { immediate: true, fade: 0.6 });
+        recoveries++;
+        console.warn(`[audio] transport was stopped (${reason}) — restarted`);
+      } else {
+        const gap = music.silentFor;
+        if (gap > SILENT_LIMIT) {
+          music.reanchor();
+          recoveries++;
+          if (Date.now() - lastStallLog > 5000) {
+            lastStallLog = Date.now();
+            console.warn(`[audio] transport stalled ${gap.toFixed(2)}s (${reason}) — re-anchored`);
+          }
+        }
+      }
+      music.heal();
+      music.tick();
+    } catch (e) {
+      console.warn('[audio] watchdog:', e?.message || e);
+    }
   }
 
   /* Only ever a RE-resume. Coming back to the tab is not a request to
      start the score for the first time — the gesture listeners above
      own that, and starting one here would jump the start beat. */
   const onVisible = () => {
-    if (globalThis.document?.visibilityState === 'hidden') return;
+    const hidden = globalThis.document?.visibilityState === 'hidden';
+    /* Widen the horizon BEFORE the throttling starts, not after the first
+       starved tick — going quiet is what makes Chrome throttle us harder
+       still, so the first gap is the one that must not happen. */
+    if (built && music) { try { music.setHorizon(hidden ? HIDDEN_HORIZON : 0); } catch {} }
+    if (hidden) {
+      if (built && actx?.state === 'running') { try { music.tick(); } catch {} }
+      return;
+    }
     nudge();
+    pump('visible');
   };
   globalThis.document?.addEventListener?.('visibilitychange', onVisible, false);
   globalThis.addEventListener?.('pageshow', onVisible, false);
@@ -433,6 +528,8 @@ export async function init(ctx) {
   /* ---------- listener ---------- */
   const lpos = [0, 0, 0], lfwd = [0, 0, -1], lup = [0, 1, 0];
   let listenerAcc = 0;
+  let wdAcc = 0;
+  let loggedUpdateError = false;
 
   function updateListener(dt) {
     const cam = ctx?.camera;
@@ -503,6 +600,31 @@ export async function init(ctx) {
     get notes() { return built ? music.notes : []; },
     get muted() { return vol.muted; },
 
+    /* Scheduler health. `silentFor` is the number to look at when someone
+       says the music stopped: seconds of context clock past the far edge
+       of what the scheduler has actually written. It is 0 while the score
+       is playing, whatever `running` claims. */
+    get transport() {
+      if (!built) return null;
+      return {
+        state: actx.state, unlocked, playing: music.running,
+        bar: music.bar, bpm: Math.round(music.bpm),
+        silentFor: +music.silentFor.toFixed(3),
+        horizon: +music.horizon.toFixed(2),
+        tickGap: +music.tickGap.toFixed(3),
+        reanchors: music.reanchors,
+        errors: music.errors,
+        lastError: music.lastError,
+        recoveries,
+        voices: music.voices,
+        tracked: music.tracked,
+        busGain: +music.out.gain.value.toFixed(3),
+      };
+    },
+    /** Force a watchdog pass. The test harness uses it; so can a player
+        who has left the tab for an hour and clicked back in. */
+    pump(reason = 'manual') { pump(reason); return api; },
+
     /* --- lifecycle --- */
     init() { build(); return api; },
 
@@ -534,7 +656,13 @@ export async function init(ctx) {
     /* --- musical context ---
        The change is queued inside music.js and committed on the next bar
        line, so a zone transition never cuts a note in half. */
-    setContext(name, opts = {}) { applyContext(name, opts); return api; },
+    setContext(name, opts = {}) {
+      /* An explicit request for a score is also a request to be playing:
+         it undoes a previous stop() as far as the watchdog is concerned. */
+      if (name && name !== 'silence') wantPlaying = true;
+      applyContext(name, opts);
+      return api;
+    },
     /** Seconds until a queued context change actually lands. */
     timeToTransition() { return built ? music.timeToBar() : 0; },
 
@@ -619,22 +747,38 @@ export async function init(ctx) {
     get space() { return built ? reverb.space : null; },
 
     /* --- teardown --- */
-    stopMusic(opts) { if (built) music.stop(opts); return api; },
+    stopMusic(opts) { wantPlaying = false; if (built) music.stop(opts); return api; },
     stop() {
+      wantPlaying = false;
       if (!built) return api;
       music.stop({ fade: 0.8 });
       sfx.stopBeds(0.8);
       return api;
     },
 
-    /* --- frame --- */
+    /* --- frame ---
+       Nothing in here may throw into main.js's frame loop: that loop has
+       no try/catch of its own, so one bad note would stop the whole game,
+       not just the music. */
     update(dt) {
-      if (!built || actx.state !== 'running') return;
-      music.tick();
-      const w = ctx?.wind?.strength;
-      sfx.update(dt, { wind: typeof w === 'number' ? w : 0.4 });
-      listenerAcc += dt;
-      if (listenerAcc >= 1 / 30) { updateListener(listenerAcc); listenerAcc = 0; }
+      if (!built || !actx) return;
+      try {
+        if (actx.state !== 'running') { nudge(); return; }
+        music.tick();
+        /* The full watchdog four times a second — cheap, but no reason to
+           run the gain reads on every frame. */
+        wdAcc += dt;
+        if (wdAcc >= 0.25) { wdAcc = 0; pump('frame'); }
+        const w = ctx?.wind?.strength;
+        sfx.update(dt, { wind: typeof w === 'number' ? w : 0.4 });
+        listenerAcc += dt;
+        if (listenerAcc >= 1 / 30) { updateListener(listenerAcc); listenerAcc = 0; }
+      } catch (e) {
+        if (!loggedUpdateError) {
+          loggedUpdateError = true;
+          console.warn('[audio] update:', e?.message || e);
+        }
+      }
     },
 
     dispose() {
@@ -656,11 +800,12 @@ export async function init(ctx) {
      and, more importantly, from scheduling a catch-up burst on return. */
   const keepAlive = setInterval(() => {
     if (!built || !actx) return;
-    if (actx.state === 'running') music.tick();
-    /* A phone that re-suspended us without ever firing a statechange we
-       heard (it happens on return from a call) gets picked up here.
-       nudge() is throttled and a no-op before the first gesture. */
-    else nudge();
+    /* pump() ticks, heals and re-anchors — and a phone that re-suspended
+       us without ever firing a statechange we heard (it happens on return
+       from a call) is picked up by its nudge(). This timer is the ONLY
+       clock left in a hidden tab, so it has to carry the watchdog too,
+       not just the tick. */
+    pump('keepalive');
   }, 120);
   keepAlive?.unref?.();   // no-op in a browser; lets a node test exit cleanly
 
@@ -716,9 +861,38 @@ export async function init(ctx) {
     dbg.audioSfx = (n, o) => api.sfx(n, o);
     dbg.audioSting = (n) => api.sting(n);
     dbg.audioResume = () => api.resume();
+    dbg.audioPump = (why) => api.pump(why || 'debug');
+    /* Simulate cause (3): a fade-out left at zero, so the score plays
+       perfectly into a muted bus. heal() must put it back. */
+    dbg.audioBreakBus = () => {
+      if (!built) return null;
+      const t = actx.currentTime;
+      music.out.gain.cancelScheduledValues(t);
+      music.out.gain.value = 0;
+      return +music.out.gain.value.toFixed(3);
+    };
+    /* Simulate the worst case: the transport is dead and nothing in the
+       game knows it, while the player is still very much expecting a
+       score. Only the watchdog can get out of this one. */
+    dbg.audioKillTransport = () => {
+      if (!built) return null;
+      music.stop({ hard: true });      // NOT api.stop(): intent is untouched
+      return music.running === false;
+    };
+    dbg.audioTransport = () => api.transport;
+    /* Simulate the failure this all exists for: freeze the transport as
+       if the tab had been backgrounded for `seconds` and every clock had
+       been throttled away. The watchdog should pick it up within a tick
+       of the next pump. Used by tools/audiotest.mjs PASS E. */
+    dbg.audioStall = (seconds = 3) => {
+      if (!built) return null;
+      music.setHorizon(0);
+      return music.stall(seconds);
+    };
     dbg.audioState = () => ({
       ready: api.ready, running: api.running, context: api.context,
       unlocked, resumeAttempts, rebuilds, state: actx?.state ?? null,
+      transport: api.transport,
       pending: api.pendingContext, bar: api.bar, bpm: Math.round(api.bpm),
       voices: api.voices, muted: api.muted, weather: wantWeather,
       space: built ? reverb.space : null,

@@ -343,6 +343,199 @@ function bikeBody(ph, w, eff = 1, k = 1) {
   breathe(w, ph * (1.4 + eff * 1.6), (0.35 + eff * 0.30) * k);
 }
 
+/* ==================================================================
+   THE TWO MOTORISED POSTURES — scooter and motorcycle.
+
+   WHY THEY ARE NOT bikeBody WITH DIFFERENT NUMBERS. The bicycle
+   posture is organised around a CRANK: the legs are a closed four-bar
+   whose phase drives everything, and the effort parameter reshapes the
+   torso over it. Neither motor has a crank. The legs stop being a
+   mechanism and become a STANCE — held, quiet, and the single loudest
+   thing telling the player which machine is under him at forty metres,
+   because a leg is a long limb against a bright road and a fold at the
+   knee survives long after the tank and the mudguards have merged into
+   one blob.
+
+     bicycle      thighs sweeping 45-81 degrees, feet BELOW the hips
+     scooter      thighs forward ~70 degrees, knees soft, feet AHEAD of
+                  the hips on a flat deck — the stance of a chair
+     motorcycle   thighs near vertical, knees folded ~115 degrees,
+                  ankles BEHIND the hips on pegs — a crouch
+
+   THE LEG ANGLES ARE SOLVED, NOT DIALLED, by the same two-bone IK the
+   bicycle's four crank stations came from (thigh 0.227 m, shin 0.169 m,
+   ankle 0.115 m above whatever it stands on). Author a foot station in
+   root-local metres and the solve returns the angles. Where the prop
+   then goes is not a second guess: rides.js reads these same records,
+   and WALLY.debug.rideInfo() reports where the skeleton actually put
+   the ankle, so the two can be checked against each other rather than
+   eyeballed off a screenshot.
+
+   MICRO-MOTION IS THE OTHER HALF. A rider on a machine that does the
+   work has nothing to do with his body, which is exactly how a badly
+   made one reads as a mannequin bolted to a prop. So both carry an
+   ENGINE — a fine fast tremor on the seat and the grips with nothing to
+   do with the wheels, at 31 Hz for the scooter's little single and
+   17 Hz for the big twin. It is a third of a degree. You do not see it;
+   you notice when it is missing, and it is the whole tell that the
+   thing is RUNNING while stopped, which no bicycle can do.
+   ================================================================== */
+
+const THIGH_L = 0.227, SHIN_L = 0.169;
+/** Two-bone sagittal IK. dy = ankle below the hip, dz = ankle ahead of
+    it, both metres. Returns [thigh forward of vertical, knee flexion]
+    in degrees, which is exactly what holdLeg writes. */
+function legSolve(dy, dz) {
+  const c = Math.min(Math.hypot(dy, dz), (THIGH_L + SHIN_L) * 0.985);
+  const inner = clamp((THIGH_L * THIGH_L + SHIN_L * SHIN_L - c * c)
+    / (2 * THIGH_L * SHIN_L), -1, 1);
+  const ia = Math.acos(inner);
+  const knee = 180 - ia * 57.2958;
+  const alpha = Math.asin(clamp(SHIN_L * Math.sin(ia) / Math.max(c, 1e-4), -1, 1)) * 57.2958;
+  return [Math.atan2(dz, Math.max(dy, 1e-4)) * 57.2958 + alpha, knee];
+}
+
+/** One leg, HELD rather than cycled. `roll` closes the knee inward
+    (positive) or lets it hang out over a peg (negative). */
+function holdLeg(w, side, thigh, knee, hipTilt, toe, roll, k) {
+  const s = side === 'L' ? -1 : 1;
+  w.r(`leg${side}0`, (-thigh + hipTilt) * k, 0, s * roll * k);
+  w.r(`leg${side}1`, knee * k, 0, 0);
+  /* the sole cancels the sum of the two above, plus whatever tilt the
+     footrest has: flat on a deck, a few degrees down on a peg */
+  w.r(`foot${side}`, (thigh - knee - hipTilt + toe) * k, 0, 0);
+}
+
+/* The two seats, in root-local metres. rides.js is fitted to these and
+   must not be allowed to disagree with them — see RIDE_FIT there. */
+/* THE FOOT STATION IS AS HIGH AS IT IS FOR THE MACHINE'S SAKE, and
+   that is a legitimate reason. Wally's leg is 0.30 H, so his seat can
+   only ever be 0.41 m off the ground; put his soles at ankle 0.260 and
+   the floor they stand on lands at 0.10, which leaves a scooter with
+   50 mm of body between its floor and the road and reads — measured on
+   shots/_scootside.png — as a skateboard with a fairing. Lifting the
+   ankle to 0.318 raises the floor to 0.156, gives the machine a body to
+   have, and takes the knee from 61 to 78 degrees: further from the
+   bicycle's stroke, and much closer to the "sitting in a chair with
+   your feet out" that a step-through actually is. */
+export const SCOOT_SEAT = {
+  dy: -0.018, dz: -0.130,       // pelvis offset from bind (hip stands 0.524)
+  footY: 0.318, footZ: 0.112,   // ankle station; the floor is 0.128 under it
+  a0x: -34, a0z: 21, a1x: -25, a1z: -12,
+  buzz: 31,
+};
+export const MOTO_SEAT = {
+  dy: 0.020, dz: -0.185,
+  footY: 0.350, footZ: -0.285,  // ankle over a peg, BEHIND the hip
+  a0x: -46, a0z: 25, a1x: -13, a1z: -8,
+  buzz: 17,
+};
+
+/**
+ * A seated motorised posture. Shared by both machines; everything that
+ * differs is in the seat record and the shape record.
+ *
+ * @param {object} P   SCOOT_SEAT | MOTO_SEAT
+ * @param {number} ph  distance phase — the road, never the legs
+ * @param {Writer} w
+ * @param {number} eff 0 = stopped, 1 = cruising, 2 = flat out
+ * @param {number} k   master weight, for the mount/dismount ramps
+ * @param {object} s   live state; `elapsed` drives the engine tremor
+ * @param {object} S   { lean, rock, tilt, roll, toe, tuck }
+ */
+function motorBody(P, ph, w, eff, k, s, S) {
+  if (k <= 0) return;
+  const a = ph * TAU;
+  const t = (s && s.elapsed) || 0;
+  const lean = (S.lean[0] + eff * S.lean[1]) * k;
+  const rock = (S.rock[0] + eff * S.rock[1]) * k;
+  const hipTilt = (S.tilt[0] + eff * S.tilt[1]) * k;
+
+  /* ---- pelvis onto the seat ---- */
+  w.p('hips', 0, P.dy * k, P.dz * k);
+  w.r('hips', -hipTilt, 0, 0);
+
+  /* ---- the legs, solved onto their footrest ----
+     footZ is a ROOT-space station and the hip has already moved back by
+     P.dz, so the reach the solve needs is the difference. */
+  const [thigh, knee] = legSolve(0.524 + P.dy - P.footY, P.footZ - P.dz);
+  holdLeg(w, 'L', thigh, knee, hipTilt, S.toe, S.roll, k);
+  holdLeg(w, 'R', thigh, knee, hipTilt, S.toe, S.roll, k);
+  /* NOT PERFECTLY SYMMETRIC. Two legs at identical angles is the one
+     thing no photograph of a rider has ever shown, and the eye reads it
+     as a shop dummy inside half a second. Two degrees of thigh and one
+     of toe is enough, and costs nothing. */
+  w.r('legR0', -2.0 * k, 0, 0);
+  w.r('footR', 1.4 * k, 0, 0);
+
+  /* ---- the fold at the hip, and the road under it ----
+     A motor rider's body moves with the ROAD, not with a stroke: a slow
+     weave the speed feeds, an order of magnitude below the bicycle's
+     pedal-frequency lurch. */
+  const weave = sin(a * 0.5) * 0.6 + sin(a * 0.19 + 1.3) * 0.4;
+  w.r('spine', lean, -1.2 * rock * weave, rock * weave);
+  w.r('chest', lean * S.tuck, 1.6 * rock * weave, -rock * 0.5 * weave);
+  w.r('belly', 0, 0, -rock * 0.3 * weave);
+
+  /* ---- head up, watching the road ----
+     Same cancellation as the bicycle: world pitch is spine + chest +
+     head, so undoing the lean means undoing all of it. The residual
+     grows with effort — you look further ahead the faster you go, and
+     on the big machine that is the only place it reads. */
+  w.r('head', -(lean * (1 + S.tuck) - (3 + eff * 2)) * k, 1.1 * weave * k, -rock * 0.3 * weave);
+
+  /* ---- hands on the bars ---- */
+  w.r('armL0', (P.a0x - eff * 3) * k, -5 * k, (P.a0z + eff * 2) * k);
+  w.r('armR0', (P.a0x - eff * 3) * k, 5 * k, (-P.a0z - eff * 2) * k);
+  w.r('armL1', (P.a1x - eff * 2) * k, 0, P.a1z * k);
+  w.r('armR1', (P.a1x - eff * 2) * k, 0, -P.a1z * k);
+  w.r('handL', -20 * k, -4 * k, -12 * k);
+  w.r('handR', -20 * k, 4 * k, 12 * k);
+  /* the road arrives through the elbows, out of phase side to side */
+  w.r('armL1', -1.6 * rock * sin(a * 0.5 + 1.1) * k, 0, 0);
+  w.r('armR1', 1.6 * rock * sin(a * 0.5 + 1.1) * k, 0, 0);
+
+  /* ---- THE ENGINE ---- see the block comment above. */
+  const buz = sin(t * P.buzz) * (0.30 + eff * 0.10) * k;
+  w.r('hips', buz * 0.6, 0, buz * 0.4);
+  w.r('handL', buz, 0, 0); w.r('handR', -buz, 0, 0);
+
+  breathe(w, ph * (1.1 + eff * 0.9) + t * 0.15, (0.30 + eff * 0.22) * k);
+}
+
+const SCOOT_SHAPE = { lean: [5, 5], rock: [1.4, 1.6], tilt: [3, 3], roll: 4.5, toe: 2, tuck: 0.34 };
+const MOTO_SHAPE = { lean: [15, 9], rock: [1.1, 1.4], tilt: [8, 5], roll: -6.5, toe: 9, tuck: 0.46 };
+
+function scootBody(ph, w, eff = 1, k = 1, s) { motorBody(SCOOT_SEAT, ph, w, eff, k, s, SCOOT_SHAPE); }
+function motoBody(ph, w, eff = 1, k = 1, s) { motorBody(MOTO_SEAT, ph, w, eff, k, s, MOTO_SHAPE); }
+
+/* ==================================================================
+   WHICH MACHINE THE MOUNT IS A MOUNT ONTO.
+
+   'bike-mount' and 'bike-dismount' carry the ARC — the dip, the push,
+   the leg over the back, the hands finding the bars — and none of that
+   is bicycle-specific. What IS specific is the pose they arrive at, so
+   the destination is a POINTER rather than a call, swapped by
+   Animator.setRide() before the clip is played. A step-through scooter
+   is walked into and barely swings a leg; a motorcycle swings one
+   further than a bicycle because the seat sits behind a tank.
+   ================================================================== */
+const RIDE_POSTURE = { bike: bikeBody, scooter: scootBody, motorcycle: motoBody };
+const RIDE_MOUNT = {
+  bike: { swing: 1.00, dip: 1.00 },
+  scooter: { swing: 0.34, dip: 0.78 },
+  motorcycle: { swing: 1.18, dip: 1.12 },
+};
+let ridePose = bikeBody;
+let rideMount = RIDE_MOUNT.bike;
+/** Point the mount/dismount clips at a machine. Animator.setRide()
+    calls this; nothing else should. */
+export function setRidePosture(id) {
+  ridePose = RIDE_POSTURE[id] || bikeBody;
+  rideMount = RIDE_MOUNT[id] || RIDE_MOUNT.bike;
+  return id;
+}
+
 export const CLIPS = {
 
   /* ---------------- idle ----------------
@@ -786,20 +979,73 @@ export const CLIPS = {
     fn(ph, w) { bikeBody(ph, w, 2.0); },
   },
 
+  /* ---- the scooter ----
+     Three rungs, same ladder shape as the bicycle's, but the SPEEDS are
+     the machine's: it cruises where the bicycle sprints. Nothing here
+     pedals, so `cycle` is only the road's contribution to the weave and
+     is set long enough that the weave never strobes. */
+  'scoot-idle': {
+    duration: 1.0, loop: true, loco: true, cycle: 5.0,
+    trunk: { curl: -0.02, side: 0.26, tip: -0.88, stiff: 420 },
+    ears: { perk: 0.04, spread: 0.03 },
+    fn(ph, w, s) { scootBody(ph, w, 0.0, 1, s); },
+  },
+  'ride-scooter': {
+    duration: 1.0, loop: true, loco: true, cycle: 5.0,
+    /* THE TRUNK IS THE SPEEDOMETER. There is no pedal cadence on a
+       motor, so the one thing that tells the player he is going faster
+       than a bicycle is the wind in the soft parts: the trunk streams
+       further back and the ears flatten. §2.3 — the wind is the
+       signature, and this is the character's share of it. */
+    trunk: { curl: -0.02, side: 0.32, tip: -1.16, stiff: 260 },
+    ears: { perk: -0.16, spread: 0.12 },
+    fn(ph, w, s) { scootBody(ph, w, 1.0, 1, s); },
+  },
+  'scoot-fast': {
+    duration: 1.0, loop: true, loco: true, cycle: 6.4,
+    trunk: { curl: 0.06, side: 0.34, tip: -1.34, stiff: 200 },
+    ears: { perk: -0.30, spread: 0.19 },
+    fn(ph, w, s) { scootBody(ph, w, 2.0, 1, s); },
+  },
+
+  /* ---- the motorcycle ---- three times the bicycle, and the ears know
+     it: at the top rung they are pinned nearly flat. */
+  'moto-idle': {
+    duration: 1.0, loop: true, loco: true, cycle: 6.0,
+    trunk: { curl: 0.02, side: 0.24, tip: -0.96, stiff: 440 },
+    ears: { perk: 0.02, spread: 0.04 },
+    fn(ph, w, s) { motoBody(ph, w, 0.0, 1, s); },
+  },
+  'ride-moto': {
+    duration: 1.0, loop: true, loco: true, cycle: 6.0,
+    trunk: { curl: 0.10, side: 0.36, tip: -1.40, stiff: 210 },
+    ears: { perk: -0.34, spread: 0.20 },
+    fn(ph, w, s) { motoBody(ph, w, 1.0, 1, s); },
+  },
+  'moto-fast': {
+    duration: 1.0, loop: true, loco: true, cycle: 8.0,
+    trunk: { curl: 0.20, side: 0.36, tip: -1.62, stiff: 165 },
+    ears: { perk: -0.52, spread: 0.28 },
+    fn(ph, w, s) { motoBody(ph, w, 2.0, 1, s); },
+  },
+
   /* ---- getting on ----
-     Ends EXACTLY on bikeBody(_, _, 0), so the crossfade out of it has
-     nothing left to travel. Reads as: dip, push, the right leg swings
-     round behind the saddle, the hands find the bars. */
+     Ends EXACTLY on the ride posture at effort 0, so the crossfade out
+     of it has nothing left to travel. Reads as: dip, push, the right
+     leg swings round behind the seat, the hands find the bars. Which
+     posture and how far the leg swings are `ridePose` / `rideMount`,
+     set by Animator.setRide() — see the block above them. */
   'bike-mount': {
     duration: 0.62, loop: false,
     trunk: { curl: 0.10, side: 0.16, tip: -0.30, stiff: 300 },
-    fn(ph, w) {
-      const dip = smoothstep(0, 0.24, ph) * (1 - smoothstep(0.22, 0.52, ph));
+    fn(ph, w, s) {
+      const M = rideMount;
+      const dip = smoothstep(0, 0.24, ph) * (1 - smoothstep(0.22, 0.52, ph)) * M.dip;
       const rise = smoothstep(0.16, 0.86, ph);
       const swing = smoothstep(0.20, 0.74, ph);
 
       armsRest(w, 6.5 * (1 - rise), 5 * (1 - rise));
-      bikeBody(0.25, w, 0, rise);        // the destination pose, faded in
+      ridePose(0.25, w, 0, rise, s);     // the destination pose, faded in
 
       /* the dip before the push */
       w.p('hips', 0, -0.085 * dip, 0);
@@ -809,7 +1055,7 @@ export const CLIPS = {
 
       /* the right leg comes over the back of the saddle: an abduction
          (z) and a yaw (y) that both die as it lands on the far pedal */
-      const over = sin(swing * Math.PI);
+      const over = sin(swing * Math.PI) * M.swing;
       w.r('legR0', -14 * over, -26 * over, -34 * over);
       w.r('legR1', 40 * over, 0, 0);
       w.r('hips', 0, -10 * over, -6 * over);
@@ -829,14 +1075,15 @@ export const CLIPS = {
   'bike-dismount': {
     duration: 0.54, loop: false,
     trunk: { curl: 0.02, side: 0.22, tip: -0.66, stiff: 420 },
-    fn(ph, w) {
+    fn(ph, w, s) {
+      const M = rideMount;
       const off = smoothstep(0.06, 0.62, ph);
-      const land = smoothstep(0.52, 0.86, ph) * (1 - smoothstep(0.80, 1, ph));
+      const land = smoothstep(0.52, 0.86, ph) * (1 - smoothstep(0.80, 1, ph)) * M.dip;
 
       armsRest(w, 6.5 * off, 5 * off);
-      bikeBody(0.25, w, 0, 1 - off);
+      ridePose(0.25, w, 0, 1 - off, s);
 
-      const over = sin(off * Math.PI);
+      const over = sin(off * Math.PI) * M.swing;
       w.r('legR0', -10 * over, -30 * over, -30 * over);
       w.r('legR1', 44 * over, 0, 0);
       w.r('hips', 0, -12 * over, -5 * over);
@@ -1112,6 +1359,28 @@ const BIKE_STEPS = [
   { name: 'bike-sprint', speed: 8.20 },
 ];
 
+/* ONE LADDER PER MACHINE, AND THE RUNGS ARE AT THAT MACHINE'S SPEEDS.
+   This is the whole reason a scooter cannot be the bicycle with a
+   different prop under it: at 7 m/s the bicycle ladder is deep into
+   'bike-sprint' — head down, twice the rock, a man working — and the
+   scooter is barely past its own cruise, because 7 m/s is what a
+   scooter DOES. Rungs sit at 0 / cruise / flat-out for each, and the
+   data agent's speed multipliers (1 / 1.5 / 3) are what put them
+   there. */
+const SCOOT_STEPS = [
+  { name: 'scoot-idle', speed: 0.00 },
+  { name: 'ride-scooter', speed: 4.60 },
+  { name: 'scoot-fast', speed: 12.60 },
+];
+const MOTO_STEPS = [
+  { name: 'moto-idle', speed: 0.00 },
+  { name: 'ride-moto', speed: 8.00 },
+  { name: 'moto-fast', speed: 22.00 },
+];
+export const RIDE_STEPS = {
+  bike: BIKE_STEPS, scooter: SCOOT_STEPS, motorcycle: MOTO_STEPS,
+};
+
 export class Animator {
   constructor() {
     this.out = makePose();
@@ -1127,6 +1396,9 @@ export class Animator {
     this.bikeTarget = 0;
     this.bikeRate = 1 / 0.34;
     this._bkA = CLIPS['bike-coast']; this._bkB = CLIPS['bike-coast']; this._bkF = 0;
+    /* which machine's ladder the bike layer resolves on */
+    this.rideId = 'bike';
+    this.rideSteps = BIKE_STEPS;
 
     this.locPhase = 0;
     this.speed = 0;
@@ -1179,7 +1451,30 @@ export class Animator {
     return this;
   }
 
-  /** Crank angle in radians, for the prop under his feet. See bike.js. */
+  /**
+   * Which machine the bike layer is a layer for.
+   *
+   * IT IS SAFE TO CALL MID-BLEND and that is deliberate: a player who
+   * equips the motorcycle while riding the scooter would otherwise
+   * watch the scooter posture play out under a motorcycle. Swapping the
+   * ladder swaps the pose the very next frame; wally.js separately
+   * swaps the prop over a short dismount/mount, so what the eye gets is
+   * one machine leaving and another arriving, never two at once.
+   *
+   * @param {'bike'|'scooter'|'motorcycle'} id
+   */
+  setRide(id) {
+    const steps = RIDE_STEPS[id];
+    if (!steps) return this;
+    this.rideId = id;
+    this.rideSteps = steps;
+    setRidePosture(id);
+    return this;
+  }
+
+  /** Crank angle in radians, for the prop under his feet. See bike.js.
+      Meaningless on a machine with no cranks; the motorised props drive
+      their wheels off distance instead (rides.js `update`). */
   get bikePhase() { return this.locPhase * TAU; }
 
   /** Return to the locomotion layer. */
@@ -1288,9 +1583,10 @@ export class Animator {
     if (this.bikeTarget === 0 && this.bikeW < 0.003) this.bikeW = 0;
     else if (this.bikeTarget === 1 && this.bikeW > 0.997) this.bikeW = 1;
     const riding = this.bikeW > 0.5;
+    const STEPS = this.rideSteps || BIKE_STEPS;
     let j = 0;
-    while (j < BIKE_STEPS.length - 2 && this.speed > BIKE_STEPS[j + 1].speed) j++;
-    const KA = BIKE_STEPS[j], KB = BIKE_STEPS[j + 1];
+    while (j < STEPS.length - 2 && this.speed > STEPS[j + 1].speed) j++;
+    const KA = STEPS[j], KB = STEPS[j + 1];
     const bf = clamp((this.speed - KA.speed) / Math.max(KB.speed - KA.speed, 1e-3), 0, 1);
     const ka = CLIPS[KA.name], kb = CLIPS[KB.name];
     this._bkA = ka; this._bkB = kb; this._bkF = bf;

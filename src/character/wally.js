@@ -45,6 +45,7 @@ import { Animator, CLIPS, CLIP_NAMES, BIKE_SEAT } from './anim.js';
 import { Expression, EXPRESSION_NAMES } from './expression.js';
 import { Secondary } from './secondary.js';
 import { createBike } from './bike.js';
+import { createScooter, createMotorcycle, triangleCost } from './rides.js';
 
 const _e = new THREE.Euler(0, 0, 0, 'XYZ');
 const _v = new THREE.Vector3();
@@ -121,6 +122,18 @@ const CAMS = {
      inside the frame at 2.9 m without a fisheye on the near tyre. */
   bike: { pos: [2.18, 1.02, 2.02], look: [0, 0.78, 0.06], fov: 41 },
   bikeSide: { pos: [3.25, 0.74, 0.06], look: [0, 0.68, 0.03], fov: 38 },
+  /* THE BIGGER MACHINES NEED A BIGGER BOX. The scooter is 1.0 m between
+     the axles and the motorcycle 1.28, against the bicycle's 0.94, and
+     both carry their mass further forward — so the bicycle's framing
+     photographs a Thunderhead with its front wheel amputated. Pulled
+     back and swung a little more to the front quarter, which is where a
+     leg shield and a tank actually read; the look-at drops with the
+     machine, because the interesting half of a motorcycle is below the
+     rider's knee. */
+  scoot: { pos: [2.42, 1.06, 2.28], look: [0, 0.74, 0.08], fov: 41 },
+  scootSide: { pos: [3.45, 0.72, 0.04], look: [0, 0.62, 0.02], fov: 38 },
+  moto: { pos: [2.72, 1.10, 2.56], look: [0, 0.72, 0.10], fov: 42 },
+  motoSide: { pos: [3.85, 0.70, 0.02], look: [0, 0.60, 0.02], fov: 38 },
 };
 
 /**
@@ -1011,12 +1024,26 @@ export async function init(ctx) {
   }
 
   /* ================================================================
-     6b. THE BICYCLE
+     6b. THE RIDES — bicycle, scooter, motorcycle
 
-     Ownership is the data agent's (state.bike.owned / .equipped, the
-     bus event 'bike', and ctx.game.actions.bike()). Everything from
-     "he has one" onward is here: when the prop exists, where it sits,
-     how he gets on and off it, how fast he goes and how far he leans.
+     Ownership is the data agent's (state.rides.owned / .equipped, the
+     bus events 'ride' and 'bike', and ctx.game.actions.bike() / .ride()).
+     Everything from "he has one" onward is here: when the prop exists,
+     where it sits, how he gets on and off it, how fast he goes and how
+     far he leans.
+
+     ONE MACHINE AT A TIME, and that is enforced here rather than hoped
+     for: `props` is a lazy cache keyed by id, `rideId` names the one
+     that is allowed to be visible, and showProp() hides every other
+     entry on every call. A save that somehow arrives with two equipped
+     still cannot render two.
+
+     THE THREE ARE ONE MECHANISM WITH THREE TABLES. RIDE_TUNE below is
+     the whole difference: the controller speeds, the lean gain, the
+     transition times and the mount offset, per id. Adding a fourth
+     machine is a row here, a posture in anim.js and a builder in
+     rides.js — not a fourth copy of this block, which is what the
+     data agent's RIDES table refactor was avoiding on its own side.
 
      THE PROP IS A CHILD OF `root`, WHICH IS THE WHOLE TRICK. root
      already carries the controller's position and yaw, so the bicycle
@@ -1041,52 +1068,121 @@ export async function init(ctx) {
      the audio layer turns each one into a footfall. A bicycle with
      footsteps is a worse defect than a bicycle with no sound at all.
      ================================================================ */
-  const BIKE = {
-    walkSpeed: 5.10,      // no shift — a relaxed cruise, 2.1x his walk
-    runSpeed: 8.80,       // shift — 32 km/h, the "worth every dollar" line
-    turnRate: 6.4,        // a bicycle arcs; it does not pivot
-    strideLength: 1e6,    // see above
-    accel: 22,            // it takes a moment to get going
-    decel: 14,            // and it rolls when you stop pedalling
+  /* THE SPEEDS ARE THE DATA AGENT'S MULTIPLIERS, NOT A SECOND OPINION.
+     data.js RIDES gives bicycle 1, scooter 1.5, motorcycle 3, and the
+     fare table divides the bicycle's journey minutes by exactly that.
+     Free-roam has to agree or the game contradicts itself: a scooter
+     that saves a third of a trip on the travel screen and moves at
+     bicycle pace on the street is a bug the player feels before they
+     can name it. So the bicycle's 5.10 / 8.80 is the base row and the
+     other two are it, multiplied, then rounded to something a hand on a
+     stick can steer.
+
+     TURN RATE GOES THE OTHER WAY. The faster and heavier the machine,
+     the wider it arcs — a motorcycle at 26 m/s that pivots like a
+     bicycle reads as a hovercraft. accel/decel likewise: the motors
+     pull harder and take longer to wash off. */
+  const RIDE_TUNE = {
+    bike: {
+      speeds: {
+        walkSpeed: 5.10,    // no shift — a relaxed cruise, 2.1x his walk
+        runSpeed: 8.80,     // shift — 32 km/h, the "worth every dollar" line
+        turnRate: 6.4,      // a bicycle arcs; it does not pivot
+        strideLength: 1e6,  // see above
+        accel: 22,          // it takes a moment to get going
+        decel: 14,          // and it rolls when you stop pedalling
+      },
+      lean: { gain: 0.115, max: 0.32, rate: 5.5 },
+      steer: 0,
+      enter: { x: -0.60, y: 0.02, z: -0.10, yaw: 0.26, roll: -0.30 },
+    },
+    scooter: {
+      speeds: {
+        walkSpeed: 7.65, runSpeed: 13.20, turnRate: 5.2,
+        strideLength: 1e6, accel: 17, decel: 11,
+      },
+      /* IT LEANS FURTHER THAN THE BICYCLE AND SETTLES SLOWER. Small
+         wheels and a low centre of mass make a scooter flickable, and
+         the extra roll is most of what sells "faster" when the pedals
+         that used to sell it are gone. */
+      lean: { gain: 0.132, max: 0.38, rate: 5.0 },
+      steer: 0.085,
+      enter: { x: -0.66, y: 0.02, z: -0.06, yaw: 0.22, roll: -0.34 },
+    },
+    motorcycle: {
+      speeds: {
+        walkSpeed: 15.30, runSpeed: 26.40, turnRate: 3.6,
+        strideLength: 1e6, accel: 26, decel: 9,
+      },
+      lean: { gain: 0.150, max: 0.46, rate: 4.2 },
+      steer: 0.055,
+      enter: { x: -0.78, y: 0.03, z: -0.14, yaw: 0.18, roll: -0.40 },
+    },
   };
   const MOUNT_T = 0.62;   // must equal CLIPS['bike-mount'].duration
   const DISMOUNT_T = 0.54;
+  const RIDE_BUILD = {
+    bike: createBike, scooter: createScooter, motorcycle: createMotorcycle,
+  };
+  /* 'moto' is what a human types into a debug console at midnight. */
+  const RIDE_ALIAS = { moto: 'motorcycle', motorbike: 'motorcycle', bicycle: 'bike', scoot: 'scooter' };
+  const rideKey = (id) => (id == null ? null : (RIDE_ALIAS[id] || (RIDE_TUNE[id] ? id : null)));
 
-  let bike = null;                 // the prop, built on first equip
+  const props = {};                // id -> prop, built on first equip
+  let rideId = 'bike';             // which machine setBike(true) mounts
+  let bike = null;                 // the CURRENT prop (the old name, kept)
   let bikeOwned = false;
   let bikeEquipped = false;
   let bikePhase = 'off';           // off | mounting | on | dismounting
   let bikeT = 0;                   // seconds into a transition
   let bikeRide = 0;                // 0..1, the prop's "is it under him"
   let bikeLean = 0;
+  let bikeSteer = 0;
   let bikeSpeedSaved = null;
   let bikeSyncT = 0;
   let ikSaved = true;
-  /* A debug hook or a cutscene has taken the bicycle over; stop
+  /* A debug hook or a cutscene has taken the ride over; stop
      reconciling it against ctx.game, which does not know about them. */
   let bikeForced = false;
 
-  function buildBike() {
-    if (bike) return bike;
-    bike = createBike(ctx);
-    bike.group.visible = false;
+  function buildProp(id) {
+    const key = rideKey(id) || 'bike';
+    if (props[key]) return props[key];
+    const p = RIDE_BUILD[key](ctx);
+    p.group.visible = false;
     /* The shadow projector renders a private layer, and it was walked
        over `root` before this existed — so opt the prop in by hand or
-       he casts a rider-shaped shadow with no bicycle in it. */
-    bike.group.traverse((o) => { if (o.isMesh) o.layers.enable(SHADOW_LAYER); });
-    root.add(bike.group);
+       he casts a rider-shaped shadow with no machine in it. */
+    p.group.traverse((o) => { if (o.isMesh) o.layers.enable(SHADOW_LAYER); });
+    root.add(p.group);
+    props[key] = p;
+    return p;
+  }
+  const buildBike = () => buildProp(rideId);
+
+  /** Exactly one prop is visible, ever. Called on every equip. */
+  function showProp(id) {
+    const key = rideKey(id) || 'bike';
+    for (const k in props) if (k !== key) props[k].group.visible = false;
+    bike = buildProp(key);
     return bike;
   }
 
   function bikeSpeeds(on) {
     const c = controller;
     if (!c || !c.opts) return;
+    const S = (RIDE_TUNE[rideId] || RIDE_TUNE.bike).speeds;
     if (on) {
+      /* THE SNAPSHOT IS TAKEN ONCE AND NEVER RE-TAKEN. Swapping from a
+         scooter to a motorcycle patches the options a second time while
+         they are already patched; re-snapshotting there would record the
+         SCOOTER's numbers as "the walk" and unequipping would leave him
+         striding around at 7.65 m/s for the rest of the session. */
       if (!bikeSpeedSaved) {
         bikeSpeedSaved = {};
-        for (const k in BIKE) bikeSpeedSaved[k] = c.opts[k];
+        for (const k in S) bikeSpeedSaved[k] = c.opts[k];
       }
-      for (const k in BIKE) c.opts[k] = BIKE[k];
+      for (const k in S) c.opts[k] = S[k];
     } else if (bikeSpeedSaved) {
       for (const k in bikeSpeedSaved) c.opts[k] = bikeSpeedSaved[k];
       bikeSpeedSaved = null;
@@ -1101,25 +1197,47 @@ export async function init(ctx) {
    */
   function setBike(on, o = {}) {
     const want = !!on;
+    /* SETBIKE IS THE ONLY WRITER OF `rideId`, and that is not tidiness:
+       the first version let the bus handler assign it before calling in
+       here, which made the swap test below compare the new machine
+       against itself, find no difference, and return early. The player
+       bought a Thunderhead, the state said motorcycle, the posture
+       changed — and the SCOOTER stayed on screen underneath him.
+       Callers now say which machine they want and nothing else. */
+    const wantRide = rideKey(o.ride) || rideId;
     const already = bikePhase === 'on' || bikePhase === 'mounting';
-    if (want === already) return api;
+    /* A SWAP IS NOT A NO-OP. Asking for the motorcycle while he is on
+       the scooter passes want === already, and returning early there is
+       how you end up riding a Thunderhead in a Vespa's posture. It falls
+       through to the mount path instead, which rebinds the ladder, the
+       prop and the controller speeds together. */
+    const swap = want && already && wantRide !== rideId;
+    if (want === already && !swap) {
+      /* Not mounting anything — but remember which machine the NEXT
+         mount is of, so equipping a scooter while on foot and then
+         getting on produces a scooter. */
+      if (!want) rideId = wantRide;
+      return api;
+    }
 
     if (want) {
-      buildBike();
+      rideId = wantRide;
+      anim.setRide(rideId);
+      showProp(rideId);
       bike.group.visible = true;
       bike.park(false);
       bikeSpeeds(true);
       ikSaved = secondary.ikEnabled;
-      secondary.ikEnabled = false;          // his feet are on pedals
-      if (o.instant) {
+      secondary.ikEnabled = false;          // his feet are on a machine
+      if (o.instant || swap) {
         bikePhase = 'on'; bikeT = 0; bikeRide = 1;
-        anim.setBike(true, 0);
+        anim.setBike(true, swap && !o.instant ? 0.22 : 0);
       } else {
         bikePhase = 'mounting'; bikeT = 0;
         anim.setBike(true, MOUNT_T * 0.72);
         if (!manual) { anim.play('bike-mount', { fade: 0.10, restart: true }); autoClip = 'bike-mount'; }
       }
-      ctx.bus?.emit('wally:bike', { riding: true, instant: !!o.instant });
+      ctx.bus?.emit('wally:bike', { riding: true, ride: rideId, instant: !!o.instant });
     } else {
       if (o.instant || !bike) {
         bikePhase = 'off'; bikeT = 0; bikeRide = 0;
@@ -1132,9 +1250,20 @@ export async function init(ctx) {
         anim.setBike(false, DISMOUNT_T * 0.62);
         if (!manual) { anim.play('bike-dismount', { fade: 0.08, restart: true }); autoClip = 'bike-dismount'; }
       }
-      ctx.bus?.emit('wally:bike', { riding: false, instant: !!o.instant });
+      ctx.bus?.emit('wally:bike', { riding: false, ride: rideId, instant: !!o.instant });
     }
     return api;
+  }
+
+  /**
+   * Put a specific machine under him. `null` walks.
+   * @param {'bike'|'scooter'|'motorcycle'|'moto'|null} id
+   * @param {{instant?:boolean}} o
+   */
+  function setRide(id, o = {}) {
+    const key = rideKey(id);
+    if (!key) return setBike(false, o);
+    return setBike(true, { ...o, ride: key });
   }
 
   /* Per-frame: advance the transition, place the prop, turn the crank,
@@ -1166,13 +1295,31 @@ export async function init(ctx) {
        does not lean at all. Damped, so it eases in and settles out with
        the corner rather than snapping to the stick. */
     const c = controller;
+    const TU = RIDE_TUNE[rideId] || RIDE_TUNE.bike;
+    const L = TU.lean;
+    /* The reference speed each machine leans FULLY at is its own cruise,
+       not the bicycle's: without that the motorcycle would be pinned at
+       max lean from walking pace and the whole corner would be one
+       angle. */
+    const ref = TU.speeds.walkSpeed * 1.08;
     const want = c && bikeRide > 0
-      ? clamp((c.yawRate || 0) * 0.115 * clamp(speed / 5.5, 0, 1.25), -0.32, 0.32)
+      ? clamp((c.yawRate || 0) * L.gain * clamp(speed / ref, 0, 1.25), -L.max, L.max)
       : 0;
-    bikeLean = damp(bikeLean, want, 5.5, dt);
+    bikeLean = damp(bikeLean, want, L.rate, dt);
     root.rotation.z = bikeLean * bikeRide;
 
     if (!bike || !bike.group.visible) return;
+
+    /* ---- the front wheel ----
+       Only the motors steer. A bicycle's bar is under the same mittens
+       and the bicycle prop has no steering group, so this is a null on
+       that machine by construction rather than by a branch. */
+    if (bike.setSteer) {
+      const s = c && bikeRide > 0
+        ? clamp(-(c.yawRate || 0) * TU.steer, -0.16, 0.16) : 0;
+      bikeSteer = damp(bikeSteer, s, 8.0, dt);
+      bike.setSteer(bikeSteer * bikeRide);
+    }
 
     /* ---- where the prop is ----
        Mounting, it comes up off its stand from his left and rights
@@ -1181,23 +1328,31 @@ export async function init(ctx) {
        fully on it) and the slide finishes late, which is what makes it
        read as him pulling it under himself rather than the bicycle
        teleporting into place. */
+    const E = TU.enter;
     const slide = 1 - smoothstepLocal(0.10, 0.92, bikeRide);
     const roll = 1 - smoothstepLocal(0.00, 0.62, bikeRide);
     const g = bike.group;
-    g.position.set(-0.60 * slide, 0.02 * slide, -0.10 * slide);
-    g.rotation.set(0, 0.26 * slide, -0.30 * roll);
+    g.position.set(E.x * slide, E.y * slide, E.z * slide);
+    g.rotation.set(0, E.yaw * slide, E.roll * roll);
     g.visible = bikeRide > 0.001;
     /* Undo the landing squash: it is a soft-body effect on a clay
-       elephant, and a bicycle frame does not squash. */
+       elephant, and a steel frame does not squash. */
     const rs = root.scale;
     g.scale.set(1 / (rs.x || 1), 1 / (rs.y || 1), 1 / (rs.z || 1));
 
-    /* ---- the crank ----
-       Straight off the animator's pedal phase, so the pedal is under
-       the foot by construction rather than by a ratio that has to be
-       kept in step by hand. */
-    bike.setCrankPhase(-anim.bikePhase + CRANK_OFFSET);
-    for (const w of bike.wheels) w.rotation.x = -anim.locPhase * Math.PI * 2 * WHEEL_PER_CRANK;
+    /* ---- the drivetrain ----
+       On the bicycle, straight off the animator's pedal phase, so the
+       pedal is under the foot by construction rather than by a ratio
+       kept in step by hand. On a motor there is no crank and no foot on
+       it: the wheels are driven by DISTANCE through the prop's own
+       radius, which is the only honest source when the gearing is
+       inside a case nobody ever sees. */
+    if (bike.crank) {
+      bike.setCrankPhase(-anim.bikePhase + CRANK_OFFSET);
+      for (const w of bike.wheels) w.rotation.x = -anim.locPhase * Math.PI * 2 * WHEEL_PER_CRANK;
+    } else {
+      bike.update(dt, speed);
+    }
   }
 
   /* Local smoothstep so this block does not depend on the import list
@@ -1235,20 +1390,36 @@ export async function init(ctx) {
     if (!s) return;
     bikeOwned = !!s.owned;
     bikeEquipped = !!(s.owned && s.equipped);
-    if (bikeEquipped && bikeOwned) buildBike();
+    /* WHICH ONE. actions.bike() reports the ride he is actually on
+       (data.js v7 folded three vehicles into one row per machine and
+       kept this call as the view onto the equipped one), so `id` is the
+       answer and the old boolean pair is only the on/off. An id this
+       file does not know about falls back to the bicycle rather than
+       leaving him seated on nothing. */
+    const want = rideKey(s.id) || 'bike';
+    if (bikeEquipped && bikeOwned) buildProp(want);
     /* Never fight a cutscene: the intro drives root.position itself and
        has its own bicycle. */
     if (!controlled) return;
-    setBike(bikeEquipped);
+    setBike(bikeEquipped, { ride: want });
   }
 
   if (ctx.bus) {
-    ctx.bus.on('bike', (e) => {
+    const onOwnership = (e) => {
       bikeOwned = !!e?.owned;
       bikeEquipped = !!(e?.owned && e?.equipped);
-      if (bikeOwned) buildBike();
-      if (controlled) setBike(bikeEquipped);
-    });
+      const want = rideKey(e?.ride) || rideId;
+      if (bikeOwned) buildProp(want);
+      if (controlled) setBike(bikeEquipped, { ride: want });
+    };
+    ctx.bus.on('bike', onOwnership);
+    /* 'ride' is the richer event the rides table emits on buy, grant,
+       equip and unequip — and game.js emits it IMMEDIATELY BEFORE the
+       'bike' above, every time, on every path. So it does not get a
+       second opinion here: it only arms the slow reconcile, which
+       re-reads the authoritative record. Two handlers both deciding
+       what is equipped is how they come to disagree. */
+    ctx.bus.on('ride', () => { bikeSyncT = 0; });
   }
 
   /* ================================================================
@@ -1544,16 +1715,24 @@ export async function init(ctx) {
     /** Aim his head. Vector3 | Object3D | {x,y,z} | null to release. */
     look(target, weight = 1) { expr.look(target, weight); return api; },
 
-    /* --- the bicycle ---
+    /* --- the rides ---
        ctx.game owns whether he HAS one; this owns what that looks like.
-       setBike(true) mounts with the animation, {instant:true} skips it. */
+       setBike(true) mounts whatever is equipped, {instant:true} skips
+       the animation, {ride:'scooter'} names the machine. */
     setBike(on, o) { return setBike(on, o || {}); },
+    /** Put a named machine under him, or null to walk. */
+    setRide(id, o) { return setRide(id, o || {}); },
     get riding() { return bikePhase === 'on' || bikePhase === 'mounting'; },
     get bike() { return bike; },
+    /** The machine he is on / would mount: 'bike'|'scooter'|'motorcycle' */
+    get rideId() { return rideId; },
+    get rideProps() { return props; },
     get bikeState() {
       return { owned: bikeOwned, equipped: bikeEquipped, phase: bikePhase,
-        ride: +bikeRide.toFixed(3), lean: +bikeLean.toFixed(3) };
+        id: rideId, ride: +bikeRide.toFixed(3), lean: +bikeLean.toFixed(3),
+        steer: +bikeSteer.toFixed(3) };
     },
+    get rideState() { return api.bikeState; },
 
     /** Set a facial/postural expression. See ctx.wally.expressions. */
     express(name, o = {}) { expr.set(name, o); return api; },
@@ -1756,7 +1935,8 @@ export async function init(ctx) {
     lateUpdate,
     dispose() {
       secondary.dispose();
-      bike?.dispose();
+      /* every machine that was ever built, not just the one under him */
+      for (const k of Object.keys(props)) { props[k].dispose(); delete props[k]; }
       bike = null;
       ctx.scene.remove(root);
       if (shadowMesh) {
@@ -2237,7 +2417,7 @@ export async function init(ctx) {
     }
     /* THE FORCE FLAG IS NOT OPTIONAL HERE. bikeSync() reconciles the
        prop against ctx.game every half second, and in a fresh save
-       state.bike.owned is false — so without this the hook mounts him
+       state.rides.owned is empty — so without this the hook mounts him
        and the next sync tick quietly puts him back on his feet, three
        seconds before the shutter. */
     bikeForced = true;
@@ -2245,6 +2425,78 @@ export async function init(ctx) {
     api.setLocomotion(speed, 0);
     dbg.studio(true, camName);
     return { riding: api.riding, speed, cam: camName, ...api.bikeState };
+  };
+
+  /* ================================================================
+     THE RIDES — WALLY.debug.ride(id, speed)
+
+     One hook for all three machines, and the entry point the verifier
+     drives. Mounts the named one, drives the locomotion blend by hand
+     at a speed that machine would actually be doing (so the posture,
+     the body rock, the engine tremor and the ear/trunk streaming are
+     all where they would be at speed rather than frozen at a
+     standstill), and frames the studio camera that shows the machine's
+     own silhouette — pulled back and up for the bigger two, because a
+     motorcycle framed like a bicycle is a motorcycle with its front
+     wheel out of shot.
+
+       WALLY.debug.ride('scooter')     mount + ride at its cruise
+       WALLY.debug.ride('moto')        ditto, the big one
+       WALLY.debug.ride('bike')        the bicycle
+       WALLY.debug.ride(null)          off, camera handed back
+       WALLY.debug.ride('moto', 22)    flat out
+       WALLY.debug.rideInfo()          the fit, measured live
+     ================================================================ */
+  const RIDE_SHOW = {
+    /* each machine's own CRUISE, not one number for all three: the
+       ladder rung a shot lands on is the pose the shot is of */
+    bike: { speed: 5.2, cam: 'bike' },
+    scooter: { speed: 7.2, cam: 'scoot' },
+    motorcycle: { speed: 11.0, cam: 'moto' },
+  };
+  dbg.ride = (id = 'bike', speed, camName) => {
+    if (id === null || id === false || id === 'off' || id === 'walk') {
+      bikeForced = false;
+      api.setBike(false, { instant: true });
+      api.setLocomotion(null);
+      dbg.studio(false);
+      return 'walking';
+    }
+    const key = rideKey(id);
+    if (!key) return 'no ride "' + id + '"';
+    const S = RIDE_SHOW[key];
+    bikeForced = true;
+    api.setRide(key, { instant: true });
+    api.setLocomotion(speed ?? S.speed, 0);
+    dbg.studio(true, camName || S.cam);
+    return {
+      ...api.bikeState, speed: speed ?? S.speed, cam: camName || S.cam,
+      cost: bike ? triangleCost(bike.group) : null,
+    };
+  };
+
+  /* Where the feet and hands actually are against where the prop puts
+     its footrests and its bars — the same measurement bikeInfo() makes
+     for the bicycle, for whichever machine is under him. This is what
+     rides.js's SCOOT_BARS / MOTO_BARS were fitted to; never eyeball
+     them off a screenshot. */
+  dbg.rideInfo = () => {
+    const info = dbg.bikeInfo();
+    const cost = bike ? triangleCost(bike.group) : null;
+    /* THE CHARACTER TOTAL COUNTS WHAT IS ON SCREEN, which means walking
+       the ancestor chain: hiding a prop sets `visible` on its GROUP, and
+       a mesh inside a hidden group still reports visible === true. The
+       first version of this counted all three machines at once and grew
+       by 17 000 triangles every time the hook was called. */
+    const shown = (o) => { for (let p = o; p; p = p.parent) if (p.visible === false) return false; return true; };
+    let tris = 0, meshes = 0;
+    root.traverse((o) => {
+      if (!o.isMesh || !o.geometry || o.userData.isOutlineHull || !shown(o)) return;
+      const g = o.geometry;
+      tris += g.index ? g.index.count / 3 : g.attributes.position.count / 3;
+      meshes++;
+    });
+    return { id: rideId, ...info, cost, characterTotal: { triangles: Math.round(tris), meshes } };
   };
   /* Sweep the reach to the bars live. See BIKE_SEAT in anim.js for why
      this cannot be reasoned about from the angles. */
@@ -2273,7 +2525,9 @@ export async function init(ctx) {
       clip: anim.current,
       hips: rel('hips'), footL: rel('footL'), footR: rel('footR'),
       handL: rel('handL'), handR: rel('handR'), head: rel('head'),
-      prop: bike ? { saddle: bike.SADDLE, bars: bike.BARS, pedal: bike.PEDAL } : null,
+      prop: bike
+        ? { kind: bike.kind || 'bike', saddle: bike.SADDLE, bars: bike.BARS, pedal: bike.PEDAL }
+        : null,
       speeds: controller ? {
         walk: controller.opts.walkSpeed, run: controller.opts.runSpeed,
         turn: controller.opts.turnRate,

@@ -6,15 +6,22 @@
    cluster, toasts bottom-left, key hints bottom-right, banners
    centred high, and the world-space interaction prompt.
 
-   Everything lives at the edges. Nothing sits where Wally is —
-   except the destination pointer on a wide screen, which sits
-   centre-top because "which way" is a question about the middle of
-   the screen. On a narrow one it joins the right-hand column,
-   directly under REP and CITY. See placePointer().
+   Everything lives at the edges. Nothing sits where Wally is.
+
+   ONE POINTER, AND ONLY ONE.
+   There used to be two: the objective strip (what to do, and where)
+   and a separate floating destination pointer (which way, how far).
+   Pick a place on the map and the second one appeared beside the
+   first, aimed somewhere else — two yellow arrows disagreeing about
+   where the player was going, which is worse than either alone.
+   They are now the same object. The strip carries the compass dial,
+   and choosing a destination RETARGETS it rather than stacking a
+   second widget next to it; a small ✕ hands it back to the quest.
+   Nothing in this file may add a second one.
 
    The HUD polls ctx.game.hud() at 8 Hz and repaints only the
    fields that actually changed — no per-frame DOM writes. The one
-   exception is the pointer's arrow, which is written every frame:
+   exception is the strip's arrow, which is written every frame:
    a compass that lags a turn is worse than no compass at all.
    ============================================================ */
 
@@ -53,16 +60,27 @@ export function createHud(ctx, ui) {
 
   const leftPills = h('div.w-pills', null, dayPill.el, clockPill.el, enPill.el, hgPill.el);
 
-  /* objective strip */
-  const objDot = h('div.dot');
+  /* ---------------- the objective strip = THE pointer ----------------
+     Left: the compass dial, whose arrow is written every frame.
+     Middle: what you are going to do, then where it is and which way.
+     Right: nothing at all while it follows the objective; a ✕ while
+     the player has chosen somewhere else, because a detour must be
+     as easy to drop as it was to take. */
+  const ptrArrow = icon('nav', 17, { fill: 'currentColor', stroke: 'currentColor', w: 1.2, class: 'arw' });
+  const objDial = h('div.dial', null, ptrArrow);
   const objT = h('div.t', { text: '—' });
   const objD = h('div.d', { text: '' });
-  const objGo = h('div.go');
-  objGo.append(icon('pin', 15));
+  const objWhy = h('div.why', { style: { display: 'none' } });
+  const objClear = h('button.go.w-pe', {
+    type: 'button', 'aria-label': 'Follow the objective again',
+    title: 'Drop this destination',
+    style: { display: 'none' },
+    onclick: (e) => { e.stopPropagation(); ui.click(); setDestination(null); },
+  }, icon('close', 13));
   const objective = h('div.w-obj.w-pe', {
-    role: 'button', tabindex: '0',
+    role: 'button', tabindex: '0', title: 'Where you are going',
     onclick: () => onObjective(),
-  }, objDot, h('div.w-grow', null, objT, objD), objGo);
+  }, objDial, h('div.w-grow', null, objT, objD, objWhy), objClear);
 
   const left = h('div.w-bar.left', null, leftPills, objective);
 
@@ -81,22 +99,84 @@ export function createHud(ctx, ui) {
     onclick: () => { ui.click(); ui.openQuickBuy(); },
   }, icon('search', 13, { w: 2 }), h('span.w-k', { text: 'TICKER' }),
     h('span.kb', { text: 'B' }));
-  const repPill = pill('star', null, '0', 'REP');
+  /* THE REPUTATION PILL — a number, the TITLE it has earned, and a
+     door. Reputation is standing, and WallyNet is where the city
+     talks about you, so pressing this opens that app instead of
+     doing nothing. The title rides beside the figure because a bare
+     "17" says nothing about who 17 makes you, and the hairline along
+     the bottom is the progress toward the next rung. */
+  const repPill = titlePill();
   const cityPill = ringPill();
   const right = h('div.w-bar.right', null,
     h('div.w-pills', null, moneyPill.el, buyPill, repPill.el, cityPill.el));
 
-  /* ---------------- the destination pointer ---------------- */
-  const ptrArrow = icon('nav', 17, { fill: 'currentColor', stroke: 'currentColor', w: 1.2, class: 'arw' });
-  const ptrT = h('div.t', { text: '—' });
-  const ptrD = h('div.d');
-  const pointer = h('div.w-ptr.w-pe.off', {
-    role: 'button', tabindex: '0', title: 'Where you are going',
-    onclick: () => onPointer(),
-    /* .tx so the label column can be told min-width:0 — without it a
-       flex child refuses to shrink below its content and the ellipsis
-       in the right-hand rail never fires */
-  }, h('div.dial', null, ptrArrow), h('div.tx', null, ptrT, ptrD));
+  /* ---------------- THE LOCK STRIP ----------------
+     One line, under the objective, for the two refusals the engine
+     enforces before an action is even attempted: maximum hunger, and
+     standing somewhere that is shut. It is a button, because the
+     point of naming a wall is to point at the door beside it. */
+  const lockT = h('div.t', { text: '' });
+  const lockD = h('div.d', { text: '' });
+  const lockStrip = h('button.w-lock.w-pe', {
+    type: 'button', style: { display: 'none' }, title: 'What can I do about it?',
+    onclick: () => { ui.click(); onLock(); },
+  }, h('div.ic', null, icon('info', 15)), h('div.w-grow', null, lockT, lockD),
+    h('span.go', { text: 'FIX' }));
+  left.append(lockStrip);
+  let lockKind = null;
+
+  function onLock() {
+    const g = game();
+    if (!g) return;
+    if (lockKind === 'hunger') { ui.showBlocked({ ...g.needs(), kind: 'hunger' }); return; }
+    const st = g.state;
+    ui.showBlocked({ kind: 'hours', loc: st.loc, why: g.closedLine(st.loc) });
+  }
+
+  function updateLock(d) {
+    const g = game();
+    let kind = null, t = '', sub = '';
+    if (d.lockedBy === 'hunger') {
+      kind = 'hunger';
+      let f = null;
+      try { f = g.needs().food; } catch (e) { f = null; }
+      t = 'TOO HUNGRY — nothing but eating, sleeping and walking to food';
+      sub = f ? (f.here ? 'There is food right here · ' + money(f.cost)
+        : f.n + ' · ' + f.hops + ' hop' + (f.hops === 1 ? '' : 's') + ' · ' + money(f.cost)
+          + (f.open ? '' : ' · opens ' + f.opens))
+        : 'Find somewhere that sells food';
+    } else if (d.open === false && d.hours) {
+      kind = 'hours';
+      t = d.hours.n + ' is CLOSED — nothing here can be done';
+      sub = 'Opens at ' + d.hours.opens + ' · ' + d.hours.span;
+    }
+    if (kind === lockKind && lockT.textContent === t && lockD.textContent === sub) return;
+    lockKind = kind;
+    lockStrip.style.display = kind ? '' : 'none';
+    lockStrip.classList.toggle('bad', kind === 'hunger');
+    if (!kind) return;
+    lockT.textContent = t;
+    lockD.textContent = sub;
+  }
+
+  /* ---------------- THE MAYOR'S DASH, live ----------------
+     Top-centre, on screen only while the race is running. The clock,
+     which corner is next, and the one thing that decides the race:
+     where the Mayor is on the same road. He is a marker on a track,
+     not a number, so "he is pulling away" is something the player
+     SEES half a lap before the result card says it. */
+  const raceClock = h('div.clk', { text: '0.0' });
+  const raceNext = h('div.nxt', { text: '' });
+  const raceMine = h('i.me');
+  const raceHis = h('i.him');
+  const raceTrack = h('div.trk', null, raceHis, raceMine);
+  const raceDelta = h('div.dl', { text: '' });
+  const raceQuit = h('button.w-btn.sm.ghost.w-pe', {
+    type: 'button', onclick: () => { ui.click(); ui.raceAbandon(); },
+  }, 'Quit');
+  const raceBox = h('div.w-race', { style: { display: 'none' } },
+    h('div.hd', null, h('span.flag', { text: '🏁' }), raceClock, raceNext, raceQuit),
+    raceTrack, raceDelta);
 
   /* ---------------- toasts / banner / prompt / hints ---------------- */
   const toasts = h('div.w-toasts');
@@ -136,7 +216,7 @@ export function createHud(ctx, ui) {
   }
   addEventListener('keydown', onHintKey);
 
-  root.append(left, right, pointer, toasts, promptLayer, hints);
+  root.append(left, right, raceBox, toasts, promptLayer, hints);
 
   /* ============================================================
      builders
@@ -202,6 +282,40 @@ export function createHud(ctx, ui) {
     };
   }
 
+  /* ★ 42 · LEDGER KEEPER  — with a progress hairline to the next rung.
+     Pressable: it opens WallyNet, where the whole ladder lives. */
+  function titlePill() {
+    const num = h('span.w-num', { text: '0' });
+    const ttl = h('span.w-k.ttl', { text: 'REP' });
+    const prog = h('i');
+    const bar = h('div.w-repbar', null, prog);
+    const el = h('button.w-pill.tap.w-pe.rep', {
+      type: 'button', 'aria-label': 'Reputation — open WallyNet',
+      onclick: () => { ui.click(); ui.openPhone('wallynet'); },
+    }, icon('star', 14), num, ttl, bar);
+    let lastN = '', lastT = '', lastP = -1;
+    return {
+      el,
+      /** `t` is game.hud().title — data.js's repProgress(). */
+      set(rep, t) {
+        const n = String(Math.round(rep));
+        if (n !== lastN) { lastN = n; num.textContent = n; }
+        const name = t && t.title ? t.title : 'REP';
+        if (name !== lastT) {
+          lastT = name;
+          ttl.textContent = name;
+          el.title = t
+            ? name + ' · rung ' + t.rung + ' of ' + t.total
+              + (t.next ? ' · ' + t.toNext + ' rep to ' + t.next : ' · the top of the ladder')
+              + '  —  open WallyNet'
+            : 'Reputation — open WallyNet';
+        }
+        const pct = t ? t.pct : 0;
+        if (pct !== lastP) { lastP = pct; prog.style.width = pct + '%'; }
+      },
+    };
+  }
+
   function ringPill() {
     const R = 8.4, CIRC = 2 * Math.PI * R;
     const svgNS = 'http://www.w3.org/2000/svg';
@@ -237,44 +351,48 @@ export function createHud(ctx, ui) {
      objective
      ============================================================ */
   let objQuest = null;
+
+  /* THE ONE CLICK. Whatever the strip is currently aimed at is what
+     it opens — the chosen destination if there is one, the quest's
+     place otherwise. There is no second target and no second control
+     that could disagree with this one. */
   function onObjective() {
     ui.click();
-    if (!objQuest) { ui.toast('Everything in this city belongs to someone now.', 'token'); return; }
-    const locId = game().quests.questLoc(objQuest.id);
-    if (!locId) { ui.toast(objQuest.d, 'token'); return; }
-    ui.goto(locId, objQuest.t);
-  }
-
-  function setObjective(q) {
-    objQuest = q;
-    if (!q) {
-      objT.textContent = 'The city is whole';
-      objD.textContent = 'Nothing left to own';
-      objDot.style.display = 'none';
+    const t = pointerTarget();
+    if (t) {
+      if (t.id === game().state.loc) { ui.openPlace(t.id); return; }
+      ui.goto(t.id, t.why);
       return;
     }
-    objDot.style.display = '';
-    if (objT.textContent !== q.t) {
-      objT.textContent = q.t;
+    if (!objQuest) { ui.toast('Everything in this city belongs to someone now.', 'token'); return; }
+    ui.toast(objQuest.d, 'token');
+  }
+
+  /* The quest changed. paintStrip() decides what the strip actually
+     says — this only records it and plays the nudge, and it plays the
+     nudge only while the strip is showing the quest: flashing a
+     detour because a quest you cannot see advanced is a lie. */
+  function setObjective(q) {
+    const was = objQuest;
+    objQuest = q;
+    if (q && (!was || was.t !== q.t) && !destOverride) {
       objective.classList.remove('flash'); void objective.offsetWidth;
       objective.animate?.(
         [{ transform: 'scale(1)' }, { transform: 'scale(1.03)' }, { transform: 'scale(1)' }],
         { duration: 520, easing: 'cubic-bezier(.22,1,.36,1)' },
       );
     }
-    const locId = game().quests.questLoc(q.id);
-    const loc = locId ? game().data.locationById[locId] : null;
-    const where = loc && game().known(locId) ? loc.n : (q.hint || q.d);
-    objD.textContent = where;
+    paintStrip();
   }
 
   /* ============================================================
-     THE DESTINATION POINTER
+     THE DIRECTION HALF OF THE STRIP
 
      Which way to go, and how far, from where Wally is standing and
      facing. It follows the current objective unless the player has
-     picked somewhere else on the map, in which case it follows that
-     until they arrive or clear it.
+     picked somewhere else on the map, in which case THE SAME STRIP
+     follows that until they arrive or clear it. There is no second
+     element: `destOverride` swaps what this one is aimed at.
 
      THE BEARING IS TAKEN IN WALLY'S OWN FRAME, not in world north.
      A compass rose would be honest and useless: the player does not
@@ -293,7 +411,7 @@ export function createHud(ctx, ui) {
      ============================================================ */
   let destOverride = null;          // a place the player chose on the map
   let ptrAngle = 0;                 // damped, radians
-  let ptrShown = { key: '', txt: '', sub: '' };
+  const ptrShown = { txt: '', sub: '', why: '', chosen: null };
 
   function pointerTarget() {
     const g = game();
@@ -308,6 +426,62 @@ export function createHud(ctx, ui) {
     const locId = g.quests.questLoc(q.id);
     if (!locId || !g.known(locId)) return null;
     return { id: locId, why: q.t, chosen: false };
+  }
+
+  /* Aim the one strip somewhere the player chose. Null hands it back
+     to the quest. It never creates an element — it retargets this one. */
+  function setDestination(locId) {
+    destOverride = locId && game()?.data?.locationById?.[locId] ? locId : null;
+    ptrShown.txt = ptrShown.sub = ptrShown.why = '';
+    ptrShown.chosen = null;
+    paintStrip();
+    return destOverride;
+  }
+
+  /* The strip's static half: the headline, the ✕, and the quest line
+     under it. Called whenever the target or the quest changes — never
+     per frame; updatePointer() owns the distance line. */
+  function paintStrip() {
+    const g = game();
+    const t = pointerTarget();
+    const chosen = !!(t && t.chosen);
+    const loc = t && g ? g.data.locationById[t.id] : null;
+
+    /* HEADLINE. Following the objective it is the quest's own words,
+       exactly as it has always been. On a detour it is the place,
+       because a detour has no other name. */
+    const txt = chosen ? (loc ? loc.n : 'Your destination')
+      : objQuest ? objQuest.t : 'The city is whole';
+    if (ptrShown.txt !== txt) { ptrShown.txt = txt; objT.textContent = txt; }
+
+    /* THE THIRD LINE, and it only exists when there is something the
+       first two do not already say: on a detour, the objective you
+       stepped away from; with no bearing to give, the quest's hint.
+       Following the objective to a known place it stays hidden — the
+       distance line below the headline is the whole story. */
+    let why = '';
+    if (chosen) why = objQuest ? 'Objective · ' + objQuest.t : '';
+    else if (!t) why = objQuest ? (objQuest.hint || objQuest.d || '') : 'Nothing left to own';
+    if (ptrShown.why !== why) {
+      ptrShown.why = why;
+      objWhy.textContent = why;
+      objWhy.style.display = why ? '' : 'none';
+    }
+
+    if (ptrShown.chosen !== chosen) {
+      ptrShown.chosen = chosen;
+      objective.classList.toggle('chosen', chosen);
+      objClear.style.display = chosen ? '' : 'none';
+    }
+    /* No target at all: the dial has nothing to point at, so it goes
+       quiet rather than lying about a bearing. */
+    objective.classList.toggle('nodir', !t);
+    if (!t) {
+      if (ptrShown.sub !== '') { ptrShown.sub = ''; objD.textContent = ''; }
+      objD.style.display = 'none';
+    } else {
+      objD.style.display = '';
+    }
   }
 
   /* The point to walk to. ctx.city.doorPosition is the real doorway;
@@ -339,13 +513,13 @@ export function createHud(ctx, ui) {
   function updatePointer(dt) {
     const t = pointerTarget();
     if (!t) {
-      if (!pointer.classList.contains('off')) pointer.classList.add('off');
+      if (!objective.classList.contains('nodir')) paintStrip();
       return;
     }
     const g = game();
-    const loc = g.data.locationById[t.id];
     const tp = targetPoint(t.id);
-    if (!tp) { pointer.classList.add('off'); return; }
+    if (!tp) { objective.classList.add('nodir'); return; }
+    if (objective.classList.contains('nodir') || ptrShown.chosen !== t.chosen) paintStrip();
 
     /* where he is and which way he is looking; before the character
        exists, stand him at his current location facing north */
@@ -364,11 +538,7 @@ export function createHud(ctx, ui) {
     ptrArrow.style.transform = `rotate(${(ptrAngle * 180 / Math.PI).toFixed(1)}deg)`;
 
     const arrived = dist < 9;
-    pointer.classList.toggle('here', arrived);
-    if (pointer.classList.contains('off')) {
-      pointer.classList.remove('off');
-      placePointer();               // place it before it is first seen
-    }
+    objective.classList.toggle('here', arrived);
 
     /* THE WORDS COME OFF `want`, NOT off ptrAngle. ptrAngle is
        deliberately never wrapped — it accumulates shortest-arc steps
@@ -381,126 +551,49 @@ export function createHud(ctx, ui) {
       : Math.abs(want) < 0.42 ? 'straight ahead'
         : Math.abs(want) > 2.3 ? 'behind you'
           : want > 0 ? 'to your right' : 'to your left';
-    const txt = loc ? loc.n : t.why;
-    const sub = arrived ? (t.chosen ? 'arrived' : 'go inside — press E')
-      : Math.round(dist) + ' m · ' + bearing;
-    if (ptrShown.txt !== txt) { ptrShown.txt = txt; ptrT.textContent = txt; }
-    if (ptrShown.sub !== sub) { ptrShown.sub = sub; ptrD.textContent = sub; }
+    const loc = g.data.locationById[t.id];
+    const place = !t.chosen && loc ? loc.n + ' · ' : '';
+    const sub = arrived ? (t.chosen ? place + 'arrived' : place + 'go inside — press E')
+      : place + Math.round(dist) + ' m · ' + bearing;
+    if (ptrShown.sub !== sub) { ptrShown.sub = sub; objD.textContent = sub; }
   }
+
+  /* THE PLACEMENT IS NOW THE STRIP'S OWN.
+     There were two placements here — centre-top on a wide screen, a
+     right-hand rail on a narrow one — and ~100 lines measuring the
+     left cluster so the floating pointer never crowded it. That whole
+     problem was created by the pointer being a second, free-floating
+     box. It is the objective strip now: it sits under the left pills,
+     in the flow, and cannot collide with anything by construction. */
 
   /* ============================================================
-     WHERE THE POINTER SITS — TWO PLACEMENTS, CHOSEN ON PURPOSE.
+     THE RACE READOUT
 
-     THE RAIL — upper right, tucked directly under the REP and CITY
-     pills and sharing their right edge, so that corner reads as one
-     column: rep, city, where you are going. This is the phone
-     placement and it is what the pointer falls back to everywhere
-     else. It used to hang under the objective strip on the LEFT,
-     which buried "which way" beneath two lines of quest text in the
-     busiest corner of a 390 px frame.
-
-     CENTRE-TOP — kept, but only where the centre is genuinely empty.
-     At 1600 px there is ~700 px of clear sky between the two
-     clusters, and "which way do I go" is a question about the middle
-     of the screen, so a screen with a middle to spare should answer
-     there rather than in a corner the eye has to hunt for.
-
-     THE RULE, stated once: centre-top if the screen is at least
-     PTR_RAIL_W wide AND the pointer fits in the gutter with room to
-     spare; the rail otherwise. Both halves are deliberate. The width
-     floor exists so no phone can ever argue its way into centre-top
-     on a stubby place name, and the fit test exists so a 1200 px
-     laptop degrades to the rail — the same corner the phone uses —
-     instead of dangling under the objective strip, which is the very
-     thing we are fixing. There is no third placement.
-
-     THE WIDTH IS MEASURED, NOT ASSUMED. In the rail the pointer must
-     never crowd the left cluster, whose widest pill is the energy
-     meter and whose objective strip is wider still. So we take the
-     right edge of every left-hand chrome box that actually shares the
-     pointer's horizontal band and refuse to grow past it. Measuring
-     the `left` bar as a whole would be wrong: it is a max-width:49vw
-     flex column, so its rect is 49vw regardless of what is in it, and
-     the pointer would be squeezed to nothing by empty space.
+     ui.js drives the race (it is the module that can see where Wally
+     actually is); this only paints. `r` is null to hide it, or:
+       {elapsed, cp, of, next, dist, target, mine, his, delta}
+     where mine/his are 0..1 along the route and delta is seconds
+     behind (positive) or ahead (negative).
      ============================================================ */
-  const PTR_RAIL_W = 900;     // never centre-top below this
-  const PTR_GAP = 10;         // clearance from the left cluster
-  const PTR_MIN_W = 150;      // below this the pill cannot hold its own sentence
-  const PTR_MAX_W = 320;
-
-  /* Every left-hand box that shares the horizontal band [top, top+h):
-     how far right it reaches, and how far down it goes. */
-  const _obs = { right: 0, bottom: 0 };
-  function leftObstacle(top, hgt) {
-    _obs.right = 0; _obs.bottom = 0;
-    for (const el of left.querySelectorAll('.w-pill,.w-obj')) {
-      const r = el.getBoundingClientRect();
-      if (r.bottom > top - 2 && r.top < top + hgt + 2) {
-        if (r.right > _obs.right) _obs.right = r.right;
-        if (r.bottom > _obs.bottom) _obs.bottom = r.bottom;
-      }
-    }
-    return _obs;
-  }
-
-  /* The width the pointer WANTS, measured without disturbing it.
-     Toggling .rail off to read offsetWidth would also work, but it
-     would write the class twice every repaint and invite the transform
-     transition to fire on a state no frame ever shows. The chrome
-     (dial + gap + padding) is fixed, and the labels report their full
-     length through scrollWidth even while they are being ellipsed. */
-  function pointerWantsWidth() {
-    const tx = ptrT.parentElement;
-    const chrome = pointer.offsetWidth - tx.offsetWidth;
-    return chrome + Math.max(ptrT.scrollWidth, ptrD.scrollWidth) + 2;
-  }
-
-  function placePointer() {
-    if (pointer.classList.contains('off')) return;
-    const vw = window.innerWidth;
-    const lb = left.getBoundingClientRect();
-    const rb = right.getBoundingClientRect();
-
-    if (vw >= PTR_RAIL_W) {
-      const half = pointerWantsWidth() / 2;
-      const cx = vw / 2;
-      if ((cx - half - 16) > lb.right && (cx + half + 16) < rb.left) {
-        pointer.classList.remove('rail');
-        pointer.style.removeProperty('--w-ptr-max');
-        pointer.style.setProperty('--w-ptr-top', Math.round(Math.max(lb.top, rb.top)) + 'px');
-        return;
-      }
-    }
-
-    /* ---- the rail ---- */
-    pointer.classList.add('rail');
-    const inset = Math.max(8, vw - rb.right);       // the right safe-area gutter
-    const ph = pointer.offsetHeight || 42;
-    let top = Math.round(rb.bottom + 8);
-    let ob = leftObstacle(top, ph);
-    let room = vw - inset - (ob.right ? ob.right + PTR_GAP : 12);
-
-    /* On a very narrow phone the left cluster can be wide enough that
-       no usable slot survives beside it — at 320 px the energy meter
-       alone leaves 121 px, which is not a sentence. Overlapping it is
-       the one thing this placement must never do, so step down past
-       the obstruction and take the full width one row lower. Still the
-       right rail, still aligned under REP and CITY. */
-    if (room < PTR_MIN_W && ob.bottom) {
-      top = Math.round(ob.bottom + 8);
-      ob = leftObstacle(top, ph);
-      room = vw - inset - (ob.right ? ob.right + PTR_GAP : 12);
-    }
-    pointer.style.setProperty('--w-ptr-top', top + 'px');
-    pointer.style.setProperty('--w-ptr-max', Math.round(clamp(room, PTR_MIN_W, PTR_MAX_W)) + 'px');
-  }
-
-  function onPointer() {
-    ui.click();
-    const t = pointerTarget();
-    if (!t) { ui.toast('Nowhere left to be.', 'token'); return; }
-    if (t.id === game().state.loc) { ui.openPlace(t.id); return; }
-    ui.goto(t.id, t.why);
+  function setRace(r) {
+    if (!r) { raceBox.style.display = 'none'; return; }
+    raceBox.style.display = '';
+    raceClock.textContent = r.elapsed.toFixed(1) + 's';
+    /* the corner NAME is the thing you steer by, so it gets the room:
+       the count is two characters in front of it and the distance
+       moves down to the line that has space for it */
+    raceNext.textContent = (r.cp >= r.of ? 'LAST' : (r.cp + 1) + '/' + r.of) + ' → ' + r.next;
+    raceMine.style.left = clamp(r.mine * 100, 0, 100) + '%';
+    raceHis.style.left = clamp(r.his * 100, 0, 100) + '%';
+    const behind = r.delta > 0.6;
+    const level = Math.abs(r.delta) <= 0.6;
+    raceDelta.textContent = (r.dist != null ? Math.round(r.dist) + ' m to the corner · ' : '')
+      + (level
+        ? 'level with him'
+        : (behind ? '+' : '−') + Math.abs(r.delta).toFixed(1) + 's ' + (behind ? 'behind him' : 'ahead of him'))
+      + ' · his target ' + Math.round(r.target) + 's';
+    raceDelta.style.color = C(behind ? BRAND.bad : level ? BRAND.warn : BRAND.good);
+    raceBox.classList.toggle('behind', behind);
   }
 
   /* ============================================================
@@ -711,7 +804,7 @@ export function createHud(ctx, ui) {
         moneyPill.delta((diff > 0 ? '+' : '−') + money(Math.abs(diff)), diff < 0);
       }
     }
-    if (force || d.rep !== shown.rep) { shown.rep = d.rep; repPill.set(String(Math.round(d.rep))); }
+    if (force || d.rep !== shown.rep) { shown.rep = d.rep; repPill.set(d.rep, d.title); }
     if (force || d.cityPct !== shown.city) { shown.city = d.cityPct; cityPill.set(d.cityPct); }
 
     /* one ramp for both, and for the phone battery: <20 bad, <45 warn.
@@ -723,12 +816,9 @@ export function createHud(ctx, ui) {
     const q = d.objective;
     const key = q ? q.id : '';
     if (force || key !== shown.quest) { shown.quest = key; setObjective(q); }
-    else if (q) {
-      const locId = g.quests.questLoc(q.id);
-      const loc = locId ? g.data.locationById[locId] : null;
-      const where = loc && g.known(locId) ? loc.n : (q.hint || q.d);
-      if (objD.textContent !== where) objD.textContent = where;
-    }
+
+    /* the two refusals the engine enforces, said out loud */
+    updateLock(d);
 
     const unread = g.actions.unreadCount();
     msgBadge.textContent = unread > 9 ? '9+' : String(unread);
@@ -737,8 +827,6 @@ export function createHud(ctx, ui) {
     /* the touch pad stands in for this row on a phone and wants the
        same count — one poll, two readouts */
     ui.touch?.setBadge?.(unread);
-
-    placePointer();
   }
 
   /* ============================================================
@@ -748,19 +836,17 @@ export function createHud(ctx, ui) {
     root,
     toast, banner, refresh,
     addPrompt, removePrompt, interact,
+    /** The Mayor's Dash readout. ui.js owns the race; this paints it. */
+    setRace,
     /* poser for screenshots — shows the money chip without having to
        actually earn anything */
     demoDelta(text) { moneyPill.flash(); moneyPill.delta(text || '+$56', /^−/.test(text || '')); },
     get nearLocation() { return DOOR.loc; },
     setObjective,
-    /* the pointer follows this until he gets there; null hands it
-       back to the current objective */
-    setDestination(locId) {
-      destOverride = locId && game()?.data?.locationById?.[locId] ? locId : null;
-      ptrShown.txt = ptrShown.sub = '';
-      refresh(true);
-      return destOverride;
-    },
+    /* THE ONE STRIP follows this until he gets there; null hands it
+       back to the current objective. It retargets — it never spawns
+       a second widget. */
+    setDestination,
     get destination() { return destOverride; },
     update(dt) {
       acc += dt;

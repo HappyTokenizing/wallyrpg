@@ -541,7 +541,15 @@ export function stylesheet() {
 }
 .w-bar.left{left:max(12px,env(safe-area-inset-left));flex-direction:column;align-items:flex-start}
 .w-bar.right{right:max(12px,env(safe-area-inset-right));justify-content:flex-end}
-.w-pills{display:flex;gap:calc(6px * var(--w-ts));align-items:center;flex-wrap:wrap}
+/* THE PILL ROW WRAPS AGAINST THE BAR, NOT AGAINST ITS SIBLING.
+   .w-bar is a shrink-to-fit absolute box: its intrinsic width is the
+   widest child, and the objective strip below is deliberately wider
+   than the pills. Without its own cap the pill row inherits that
+   width, stops wrapping, and walks straight into the right-hand
+   cluster — measured at 390 px, the clock pill vanished under the
+   money pill. So the row carries the same cap the bar does. */
+.w-pills{display:flex;gap:calc(6px * var(--w-ts));align-items:center;flex-wrap:wrap;max-width:46vw}
+.w-bar.right .w-pills{max-width:none}
 .w-pill{
   display:flex;align-items:center;gap:calc(7px * var(--w-ts));
   height:calc(32px * var(--w-ts));padding:0 calc(11px * var(--w-ts));
@@ -571,6 +579,85 @@ export function stylesheet() {
 .w-pill.tap:hover{border-color:${rgba(BRAND.token, 0.6)}}
 .w-pill.flash{animation:wFlash .7s var(--w-ease)}
 @keyframes wFlash{0%{border-color:var(--w-token);box-shadow:0 0 0 0 ${rgba(BRAND.token, 0.5)}}100%{border-color:var(--w-line);box-shadow:var(--w-shadow),var(--w-inset)}}
+
+/* THE REPUTATION PILL — figure, title, and a progress hairline.
+   The title is capped and ellipsised rather than allowed to push the
+   city ring off a narrow screen; the full text is in the tooltip. */
+.w-pill.rep{position:relative;overflow:hidden;padding-bottom:calc(2px * var(--w-ts))}
+.w-pill.rep .ttl{max-width:calc(150px * var(--w-ts));overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:var(--w-token);letter-spacing:.11em}
+.w-pill.rep .w-num{font-weight:800}
+.w-repbar{position:absolute;left:calc(11px * var(--w-ts));right:calc(11px * var(--w-ts));
+  bottom:calc(3px * var(--w-ts));height:2px;border-radius:999px;background:${rgba(BRAND.text, 0.18)}}
+.w-repbar i{display:block;height:100%;border-radius:999px;background:var(--w-token);
+  transition:width .6s cubic-bezier(.22,1,.36,1)}
+
+/* THE LOCK STRIP — the engine's two hard refusals, said out loud and
+   with the way out one press away. Sits under the objective, in the
+   same column, so it can never collide with anything. */
+.w-lock{
+  -webkit-appearance:none;appearance:none;font-family:inherit;cursor:pointer;text-align:left;
+  display:flex;align-items:center;gap:calc(9px * var(--w-ts));
+  max-width:min(430px,52vw);margin-top:calc(6px * var(--w-ts));
+  padding:calc(8px * var(--w-ts)) calc(11px * var(--w-ts));border-radius:calc(14px * var(--w-ts));
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid ${rgba(BRAND.warn, 0.5)};color:var(--w-text);
+  box-shadow:var(--w-shadow),var(--w-inset),0 0 20px ${rgba(BRAND.warn, 0.16)};
+  animation:wLock .34s var(--w-ease) both;
+}
+.w-lock.bad{border-color:${rgba(BRAND.bad, 0.6)};box-shadow:var(--w-shadow),var(--w-inset),0 0 22px ${rgba(BRAND.bad, 0.22)}}
+.w-lock:active{transform:scale(.985)}
+.w-lock .ic{flex:none;color:var(--w-yellow2);display:grid;place-items:center}
+.w-lock.bad .ic{color:var(--w-bad)}
+.w-lock .t{font-size:calc(11px * var(--w-ts));font-weight:800;letter-spacing:.02em;line-height:1.28}
+.w-lock .d{font-size:calc(10.4px * var(--w-ts));font-weight:700;color:var(--w-dim2);margin-top:1px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-lock .go{flex:none;font-size:calc(8.6px * var(--w-ts));letter-spacing:.16em;font-weight:800;
+  padding:calc(3px * var(--w-ts)) calc(7px * var(--w-ts));border-radius:999px;
+  background:${rgba(BRAND.warn, 0.24)};color:var(--w-yellow)}
+.w-lock.bad .go{background:${rgba(BRAND.bad, 0.26)};color:${C(mix(BRAND.bad, 0xffffff, 0.5))}}
+@keyframes wLock{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+
+/* THE MAYOR'S DASH, live. Top-centre, above everything, and only on
+   screen while the race is actually running. The two markers on one
+   track are the whole readout: the race is a comparison. */
+.w-race{
+  /* UNDER the pill row, never across it. The top of the frame is
+     already two stat clusters wide; a centred box at y=14 sat on top
+     of the money and reputation readouts. */
+  position:absolute;top:calc(54px * var(--w-ts));left:50%;transform:translateX(-50%);
+  width:min(470px,50vw);pointer-events:auto;
+  padding:calc(10px * var(--w-ts)) calc(13px * var(--w-ts)) calc(9px * var(--w-ts));
+  border-radius:calc(17px * var(--w-ts));
+  ${G('var(--w-chrome)')}
+  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
+  border:1px solid ${rgba(BRAND.warn, 0.46)};color:var(--w-text);
+  box-shadow:var(--w-shadow),var(--w-inset),0 0 26px ${rgba(BRAND.warn, 0.18)};
+  animation:wLock .3s var(--w-ease) both;
+}
+.w-race.behind{border-color:${rgba(BRAND.bad, 0.5)}}
+.w-race .hd{display:flex;align-items:center;gap:calc(9px * var(--w-ts))}
+.w-race .flag{font-size:calc(14px * var(--w-ts));flex:none}
+.w-race .clk{font-family:var(--w-mono);font-variant-numeric:tabular-nums;
+  font-size:calc(19px * var(--w-ts));font-weight:800;letter-spacing:-.02em;flex:none}
+.w-race .nxt{flex:1 1 auto;min-width:0;font-size:calc(10.4px * var(--w-ts));font-weight:800;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--w-yellow);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-race .hd .w-btn{flex:none;white-space:nowrap}
+.w-race .trk{position:relative;height:calc(9px * var(--w-ts));border-radius:999px;
+  margin:calc(8px * var(--w-ts)) 0 calc(6px * var(--w-ts));
+  background:${rgba(BRAND.text, 0.16)};box-shadow:inset 0 0 0 1px ${rgba(BRAND.text, 0.14)}}
+/* TWO SHAPES, NOT TWO COLOURS. The markers cross each other by
+   definition, and a red dot behind an orange dot is one dot: the
+   Mayor is a tall bar, Wally is the disc that runs over it. */
+.w-race .trk i{position:absolute;top:50%;transform:translate(-50%,-50%);transition:left .12s linear}
+.w-race .trk .me{width:calc(13px * var(--w-ts));height:calc(13px * var(--w-ts));border-radius:999px;
+  background:var(--w-token);box-shadow:0 0 10px ${rgba(BRAND.token, 0.85)},0 0 0 2px ${rgba(0x05070c, 0.55)};z-index:2}
+.w-race .trk .him{width:calc(4px * var(--w-ts));height:calc(24px * var(--w-ts));border-radius:2px;
+  background:${C(BRAND.bad)};box-shadow:0 0 9px ${rgba(BRAND.bad, 0.8)};z-index:1}
+.w-race .dl{font-size:calc(10.6px * var(--w-ts));font-weight:800;font-variant-numeric:tabular-nums;
+  letter-spacing:.02em}
 
 /* the money delta chip — the one thing in the pill row allowed to
    shout, because money changing is the game's core feedback */
@@ -604,25 +691,67 @@ export function stylesheet() {
 .w-ring{transform:rotate(-90deg)}
 .w-ring circle{fill:none;stroke-linecap:round}
 
-/* ---------- objective ---------- */
+/* ---------- the objective strip — AND THE ONLY POINTER ----------
+
+   What to do, where it is, and which way to turn, in one object.
+   There is no second floating compass: a chosen destination
+   retargets THIS strip (hud.js paintStrip / setDestination) and
+   lights the .chosen accent, and the ✕ hands it back to the quest.
+
+   The dial's arrow is written every frame by hud.js. The bearing is
+   taken in Wally's own frame, so "point it up and walk". */
 .w-obj{
   margin-top:calc(7px * var(--w-ts));
   display:flex;align-items:center;gap:calc(10px * var(--w-ts));
-  padding:calc(8px * var(--w-ts)) calc(13px * var(--w-ts)) calc(8px * var(--w-ts)) calc(11px * var(--w-ts));
-  border-radius:calc(13px * var(--w-ts));
+  padding:calc(7px * var(--w-ts)) calc(13px * var(--w-ts)) calc(7px * var(--w-ts)) calc(7px * var(--w-ts));
+  border-radius:calc(15px * var(--w-ts));
   ${G('var(--w-chrome)')}
   -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
   border:1px solid var(--w-line);border-left:calc(3px * var(--w-ts)) solid var(--w-token);
   box-shadow:var(--w-shadow),var(--w-inset);
   cursor:pointer;max-width:min(420px,44vw);
-  transition:transform .18s var(--w-ease),border-color .2s;
+  transition:transform .18s var(--w-ease),border-color .2s,box-shadow .25s var(--w-ease);
 }
 .w-obj:active{transform:scale(.985)}
-.w-obj .t{font-weight:800;font-size:calc(13px * var(--w-ts));letter-spacing:.005em}
-.w-obj .d{font-size:calc(10.5px * var(--w-ts));color:var(--w-dim);margin-top:1px}
-.w-obj .go{margin-left:auto;color:var(--w-token);opacity:.85}
-.w-obj .dot{width:calc(7px * var(--w-ts));height:calc(7px * var(--w-ts));border-radius:99px;background:var(--w-token);
-  box-shadow:0 0 10px ${rgba(BRAND.token, 0.8)};animation:wPulse 2.4s ease-in-out infinite;flex:none}
+.w-obj .w-grow{min-width:0}
+.w-obj .t{font-weight:800;font-size:calc(13px * var(--w-ts));letter-spacing:.005em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.w-obj .d{font-size:calc(10.5px * var(--w-ts));color:var(--w-yellow);font-weight:700;
+  font-variant-numeric:tabular-nums;margin-top:1px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.w-obj .why{font-size:calc(10px * var(--w-ts));color:var(--w-dim);font-weight:600;margin-top:1px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* THE DIAL. Ex-.w-ptr, unchanged in look — it moved house, it did
+   not change identity, and the player should not notice a new object
+   where the old arrow used to be. */
+.w-obj .dial{
+  position:relative;flex:none;
+  width:calc(34px * var(--w-ts));height:calc(34px * var(--w-ts));border-radius:50%;
+  display:grid;place-items:center;
+  background:radial-gradient(circle at 50% 34%,${rgba(BRAND.warn, 0.30)},${rgba(BRAND.warn, 0.10)});
+  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.warn, 0.62)};
+  transition:background .3s var(--w-ease),box-shadow .3s var(--w-ease),opacity .3s var(--w-ease);
+}
+/* the tick marks that make it read as a dial rather than a badge */
+.w-obj .dial:before{content:'';position:absolute;inset:calc(3px * var(--w-ts));border-radius:50%;
+  border:1px dashed ${rgba(BRAND.warn, 0.30)}}
+.w-obj .arw{color:var(--w-yellow);filter:drop-shadow(0 0 6px ${rgba(BRAND.warn, 0.7)});
+  transform-origin:50% 50%;will-change:transform}
+.w-obj.here .dial{background:${rgba(BRAND.good, 0.22)};box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.good, 0.6)}}
+.w-obj.here .arw{color:${C(BRAND.good)};filter:none}
+/* nothing to point at — the dial dims rather than inventing a bearing */
+.w-obj.nodir .dial{opacity:.34}
+.w-obj.nodir .arw{filter:none}
+/* a chosen destination: same strip, warmer edge, and a way out */
+.w-obj.chosen{border-left-color:var(--w-yellow);
+  box-shadow:var(--w-shadow),var(--w-inset),0 0 24px ${rgba(BRAND.warn, 0.18)}}
+.w-obj .go{margin-left:auto;flex:none;display:grid;place-items:center;
+  width:calc(22px * var(--w-ts));height:calc(22px * var(--w-ts));border-radius:50%;
+  border:0;background:${rgba(BRAND.paper, 0.12)};color:var(--w-text);opacity:.72;cursor:pointer;
+  transition:opacity .18s,transform .18s var(--w-ease)}
+.w-obj .go:hover{opacity:1}
+.w-obj .go:active{transform:scale(.9)}
 @keyframes wPulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.72)}}
 
 /* ---------- toasts ---------- */
@@ -862,12 +991,11 @@ export function stylesheet() {
    a reading experience. While someone is speaking the HUD steps
    back; the objective holds a little higher because it is the one
    thing a player may want to check mid-conversation. */
-.w-root .w-pills,.w-root .w-obj,.w-root .w-hints,.w-root .w-toasts,.w-root .w-promptlayer,.w-root .w-ptr{
+.w-root .w-pills,.w-root .w-obj,.w-root .w-hints,.w-root .w-toasts,.w-root .w-promptlayer{
   transition:opacity .35s var(--w-ease);
 }
 .w-root.w-dlg-open .w-pills{opacity:.26}
 .w-root.w-dlg-open .w-obj{opacity:.5}
-.w-root.w-dlg-open .w-ptr{opacity:.34}
 .w-root.w-dlg-open .w-hints{opacity:.18}
 .w-root.w-dlg-open .w-toasts{opacity:.3}
 .w-root.w-dlg-open .w-promptlayer{opacity:.22}
@@ -940,6 +1068,20 @@ export function stylesheet() {
 .w-card .d{font-size:calc(11px * var(--w-ts));opacity:.62;margin-top:1px;line-height:1.3}
 .w-card .m{margin-left:auto;text-align:right;font-weight:800;font-size:calc(12px * var(--w-ts));white-space:nowrap}
 .w-card .m small{display:block;font-weight:600;font-size:calc(10px * var(--w-ts));opacity:.6}
+
+/* A LOCKED RIDE IS A SHOP WINDOW, NOT A GREY ROW. Same card, but
+   unfilled and outlined in warm token dashes — the register of a
+   thing on display behind glass rather than a control that has been
+   switched off. The glyph keeps its colour: it is the whole reason
+   to want it. 'on' is the mirror of it — the one under him right
+   now, in green, so the list has an obvious head. */
+.w-card.locked{background:${rgba(BRAND.token, 0.055)};
+  box-shadow:inset 0 0 0 1.5px ${rgba(BRAND.token, 0.26)}}
+.w-card.locked .t{opacity:.9}
+.w-card.locked .ic{background:${rgba(BRAND.token, 0.13)}}
+.w-card.on{background:${rgba(BRAND.good, 0.11)};
+  box-shadow:inset 0 0 0 1.5px ${rgba(BRAND.good, 0.34)}}
+.w-card.on .ic{background:${rgba(BRAND.good, 0.16)}}
 .w-empty{padding:calc(26px * var(--w-ts)) calc(14px * var(--w-ts));text-align:center;opacity:.5;font-size:calc(12px * var(--w-ts))}
 .w-chipbar{display:flex;gap:calc(6px * var(--w-ts));overflow-x:auto;padding-bottom:calc(4px * var(--w-ts));scrollbar-width:none}
 .w-chipbar::-webkit-scrollbar{display:none}
@@ -1051,10 +1193,18 @@ export function stylesheet() {
 .w-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:calc(7px * var(--w-ts));margin-bottom:calc(8px * var(--w-ts))}
 .w-stat{padding:calc(9px * var(--w-ts)) calc(10px * var(--w-ts));border-radius:calc(13px * var(--w-ts));
   background:${rgba(0xffffff, 0.62)};box-shadow:inset 0 0 0 1px ${rgba(BRAND.ink, 0.07)};
-  display:flex;flex-direction:column;gap:calc(5px * var(--w-ts));min-width:0}
-.w-stat .k{display:flex;align-items:center;gap:calc(5px * var(--w-ts));
-  font-size:calc(8.8px * var(--w-ts));letter-spacing:.13em;text-transform:uppercase;
-  font-weight:800;color:${rgba(BRAND.ink, 0.46)};white-space:nowrap;overflow:hidden}
+  display:flex;flex-direction:column;gap:calc(5px * var(--w-ts));min-width:0;
+  /* a pressable tile is a <button>: kill the UA chrome, keep the card */
+  -webkit-appearance:none;appearance:none;border:0;font-family:inherit;color:inherit;
+  text-align:left;cursor:default}
+button.w-stat{cursor:pointer;transition:transform .15s var(--w-ease)}
+button.w-stat:active{transform:scale(.97)}
+/* THE LABEL WRAPS RATHER THAN TRUNCATES. It carries the reputation
+   TITLE now, and "A Little C." is worse than two short lines. */
+.w-stat .k{display:flex;align-items:flex-start;gap:calc(5px * var(--w-ts));
+  font-size:calc(8.8px * var(--w-ts));letter-spacing:.11em;text-transform:uppercase;line-height:1.32;
+  font-weight:800;color:${rgba(BRAND.ink, 0.46)};overflow:hidden}
+.w-stat .k .w-i{flex:none;margin-top:calc(1px * var(--w-ts))}
 .w-stat .k .w-i{opacity:.7;flex:none}
 .w-stat .v{font-size:calc(16px * var(--w-ts));font-weight:800;letter-spacing:-.01em;
   font-variant-numeric:tabular-nums;color:${rgba(BRAND.ink, 0.86)}}
@@ -1134,71 +1284,6 @@ export function stylesheet() {
   box-shadow:inset 0 0 0 1.2px ${rgba(BRAND.paper, 0.2)}}
 .w-ticket{display:inline-flex;align-items:center;gap:calc(5px * var(--w-ts));flex-wrap:wrap}
 .w-ticket .sep{opacity:.35;font-weight:800}
-
-/* ============================================================
-   THE DESTINATION POINTER — centre-top wide, upper-right narrow.
-
-   Which way, and how far. The bearing is taken in Wally's own
-   frame, so the arrow points where he would have to turn, and it is
-   written every frame rather than at the 8 Hz the rest of the HUD
-   repaints at: a compass that lags a turn is worse than no compass.
-
-   It is placed by JS, not by CSS, because the width it may have
-   depends on what the left-hand cluster is showing right now — see
-   placePointer() in hud.js, which writes --w-ptr-top and, in the
-   rail, --w-ptr-max. hud.js owns the breakpoint between the two.
-   ============================================================ */
-.w-ptr{
-  position:absolute;left:50%;transform:translateX(-50%);
-  top:var(--w-ptr-top,max(12px,env(safe-area-inset-top)));
-  display:flex;align-items:center;gap:calc(10px * var(--w-ts));
-  padding:calc(6px * var(--w-ts)) calc(14px * var(--w-ts)) calc(6px * var(--w-ts)) calc(6px * var(--w-ts));
-  border-radius:999px;
-  ${G('var(--w-chrome)')}
-  -webkit-backdrop-filter:var(--w-blur);backdrop-filter:var(--w-blur);
-  border:1px solid ${rgba(BRAND.warn, 0.42)};
-  box-shadow:var(--w-shadow),var(--w-inset),0 0 26px ${rgba(BRAND.warn, 0.16)};
-  cursor:pointer;max-width:min(340px,42vw);
-  transition:opacity .3s var(--w-ease),transform .18s var(--w-ease);
-}
-.w-ptr:active{transform:translateX(-50%) scale(.97)}
-.w-ptr.off{opacity:0;pointer-events:none}
-
-/* THE RIGHT-HAND RAIL — the narrow-screen placement. Same right edge
-   as the REP and CITY pills above it, so the upper-right corner reads
-   as one column. The width comes from --w-ptr-max, which hud.js
-   measures against the left cluster every repaint; the label column
-   needs min-width:0 or flex will refuse to shrink it and the pill
-   will barge into the energy meter instead of ellipsing. */
-.w-ptr.rail{
-  left:auto;right:max(12px,env(safe-area-inset-right));
-  transform:none;transform-origin:100% 50%;
-  max-width:var(--w-ptr-max,min(300px,74vw));
-}
-.w-ptr.rail:active{transform:scale(.97)}
-.w-ptr .tx{min-width:0}
-.w-ptr.rail .t,.w-ptr.rail .d{
-  max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-}
-.w-ptr .dial{
-  position:relative;flex:none;
-  width:calc(34px * var(--w-ts));height:calc(34px * var(--w-ts));border-radius:50%;
-  display:grid;place-items:center;
-  background:radial-gradient(circle at 50% 34%,${rgba(BRAND.warn, 0.30)},${rgba(BRAND.warn, 0.10)});
-  box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.warn, 0.62)};
-}
-/* the tick marks that make it read as a dial rather than a badge */
-.w-ptr .dial:before{content:'';position:absolute;inset:calc(3px * var(--w-ts));border-radius:50%;
-  border:1px dashed ${rgba(BRAND.warn, 0.30)}}
-.w-ptr .arw{color:var(--w-yellow);filter:drop-shadow(0 0 6px ${rgba(BRAND.warn, 0.7)});
-  transform-origin:50% 50%;will-change:transform}
-.w-ptr .t{font-size:calc(12.4px * var(--w-ts));font-weight:800;letter-spacing:.01em;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(210px * var(--w-ts))}
-.w-ptr .d{font-size:calc(10.4px * var(--w-ts));color:var(--w-dim);font-weight:700;
-  font-variant-numeric:tabular-nums;margin-top:1px}
-.w-ptr .d b{color:var(--w-yellow);font-weight:800}
-.w-ptr.here .dial{background:${rgba(BRAND.good, 0.22)};box-shadow:inset 0 0 0 1.6px ${rgba(BRAND.good, 0.6)}}
-.w-ptr.here .arw{color:${C(BRAND.good)};filter:none}
 
 /* ============================================================
    THE MAP — ui/map.js
@@ -1283,8 +1368,143 @@ export function stylesheet() {
   font-variant-numeric:tabular-nums;font-size:calc(19px * var(--w-ts));font-weight:800}
 .w-qty .pre{margin-left:auto;display:flex;gap:calc(5px * var(--w-ts))}
 
+/* ============================================================
+   THE ASK — the price legibility block.
+
+   economy.buyPrice() is mid x (1 + venue spread), so a list quoting
+   the mid beside a button charging the ask reads as a bug. These two
+   surfaces put the ask on top, at size, and print the mid and the
+   spread underneath it in cash: the difference is a stated fee.
+   ============================================================ */
+.w-ask{
+  margin-top:calc(10px * var(--w-ts));padding:calc(10px * var(--w-ts)) calc(12px * var(--w-ts));
+  border-radius:calc(12px * var(--w-ts));
+  background:${rgba(BRAND.token, 0.13)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.token, 0.30)};
+}
+.w-ask .row{display:flex;align-items:baseline;gap:calc(8px * var(--w-ts))}
+.w-ask .k{font-size:calc(9.4px * var(--w-ts));letter-spacing:.16em;text-transform:uppercase;
+  font-weight:800;color:${rgba(BRAND.ink, 0.55)}}
+.w-ask .v{margin-left:auto;font-size:calc(21px * var(--w-ts));font-weight:800;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;color:var(--w-token2)}
+.w-ask .u{font-size:calc(10px * var(--w-ts));font-weight:800;opacity:.55}
+.w-ask .brk{display:flex;align-items:center;flex-wrap:wrap;gap:calc(7px * var(--w-ts));
+  margin-top:calc(5px * var(--w-ts));font-size:calc(11px * var(--w-ts));font-weight:700;opacity:.78}
+.w-ask .brk b{font-variant-numeric:tabular-nums}
+.w-ask .brk .op{font-weight:800;opacity:.5}
+.w-spread{
+  padding:calc(9px * var(--w-ts)) calc(11px * var(--w-ts));border-radius:calc(12px * var(--w-ts));
+  background:${rgba(BRAND.info, 0.11)};box-shadow:inset 0 0 0 1.2px ${rgba(BRAND.info, 0.26)};
+  margin:calc(6px * var(--w-ts)) 0;
+}
+.w-spread .k{display:block;font-size:calc(9.4px * var(--w-ts));letter-spacing:.16em;
+  text-transform:uppercase;font-weight:800;color:${rgba(BRAND.ink, 0.55)}}
+.w-spread .d{display:block;font-size:calc(11.4px * var(--w-ts));line-height:1.45;
+  font-weight:700;margin-top:calc(3px * var(--w-ts));opacity:.85}
+
+/* ---------- notes, warnings, and the refusal card ---------- */
+.w-note{font-size:calc(11.4px * var(--w-ts));line-height:1.5;font-weight:600;opacity:.72;
+  padding:calc(8px * var(--w-ts)) 0}
+.w-warnbox{
+  padding:calc(11px * var(--w-ts)) calc(13px * var(--w-ts));border-radius:calc(13px * var(--w-ts));
+  font-size:calc(12.2px * var(--w-ts));font-weight:700;line-height:1.46;
+  background:${rgba(BRAND.warn, 0.15)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.warn, 0.38)};
+}
+.w-warnbox.bad{background:${rgba(BRAND.bad, 0.13)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.bad, 0.34)}}
+.w-warnbox.good{background:${rgba(BRAND.good, 0.13)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.good, 0.34)}}
+
+/* ---------- the producer upgrade card ----------
+   The cost, then the three effects in numbers, then the button. A
+   level is a purchase; a purchase gets a receipt before the money. */
+.w-up{
+  padding:calc(12px * var(--w-ts)) calc(13px * var(--w-ts));border-radius:calc(15px * var(--w-ts));
+  background:${rgba(0xffffff, 0.70)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.ink, 0.12)};
+}
+.w-up.poor{opacity:.82}
+.w-up .hd{display:flex;align-items:center;gap:calc(10px * var(--w-ts))}
+.w-up .hd .ic{width:calc(32px * var(--w-ts));height:calc(32px * var(--w-ts));flex:none;
+  border-radius:calc(10px * var(--w-ts));display:grid;place-items:center;
+  background:${rgba(BRAND.token, 0.16)};color:var(--w-token2)}
+.w-up .hd .t{font-weight:800;font-size:calc(12.8px * var(--w-ts))}
+.w-up .hd .d{font-size:calc(10.6px * var(--w-ts));opacity:.6;margin-top:1px}
+.w-up .hd .m{margin-left:auto;text-align:right;font-weight:800;font-size:calc(13px * var(--w-ts));
+  white-space:nowrap;font-variant-numeric:tabular-nums}
+.w-up .hd .m small{display:block;font-weight:700;font-size:calc(9.4px * var(--w-ts));opacity:.6}
+.w-up .eff{margin-top:calc(9px * var(--w-ts));display:flex;flex-direction:column;
+  gap:calc(6px * var(--w-ts))}
+.w-up .eff .row{display:flex;gap:calc(8px * var(--w-ts));align-items:flex-start;
+  padding:calc(7px * var(--w-ts)) calc(9px * var(--w-ts));border-radius:calc(10px * var(--w-ts));
+  background:${rgba(BRAND.ink, 0.045)};color:${rgba(BRAND.ink, 0.55)}}
+.w-up .eff .row.on{background:${rgba(BRAND.good, 0.11)};color:var(--w-good)}
+.w-up .eff .row b{display:block;font-size:calc(11.8px * var(--w-ts));font-weight:800;color:var(--w-ink)}
+.w-up .eff .row span{display:block;font-size:calc(10.6px * var(--w-ts));line-height:1.42;
+  font-weight:600;color:${rgba(BRAND.ink, 0.62)};margin-top:1px}
+.w-up .eff .row .w-i{margin-top:calc(2px * var(--w-ts));flex:none}
+
+/* ---------- the race: route, splits, and the two clocks ---------- */
+.w-route{display:flex;flex-direction:column;gap:calc(4px * var(--w-ts))}
+.w-route .leg{display:flex;align-items:center;gap:calc(9px * var(--w-ts));
+  padding:calc(7px * var(--w-ts)) calc(10px * var(--w-ts));border-radius:calc(10px * var(--w-ts));
+  background:${rgba(BRAND.ink, 0.045)};font-size:calc(11.6px * var(--w-ts));font-weight:700}
+.w-route .leg.done{background:${rgba(BRAND.good, 0.12)}}
+.w-route .leg.lost{background:${rgba(BRAND.bad, 0.10)}}
+.w-route .leg .n{min-width:calc(44px * var(--w-ts));font-size:calc(9px * var(--w-ts));
+  letter-spacing:.14em;font-weight:800;opacity:.5;text-transform:uppercase}
+.w-route .leg .p{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-route .leg .m{font-variant-numeric:tabular-nums;opacity:.66;font-weight:800}
+.w-versus{display:flex;align-items:stretch;gap:calc(8px * var(--w-ts));margin-bottom:calc(10px * var(--w-ts))}
+.w-versus .side{flex:1 1 0;min-width:0;text-align:center;padding:calc(11px * var(--w-ts)) calc(8px * var(--w-ts));
+  border-radius:calc(14px * var(--w-ts));background:${rgba(BRAND.ink, 0.05)}}
+.w-versus .side.win{background:${rgba(BRAND.good, 0.14)};box-shadow:inset 0 0 0 1.4px ${rgba(BRAND.good, 0.34)}}
+.w-versus .side .k{display:block;font-size:calc(9px * var(--w-ts));letter-spacing:.16em;
+  text-transform:uppercase;font-weight:800;opacity:.55;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-versus .side b{display:block;font-size:calc(25px * var(--w-ts));font-weight:800;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;line-height:1.1;margin-top:2px}
+.w-versus .side .d{display:block;font-size:calc(9.6px * var(--w-ts));font-weight:700;opacity:.55;margin-top:2px}
+.w-versus .gap{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-width:calc(58px * var(--w-ts))}
+.w-versus .gap b{font-size:calc(16px * var(--w-ts));font-weight:800;font-variant-numeric:tabular-nums}
+.w-versus .gap span{font-size:calc(8.6px * var(--w-ts));letter-spacing:.12em;text-transform:uppercase;
+  font-weight:800;opacity:.5}
+
+/* ---------- WallyNet: the title, and the ladder under it ---------- */
+.w-title{
+  padding:calc(14px * var(--w-ts));border-radius:calc(18px * var(--w-ts));
+  background:linear-gradient(150deg,${rgba(BRAND.token, 0.26)},${rgba(0xffffff, 0.70)} 74%);
+  box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.token, 0.34)},0 4px 14px ${rgba(BRAND.token2, 0.12)};
+  margin-bottom:calc(9px * var(--w-ts));position:relative;
+}
+.w-title .rung{font-size:calc(9px * var(--w-ts));letter-spacing:.18em;text-transform:uppercase;
+  font-weight:800;color:${rgba(BRAND.ink, 0.5)}}
+.w-title .nm{font-size:calc(21px * var(--w-ts));font-weight:800;letter-spacing:-.015em;
+  line-height:1.14;margin-top:calc(3px * var(--w-ts));color:var(--w-token2)}
+.w-title .ds{font-size:calc(11.4px * var(--w-ts));line-height:1.46;font-weight:600;
+  opacity:.72;margin-top:calc(4px * var(--w-ts))}
+.w-title .fig{position:absolute;top:calc(12px * var(--w-ts));right:calc(14px * var(--w-ts));text-align:right}
+.w-title .fig b{display:block;font-size:calc(28px * var(--w-ts));font-weight:800;letter-spacing:-.03em;
+  line-height:1;font-variant-numeric:tabular-nums}
+.w-title .fig span{display:block;font-size:calc(8.4px * var(--w-ts));letter-spacing:.14em;
+  text-transform:uppercase;font-weight:800;opacity:.5}
+.w-title .nx{display:flex;align-items:baseline;flex-wrap:wrap;gap:calc(5px * var(--w-ts));
+  margin-top:calc(7px * var(--w-ts));font-size:calc(11px * var(--w-ts));font-weight:700;opacity:.8}
+.w-title .nx b{font-weight:800;color:var(--w-token2)}
+.w-title .nx .at{opacity:.55;font-weight:700}
+.w-titlebar{height:calc(7px * var(--w-ts));border-radius:999px;margin-top:calc(10px * var(--w-ts));
+  background:${rgba(BRAND.ink, 0.14)};overflow:hidden}
+.w-titlebar i{display:block;height:100%;border-radius:999px;
+  background:linear-gradient(90deg,var(--w-token),var(--w-token2));
+  transition:width .6s cubic-bezier(.22,1,.36,1)}
+.w-ladder{display:flex;flex-direction:column;gap:calc(3px * var(--w-ts))}
+.w-ladder .rw{display:flex;align-items:center;gap:calc(8px * var(--w-ts));
+  padding:calc(6px * var(--w-ts)) calc(10px * var(--w-ts));border-radius:calc(9px * var(--w-ts));
+  font-size:calc(11.4px * var(--w-ts));font-weight:700;opacity:.5}
+.w-ladder .rw.on{opacity:1;background:${rgba(BRAND.token, 0.10)}}
+.w-ladder .rw.now{background:${rgba(BRAND.token, 0.22)};box-shadow:inset 0 0 0 1.3px ${rgba(BRAND.token, 0.40)}}
+.w-ladder .rw .d{display:grid;place-items:center;flex:none;color:var(--w-token2)}
+.w-ladder .rw .t{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.w-ladder .rw .r{font-variant-numeric:tabular-nums;font-weight:800;opacity:.6}
+
 /* ---------- accessibility modes ---------- */
-.w-hc .w-chrome,.w-hc .w-pill,.w-hc .w-obj,.w-hc .w-toast,.w-hc .w-prompt,.w-hc .w-banner,.w-hc .w-hint,.w-hc .w-ptr{
+.w-hc .w-chrome,.w-hc .w-pill,.w-hc .w-obj,.w-hc .w-toast,.w-hc .w-prompt,.w-hc .w-banner,.w-hc .w-hint{
   background:${rgba(0x05070c, 0.94)} !important;border-color:${rgba(BRAND.paper, 0.42)} !important;
   -webkit-backdrop-filter:none !important;backdrop-filter:none !important;
 }
@@ -1306,7 +1526,7 @@ export function stylesheet() {
 }
 @media (max-width:720px){
   .w-bar{max-width:62vw}
-  .w-obj{max-width:min(340px,66vw)}
+  .w-obj{max-width:min(360px,66vw)}
   .w-hints{max-width:44vw}
   .w-dlg-tx{font-size:calc(14px * var(--w-ts))}
 }
@@ -1315,26 +1535,28 @@ export function stylesheet() {
    the top of the frame. Shrink the pills, shorten the meters and give
    each side under half the width, so the left column reads as a column,
    the right one as a column, and there is a gutter between them. */
+@media (max-width:720px){
+  /* the right cluster becomes a column here, so the race box drops
+     below both of them and takes the full width instead */
+  .w-race{top:calc(96px * var(--w-ts));width:min(430px,90vw)}
+}
 @media (max-width:480px){
+  .w-race{top:calc(116px * var(--w-ts));width:92vw}
   .w-bar{max-width:49vw;gap:calc(5px * var(--w-ts))}
+  .w-bar.left .w-pills{max-width:49vw}
   .w-bar.right{flex-direction:column;align-items:flex-end}
   .w-bar.right .w-pills{justify-content:flex-end}
   .w-pill{height:calc(27px * var(--w-ts));padding:0 calc(8px * var(--w-ts));
     gap:calc(5px * var(--w-ts));font-size:calc(11.5px * var(--w-ts))}
   .w-meter{width:calc(42px * var(--w-ts))}
-  .w-obj{max-width:min(300px,76vw);padding:calc(7px * var(--w-ts)) calc(11px * var(--w-ts))}
+  /* THE STRIP IS THE POINTER, so on a phone it gets the width the
+     floating pointer used to be squeezed out of: 82vw of the left
+     column, a smaller dial, tighter padding. Nothing sits beside it. */
+  .w-obj{max-width:min(320px,82vw);padding:calc(6px * var(--w-ts)) calc(10px * var(--w-ts))
+    calc(6px * var(--w-ts)) calc(6px * var(--w-ts));gap:calc(8px * var(--w-ts))}
   .w-obj .t{font-size:calc(12px * var(--w-ts))}
+  .w-obj .dial{width:calc(30px * var(--w-ts));height:calc(30px * var(--w-ts))}
   .w-toasts{max-width:74vw}
-  /* On a phone the pointer is in the right-hand rail under REP and
-     CITY, sharing a ~190 px slot with nothing to its left but the
-     energy meter. Every pixel of chrome here is a pixel the words
-     "· to your left" does not get, so the dial shrinks, the gap
-     closes and the trailing padding comes in. The width itself is
-     --w-ptr-max, written by hud.js. */
-  .w-ptr{padding:calc(5px * var(--w-ts)) calc(11px * var(--w-ts)) calc(5px * var(--w-ts)) calc(5px * var(--w-ts));
-    gap:calc(8px * var(--w-ts))}
-  .w-ptr .dial{width:calc(30px * var(--w-ts));height:calc(30px * var(--w-ts))}
-  .w-ptr .t{font-size:calc(11.6px * var(--w-ts));max-width:calc(168px * var(--w-ts))}
   .w-tkt{padding-left:calc(17px * var(--w-ts))}
   .w-qty .n{min-width:calc(44px * var(--w-ts));font-size:calc(17px * var(--w-ts))}
 }

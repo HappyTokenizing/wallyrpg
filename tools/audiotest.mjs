@@ -11,7 +11,7 @@
    exactly how the opening cinematic used to play. Silent.
 
    So this file boots the real game in real Chrome with none of the
-   tools/ escape flags, and runs two passes.
+   tools/ escape flags, and runs five passes.
 
    PASS A — autoplay blocked. Headless Chrome will not block Web Audio
    for any value of --autoplay-policy, so the block is imposed on the
@@ -67,11 +67,25 @@
    every screenshot tool in tools/ hangs on a keystroke that will not
    come.
 
+   PASS E — THE DROPOUT. Reported from the field: "my music cut off
+   after playing for some time. And then stayed off and came back after
+   some time." Intermittent, self-healing silence during play, which is
+   a different animal from never starting: the context is running, every
+   flag says the score is playing, and the room is quiet. The four ways
+   Web Audio produces that — a starved look-ahead scheduler in a
+   throttled tab, a context suspended and handed back without the
+   transport being re-armed, a bus left at zero by an interrupted
+   transition, and a transport that simply stopped — are each broken on
+   purpose and each has to heal itself. It closes with a soak that
+   proves bars keep turning at the score's own rate for minutes on end,
+   with no window of silence and no growth in the voice table.
+
    Every pass also asserts __WALLY_READY__ arrives without a gesture,
    because every tool in tools/ waits on it.
 
        node tools/audiotest.mjs
        node tools/audiotest.mjs --verbose
+       node tools/audiotest.mjs --only E --soak 300   # a five-minute soak
 
    Exits non-zero if any assertion failed.
    ============================================================ */
@@ -706,6 +720,286 @@ await attempt('PASS D', async () => {
   const real4 = [...errors, ...two.errors].filter((e) => !/favicon|status of 404|autoplay/i.test(e));
   ok(real4.length === 0, 'no page errors', real4.slice(0, 4).join(' | '));
   } finally { await two.browser.close().catch(() => {}); }
+});
+
+/* ================================================================
+   PASS E — THE DROPOUT.
+
+   Reported from the field: "my music cut off after playing for some
+   time. And then stayed off and came back after some time."
+
+   Intermittent, self-healing silence during play. Web Audio gives you
+   four ways to produce exactly that and this pass exercises all four,
+   plus a soak that proves the score does not simply drift into silence
+   on its own:
+
+     E1  THE HIDDEN TAB. requestAnimationFrame stops dead in a
+         backgrounded tab and setTimeout is clamped to 1 s — and a page
+         that has made no sound for 30 s is dropped to ONE TICK PER
+         MINUTE. A fixed 0.28 s look-ahead cannot bridge either, and
+         going quiet is what earns the harsher clamp, so the failure
+         feeds itself. The invariant that makes it impossible is
+         horizon >= the tick gap we are actually being given, and it is
+         asserted directly.
+
+     E2  THE FROZEN PAGE. Not simulated: Page.setWebLifecycleState
+         through CDP genuinely stops every clock in the renderer while
+         the audio clock keeps running — the real shape of a phone that
+         went away and came back. The score must be scheduling again
+         within a second of the thaw, and must NOT machine-gun the bars
+         it missed.
+
+     E3  THE SUSPENDED CONTEXT. Taken away and handed back with no
+         visibilitychange at all, which is what a phone call does. A
+         resumed context with a dead scheduler is still silence, so what
+         is asserted is that the TRANSPORT came back, not the context.
+
+     E4  A STALLED TRANSPORT AND A MUTED BUS — the two states that
+         produce silence while every flag still says "playing". The
+         watchdog has to notice both without being told why.
+
+     E5  SOAK. Several minutes of simulated time by default (--soak
+         <seconds> to change it): bars must keep turning at the score's
+         own rate throughout, with no window of silence, no scheduler
+         errors, and no unbounded growth in the voice table.
+   ================================================================ */
+const SOAK = (() => {
+  const i = process.argv.indexOf('--soak');
+  const v = i > -1 ? Number(process.argv[i + 1]) : NaN;
+  return Number.isFinite(v) && v > 0 ? v : 60;
+})();
+
+await attempt('PASS E', async () => {
+  console.log('\nPASS E — the dropout: silence that comes back on its own');
+  const { browser, page, errors } = await boot({ block: false, query: '?skipIntro=1', settle: 2000 });
+  try {
+  const cdp = await page.context().newCDPSession(page);
+
+  /* The unblocked context is already running; make sure the transport is
+     unlocked and on a real score before any of this means anything. */
+  await page.evaluate(() => {
+    WALLY.ctx.audio.resume();
+    WALLY.ctx.audio.setContext('explore', { immediate: true, fade: 0.4 });
+  });
+  await page.waitForTimeout(2500);
+
+  const T = () => page.evaluate(() => ({
+    ...WALLY.ctx.audio.transport, notes: WALLY.ctx.audio.notes.length,
+  }));
+
+  head('the score is actually running before we break it');
+  const t0 = await T();
+  note('transport:', t0);
+  ok(t0 && t0.playing === true, 'the transport is playing');
+  ok(t0.notes > 0, 'notes are on the wire', `${t0.notes}`);
+  ok(t0.silentFor < 0.5, 'the wire is written ahead of the clock',
+    `silentFor ${t0.silentFor}s`);
+
+  /* ---- E1 the hidden tab ---- */
+  head('E1 — a backgrounded tab');
+  const hid = await page.evaluate(async () => {
+    /* visibilityState is read-only, so shadow it for the duration —
+       the game only ever reads it, and this is the one honest way to
+       ask "what would you do if you were hidden?" in a headless tab. */
+    Object.defineProperty(document, 'visibilityState',
+      { configurable: true, get: () => 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await new Promise((r) => setTimeout(r, 400));
+    return { ...WALLY.ctx.audio.transport };
+  });
+  note('hidden:', hid);
+  ok(hid.horizon >= 1.5,
+    'the look-ahead widens the moment the tab hides, before the clamp bites',
+    `horizon ${hid.horizon}s`);
+  ok(hid.horizon >= hid.tickGap * 2,
+    'the horizon covers at least twice the gap between ticks',
+    `horizon ${hid.horizon}s vs gap ${hid.tickGap}s`);
+  /* 1 s is what Chrome clamps a hidden tab's timers to. Anything less
+     than that scheduled ahead is an audible hole every second. */
+  ok(hid.horizon >= 1.0,
+    'a 1 s clamped timer cannot starve the scheduler', `${hid.horizon}s`);
+
+  const hidOn = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = a.notes.length, bar = a.bar;
+    await new Promise((r) => setTimeout(r, 2500));
+    return { grew: a.notes.length - before, bars: a.bar - bar, silentFor: a.transport.silentFor };
+  });
+  note('hidden, 2.5s:', hidOn);
+  ok(hidOn.grew > 0, 'the score keeps being scheduled while hidden', `${hidOn.grew} notes`);
+  ok(hidOn.bars > 0, 'bars keep turning while hidden', `${hidOn.bars} bars`);
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState',
+      { configurable: true, get: () => 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.waitForTimeout(700);
+  const backVis = await T();
+  ok(backVis.horizon < 1.5, 'the horizon narrows again when the tab returns',
+    `${backVis.horizon}s`);
+  ok(backVis.silentFor < 0.6, 'and the score never went quiet across the change',
+    `silentFor ${backVis.silentFor}s`);
+
+  /* ---- E2 a genuinely frozen page ---- */
+  head('E2 — the page is frozen for four seconds, then thawed');
+  const beforeFreeze = await T();
+  let froze = true;
+  try {
+    await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
+  } catch (e) { froze = false; note('freeze unsupported:', String(e?.message || e)); }
+  await new Promise((r) => setTimeout(r, 4000));
+  if (froze) await cdp.send('Page.setWebLifecycleState', { state: 'active' });
+  await page.waitForTimeout(900);
+  const thawed = await T();
+  note('thawed:', thawed);
+  ok(thawed.playing === true, 'the transport survived the freeze');
+  ok(thawed.silentFor < 0.8,
+    'it is writing ahead of the clock again within a second of the thaw',
+    `silentFor ${thawed.silentFor}s`);
+  ok(thawed.errors === 0, 'no scheduler errors', String(thawed.errors));
+  /* A catch-up burst is the other failure: sixty bars fired at once. */
+  ok(thawed.bar - beforeFreeze.bar < 40,
+    'it re-anchored instead of machine-gunning the bars it missed',
+    `bar ${beforeFreeze.bar} -> ${thawed.bar}`);
+  const after2 = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio; const n = a.notes.length, b = a.bar;
+    await new Promise((r) => setTimeout(r, 2500));
+    return { grew: a.notes.length - n, bars: a.bar - b };
+  });
+  ok(after2.grew > 0 && after2.bars > 0, 'and it keeps playing afterwards',
+    `${after2.grew} notes / ${after2.bars} bars`);
+
+  /* ---- E3 a suspended context, no visibilitychange ---- */
+  head('E3 — the context is taken away and handed back (a phone call)');
+  const susp = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    await a.actx.suspend();
+    const dipped = a.actx.state;
+    await new Promise((r) => setTimeout(r, 1200));
+    await a.actx.resume();            // no visibilitychange at all
+    const n = a.notes.length, b = a.bar;
+    await new Promise((r) => setTimeout(r, 2000));
+    return {
+      dipped, state: a.actx.state, grew: a.notes.length - n, bars: a.bar - b,
+      t: a.transport,
+    };
+  });
+  note('suspend/resume:', susp);
+  ok(susp.dipped === 'suspended', 'the context can be taken away', susp.dipped);
+  ok(susp.state === 'running', 'it comes back', susp.state);
+  ok(susp.grew > 0, 'THE TRANSPORT comes back too, not just the context',
+    `${susp.grew} notes`);
+  ok(susp.bars > 0, 'bars keep turning after the resume', `${susp.bars} bars`);
+  ok(susp.t.silentFor < 0.8, 'the wire is written ahead again',
+    `silentFor ${susp.t.silentFor}s`);
+
+  /* ---- E4 a stalled transport and a muted bus ---- */
+  head('E4 — the watchdog: stalled transport, muted bus');
+  const stall = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = a.transport;
+    const s = WALLY.debug.audioStall(3);       // the wire runs dry, flags say "playing"
+    const dry = a.transport.silentFor;
+    await new Promise((r) => setTimeout(r, 900));
+    const after = a.transport;
+    return { before, dry, after };
+  });
+  note('stall:', stall);
+  ok(stall.dry > 2.5, 'the transport can be left believing it is playing while silent',
+    `silentFor ${stall.dry}s`);
+  ok(stall.after.silentFor < 0.8, 'the watchdog re-anchors it inside a second',
+    `silentFor ${stall.after.silentFor}s`);
+  ok(stall.after.reanchors > stall.before.reanchors,
+    'and it re-clocked rather than trying to play the bars it missed',
+    `reanchors ${stall.before.reanchors} -> ${stall.after.reanchors}`);
+  ok(stall.after.playing === true, 'the transport is still playing afterwards');
+
+  /* The case tick() cannot save us from: the transport is not merely
+     behind, it is stopped, and nothing in the game knows. This is the
+     "a cause you have not thought of" branch of the watchdog. */
+  const dead = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = a.transport;
+    const killed = WALLY.debug.audioKillTransport();
+    const mid = a.transport.playing;
+    const n = a.notes.length;
+    await new Promise((r) => setTimeout(r, 1500));
+    return { killed, mid, before, after: a.transport, grew: a.notes.length - n };
+  });
+  note('killed transport:', dead);
+  ok(dead.killed && dead.mid === false, 'the transport can be killed outright');
+  ok(dead.after.playing === true, 'the watchdog restarts a dead transport');
+  ok(dead.after.recoveries > dead.before.recoveries, 'and counts the recovery',
+    `${dead.before.recoveries} -> ${dead.after.recoveries}`);
+  ok(dead.grew > 0, 'notes are being scheduled again', `${dead.grew} notes`);
+  ok(dead.after.busGain > 0.5, 'and the bus the kill faded out came back',
+    `gain ${dead.after.busGain}`);
+
+  const bus = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const zeroed = WALLY.debug.audioBreakBus();   // score plays into a muted bus
+    await new Promise((r) => setTimeout(r, 900));
+    return { zeroed, gain: a.transport.busGain };
+  });
+  note('bus:', bus);
+  ok(bus.zeroed === 0, 'the music bus can be left at zero by a bad transition');
+  ok(bus.gain > 0.5, 'the watchdog hears the silence and restores the bus',
+    `gain ${bus.gain}`);
+
+  /* ---- E5 the soak ---- */
+  head(`E5 — ${SOAK}s of continuous play (--soak to lengthen)`);
+  const soak = await page.evaluate(async (seconds) => {
+    const a = WALLY.ctx.audio;
+    const t0 = performance.now();
+    const samples = [];
+    let last = a.bar, worstGap = 0, gapStart = t0, maxSilent = 0, maxTracked = 0;
+    while (performance.now() - t0 < seconds * 1000) {
+      await new Promise((r) => setTimeout(r, 250));
+      const t = a.transport;
+      maxSilent = Math.max(maxSilent, t.silentFor);
+      maxTracked = Math.max(maxTracked, t.tracked);
+      if (a.bar > last) { last = a.bar; gapStart = performance.now(); }
+      else worstGap = Math.max(worstGap, performance.now() - gapStart);
+      samples.push(a.bar);
+    }
+    const t = a.transport;
+    return {
+      elapsed: (performance.now() - t0) / 1000,
+      bars: a.bar - samples[0], worstGap: worstGap / 1000,
+      maxSilent, maxTracked, errors: t.errors, reanchors: t.reanchors,
+      voices: t.voices, notes: a.notes.length, playing: t.playing,
+      bpm: Math.round(t.bpm),
+    };
+  }, SOAK);
+  note('soak:', soak);
+  /* The score's own rate: explore is 4/4, so bars/second = bpm/(60*4).
+     Half of that is a generous floor — a transport that stalls at all
+     will not reach it. */
+  const expectBars = (soak.bpm / (60 * 4)) * soak.elapsed;
+  ok(soak.playing, 'the transport is still playing after the soak');
+  ok(soak.bars > expectBars * 0.5,
+    'bars kept turning at roughly the score\'s own rate',
+    `${soak.bars} bars in ${soak.elapsed.toFixed(0)}s, expected ~${expectBars.toFixed(0)}`);
+  /* A bar at this tempo is 60*meter/bpm seconds; two of them plus slack
+     is the most that may ever pass without the bar counter moving. */
+  const barSecs = (60 * 4) / soak.bpm;
+  ok(soak.worstGap < barSecs * 2 + 0.6,
+    'no window of the soak went without a new bar',
+    `worst gap ${soak.worstGap.toFixed(2)}s vs bar ${barSecs.toFixed(2)}s`);
+  ok(soak.maxSilent < 1.5, 'the wire was never dry for long', `${soak.maxSilent.toFixed(2)}s`);
+  ok(soak.errors === 0, 'no scheduler errors over the whole soak', String(soak.errors));
+  /* The voice table used to be pruned only by a getter nothing calls, so
+     it grew by one object per note forever. It must track what is
+     SOUNDING, not what has ever sounded. */
+  ok(soak.maxTracked < 400,
+    'the voice table stays bounded — no per-note leak',
+    `${soak.maxTracked} tracked vs ${soak.notes} notes played`);
+
+  head('console');
+  const real5 = errors.filter((e) => !/favicon|status of 404|autoplay/i.test(e));
+  ok(real5.length === 0, 'no page errors', real5.slice(0, 4).join(' | '));
+  } finally { await browser.close().catch(() => {}); }
 });
 
 server.close();

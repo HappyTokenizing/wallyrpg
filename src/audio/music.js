@@ -268,7 +268,33 @@ const LAYER_PLACE = {
 
 /* ---------- engine ---------- */
 
-const LOOKAHEAD = 0.28;   // seconds of score scheduled beyond `now`
+/* --- the look-ahead, and why it is not a constant -------------------
+
+   A look-ahead scheduler is only safe while it is called back more often
+   than its own horizon. Neither of the two clocks that drive this one
+   guarantees that:
+
+     · requestAnimationFrame stops entirely in a hidden tab;
+     · setTimeout/setInterval is clamped to 1 s in a hidden tab, and
+       Chrome drops a page that has made no sound for 30 s to ONE TICK
+       PER MINUTE ("intensive throttling").
+
+   With a fixed 0.28 s horizon that is fatal, and self-reinforcing: the
+   tab goes to the background, the scheduler starves, the score goes
+   quiet, being quiet makes the page eligible for the harsher throttle,
+   and now it is a minute between ticks and the music is properly dead
+   until the player comes back and rAF starts again. THAT IS THE
+   "my music cut out, stayed off, and came back later" report.
+
+   So the horizon is measured, not assumed: tick() watches how far apart
+   its own calls actually land and schedules far enough ahead to cover
+   the gap it is really being given, up to MAX_LOOKAHEAD. audio.js also
+   raises the floor the moment the document is hidden, so the very first
+   throttled tick is already covered rather than the second. Staying
+   audible is what keeps us out of intensive throttling in the first
+   place. */
+const LOOKAHEAD = 0.28;       // seconds of score scheduled beyond `now`
+const MAX_LOOKAHEAD = 3.0;    // ceiling: any more and a context change drags
 const MIN_STEP = 0.02;
 
 export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a11 } = {}) {
@@ -319,11 +345,26 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
       node.onended = () => { try { node.disconnect(); } catch { /* already gone */ } };
     }
   }
-  function voiceCount() {
-    const t = actx.currentTime;
-    for (let i = live.length - 1; i >= 0; i--) {
-      if (live[i].stopTime <= t - 0.5) live.splice(i, 1);
+  /* Drop the entries whose voices have already finished.
+
+     THIS USED TO HAPPEN ONLY INSIDE voiceCount(), which nothing but the
+     test harness ever calls — so in a real session `live` grew by one
+     object per note, forever, each holding a reference to an AudioNode
+     that had long since stopped. An hour of play is tens of thousands of
+     retained nodes and a steadily growing heap behind the audio thread.
+     reap() is now called from tick(), so the list stays the size of what
+     is genuinely sounding. */
+  function reap() {
+    const cut = actx.currentTime - 0.5;
+    let w = 0;
+    for (let i = 0; i < live.length; i++) {
+      if (live[i].stopTime > cut) live[w++] = live[i];
     }
+    live.length = w;
+  }
+  function voiceCount() {
+    reap();
+    const t = actx.currentTime;
     let n = 0;
     for (const v of live) if (v.stopTime > t) n++;
     return n;
@@ -688,6 +729,21 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
      low tier gets the same *piece*, thinner, rather than a different one. */
   let detail = 1;
 
+  /* --- scheduler health, all in context-clock seconds ---
+     Everything the watchdog in audio.js needs to tell "playing" from
+     "believes it is playing". `nextTime` doubles as the answer to "how
+     far is the score written on the wire": once currentTime passes it,
+     the room has gone quiet. */
+  let horizonFloor = 0;     // raised by setHorizon() while the tab is hidden
+  let horizon = LOOKAHEAD;  // what the last tick actually used
+  let tickGap = 0;          // measured seconds between tick() calls
+  let lastTick = -1;
+  let reanchors = 0;        // times we gave up catching up and re-clocked
+  let tickErrors = 0;
+  let lastError = null;
+  let crossfadeUntil = 0;   // a commit is gliding the layers; heal() waits
+  let silentUntil = 0;      // stop()'s fade owns the bus until this time
+
   let progIdx = 0, progBarsLeft = 0;
   let voicing = null;
   let chordRoot = 55;
@@ -950,6 +1006,8 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
       g.gain.linearRampToValueAtTime(target, t + fade);
     }
     if (reverb && next.space) reverb.setSpace(next.space, Math.max(0.8, fade));
+    // heal() must not fight a cross-fade that is legitimately at zero.
+    crossfadeUntil = t + fade + 0.2;
     pending = null;
   }
 
@@ -960,26 +1018,114 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
   }
 
   /* The scheduler. Called from the frame loop (and from a timer, so the
-     score survives a browser throttling requestAnimationFrame). */
-  function tick() {
-    if (!running) return;
-    const now = actx.currentTime;
-    if (nextTime < now) nextTime = now + MIN_STEP;
+     score survives a browser throttling requestAnimationFrame).
 
-    let guard = 0;
-    while (nextTime < now + LOOKAHEAD && guard++ < 64) {
+     Three things here exist purely so that a stall becomes a short gap
+     instead of permanent silence — see the LOOKAHEAD note at the top:
+       1  the horizon tracks how often we are really being called;
+       2  a transport that has fallen behind RE-ANCHORS onto the clock
+          rather than scheduling a catch-up burst of the bars it missed
+          (which is a machine-gun of sixty bars at once) or bailing;
+       3  a throw inside the loop is contained. It used to take the whole
+          loop with it, and a scheduler that has stopped is silence for
+          the rest of the session.
+     Returns the number of bars it put on the wire. */
+  function tick() {
+    if (!running) return 0;
+    const now = actx.currentTime;
+
+    /* How far apart our ticks are actually arriving. Rises instantly (we
+       must cover the worst gap we have just seen) and decays slowly. */
+    if (lastTick >= 0) {
+      const gap = now - lastTick;
+      if (gap > 0) tickGap = gap > tickGap ? gap : tickGap * 0.9 + gap * 0.1;
+    }
+    lastTick = now;
+    horizon = Math.min(MAX_LOOKAHEAD,
+      Math.max(LOOKAHEAD, horizonFloor, tickGap * 2.5 + 0.25));
+
+    if (nextTime < now - 0.12) {
+      /* Genuinely behind — a suspended context, a stalled tab, a long GC.
+         Start a clean bar from here; the bars we missed are gone and
+         playing them late is worse than not playing them. */
+      nextTime = now + MIN_STEP;
+      beat = 0; bar++;
+      reanchors++;
+    } else if (nextTime < now) {
+      nextTime = now + MIN_STEP;
+    }
+
+    let bars = 0, guard = 0;
+    while (nextTime < now + horizon && guard++ < 512) {
       if (beat === 0) {
-        // Bar line: this is the only place a context change may land.
-        if (pending) commitPending();
-        // Ease the tempo rather than jumping it.
-        bpm += (bpmTarget - bpm) * 0.34;
-        if (Math.abs(bpm - bpmTarget) < 0.4) bpm = bpmTarget;
-        scheduleBar(nextTime);
+        try {
+          // Bar line: this is the only place a context change may land.
+          if (pending) commitPending();
+          // Ease the tempo rather than jumping it.
+          bpm += (bpmTarget - bpm) * 0.34;
+          if (Math.abs(bpm - bpmTarget) < 0.4) bpm = bpmTarget;
+          scheduleBar(nextTime);
+          bars++;
+        } catch (e) {
+          tickErrors++;
+          lastError = String(e?.message || e);
+          if (tickErrors <= 3) console.warn('[music] bar failed:', lastError);
+        }
       }
       nextTime += beatDur();
       beat++;
       if (beat >= meter) { beat = 0; bar++; }
     }
+    reap();
+    return bars;
+  }
+
+  /* Put the transport back on the clock without trying to replay the
+     past. The watchdog in audio.js calls this when the score believes it
+     is playing but the wire has been empty long enough to hear. */
+  function reanchor() {
+    if (!running) return 0;
+    nextTime = actx.currentTime + MIN_STEP;
+    beat = 0; bar++;
+    lastTick = -1; tickGap = 0;
+    reanchors++;
+    return tick();
+  }
+
+  /* The other way this goes silent: the score plays perfectly into a bus
+     somebody left at zero. A cross-fade interrupted by a suspend, a
+     stop() whose restore never ran, a sting that ended in the wrong
+     place. Cheap to check, so check it every watchdog pass — but never
+     during a fade that is legitimately in progress. */
+  function heal() {
+    if (!running) return false;
+    const t = actx.currentTime;
+    if (t < silentUntil || t < crossfadeUntil) return false;
+    let fixed = null;
+
+    if (out.gain.value < 0.02) {
+      out.gain.cancelScheduledValues(t);
+      out.gain.setValueAtTime(out.gain.value, t);
+      out.gain.linearRampToValueAtTime(1, t + 0.25);
+      fixed = 'bus';
+    }
+
+    let want = 0, have = 0;
+    for (const n of LAYER_NAMES) {
+      want += layers[n].target;
+      have += layers[n].gain.gain.value;
+    }
+    if (want > 0.05 && have < want * 0.02) {
+      for (const n of LAYER_NAMES) {
+        const g = layers[n].gain;
+        g.gain.cancelScheduledValues(t);
+        g.gain.setValueAtTime(g.gain.value, t);
+        g.gain.linearRampToValueAtTime(layers[n].target, t + 0.6);
+      }
+      fixed = fixed ? 'bus+layers' : 'layers';
+    }
+    if (fixed) console.warn(`[music] muted ${fixed} while playing — restored`);
+    return !!fixed;
   }
 
   /* --- stings ---
@@ -1042,6 +1188,15 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
       nextTime = at;
       bar = 0; beat = 0;
       bpm = bpmTarget;
+      lastTick = -1; tickGap = 0;
+      /* A restart after stop() has to take the bus back: stop() ramped it
+         down, and a transport playing into a muted bus is still silence. */
+      const t = actx.currentTime;
+      out.gain.cancelScheduledValues(t);
+      out.gain.setValueAtTime(out.gain.value, t);
+      out.gain.linearRampToValueAtTime(1, t + 0.12);
+      silentUntil = 0;
+      crossfadeUntil = 0;
       return engine;
     },
 
@@ -1064,6 +1219,42 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
 
     tick,
     update() { tick(); },
+    reanchor,
+    heal,
+
+    /* --- scheduler health, for the watchdog and for audiotest.mjs ---
+       `silentFor` is the one that matters: seconds of context clock that
+       have passed the far edge of what the scheduler has actually
+       written. Zero while the score is playing, and growing means the
+       room is quiet no matter what `running` says. */
+    get silentFor() { return running ? Math.max(0, actx.currentTime - nextTime) : 0; },
+    get scheduledThrough() { return nextTime; },
+    get horizon() { return horizon; },
+    get tickGap() { return tickGap; },
+    get reanchors() { return reanchors; },
+    /** How many voice records are still held. Watch this over a long
+        session: it must track what is sounding, not what has ever sounded. */
+    get tracked() { return live.length; },
+    get errors() { return tickErrors; },
+    get lastError() { return lastError; },
+
+    /** Raise the floor under the look-ahead (audio.js does this while the
+        document is hidden, where our clocks are clamped to 1 s). 0 or
+        less restores the measured behaviour. */
+    setHorizon(sec) {
+      horizonFloor = Math.max(0, Math.min(MAX_LOOKAHEAD, +sec || 0));
+      return engine;
+    },
+
+    /** TEST HOOK. Leave the transport believing it is playing while the
+        wire runs dry — exactly the state a throttled-away tab returns in.
+        The watchdog must notice and re-anchor. */
+    stall(seconds = 3) {
+      if (!running) return null;
+      nextTime = actx.currentTime - Math.max(0, seconds);
+      lastTick = -1;
+      return { silentFor: engine.silentFor, bar };
+    },
 
     /** 0..1 voice budget. `low` quality gets a thinner arrangement of the
         same piece, never a different one. */
@@ -1080,6 +1271,7 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
       out.gain.setValueAtTime(out.gain.value, t);
       out.gain.linearRampToValueAtTime(0.0001, t + (hard ? 0.02 : fade));
       out.gain.setValueAtTime(1, t + (hard ? 0.03 : fade) + 0.01);
+      silentUntil = t + (hard ? 0.03 : fade) + 0.1;
       for (const n of LAYER_NAMES) {
         const g = layers[n].gain;
         g.gain.cancelScheduledValues(t);

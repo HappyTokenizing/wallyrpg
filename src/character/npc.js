@@ -34,9 +34,10 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { clamp, damp, smoothstep } from '../core/contracts.js';
-import { CLIENTS, CLIENT_BY_ID, LOCATIONS, ZONES } from '../game/data.js';
+import { CLIENTS, CLIENT_BY_ID, LOCATIONS, ZONES, RACE } from '../game/data.js';
 import { createHumans, randomSpec, H as HUMAN_H } from './humans.js';
 import { HumanAnim, createCrowd } from './crowd.js';
+import { createBubbles, BULL_LINES, BEAR_LINES, STREET_LINES } from './bubbles.js';
 
 /* Hidden past this. 150 m emptied a district the moment the camera
    pulled back to look at it — §2.4 hazes everything past 120 m, so a
@@ -117,17 +118,78 @@ export async function init(ctx) {
   /** The height a pair of shoes should actually rest at. */
   function groundY(x, z) { return ctx.world.heightAt(x, z) + roadLift(x, z); }
 
+  /* ------------------------------------------------------------------
+     THE DOOR IS THE ANCHOR AND ALSO THE ONE PLACE NOBODY MAY STAND.
+
+     "Barnaby and other NPCs are too close to some of the entrances to
+     the buildings and interfere." The bug is in the two lines above
+     this comment as they used to read: the search arc was ±1.25 rad
+     centred on the door's OWN outward direction and the near radius was
+     1.7 m, so the highest-scoring spot at a narrow frontage — near the
+     road, off the slope, out from the centre — is very often the spot
+     directly in front of the door at arm's length. ctx.city.doorPosition
+     is documented as "the point you walk to", ui.js warps the player
+     onto it and hud.js aims the compass at it, so a person standing
+     there is standing inside the player and inside the camera that
+     frames the entrance.
+
+     THE FIX IS A SCORE, NOT A REJECTION. A hard exclusion zone would
+     throw away every candidate at a location whose forecourt is only as
+     wide as its door, and `best` would fall through to the fallback,
+     which is the door itself — the bug, restored, with extra steps. A
+     large penalty on being in the corridor plus a widened arc means the
+     search STILL prefers the frontage (which is where a shopkeeper
+     belongs) and takes the nearest patch of it that is not the
+     threshold. Measured with ctx.npc.doorAudit().
+
+     The volume is the same one crowd.js keeps its wanderers out of: a
+     disc at the door and a corridor reaching out along the way the
+     facade faces, wide enough for an elephant.
+     ------------------------------------------------------------------ */
+  const DOOR_CLEAR_R = 2.30;
+  const DOOR_CLEAR_LEN = 3.60;
+  const DOOR_CLEAR_HALF = 1.25;
+  /* Switched OFF only by doorAudit({before:true}), which re-plans the
+     whole population on the same seeds with the old arc and the old
+     score so the fix can be reported as a number rather than as a
+     claim. Nothing else touches it. */
+  let doorPenalty = true;
+
+  /** 0 = clear of every doorway, 1 = standing in one. */
+  function doorClearance(x, z, dx, dz, ax, az) {
+    const ox = x - dx, oz = z - dz;
+    const along = ox * ax + oz * az;
+    const side = ox * az - oz * ax;
+    let k = 0;
+    if (along > -0.8 && along < DOOR_CLEAR_LEN && Math.abs(side) < DOOR_CLEAR_HALF) {
+      k = 1 - Math.abs(side) / DOOR_CLEAR_HALF;
+    }
+    const r = Math.hypot(ox, oz);
+    if (r < DOOR_CLEAR_R) k = Math.max(k, 1 - r / DOOR_CLEAR_R);
+    return k;
+  }
+
   const _door = new THREE.Vector3();
   function standingSpot(loc, rng, opts = {}) {
     const _tp = performance.now();
     const want = opts.want ?? 2.1;
     const cx = loc.world.x, cz = loc.world.z;
     let ax = cx, az = cz, outA = rng() * Math.PI * 2, arc = Math.PI;
+    /* the door's outward normal, when there is a door */
+    let hasDoor = false, nx = 0, nz = 0;
     const d = ctx.city?.doorPosition?.(loc.id, _door);
     if (d && Number.isFinite(d.x)) {
       ax = d.x; az = d.z;
       const ox = ax - cx, oz = az - cz;
-      if (Math.hypot(ox, oz) > 0.4) { outA = Math.atan2(ox, oz); arc = 1.25; }
+      const ol = Math.hypot(ox, oz);
+      if (ol > 0.4) {
+        outA = Math.atan2(ox, oz);
+        /* 1.25 -> 1.55 rad. The corridor penalty below rules out the
+           middle of this arc, so the arc has to reach far enough round
+           the frontage to have somewhere left to put anybody. */
+        arc = doorPenalty ? 1.55 : 1.25;
+        hasDoor = true; nx = ox / ol; nz = oz / ol;
+      }
     }
     const near = opts.near ?? 1.7;
     const far = opts.far ?? Math.max(near + 1.4, Math.min(7, (loc.radius || 9) * 0.7));
@@ -151,10 +213,24 @@ export async function init(ctx) {
          built on. */
       const outward = Math.hypot(x - cx, z - cz);
       const roadW = far > 12 ? 3.2 : 1.8;
-      const score = -Math.abs(dRoad - want) * roadW - slope * 7 + outward * 0.22;
+      let score = -Math.abs(dRoad - want) * roadW - slope * 7 + outward * 0.22;
+      /* THE DOORWAY PENALTY. 26 is deliberately larger than anything
+         else in this expression can produce: being on the doorstep has
+         to lose to every legal spot on the frontage, not merely to the
+         good ones. It is a ramp rather than a cliff so that a location
+         with no clear frontage at all still degrades gracefully — it
+         takes the least-bad spot instead of the fallback. */
+      if (hasDoor && doorPenalty) score -= doorClearance(x, z, ax, az, nx, nz) * 26;
       if (score > bestScore) { bestScore = score; best = { x, y, z, a }; }
     }
-    if (!best) best = { x: ax, y: ctx.world.heightAt(ax, az), z: az, a: outA };
+    /* THE FALLBACK MAY NOT BE THE DOOR ITSELF. Nothing scored, so put
+       them a stride to one side of the threshold rather than in it. */
+    if (!best) {
+      const s = rng() < 0.5 ? 1 : -1;
+      const sx = ax + (hasDoor ? nz * s * 2.0 : 0);
+      const sz = az - (hasDoor ? nx * s * 2.0 : 0);
+      best = { x: sx, y: ctx.world.heightAt(sx, sz), z: sz, a: outA };
+    }
     best.y = groundY(best.x, best.z);
     /* face away from the building — nobody stands looking at a wall */
     best.yaw = Math.atan2(best.x - cx, best.z - cz) + (rng() - 0.5) * 0.9;
@@ -264,6 +340,12 @@ export async function init(ctx) {
       build: 0.92 + rng() * 0.20 + (c.age === 2 ? 0.04 : 0),
       stature: (c.age === 2 ? 0.955 : 0.98) + rng() * 0.075,
     };
+    /* MAYOR KEN JONES IS A LIKENESS, not a row of data fields — see the
+       MAYOR_LOOK block below for what is being overridden and why. It is
+       applied AFTER the build/stature draws above so that his height is
+       his and not the dice's, and it consumes no rng of its own, so
+       every other client on the island comes out identical. */
+    if (id === MAYOR_ID) Object.assign(spec, MAYOR_LOOK);
     let p = pos, homeLoc = null, yaw;
     if (!p) {
       /* their home is a district; stand them by a location inside it */
@@ -313,7 +395,24 @@ export async function init(ctx) {
   /* ------------------------------------------------------------
      The ambient crowd
      ------------------------------------------------------------ */
-  const crowd = createCrowd(ctx, { groundY, roadLift });
+  /* EVERY DOOR IN THE CITY, ONCE, AS A POINT AND A FACING. crowd.js
+     needs this to keep its wanderers out of the thresholds and it has no
+     business reaching for ctx.city itself — this module is the one that
+     already owns the location table and the door query. The outward
+     normal is the door minus the building's own centre, which by
+     construction points away from the facade. */
+  const _dq = new THREE.Vector3();
+  const DOORS = [];
+  for (const l of LOCATIONS) {
+    const p = ctx.city?.doorPosition?.(l.id, _dq);
+    if (!p || !Number.isFinite(p.x)) continue;
+    const ox = p.x - l.world.x, oz = p.z - l.world.z;
+    const ol = Math.hypot(ox, oz);
+    if (ol < 0.4) continue;              // no usable facing; skip it
+    DOORS.push({ id: l.id, x: p.x, z: p.z, ax: ox / ol, az: oz / ol });
+  }
+
+  const crowd = createCrowd(ctx, { groundY, roadLift, doors: DOORS });
   const crowdRng = ctx.makeRng('npc.crowd.spec');
   let crowdTarget = 0;
 
@@ -541,6 +640,13 @@ export async function init(ctx) {
       if (h.asleep) { h.root.visible = false; h.active = false; continue; }
       const d = h.root.position.distanceTo(_v);
       h.dist = d;
+      /* EXEMPT: a character the game is currently telling a story with.
+         The Mayor mid-dash is 300 m away down the far side of the island
+         for most of a race, which is past FAR and well past the thinning
+         band — and a rival who vanishes because he is winning is not a
+         rival. He keeps his skeleton too: he is the only figure on the
+         island whose gait is the point. */
+      if (h.exempt) { h.root.visible = true; h.active = true; live++; continue; }
       if (d > FAR) { h.root.visible = false; h.active = false; continue; }
       /* THINNING, not culling. Quadrupling the population to make a
          square look inhabited also quadruples what a vista has to draw,
@@ -569,6 +675,7 @@ export async function init(ctx) {
     for (const h of all) {
       if (h.agent && !h.agent.frozen) continue;      // the crowd owns them
       if (!h.active) continue;
+      if (h.mayorDriven) continue;                   // the dash owns him
       if (wp) {
         const d = h.root.position.distanceTo(wp);
         h.lookW = damp(h.lookW, d < 8 ? 1 : 0, 3.2, dt);
@@ -594,7 +701,15 @@ export async function init(ctx) {
       if (h.sayT > 0) { h.sayT -= dt; if (h.sayT <= 0) h.anim.setMode(h.baseMode || 'idle'); }
     }
 
+    /* One object read per frame until ctx.game exists, then never
+       again — see registerPortrait. It cannot be done at init(): npc.js
+       boots before game.js in main.js's order. */
+    if (!portraitDone) registerPortrait();
+    if (!mayorPortraitDone) registerMayorPortrait();
+
     happyUpdate(dt, t);
+    mayorUpdate(dt, t);
+    bubbleUpdate(dt, t, _v);
     updatePrompt(dt);
   }
 
@@ -651,25 +766,55 @@ export async function init(ctx) {
   const HAPPY_LINE = "Hey Wally, I'm Happy. You're the new trader in town right? "
     + 'This place could really use your help. Happy tokenizing!';
 
-  /* Blonde, fair, and built to be RECOGNISED later. Every field is a
-     deliberate outlier against randomSpec()'s distribution: the quiff
-     is one of seventeen hair styles and the only tall one, `platinum`
-     the lightest of thirteen hair colours, `porcelain` the lightest of
-     eight skins, and the hue is BRAND.token — the game's own orange,
-     which no ambient wanderer can wear because randomSpec picks from a
-     fourteen-colour list that does not contain it. So he is the only
-     pale blond in orange on the island: one silhouette, one colour, no
-     name tag needed. */
+  /* HAPPY IS A LIKENESS. There is a photograph of the real person on
+     disk at ref/happy-ref.webp and every field below is read off it,
+     then translated into the clay/vinyl vocabulary §1.2 states for
+     everybody in this game — a stylised likeness, not a portrait. What
+     carries identity out of that photograph, in the order the eye finds
+     it:
+
+       the hair       short, light, parted at the side and swept over.
+                      Not a quiff: a quiff is symmetric and stands up,
+                      and this cut is thick on one side of a line and
+                      combed forward over the temple on the other. It is
+                      the first thing you recognise about him from any
+                      angle, so it is real geometry — see `sidepart` in
+                      humans.js — and not a colour on a cap.
+       the clothes    charcoal unstructured blazer worn OPEN over a
+                      white crew-neck tee, cream/stone trousers. Nobody
+                      else on this island wears a jacket; four hundred
+                      pedestrians are one shirt above a hem and one
+                      trouser below it. The open blazer, with the bright
+                      V of the tee down the middle of a dark field, is a
+                      silhouette no wanderer can accidentally produce —
+                      which is what the old orange shirt was for, done
+                      properly.
+       the print      a dark elephant on the tee with lettering over and
+                      under it. It is Wally's own mark, so it is reused
+                      rather than invented (humans.js teePrintGeo, from
+                      ref/wally-logo.png).
+       the face       longish, straight nose, defined jaw, clean-shaven,
+                      fair. `oval` (rx 0.1385, ry 0.207, jaw 0.86) is
+                      the long-and-defined one; `long` is 12 % narrower
+                      again and rendered as a slab, and it also warps
+                      the cached hair hardest, which is what turned the
+                      parting into a hood. `age: 0`, not 1: he is early
+                      thirties and 1 adds a nasolabial fold the
+                      photograph does not have.
+
+     THE HUE STAYS BRAND.token even though nothing he wears is orange
+     any more: ui/style.js draws his dialogue and phone portrait on a
+     disc of `hue`, so it is his card colour, not his shirt. */
   const HAPPY_SPEC = {
     id: 'happy',
     n: 'Happy',
     role: 'Tokenizer',
     skin: 'porcelain',
     face: 'oval',
-    hair: 'quiff',
+    hair: 'sidepart',
     /* `blonde` (#C69A55), not `platinum` (#DCC9A4). Measured on the
        first render: platinum sits 6 % from `porcelain` skin (#F0D2BC)
-       in luminance and 4 points in hue, so the quiff and the forehead
+       in luminance and 4 points in hue, so the hair and the forehead
        fused into one pale mass and he read as a bald man with a cone on
        his head. A golden blonde is unambiguously HAIR against a fair
        face, which is the whole point of the description. */
@@ -677,8 +822,20 @@ export async function init(ctx) {
     beard: 'none',
     specs: 'none',
     hat: 'none',
-    hue: '#F5913C',            // BRAND.token
-    age: 1,
+    hue: '#F5913C',            // BRAND.token — his CARD colour, see above
+    /* the outfit, from the photograph */
+    jacket: 0x3a3d42,          // charcoal, unstructured, worn open
+    shirtCol: 0xf2f0ea,        // white tee. §7: not 0xffffff — a lit
+                               // cheek tops out at #DEDEDD and a pure
+                               // white tee would be the brightest thing
+                               // in any frame he is in
+    trouserCol: 0xd9cdb4,      // cream / stone
+    shoeCol: 0x5a4b42,
+    jacketOpen: [0.044, 0.086],
+    tee: true,                 // the elephant print
+    teeWidth: 0.106,
+    teeY: 1.138,
+    age: 0,
     mood: 'warm',
     build: 0.94,
     stature: 1.02,
@@ -732,6 +889,82 @@ export async function init(ctx) {
     return _hTarget;
   }
 
+  /* ------------------------------------------------------------------
+     HIS FACE, WHEREVER A FACE IS DRAWN IN 2D.
+
+     ui/style.js `portrait(client)` draws a real vector portrait from
+     exactly the fields HAPPY_SPEC already carries — skin, face, hair,
+     hairCol, beard, specs, hat, mood, age, hue — and every place a
+     speaker gets an avatar (ui/dialogue.js makeAvatar, ui/phone.js
+     avatarFor, the client cards in ui/menus.js) resolves it through
+     `ctx.game.data.clientById`. Happy is not a CLIENT — you never trade
+     with him, he is a story beat — so he was not in that map, and every
+     one of those call sites fell through to glyphAvatar: an orange disc
+     with the letter H, which is what shipped.
+
+     Registering the record is therefore the whole fix, and it is a
+     registration and not a second portrait system. He goes into
+     `clientById` only, never into `data.clients`, so the client roster,
+     the order book and every list that iterates the ARRAY are untouched
+     — only the by-id lookups the avatars use can see him.
+
+     THE TABLE IS DEEP-FROZEN (data.js deepFreeze), so the entry cannot
+     simply be written into it. `ctx.game` itself is not frozen, so what
+     goes in is a SHALLOW COPY of the data record whose `clientById` is
+     a shallow copy plus one key. Everything else in it — `clients`,
+     `assets`, `rides`, every array and every table — comes across BY
+     REFERENCE and is the identical object it was, so nothing that reads
+     game.data reads anything different, and game.js's own logic does
+     not go through ctx.game.data at all (it imports DATA directly).
+     Verified before it is kept: if the copy does not take, the letter
+     H comes back and nothing else changes.
+
+     THIS BELONGS IN data.js, as one record next to CLIENTS, and the
+     whole function should be deleted when the data agent adds it: this
+     file owns how he is MESHED, not what the UI knows about him. It is
+     here because the character layer is the only place that currently
+     holds his appearance, and an avatar that silently degrades to an
+     initial is worse than a cross-layer write that says so out loud.
+     ------------------------------------------------------------------ */
+  let portraitDone = false;
+  function happyPortraitRecord() {
+    return {
+      id: HAPPY_SPEC.id, n: HAPPY_SPEC.n, role: HAPPY_SPEC.role,
+      skin: HAPPY_SPEC.skin, face: HAPPY_SPEC.face,
+      /* style.js draws from its OWN vocabulary of seventeen hair paths
+         and has no `sidepart`; `side` is the one that means the same
+         thing there — a short cut with a parting swept over. */
+      hair: 'side',
+      hairCol: HAPPY_SPEC.hairCol, beard: HAPPY_SPEC.beard,
+      specs: HAPPY_SPEC.specs, hat: HAPPY_SPEC.hat,
+      age: HAPPY_SPEC.age, mood: HAPPY_SPEC.mood, hue: HAPPY_SPEC.hue,
+      /* NOT a tradeable client, and marked so, in case anything ever
+         does walk this map expecting an order book on every row. */
+      npc: true,
+    };
+  }
+  function registerPortrait() {
+    if (portraitDone) return false;
+    const game = ctx.game;
+    const data = game?.data;
+    const reg = data?.clientById;
+    if (!reg) return false;               // game not up yet; try again later
+    portraitDone = true;
+    if (reg[HAPPY_SPEC.id]) return true;  // data.js has adopted him — good
+    const rec = happyPortraitRecord();
+    try {
+      reg[HAPPY_SPEC.id] = rec;
+      if (reg[HAPPY_SPEC.id]) return true;   // it was writable after all
+      game.data = { ...data, clientById: { ...reg, [HAPPY_SPEC.id]: rec } };
+      return !!ctx.game?.data?.clientById?.[HAPPY_SPEC.id];
+    } catch (e) {
+      try {
+        game.data = { ...data, clientById: { ...reg, [HAPPY_SPEC.id]: rec } };
+        return !!ctx.game?.data?.clientById?.[HAPPY_SPEC.id];
+      } catch (e2) { return false; }      // the letter H is survivable
+    }
+  }
+
   /**
    * Run the encounter. Safe to call twice: the second call is ignored
    * while one is in flight.
@@ -740,6 +973,7 @@ export async function init(ctx) {
    */
   function playHappy(o = {}) {
     if (happy) return happy;
+    registerPortrait();          // before the card, not after it
     const w = ctx.wally;
     if (!w) return null;
     const wp = w.position;
@@ -748,6 +982,14 @@ export async function init(ctx) {
     happy = makeHuman(HAPPY_SPEC, 'npc.happy', 'fine');
     happy.name = 'Happy';
     happy.baseMode = 'idle';
+    /* HE TALKS WITH HIS HAND OPEN, as the man in the photograph does —
+       see Agent.talk in crowd.js. It is also the only version of the
+       gesture that does not park a forearm over the front of the shirt
+       for the entire beat. */
+    happy.anim.talkOpen = 0.92;
+    /* and on the same side as the reference, rather than the seeded
+       coin-flip every wanderer gets */
+    happy.anim.handed = 1;
     named.set('happy', happy);
     happyFade = 1;
 
@@ -833,15 +1075,20 @@ export async function init(ctx) {
     if (f >= 1) return;
     const m = humans.fadeMaterial();
     if (happy.body.material !== m) {
-      happy.body.material = m;
-      happy.head.material = m;
-      /* It is transparent now, so the normal+depth prepass would leave
-         it on its own material and it would write colour into the
-         buffer that the DOF and the ground shadow both read. */
-      happy.body.userData.noPrepass = true;
-      happy.head.userData.noPrepass = true;
-      happy.body.castShadow = false;
-      happy.head.castShadow = false;
+      /* EVERY MESH HE HAS, not the two this used to name. He now wears a
+         printed tee and the print is a third mesh on the same shared
+         clay material — miss it and the man dissolves and leaves an
+         opaque elephant logo hanging in the air at chest height, which
+         is a considerably worse exit than the one this whole block
+         exists to avoid. humans.js publishes `meshes` for exactly this. */
+      for (const mesh of (happy.meshes || [happy.body, happy.head])) {
+        mesh.material = m;
+        /* It is transparent now, so the normal+depth prepass would leave
+           it on its own material and it would write colour into the
+           buffer that the DOF and the ground shadow both read. */
+        mesh.userData.noPrepass = true;
+        mesh.castShadow = false;
+      }
       happy._cast = false;
     }
     if (m.uniforms && m.uniforms.uFade) m.uniforms.uFade.value = f;
@@ -955,6 +1202,606 @@ export async function init(ctx) {
      the same event and lands in the same place. */
   ctx.bus?.on('story', (e) => { if (e && e.beat === 'happy') playHappy(); });
 
+  /* ============================================================
+     MAYOR KEN JONES.
+
+     He is client `tusk` — the id is in save files, in the order book
+     and in RACE.mayor, and only the name the player reads ever changed
+     — so he is planned, meshed, placed, talked to and drawn in the
+     phone by exactly the same machinery as the other twenty-three. What
+     is here is the two things that machinery cannot know: what he LOOKS
+     like, and what he does during a race.
+
+     THE LIKENESS. There is no photograph on disk; the user's
+     transcription of one IS the reference, and every field below is
+     read off it in the order the eye finds them:
+
+       the hair    a full head of THICK WHITE hair, swept back and
+                   slightly tousled, receding a little at the temples.
+                   It is the first thing you see and the thing that
+                   reads at forty metres, so it is real geometry —
+                   `swept` in humans.js, written for him — and not the
+                   22 mm skullcap `receding` would have given him.
+       the beard   full, white, moustache included, neatly kept, over
+                   jaw and chin. `full` grows off the head's own offset
+                   surface, so it follows this face's jaw rather than an
+                   approximation of one.
+       the face    older, broad, warm. `broad` is the widest cranium
+                   with a heavy jaw, which is the one a full beard sits
+                   on properly; `age: 2` puts the laughter lines in and
+                   `mood: 'warm'` tilts the brows up rather than down.
+                   He is a civic man and a friendly one, not a villain.
+       the skin    warm, RUDDY, pink-toned. None of the eight stock
+                   tones is pink — they all run yellow-warm — so he
+                   carries his own {b,s,d,l}. See humans.js `skinTone`
+                   for why that is an override and not a ninth row.
+       the clothes a dark navy BUTTON-UP shirt. The button placket is
+                   the thing that makes it a shirt rather than a jersey,
+                   and it is painted the way the jacket is (humans.js
+                   `placket`), because 1.5 mm of doubled cloth cannot be
+                   meshed on a 21.5 mm shared cell.
+       the height  TALL, per the user, and broad in the shoulder.
+                   1.24 stature is 2.08 m against a 1.70 m median and
+                   the `heavy` body carries the shoulders. This is not
+                   decoration: it is how you find him in a race.
+
+     THE HAT GOES. data.js dresses him in a top hat, which was the old
+     joke-mayor, and a top hat covers the one feature the description
+     leads with. Nothing else about the data row is touched — the same
+     record still drives his orders, his patience, his budget and his
+     name.
+     ============================================================ */
+  const MAYOR_ID = RACE?.mayor || 'tusk';
+
+  const MAYOR_LOOK = {
+    face: 'broad',
+    hair: 'swept',
+    hairCol: 'white',
+    beard: 'full',
+    specs: 'none',
+    hat: 'none',
+    age: 2,
+    mood: 'warm',
+    /* ruddy, pink-toned, warm — and light enough that a white beard
+       still reads as white against it */
+    skinTone: { b: 0xecb3a3, s: 0xd0887b, d: 0xa5645a, l: 0xf9d2c5 },
+    /* DARK NAVY, NOT BLACK-BLUE. A shirt is the largest single field of
+       colour on a human and it is multiplied three more times before it
+       reaches the screen — by its own baked AO, by the shade band and by
+       whatever cast shadow he is standing in. A true midnight navy
+       lands under #0a0e1c on the shaded flank, which §7 forbids
+       outright. 0x33405f reads unmistakably navy at noon and still has
+       a hue left in it at dusk. */
+    shirtCol: 0x33405f,
+    placket: 0.022,
+    trouserCol: 0x4a4a52,
+    shoeCol: 0x5a4b42,
+    build: 1.14,             // broad-shouldered: picks the `heavy` body
+    stature: 1.24,           // TALL — 2.08 m against a 1.70 m median
+  };
+
+  /* HIS FACE IN 2D, WHEREVER ONE IS DRAWN. ui/style.js has its own
+     vocabulary of seventeen hair paths and no `swept`; `short` is the
+     one that means the same thing there — a full cap of hair — and in
+     white at 34-66 px that is exactly what the description says. The
+     registration is the same shallow-copy path Happy uses (see
+     registerPortrait) and for the same reason: DATA is deep-frozen, and
+     an avatar that silently disagrees with the model standing in the
+     street is worse than a cross-layer write that says so out loud.
+     THIS BELONGS IN data.js. Delete it when the data agent adopts it. */
+  function mayorPortraitRecord(c) {
+    return {
+      ...c,
+      hair: 'short', hairCol: 'white', beard: 'full',
+      hat: 'none', specs: 'none', skin: 'porcelain',
+      age: 2, mood: 'warm',
+    };
+  }
+  let mayorPortraitDone = false;
+  function registerMayorPortrait() {
+    if (mayorPortraitDone) return false;
+    const game = ctx.game;
+    const data = game?.data;
+    const reg = data?.clientById;
+    if (!reg) return false;
+    mayorPortraitDone = true;
+    const c = reg[MAYOR_ID];
+    if (!c) return false;
+    if (c.hair === 'short' && c.hairCol === 'white') return true;   // adopted
+    const rec = mayorPortraitRecord(c);
+    try {
+      reg[MAYOR_ID] = rec;
+      if (reg[MAYOR_ID] === rec) return true;
+      game.data = { ...data, clientById: { ...reg, [MAYOR_ID]: rec } };
+      return ctx.game?.data?.clientById?.[MAYOR_ID] === rec;
+    } catch (e) {
+      try {
+        game.data = { ...data, clientById: { ...reg, [MAYOR_ID]: rec } };
+        return ctx.game?.data?.clientById?.[MAYOR_ID] === rec;
+      } catch (e2) { return false; }
+    }
+  }
+
+  /* ------------------------------------------------------------------
+     THE RACE, AS PRESENTATION.
+
+     THE SPLIT, and it is the same one Happy's beat is built on. The
+     rules agent owns WHETHER and HOW FAST: game.race.start() returns
+     {mps, mayorSeconds, route} and emits bus 'race' with the same
+     payload, game.race.checkpoint(i) counts the rings, game.race.finish()
+     judges it, and game.race.hint() decides when anybody is allowed to
+     mention a scooter. NOTHING HERE DECIDES ANY OF THAT. What is here
+     is where the man is on the island while it happens, how fast his
+     legs go round, and what he says as he goes past.
+
+     HE RUNS THE ROADS, NOT THE CROW'S LINE. Interpolating between the
+     five route locations would run him through the Market Hall and over
+     a hedge. crowd.js already holds the road graph — the same relaxed,
+     terrain-carved polylines the ribbons are drawn on — so the legs are
+     routed over it with a Dijkstra and stitched into one polyline. The
+     search runs once per race, over ~40 nodes, and costs well under a
+     millisecond.
+
+     HE IS PACED BY THE RULE, NOT BY A GUESS. `mps` from the payload IS
+     his speed, so the man on screen arrives when the clock underneath
+     says he arrives. If the route is longer or shorter than the rules
+     layer's straight-line metres — it is longer, roads bend — his speed
+     is scaled by the ratio so that he still finishes at mayorSeconds.
+     A Mayor who beats his own published time is a bug the player can
+     see.
+     ------------------------------------------------------------------ */
+  const MAYOR = {
+    RUN_ANIM: 'run',
+    LEAD_IN: 1.1,           // seconds of him on the line before he goes
+    LINGER: 6.0,            // how long he stays put after he finishes
+    NEAR_TALK: 26,          // he only calls out if you can see him
+  };
+  /* What he says, and when. Short, dry, unbothered — he is a sixty-year
+     -old man in a shirt who runs this route every week and knows it. */
+  const MAYOR_LINES = {
+    start: ['Try to keep up, Wally.', 'Off we go then!', 'Mind the noodle carts.'],
+    mid: ['Still with me?', 'Lovely morning for it!', 'I do this every Tuesday.',
+      'Left at the bank. Always left at the bank.'],
+    behind: ['Take your time!', 'I will wait at the Spoon.', 'No hurry at all.'],
+    ahead: ['Oh, well done.', 'Right. RIGHT.', 'Now you are just showing off.'],
+  };
+
+  let mayor = null;
+  let mayorState = 'none';      // none|ready|run|finish
+  let mayorT = 0;
+  let mayorPath = null;         // [{x,z}, ...] the stitched road route
+  let mayorLen = 0;
+  let mayorDist = 0;
+  let mayorSpeed = 0;
+  let mayorSayT = 0;
+  let mayorFrozen = false;
+  const _mv = new THREE.Vector3();
+
+  /** Ensure he exists, meshed, wherever he is standing. */
+  function ensureMayor() {
+    mayor = named.get(MAYOR_ID) || ensure(MAYOR_ID);
+    return mayor;
+  }
+
+  /* ---- the road router ---- */
+  let ADJ = null;
+  function adjacency() {
+    if (ADJ) return ADJ;
+    const nodes = crowd.nodes || [];
+    ADJ = nodes.map(() => []);
+    for (const e of (crowd.edges || [])) {
+      if (!e.points || e.points.length < 2) continue;
+      let len = 0;
+      for (let i = 1; i < e.points.length; i++) {
+        len += Math.hypot(e.points[i].x - e.points[i - 1].x, e.points[i].z - e.points[i - 1].z);
+      }
+      if (!ADJ[e.a.i] || !ADJ[e.b.i]) continue;
+      ADJ[e.a.i].push({ to: e.b.i, e, fwd: true, len });
+      ADJ[e.b.i].push({ to: e.a.i, e, fwd: false, len });
+    }
+    return ADJ;
+  }
+  function nodeOfLoc(id) {
+    const nodes = crowd.nodes || [];
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].kind === 'loc' && nodes[i].ref && nodes[i].ref.id === id) return i;
+    }
+    return -1;
+  }
+  /** Shortest road walk between two graph nodes, as a list of points. */
+  function roadLeg(from, to) {
+    const adj = adjacency();
+    if (from < 0 || to < 0 || !adj[from]) return null;
+    const N = adj.length;
+    const dist = new Float64Array(N).fill(Infinity);
+    const prev = new Int32Array(N).fill(-1);
+    const via = new Array(N).fill(null);
+    const seen = new Uint8Array(N);
+    dist[from] = 0;
+    /* A linear scan for the minimum. N is about forty and this runs five
+       times per race — a binary heap here would be more code than it
+       could ever save. */
+    for (let it = 0; it < N; it++) {
+      let u = -1, bd = Infinity;
+      for (let i = 0; i < N; i++) if (!seen[i] && dist[i] < bd) { bd = dist[i]; u = i; }
+      if (u < 0 || u === to) break;
+      seen[u] = 1;
+      for (const l of adj[u]) {
+        const nd = dist[u] + l.len;
+        if (nd < dist[l.to]) { dist[l.to] = nd; prev[l.to] = u; via[l.to] = l; }
+      }
+    }
+    if (!Number.isFinite(dist[to])) return null;
+    const chain = [];
+    for (let n = to; n !== from && n >= 0; n = prev[n]) {
+      if (!via[n]) return null;
+      chain.unshift(via[n]);
+    }
+    const out = [];
+    for (const l of chain) {
+      const pts = l.fwd ? l.e.points : [...l.e.points].reverse();
+      for (const p of pts) {
+        const last = out[out.length - 1];
+        if (last && Math.hypot(last.x - p.x, last.z - p.z) < 0.4) continue;
+        out.push({ x: p.x, z: p.z });
+      }
+    }
+    return out.length > 1 ? out : null;
+  }
+  /** The whole dash, as one polyline over the road network. */
+  function buildMayorPath(route) {
+    const ids = (route && route.length ? route : (RACE?.route || [])).map((r) => r.loc || r);
+    const pts = [];
+    for (let i = 1; i < ids.length; i++) {
+      const leg = roadLeg(nodeOfLoc(ids[i - 1]), nodeOfLoc(ids[i]));
+      if (leg) {
+        for (const p of leg) {
+          const last = pts[pts.length - 1];
+          if (last && Math.hypot(last.x - p.x, last.z - p.z) < 0.4) continue;
+          pts.push(p);
+        }
+      } else {
+        /* no road between them — the straight line is still better than
+           standing still, and this is the branch that keeps a broken or
+           half-built path network from breaking the race */
+        const a = LOCATIONS.find((l) => l.id === ids[i - 1]);
+        const b = LOCATIONS.find((l) => l.id === ids[i]);
+        if (a && b) {
+          if (!pts.length) pts.push({ x: a.world.x, z: a.world.z });
+          pts.push({ x: b.world.x, z: b.world.z });
+        }
+      }
+    }
+    /* HE RUNS PAST THE DOOR, NOT THROUGH THE LOBBY. A location's graph
+       node sits at the location's CENTRE — which is the building — so
+       the lane polylines that terminate on one run straight into the
+       middle of the Market Hall. Following them put both the Mayor and
+       the shot's camera inside a wall; the first two attempts at this
+       screenshot are a full frame of interior plaster.
+
+       So every point is pushed out of every building footprint it is
+       inside, radially, to the rim plus a stride. The route still
+       visits each corner of the Dash — it now rounds it, the way a
+       runner rounds a corner, instead of taking the reception desk. */
+    for (const p of pts) {
+      for (const l of LOCATIONS) {
+        const r = Math.max(l.size?.w || 8, l.size?.d || 8) * 0.5 + 1.8;
+        const dx = p.x - l.world.x, dz = p.z - l.world.z;
+        const d = Math.hypot(dx, dz);
+        if (d < r) {
+          if (d < 1e-3) { p.x += r; continue; }
+          p.x = l.world.x + (dx / d) * r;
+          p.z = l.world.z + (dz / d) * r;
+        }
+      }
+    }
+    let len = 0;
+    for (let i = 1; i < pts.length; i++) {
+      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+    }
+    return { pts, len };
+  }
+
+  /** Where he is, `d` metres into the route. Writes into `_mv`. */
+  function mayorAt(d, out) {
+    const pts = mayorPath;
+    if (!pts || pts.length < 2) return out.set(0, 0, 0);
+    let acc = 0;
+    for (let i = 1; i < pts.length; i++) {
+      const seg = Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z) || 1e-4;
+      if (acc + seg >= d || i === pts.length - 1) {
+        const t = clamp((d - acc) / seg, 0, 1);
+        const x = pts[i - 1].x + (pts[i].x - pts[i - 1].x) * t;
+        const z = pts[i - 1].z + (pts[i].z - pts[i - 1].z) * t;
+        return out.set(x, groundY(x, z), z);
+      }
+      acc += seg;
+    }
+    return out.set(pts[0].x, groundY(pts[0].x, pts[0].z), pts[0].z);
+  }
+
+  function mayorSay(pool) {
+    if (!mayor || !bubbles) return;
+    const line = pool[Math.floor(bubbleRng() * pool.length) % pool.length];
+    bubbles.show(mayor, line, { key: 'mayor', ttl: 3.8, tint: '#c98a3a' });
+  }
+
+  /**
+   * Put him on the start line and set him running.
+   * @param {{mps?:number, mayorSeconds?:number, route?:Array, demo?:boolean}} o
+   */
+  function startMayorRun(o = {}) {
+    const h = ensureMayor();
+    if (!h) return null;
+    const built = buildMayorPath(o.route || ctx.game?.race?.route?.());
+    if (!built.pts.length) return null;
+    mayorPath = built.pts;
+    mayorLen = built.len;
+    mayorDist = 0;
+    /* PACED BY THE RULE. The rules layer's metres are straight-line
+       between locations; the road is longer, so his metres-per-second is
+       scaled to land him on the same finishing time. */
+    const secs = o.mayorSeconds || ctx.game?.race?.pace?.().mayorSeconds || 0;
+    const mps = o.mps || ctx.game?.race?.pace?.().mps || 4.4;
+    /* AND CLAMPED, because the two lengths do not agree. The rules
+       layer's metres are STRAIGHT LINES between five locations — 790 m
+       — and the roads that actually join them are 1330 m. Solving
+       mayorLen / mayorSeconds exactly therefore asked a sixty-year-old
+       in a shirt to run at 8.3 m/s, which is world-record pace and
+       reads, correctly, as a bug. He is held to a fast but human 6.2
+       m/s instead. The RESULT is unaffected — game.race.finish() judges
+       the UI's clock against the rule's own number and never looks at
+       where this man is standing — so what is being traded is a
+       cosmetic agreement between two lengths for a Mayor who moves like
+       a person. */
+    mayorSpeed = clamp(secs > 0 ? mayorLen / secs : mps, 3.2, 6.2);
+    mayorState = 'ready';
+    mayorFrozen = false;
+    mayorT = 0;
+    mayorSayT = 2.2;
+    h.exempt = true;
+    h.mayorDriven = true;
+    h.asleep = false;
+    h.active = true;
+    h.root.visible = true;
+    mayorAt(0, _mv);
+    h.root.position.copy(_mv);
+    h.anim.setMode('idle');
+    h.anim.lookTarget = null;
+    h.anim.lookW = 0;
+    if (h.agent) { h.agent.frozen = true; h.agent.speed = 0; }
+    return { len: +mayorLen.toFixed(1), mps: +mayorSpeed.toFixed(2), points: mayorPath.length };
+  }
+
+  function stopMayorRun(where) {
+    if (!mayor) return;
+    mayorState = 'finish';
+    mayorT = 0;
+    mayor.anim.setMode('idle');
+    if (where) mayorSay(where);
+  }
+
+  function mayorUpdate(dt, t) {
+    if (!mayor || mayorState === 'none') return;
+    const h = mayor;
+    h.root.visible = true;
+    h.active = true;
+    h.asleep = false;
+    const wp = ctx.wally ? ctx.wally.position : null;
+
+    switch (mayorState) {
+      case 'ready': {
+        mayorT += dt;
+        h.anim.update(dt, t, _still);
+        if (mayorT === dt && wp) mayorSay(MAYOR_LINES.start);
+        if (mayorT >= MAYOR.LEAD_IN) { mayorState = 'run'; mayorT = 0; h.anim.setMode(MAYOR.RUN_ANIM); }
+        break;
+      }
+      case 'run': {
+        mayorT += dt;
+        /* FROZEN IS FOR THE CAMERA, NOT FOR THE GAME. tools/shot.mjs
+           runs its --eval and THEN waits out the settle time, so a
+           Mayor posed for a screenshot is eighty metres up the road by
+           the time the shutter opens. Frozen holds his position and
+           keeps his legs turning, which is what a still of a run needs.
+           Nothing sets it but a debug hook. */
+        if (!mayorFrozen) mayorDist += mayorSpeed * dt;
+        const prevX = h.root.position.x, prevZ = h.root.position.z;
+        mayorAt(Math.min(mayorDist, mayorLen), _mv);
+        h.root.position.copy(_mv);
+        const dx = _mv.x - prevX, dz = _mv.z - prevZ;
+        if (dx * dx + dz * dz > 1e-6) {
+          const want = Math.atan2(dx, dz);
+          const cur = h.root.rotation.y;
+          const dy = Math.atan2(Math.sin(want - cur), Math.cos(want - cur));
+          h.root.rotation.y = cur + dy * (1 - Math.exp(-6 * dt));
+        }
+        h.anim.update(dt, t, { speed: mayorSpeed, turn: 0 });
+        /* HE CALLS OUT, but only when he is close enough for you to have
+           heard it, and never twice inside eight seconds. */
+        mayorSayT -= dt;
+        if (mayorSayT <= 0 && wp) {
+          mayorSayT = 8 + bubbleRng() * 7;
+          const d = h.root.position.distanceTo(wp);
+          if (d < MAYOR.NEAR_TALK) {
+            /* is he ahead of Wally on the route, or behind? Distance
+               from the finish is the honest measure of that. */
+            mayorAt(mayorLen, _mv);
+            const mine = mayorLen - mayorDist;
+            const yours = wp.distanceTo(_mv);
+            mayorSay(mine < yours - 12 ? MAYOR_LINES.behind
+              : mine > yours + 12 ? MAYOR_LINES.ahead : MAYOR_LINES.mid);
+          }
+        }
+        if (mayorDist >= mayorLen && !mayorFrozen) stopMayorRun(null);
+        break;
+      }
+      case 'finish': {
+        mayorT += dt;
+        h.anim.update(dt, t, _still);
+        if (wp && h.root.position.distanceTo(wp) < 14) {
+          h.lookVec.set(wp.x, wp.y + 1.2, wp.z);
+          h.anim.lookTarget = h.lookVec;
+          h.anim.lookW = damp(h.anim.lookW || 0, 1, 3, dt);
+        }
+        if (mayorT > MAYOR.LINGER) {
+          mayorState = 'none';
+          h.mayorDriven = false;
+          h.exempt = false;
+          /* home is where he was standing before the Mayor's Dash */
+          if (h.home) { h.root.position.copy(h.home); h.root.rotation.y = h.baseYaw; }
+          h.anim.setMode(h.baseMode || 'idle');
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+  /* THE RULES LAYER OWNS THE RACE. Every one of these is a report of
+     something that has already been decided elsewhere. */
+  ctx.bus?.on('race', (e) => {
+    if (!e) return;
+    if (e.kind === 'offer') { registerMayorPortrait(); ensureMayor(); return; }
+    if (e.kind === 'start') {
+      registerMayorPortrait();
+      startMayorRun({ mps: e.mps, mayorSeconds: e.mayorSeconds, route: e.route });
+      return;
+    }
+    if (e.kind === 'abandon') { stopMayorRun(null); return; }
+    if (e.kind === 'finish') {
+      stopMayorRun(e.won ? MAYOR_LINES.ahead : MAYOR_LINES.behind);
+      return;
+    }
+    if (e.kind === 'hint') sayHint(e.text);
+  });
+
+  /* ============================================================
+     BULL AND BEAR — the city talking as it walks past.
+
+     The pool of lines and the drawing both live in bubbles.js. What is
+     here is the SCHEDULING, because only this module knows who is on
+     screen, who is walking, who spoke last and how far away the camera
+     is.
+
+     WHO GETS A LINE. Somebody in the crowd, between 5 and 22 metres
+     out, currently animated (so they are in frame and near enough to
+     have their skeleton written), who has not spoken in a minute. A
+     walker is preferred over a stander two to one: the brief asks for
+     NPCs walking BY, and a line over somebody who is going somewhere
+     reads as overheard, while a line over somebody stationary reads as
+     a shopkeeper's sign.
+
+     HOW OFTEN. One every 4.5 to 9 seconds at most, and bubbles.js caps
+     how many can be on screen and refuses any that would overlap one
+     that is already up. On a quiet street that is a line every few
+     seconds; in a crowded market square it is the same rate, which is
+     the point — the frequency is a property of the PLAYER, not of the
+     population, or a busy district would turn into a wall of text.
+
+     THE SEED. A dedicated stream, so two runs of the same build
+     overhear the same city in the same order and a screenshot is
+     reproducible.
+     ============================================================ */
+  const bubbles = createBubbles(ctx, {});
+  const bubbleRng = ctx.makeRng('npc.bubbles.v1');
+  let bubbleT = 3.0;
+  let hintPokeT = 20;
+  const LINE_POOLS = [BULL_LINES, BEAR_LINES, STREET_LINES];
+
+  function pickLine() {
+    /* Bull, bear and street in roughly equal measure — this is a market
+       town, so half of what you overhear is a position and half of it is
+       the rent. */
+    const pool = LINE_POOLS[Math.floor(bubbleRng() * 3) % 3];
+    return pool[Math.floor(bubbleRng() * pool.length) % pool.length];
+  }
+
+  /* `loose` skips the ANIMATED test. h.active is written by the LOD
+     pass at the top of update(), i.e. against LAST frame's camera — so
+     a debug hook that has just moved the camera finds nobody animated
+     anywhere near it and returns null. In gameplay the strict test is
+     the right one: a person whose skeleton is frozen is a person the
+     frustum or the budget has already given up on. */
+  const _fwd = new THREE.Vector3();
+  function bubbleCandidate(camPos, loose) {
+    let best = null, bestScore = -1e9;
+    /* IN FRONT OF THE LENS, and this is not an optimisation. bubbles.js
+       rejects anything that projects behind the camera — it has to, or a
+       balloon appears mirrored on the wrong side of the screen — so a
+       candidate chosen from behind is a granted line that is silently
+       thrown away, and the anti-spam timer has already been spent on
+       it. Measured: at Market Hall the nearest six people were all
+       behind the camera and the feature produced nothing at all. */
+    ctx.camera.getWorldDirection(_fwd);
+    for (const h of all) {
+      if (h.asleep) continue;
+      if (!loose && (!h.active || !h.root.visible)) continue;
+      if (h.isClient || h.mayorDriven || h === happy) continue;
+      if ((h.bubbleAt ?? -1e9) > elapsed - 55) continue;
+      const d = h.root.position.distanceTo(camPos);
+      if (d < 5 || d > 22) continue;
+      if (((h.root.position.x - camPos.x) * _fwd.x
+        + (h.root.position.z - camPos.z) * _fwd.z) / d < 0.30) continue;
+      const moving = h.agent && h.agent.speed > 0.5;
+      /* nearest first, walkers weighted up, plus a little noise so the
+         same person is not always the one who talks */
+      const s = -d + (moving ? 9 : 0) + bubbleRng() * 4;
+      if (s > bestScore) { bestScore = s; best = h; }
+    }
+    return best;
+  }
+
+  /** The scooter hint, on whoever is nearest — the rules layer decided
+      that this is allowed to be said; this only finds a mouth for it. */
+  let pendingHint = null, pendingHintT = 0;
+  function sayHint(text) {
+    if (!text) return false;
+    pendingHint = text;
+    pendingHintT = 12;          // keep trying for twelve seconds
+    return true;
+  }
+  function hintUpdate(dt, camPos) {
+    if (!pendingHint) return;
+    pendingHintT -= dt;
+    if (pendingHintT <= 0) { pendingHint = null; return; }
+    const h = bubbleCandidate(camPos, true) || api.nearest(camPos, 24);
+    if (!h || h.mayorDriven) return;
+    if (bubbles.show(h, pendingHint, { ttl: 6.0, tint: '#f5913c', key: 'hint' })) {
+      h.bubbleAt = elapsed;
+      h.anim.setMode('talk');
+      h.sayT = 3.0;
+      pendingHint = null;
+    }
+  }
+
+  function bubbleUpdate(dt, t, camPos) {
+    bubbles.update(dt, t);
+    hintUpdate(dt, camPos);
+    if (ctx.ui?.modal || ctx.ui?.dialogueOpen) return;
+
+    /* THE HINT IS THE RULES LAYER'S TO GIVE. game.race.hint() is the
+       whole gate — never before the second loss, never twice in a day,
+       and then only about a third of the time — so this does nothing
+       but ASK, occasionally, and obey the answer. It returns null far
+       more often than not, which is exactly the intent. */
+    hintPokeT -= dt;
+    if (hintPokeT <= 0) {
+      hintPokeT = 45 + bubbleRng() * 30;
+      const race = ctx.game?.race;
+      if (race && !pendingHint && race.status?.() === 'lost') {
+        try { race.hint(); } catch (e) { /* the rules layer said no */ }
+      }
+    }
+
+    bubbleT -= dt;
+    if (bubbleT > 0) return;
+    bubbleT = 4.5 + bubbleRng() * 4.5;
+    const h = bubbleCandidate(camPos);
+    if (!h) return;
+    if (bubbles.show(h, pickLine(), {})) h.bubbleAt = elapsed;
+  }
+
   /* ------------------------------------------------------------
      ctx.npc
      ------------------------------------------------------------ */
@@ -1035,6 +1882,94 @@ export async function init(ctx) {
       return h;
     },
 
+    /** The bubble pool — bubbles.show(human, text) puts a line over
+        anybody, and the line pools are on it (bull / bear / street). */
+    bubbles,
+    /** A line over one named client, through the bubble system rather
+        than the world-space prompt. */
+    bubble(id, text, o) {
+      const h = ensure(id);
+      return h ? bubbles.show(h, text, o || { force: true }) : false;
+    },
+
+    /* --- Mayor Ken Jones, and the Dash ---
+       WHETHER and HOW FAST belong to ctx.game.race; this runs the man.
+       `mayorRun` exists so a cutscene or a test can drive the
+       presentation without the rules layer having to be in a state
+       where a race is legal. */
+    get mayor() { return mayor || named.get(MAYOR_ID) || null; },
+    get mayorState() { return mayorState; },
+    mayorRun(o) { return startMayorRun(o || {}); },
+    mayorStop() { stopMayorRun(null); },
+
+    /** Everyone standing inside a doorway keep-clear, worst first.
+        An empty `blocking` list is the fix, measured.
+
+        `{before: true}` re-plans every standing spot on the SAME seeds
+        with the penalty and the widened arc switched off — i.e. the
+        code as it was — and reports what it would have produced. That
+        is the A/B, and it is the only honest way to say the fix did
+        anything. */
+    doorAudit(opts = {}) {
+      const rows = [];
+      const spots = new Map();
+      if (opts.before) {
+        doorPenalty = false;
+        for (const c of CLIENTS) {
+          const locs = LOCATIONS.filter((l) => l.z === c.home);
+          const rng = ctx.makeRng('npc.place.' + c.id);
+          /* the same three draws planClient makes, in the same order */
+          rng(); rng();
+          const anchor = locs.length
+            ? locs[Math.floor(rng() * locs.length) % locs.length] : null;
+          if (!anchor) continue;
+          spots.set(c.id, standingSpot(anchor, rng, { near: 2.0, far: 6.0 }));
+        }
+        doorPenalty = true;
+      }
+      for (const h of all) {
+        if (h.mayorDriven) continue;
+        const p = spots.get(h.id) || h.root.position;
+        let worst = 0, at = null;
+        for (const d of DOORS) {
+          const k = doorClearance(p.x, p.z, d.x, d.z, d.ax, d.az);
+          if (k > worst) { worst = k; at = d; }
+        }
+        if (worst > (opts.min ?? 0.001)) {
+          rows.push({
+            who: h.id || 'stranger', kind: h.isClient ? 'client' : (h.agent ? 'wander' : 'res'),
+            door: at.id, k: +worst.toFixed(3),
+            metres: +Math.hypot(p.x - at.x, p.z - at.z).toFixed(2),
+          });
+        }
+      }
+      rows.sort((a, b) => b.k - a.k);
+      /* AND THE OTHER DIRECTION: for every door, how far away the
+         nearest human actually is. `blocking` proves nobody is in a
+         corridor; this proves the corridors are not merely empty by
+         luck — a door whose nearest person is 2.6 m away has an
+         approach, and one whose nearest is 0.8 m does not, whatever the
+         corridor test says about which side of it they are on. */
+      const near = [];
+      for (const d of DOORS) {
+        let bd = Infinity, who = null;
+        for (const h of all) {
+          if (h.mayorDriven) continue;
+          const p = spots.get(h.id) || h.root.position;
+          const dd = Math.hypot(p.x - d.x, p.z - d.z);
+          if (dd < bd) { bd = dd; who = h.id || 'stranger'; }
+        }
+        near.push({ door: d.id, metres: +bd.toFixed(2), who });
+      }
+      near.sort((a, b) => a.metres - b.metres);
+      return {
+        doors: DOORS.length, people: all.length,
+        blocking: rows.filter((r) => r.k > 0.25),
+        grazing: rows.filter((r) => r.k <= 0.25).length,
+        tightest: near.slice(0, 5),
+      };
+    },
+
     /* --- Happy, the opening encounter ---
        The TRIGGER belongs to ctx.game (bus 'story', beat 'happy'). This
        is here so a cutscene, a test or the screenshot harness can run
@@ -1062,6 +1997,9 @@ export async function init(ctx) {
       if (typeof window !== 'undefined') removeEventListener('keydown', onKey);
       happy = null;
       happyState = 'none';
+      mayor = null;
+      mayorState = 'none';
+      bubbles.dispose();
       for (const h of all) h.dispose();
       all.length = 0;
       pending.length = 0;
@@ -1261,7 +2199,352 @@ export async function init(ctx) {
     return takeCamera(cx, y + 1.02, cz + d, cx, ctx.world.heightAt(cx, cz) + 0.90, cz, fov);
   };
 
+  /* ================================================================
+     THE MAYOR — WALLY.debug.mayor()
+
+     The verifier's entry point, and the shot that has to prove three
+     separate claims at once: that he is a LIKENESS (white hair, white
+     beard, ruddy face, navy button-up), that he is TALL (he is framed
+     beside Wally and the street, not alone against the sky), and that
+     he READS IN A RACE (the frame is the game's own over-the-shoulder
+     camera at gameplay distance, not a portrait lens).
+
+       WALLY.debug.mayor()          mid-dash, over Wally's shoulder
+       WALLY.debug.mayor({t: 40})   forty seconds into the route
+       WALLY.debug.mayorSolo()      the likeness, close
+       WALLY.debug.mayorInfo()      where he is and how fast, measured
+     ================================================================ */
+  /* IS THERE A ROOF OVER THIS SPOT. The Dash runs down lanes that pass
+     under and between 154 collision volumes, and the first three
+     attempts at this screenshot put the lens inside a building —
+     shots/x-mayor.png went plaster, plaster, then an interior floor
+     with Wally standing in somebody's front room. A ray straight down
+     from thirty metres against the physics statics is the only cheap
+     query in the game that can tell open sky from a lobby. */
+  const _rayO = new THREE.Vector3();
+  const _rayD = new THREE.Vector3(0, -1, 0);
+  function underRoof(x, z) {
+    if (!ctx.phys?.raycast) return false;
+    const g = ctx.world.heightAt(x, z);
+    _rayO.set(x, g + 30, z);
+    const hit = ctx.phys.raycast(_rayO, _rayD, 34);
+    return !!hit && hit.point.y > g + 1.4;
+  }
+
+  dbg.mayor = (opts = {}) => {
+    registerMayorPortrait();
+    api.drain();
+    const started = startMayorRun({
+      route: ctx.game?.race?.route?.(),
+      mayorSeconds: opts.seconds,
+      mps: opts.mps,
+    });
+    if (!started) return 'no route';
+    const h = mayor;
+    /* drop him into the run, `t` seconds in, so he is mid-stride on a
+       road rather than standing on the start line */
+    mayorState = 'run';
+    mayorT = opts.t ?? 26;
+    mayorDist = clamp(mayorSpeed * mayorT, 0, mayorLen - 2);
+    /* AND THEN MOVE HIM TO WHERE THE SHOT WORKS. Unless a `t` was asked
+       for by hand, the three points this frame needs — him, Wally six
+       metres back, and the lens six metres behind that — are scanned
+       along the route for the first stretch where all three stand under
+       open sky. It is a screenshot hook: it may take a hundred
+       raycasts to find a frame that is actually of the thing it claims
+       to be of. */
+    if (opts.t == null) {
+      const lens = (opts.gap ?? 6.5) + (opts.dist ?? 5.6);
+      let bestD = -1, bestScore = -1e9;
+      for (let d = 30; d < mayorLen - 20; d += 4) {
+        mayorAt(d, _mv);
+        if (underRoof(_mv.x, _mv.z)) continue;
+        mayorAt(d - (opts.gap ?? 6.5), _v2);
+        if (underRoof(_v2.x, _v2.z)) continue;
+        mayorAt(d - lens, _door);
+        if (underRoof(_door.x, _door.z)) continue;
+        /* AND NOT IN THE MIDDLE OF A SCRUM. The first open stretch on
+           the route is a forecourt with a dozen residents on it, and
+           they stand between the lens and the subject: the shot came
+           back as a wall of shoulders with a small running man behind
+           it. Penalising near-field bodies picks an open stretch of the
+           same road instead. */
+        let crowdNear = 0;
+        for (const h of all) {
+          if (h.asleep || h.mayorDriven) continue;
+          if (h.root.position.distanceTo(_door) < 7) crowdNear++;
+        }
+        const score = -crowdNear * 3 - d * 0.004;
+        if (score > bestScore) { bestScore = score; bestD = d; }
+      }
+      if (bestD > 0) mayorDist = bestD;
+    }
+    mayorAt(mayorDist, _mv);
+    h.root.position.copy(_mv);
+    /* face along the route */
+    mayorAt(Math.min(mayorDist + 3, mayorLen), _v2);
+    h.root.rotation.y = Math.atan2(_v2.x - _mv.x, _v2.z - _mv.z);
+    h.anim.setMode(MAYOR.RUN_ANIM);
+    h.anim.w.run = 1; h.anim.w.walk = 1; h.anim.speed = mayorSpeed;
+    /* wind the cycle to a moment where one leg is up: the pose that
+       says "running" in a still frame */
+    h.anim.walkPhase = 1.15;
+    h.anim.update(1 / 60, 0, { speed: mayorSpeed, turn: 0 });
+
+    /* WALLY IS IN THIS SHOT ON PURPOSE. "Noticeably taller than the
+       other NPCs" is a claim about a comparison, and a comparison needs
+       both terms in the frame. He is put a few metres back down the
+       Mayor's own route, which is also where a player who is losing
+       actually is. */
+    const back = opts.gap ?? 6.5;
+    mayorAt(Math.max(0, mayorDist - back), _v2);
+    ctx.wally?.setBike?.(false, { instant: true });
+    ctx.wally?.setPosition?.(_v2.x, _v2.y, _v2.z);
+    ctx.wally?.setYaw?.(Math.atan2(_mv.x - _v2.x, _mv.z - _v2.z));
+    ctx.wally?.look?.(h.byName.head, 1);
+
+    mayorFrozen = opts.frozen !== false;
+    /* a long ttl for the same reason: the shutter opens seconds after
+       this returns, and a 3.8 s bubble is gone by then */
+    if (opts.say !== false) {
+      const line = MAYOR_LINES.behind[0];
+      bubbles.show(h, line, { key: 'mayor', ttl: 120, tint: '#c98a3a', force: true });
+    }
+
+    /* THE CAMERA SWINGS OFF THE LINE. Dead behind, the lens, Wally and
+       the Mayor are collinear BY CONSTRUCTION — all three stand on the
+       same road — and a 1.6 m elephant five metres from the camera
+       hides a 2.08 m man twelve metres from it almost exactly. That was
+       the fourth failed attempt at this shot: a perfect street, and the
+       subject behind Wally's ears. Swung a quarter-radian to whichever
+       side has open sky over it, both figures are in frame with the
+       road running between them, which is the composition a chase
+       actually has. `underRoof` is what keeps the swing out of the
+       building it would otherwise swing into. */
+    const d0 = opts.dist ?? 5.6;
+    const base = Math.atan2(_mv.x - _v2.x, _mv.z - _v2.z);
+    let ex = _v2.x - Math.sin(base) * d0, ez = _v2.z - Math.cos(base) * d0;
+    for (const swing of [0.50, -0.50, 0.78, -0.78, 0]) {
+      const a2 = base + swing;
+      const cx2 = _v2.x - Math.sin(a2) * d0, cz2 = _v2.z - Math.cos(a2) * d0;
+      if (!underRoof(cx2, cz2)) { ex = cx2; ez = cz2; break; }
+    }
+    return {
+      ...started,
+      ...takeCamera(ex, groundY(ex, ez) + 2.55, ez,
+        (_mv.x + _v2.x) * 0.5, _mv.y + 1.30, (_mv.z + _v2.z) * 0.5, opts.fov ?? 46),
+      mayor: _mv.toArray().map((v) => +v.toFixed(1)),
+      height: +h.height.toFixed(2),
+    };
+  };
+
+  /** HIS LIKENESS ON ITS OWN — the hair, the beard, the ruddy face, the
+      navy button-up. The race shot proves he READS; it cannot prove he
+      is a likeness, because at twelve metres his head is ninety pixels.
+      Every judgement about the transcription — thick white hair swept
+      back, full white beard, pink complexion, dark navy shirt — was
+      made against this hook.
+
+      HE IS MOVED TO OPEN GROUND FIRST, and that is not vanity: he
+      stands on a Main Street forecourt hemmed in by an awning, a
+      lamp-post and a fruit stall, and a 2.3 m portrait lens put inside
+      any of them photographs the inside of a crate. `lineup` solves the
+      same problem the same way. */
+  dbg.mayorSolo = (y = 1.62, dist = 2.3, fov = 34) => {
+    const h = ensureMayor();
+    if (!h) return 'no mayor';
+    api.drain();
+    h.exempt = true;
+    if (h.agent) { h.agent.frozen = true; h.agent.speed = 0; }
+    const zone = ZONES.greenedge;
+    const px = zone.world.x, pz = zone.world.z + 26;
+    h.root.position.set(px, groundY(px, pz), pz);
+    h.root.rotation.y = h.baseYaw = 0;
+    h.root.visible = true; h.active = true; h.asleep = false;
+    h.anim.setMode('idle');
+    h.anim.lookTarget = null; h.anim.lookW = 0; h.lookW = 0;
+    h.anim.update(1 / 60, 0, _still);
+    const p = h.root.position;
+    const a = h.root.rotation.y + 0.34;
+    return {
+      ...takeCamera(
+        p.x + Math.sin(a) * dist, p.y + y + 0.06, p.z + Math.cos(a) * dist,
+        p.x, p.y + y, p.z, fov),
+      height: +h.height.toFixed(2),
+    };
+  };
+
+  dbg.mayorInfo = () => ({
+    state: mayorState,
+    built: !!mayor,
+    height: mayor ? +mayor.height.toFixed(2) : null,
+    medianHeight: (() => {
+      const hs = all.filter((x) => !x.isClient).map((x) => x.height).sort((a, b) => a - b);
+      return hs.length ? +hs[hs.length >> 1].toFixed(2) : null;
+    })(),
+    routeMetres: +mayorLen.toFixed(1),
+    mps: +mayorSpeed.toFixed(2),
+    dist: +mayorDist.toFixed(1),
+    pos: mayor ? mayor.root.position.toArray().map((v) => +v.toFixed(1)) : null,
+    spec: mayor ? {
+      hair: mayor.spec.hair, hairCol: mayor.spec.hairCol, beard: mayor.spec.beard,
+      hat: mayor.spec.hat, shirt: '#' + (mayor.spec.shirtCol || 0).toString(16),
+    } : null,
+    race: ctx.game?.race?.status?.() ?? null,
+  });
+
+  /* ================================================================
+     THE BUBBLES — WALLY.debug.bubbles()
+
+     Forces three lines out over three different people immediately,
+     rather than waiting out the four-to-nine second spacing, and
+     returns who said what so the verifier can check the text against
+     the picture. `WALLY.debug.bubbleHint()` fires the scooter line
+     through the same path the rules layer uses.
+     ================================================================ */
+  dbg.bubbles = (n = 3) => {
+    api.drain();
+    ctx.camera.updateMatrixWorld();
+    ctx.camera.getWorldPosition(_v);
+    const said = [];
+    for (let i = 0; i < n; i++) {
+      const h = bubbleCandidate(_v, true);
+      if (!h) break;
+      const line = pickLine();
+      if (bubbles.show(h, line, { ttl: 240 })) {
+        h.bubbleAt = elapsed;
+        h.anim.setMode('talk');
+        h.sayT = 1e6;
+        /* HOLD THEM STILL FOR THE SHUTTER. shot.mjs runs its --eval and
+           then waits out the settle, and a walker covers eleven metres
+           in that time — the first bubble shot photographed three
+           speech balloons pointing off the edge of the frame. */
+        if (h.agent) { h.agent.frozen = true; h.agent.speed = 0; }
+        said.push({ who: h.id || h.spec?.id || 'stranger', line });
+      }
+    }
+    bubbles.update(0.30, elapsed);
+    return { said, live: bubbles.live };
+  };
+  /** A STREET-LEVEL CAMERA WITH THE CITY TALKING IN IT. The ambient
+      lines are a gameplay-distance feature by design — nothing speaks
+      past thirty metres, and a debug fly-to sits sixty metres up, so a
+      vista shot of a district correctly shows no bubbles at all. This
+      is the frame the feature actually lives in. */
+  dbg.bubbleCam = (locId = 'marketsq', opts = {}) => {
+    api.drain();
+    /* WALK THE ROADS AND STOP WHERE THE PEOPLE ARE.
+
+       Three earlier versions of this hook aimed at a location, then at
+       the crowd's own centroid, and both put the lens indoors — the
+       centroid of the people at Market Hall is inside the Market Hall,
+       and the ring around it is inside the awnings. The roads are the
+       one surface in this city that is guaranteed to be outdoors and
+       guaranteed to have pedestrians on it, which is the whole subject
+       of the feature: lines overheard from people walking past. So the
+       Mayor's own route — already stitched out of the road graph — is
+       walked in four-metre steps, and the step with the most people
+       ahead of the lens and open sky over it wins. */
+    const built = buildMayorPath(ctx.game?.race?.route?.());
+    if (!built.pts.length) return 'no roads';
+    mayorPath = built.pts; mayorLen = built.len;
+    const look = new THREE.Vector3(), eye = new THREE.Vector3();
+    let bestD = -1, bestN = -1;
+    for (let d = 12; d < mayorLen - 12; d += 4) {
+      mayorAt(d, eye);
+      mayorAt(d + 10, look);
+      const fx = look.x - eye.x, fz = look.z - eye.z;
+      const fl = Math.hypot(fx, fz) || 1;
+      /* THE WHOLE SHOT HAS TO BE OUTDOORS, not just the lens. Checking
+         the eye alone picked a spot two metres clear of Dispatch's
+         first-floor overhang and photographed the underside of it. The
+         eye, the ground Wally stands on, the point being looked at, and
+         a stride to either side of the lens all have to have sky over
+         them — five taps, once, in a debug hook. */
+      if (underRoof(eye.x, eye.z)) continue;
+      if (underRoof(eye.x + fx * 0.44 / fl * 10, eye.z + fz * 0.44 / fl * 10)) continue;
+      if (underRoof(look.x, look.z)) continue;
+      if (underRoof(eye.x + fz / fl * 2.2, eye.z - fx / fl * 2.2)) continue;
+      if (underRoof(eye.x - fz / fl * 2.2, eye.z + fx / fl * 2.2)) continue;
+      let n = 0;
+      for (const h of all) {
+        if (h.asleep || h.isClient) continue;
+        const dx = h.root.position.x - eye.x, dz = h.root.position.z - eye.z;
+        const dd = Math.hypot(dx, dz);
+        if (dd < 6 || dd > 20) continue;
+        if ((dx * fx + dz * fz) / (fl * dd) < 0.55) continue;
+        n++;
+      }
+      if (n > bestN) { bestN = n; bestD = d; }
+    }
+    if (bestD < 0) return 'nowhere open';
+    mayorAt(bestD, eye);
+    mayorAt(bestD + 10, look);
+    const a0 = Math.atan2(look.x - eye.x, look.z - eye.z);
+    /* Wally in the frame, walking the same street — this is a shot of
+       the city he is standing in, not a survey of it */
+    const wx = eye.x + Math.sin(a0) * 4.4, wz = eye.z + Math.cos(a0) * 4.4;
+    ctx.wally?.setBike?.(false, { instant: true });
+    ctx.wally?.setPosition?.(wx, groundY(wx, wz), wz);
+    ctx.wally?.setYaw?.(a0);
+    takeCamera(eye.x, groundY(eye.x, eye.z) + 2.25, eye.z,
+      look.x, groundY(look.x, look.z) + 1.45, look.z, opts.fov ?? 50);
+    ctx.camera.updateMatrixWorld();
+    ctx.camera.matrixWorldInverse.copy(ctx.camera.matrixWorld).invert();
+    return { ahead: bestN, ...dbg.bubbles(opts.n ?? 3) };
+  };
+
+  dbg.bubbleHint = () => {
+    const r = ctx.game?.race?.hint?.();
+    if (!r) sayHint(RACE.hints[0].text);      // the rules layer said no
+    return { fromRules: !!r, text: r ? r.text : RACE.hints[0].text };
+  };
+
+  /* ================================================================
+     THE DOORWAYS — WALLY.debug.doorAudit()
+
+     The fix for "Barnaby and other NPCs are too close to the entrances"
+     is a score, so it is measurable: this walks every person in the
+     game against every door and reports anybody inside a keep-clear,
+     worst first. A green run is an empty `blocking` list.
+     ================================================================ */
+  dbg.doorAudit = (o) => api.doorAudit(o || {});
+
+  const LOC = (id) => LOCATIONS.find((x) => x.id === id)
+    || LOCATIONS.filter((x) => x.z === id)[0] || LOCATIONS[0];
+
+  /** Stand in the approach corridor and look at the door. This is the
+      shot the complaint is about: if anybody is in the way of an
+      entrance, this is the frame they are in the way of. */
+  dbg.doorCam = (locId, opts = {}) => {
+    api.drain();
+    const d = DOORS.find((x) => x.id === locId) || DOORS[0];
+    if (!d) return 'no doors';
+    const back = opts.dist ?? 9.5;
+    const ex = d.x + d.ax * back, ez = d.z + d.az * back;
+    const l = LOCATIONS.find((x) => x.id === d.id);
+    ctx.wally?.setBike?.(false, { instant: true });
+    /* Wally stands where the game would put him: on the door point, the
+       far end of the corridor this hook exists to photograph. */
+    const wx = d.x + d.ax * 2.2, wz = d.z + d.az * 2.2;
+    ctx.wally?.setPosition?.(wx, groundY(wx, wz), wz);
+    ctx.wally?.setYaw?.(Math.atan2(-d.ax, -d.az));
+    return {
+      door: d.id,
+      ...takeCamera(ex, groundY(ex, ez) + (opts.up ?? 3.0), ez,
+        d.x, groundY(d.x, d.z) + 1.5, d.z, opts.fov ?? 50),
+      people: api.at(d.id).length,
+      audit: api.doorAudit().tightest.filter((r) => r.door === d.id),
+      loc: l ? l.n : d.id,
+    };
+  };
+
   dbg.npcRelease = () => {
+    /* whatever a debug hook froze, the game gets back */
+    mayorFrozen = false;
+    if (mayor) { mayor.exempt = false; if (mayor.agent) mayor.agent.frozen = false; }
+    for (const h of all) if (h.agent && h.bubbleAt != null) h.agent.frozen = false;
+    bubbles.clear();
     camState = null;
     ctx.cam?.releaseOverride?.();
     ctx.bus?.emit('cam:release', { owner: 'npc.debug' });
@@ -1394,9 +2677,19 @@ export async function init(ctx) {
     /* NOT dead perpendicular. At exactly 90 degrees the two stand at
        opposite edges of the frame with two metres of empty grass down
        the middle, which reads as two strangers ignoring each other.
-       Swung 26 degrees round toward Happy, their silhouettes just
-       overlap and the composition closes. */
-    const a = Math.atan2(hp.x - wp.x, hp.z - wp.z) + Math.PI / 2 - 0.45;
+       Swung 26 degrees round, their silhouettes just overlap and the
+       composition closes.
+
+       AND IT SWINGS ROUND TOWARD WALLY, NOT TOWARD HAPPY. The sign of
+       that was wrong and it cost the shot: swung the other way the lens
+       sits behind Happy's shoulder and photographs the back of his head
+       for the entire beat — see shots/c0-happy.png, where the only
+       thing visible of the man saying the line is a blond crown. From
+       this side it is the over-the-shoulder every film has used for a
+       hundred years: the player's own character with his back to us,
+       the person who is talking facing the camera. Which is also the
+       only framing in which any of his likeness is on screen. */
+    const a = Math.atan2(hp.x - wp.x, hp.z - wp.z) + Math.PI / 2 + 0.45;
     const d = opts.dist ?? 4.05;
     takeCamera(
       mx + Math.sin(a) * d, wp.y + 1.52, mz + Math.cos(a) * d,
@@ -1411,6 +2704,42 @@ export async function init(ctx) {
       wally: wp.toArray().map((v) => +v.toFixed(2)),
     };
   };
+  /* ================================================================
+     HIS LIKENESS ON ITS OWN — WALLY.debug.happySolo(y, dist)
+
+     The two-shot proves the ENCOUNTER. It cannot prove the LIKENESS:
+     Happy is 1.68 m tall in a frame that also has to hold a 1.60 m
+     elephant and a dialogue card, so his head is 90 px and his tee is
+     40, and at that size a jacket lapel and a printed elephant are two
+     smudges. Every judgement about whether he looks like the man in
+     ref/happy-ref.webp — the parting, the sweep, the open blazer, the
+     V of the tee, the print — was made against this hook instead, and
+     it is left here so the next person can check the same things.
+
+       WALLY.debug.happySolo()        head to knee, front on
+       WALLY.debug.happySolo(1.45, 0.9)   the face, close
+       WALLY.debug.happySolo(1.10, 1.4)   the tee print
+     ================================================================ */
+  dbg.happySolo = (y = 1.16, dist = 2.1, fov = 34) => {
+    const h = happy || api.happy({ instant: true });
+    if (!h) return 'no happy';
+    api.drain();
+    /* Out of `talk`: his gesture arm crosses the chest and hides the
+       one panel this hook exists to look at. */
+    h.anim.setMode('idle');
+    h.sayT = 0;
+    h.baseMode = 'idle';
+    const p = h.root.position;
+    const yaw = h.root.rotation.y;
+    /* stand where he is looking, a few degrees off axis so the parting
+       and the jaw both read */
+    const a = yaw + 0.30;
+    return takeCamera(
+      p.x + Math.sin(a) * dist, p.y + y + 0.10, p.z + Math.cos(a) * dist,
+      p.x, p.y + y, p.z, fov,
+    );
+  };
+
   dbg.happyInfo = () => {
     const w = ctx.wally;
     return {

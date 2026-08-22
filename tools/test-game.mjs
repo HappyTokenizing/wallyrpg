@@ -17,10 +17,16 @@
    the API surface; a 30-day simulated run; save round-trip and the
    v4→v6 and v5→v6 migrations; quest reachability; milestones and
    clients; THE OPENING (phone → Happy → Dispatch, and the cafe SIDE
-   quest that must never touch the main objective); THE BICYCLE
-   (gated on purchase and on being equipped); the guarantee that a
-   broke, exhausted player is never hard-locked; refusals; and the
-   world queries the 3D builder needs.
+   quest that must never touch the main objective); THE FRIEND'S
+   MESSAGE, word for word; THE BROKER HAND-OFF (picking an order up
+   at the desk must move the objective to the Business Broker); THE
+   BICYCLE (gated on purchase and on being equipped); THE RIDES
+   (bicycle / scooter / motorcycle, their speed ratios, the scooter's
+   quest-only door and the motorcycle's price, one-at-a-time
+   equipping and the v6 -> v7 migration); the guarantee that a broke,
+   exhausted player is never hard-locked; that no player-visible
+   string says Uber; refusals; and the world queries the 3D builder
+   needs.
 
    Exits non-zero on the first hard failure summary.
    ============================================================ */
@@ -32,8 +38,14 @@ import DATA, {
   TRAVEL, BIKE, JOBS, EMPLOYEE_POOL, IPOS, IPO_STEPS, STADIUM_STEPS,
   NEWS_POOL, QUESTS, SIDE_QUESTS, MILESTONES, TIPS, MORNING_NOTES,
   OPENING_MESSAGE, byTicker, assetLabel, searchAssets, normTicker,
-  hops, fare, worldDistance,
+  RIDES, RIDE_LIST, RIDE_ORDER, SIDE_QUEST_BY_ID, QUEST_BY_ID,
+  REP_TITLES, RACE, PRODUCERS, SLATE_MEAL, NPC_POSTS, ORDER_FAIL,
+  repProgress, orderFailRep,
+  hops, fare, rideFare, worldDistance,
 } from '../src/game/data.js';
+import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { newState, mulberry32 } from '../src/game/state.js';
 import { createGame } from '../src/game/game.js';
 
@@ -306,7 +318,7 @@ ok(fare('walk', 'apartment', 'exchange').cost === 0, 'walking is always free');
    returns all-zeroes for an unknown mode, so `0 < anything` passed
    the assertion while testing nothing at all. */
 ok(fare('trunk', 'apartment', 'exchange').mins < fare('bike', 'apartment', 'exchange').mins,
-  'an Uber beats the bicycle on time');
+  'a Yoober beats the bicycle on time');
 eq(fare('bike', 'apartment', 'apartment').mins, 0, 'going nowhere takes no time');
 eq(fare('nosuchmode', 'apartment', 'exchange').mins, 0, 'an unknown mode returns a zeroed fare');
 
@@ -328,7 +340,7 @@ T('the travel table');
   eq(Object.keys(TRAVEL).length, 4, 'four travel modes');
   for (const m of ['walk', 'bike', 'train', 'trunk']) ok(!!TRAVEL[m], `mode '${m}' exists (id unchanged)`, m);
   eq(TRAVEL.train.n, 'Metro', "'train' displays as Metro");
-  eq(TRAVEL.trunk.n, 'Uber', "'trunk' displays as Uber");
+  eq(TRAVEL.trunk.n, 'Yoober', "'trunk' displays as Yoober");
 
   const at = (m, p) => fare(m, p[0], p[1]);
   for (const m of Object.keys(TRAVEL)) {
@@ -359,27 +371,27 @@ T('the travel table');
 
   /* THE METRO — a lot of energy, very little money. */
   ok(m5.cost > 0 && m5.cost < 15, 'the Metro across town costs pocket change', m5.cost);
-  ok(m5.cost < u5.cost * 0.2, 'and a small fraction of an Uber', `${m5.cost} vs ${u5.cost}`);
+  ok(m5.cost < u5.cost * 0.2, 'and a small fraction of a Yoober', `${m5.cost} vs ${u5.cost}`);
   ok(m1.energy > w1.energy, 'one Metro stop is more tiring than walking it', `${m1.energy}e vs ${w1.energy}e`);
   ok(m5.energy / m5.mins > w5.energy / w5.mins * 1.5,
     'per minute, the Metro is far more draining than walking',
     `${(m5.energy / m5.mins).toFixed(2)} vs ${(w5.energy / w5.mins).toFixed(2)} e/min`);
   ok(m5.mins < w5.mins * 0.5, 'but it buys back most of the day', `${m5.mins}m vs ${w5.mins}m`);
 
-  /* UBER — very little energy, expensive, and sharply distance-priced. */
-  ok(u1.energy <= 0.5, 'an Uber costs almost no energy', u1.energy);
+  /* YOOBER — very little energy, expensive, and sharply distance-priced. */
+  ok(u1.energy <= 0.5, 'a Yoober costs almost no energy', u1.energy);
   ok(u5.energy < m5.energy * 0.1, 'a fraction of the Metro', `${u5.energy} vs ${m5.energy}`);
-  ok(u1.cost >= 20, 'an Uber is never cheap, even for one hop', u1.cost);
-  ok(u5.cost / u1.cost > 3, 'a five-hop Uber is more than triple a one-hop Uber',
+  ok(u1.cost >= 20, 'a Yoober is never cheap, even for one hop', u1.cost);
+  ok(u5.cost / u1.cost > 3, 'a five-hop Yoober is more than triple a one-hop Yoober',
     `1 hop $${u1.cost}, 5 hops $${u5.cost}`);
   /* CONVEX IN DISTANCE. The user asked for a fare that varies with
      distance more sharply than the old flat 9 + 7·h. Convexity is the
-     property that makes a long Uber hurt: each additional hop costs
+     property that makes a long Yoober hurt: each additional hop costs
      MORE than the one before it. Measured on the hop counts directly,
      not on a pair of locations, so it is the pricing rule under test. */
   const uc = (h) => TRAVEL.trunk.base + TRAVEL.trunk.per * h + TRAVEL.trunk.surge * h * h;
   const d1 = uc(2) - uc(1), d4 = uc(5) - uc(4);
-  ok(d4 > d1, 'each extra hop in an Uber costs more than the last',
+  ok(d4 > d1, 'each extra hop in a Yoober costs more than the last',
     `2nd hop +$${d1.toFixed(2)}, 5th hop +$${d4.toFixed(2)}`);
   ok(uc(5) / 5 > uc(1) - TRAVEL.trunk.base, 'the fare is superlinear, not a flat rate per hop');
   ok(u5.mins < m5.mins, 'it is the fastest way across town', `${u5.mins}m vs ${m5.mins}m`);
@@ -464,6 +476,14 @@ T('economy basics');
 {
   const id = 'trnk';
   ok(game.economy.buyPrice(id) > game.economy.sellPrice(id), 'the spread costs you money');
+  /* THE COUNTER KEEPS HOURS. The Exchange trades 09:00–16:00 and until
+     this pass economy.buy() would sell you a share at four in the
+     morning — the hours were drawn in the UI and enforced nowhere. */
+  game.state.time = 4 * 60;
+  const shut = game.economy.buy(id, 1);
+  ok(!shut.ok && shut.kind === 'hours', 'a closed venue refuses to trade', JSON.stringify(shut));
+  ok(/opens at 09:00/.test(shut.why), 'and the refusal names the opening time', shut.why);
+  game.state.time = 12 * 60;                 // every venue in the city is open at noon
   const before = game.state.money;
   const r = game.economy.buy(id, 1);
   ok(r.ok, 'you can buy a cheap stock on day 1', r.why);
@@ -526,9 +546,27 @@ const bestMode = (destId) => {
   return 'walk';
 };
 
+/* THE BOT NOW OBEYS THE RULES LAYER, because the rules layer is now
+   the authority: a shift is worked AT the depot during its hours, a
+   meal is eaten where food is sold, a venue that is shut will not sell
+   you anything, and you sleep in your own bed. Every one of those used
+   to work from anywhere at any hour. The bot doing the day properly is
+   itself the test. */
+const go = (id) => {
+  if (sim.state.loc === id) return true;
+  const r = sim.travel(id, bestMode(id));
+  return !!(r && r.ok);
+};
+const feed = () => step('eat', () => {
+  const f = sim.needs().food;
+  if (!f || !f.act) return;
+  if (!go(f.id)) return;
+  sim.actions.eatAct(f.act);
+});
+
 for (let day = 1; day <= 30; day++) {
   /* --- morning: eat if hungry --- */
-  if (sim.state.hunger > 45) step('eat', () => sim.actions.eat(6, 34));
+  if (sim.state.hunger > 45) feed();
 
   /* --- take whatever is on the desk that we can afford --- */
   step('accept', () => {
@@ -540,11 +578,12 @@ for (let day = 1; day <= 30; day++) {
     }
   });
 
-  /* --- work a shift or two for cash --- */
+  /* --- work a shift or two for cash, AT THE DEPOT --- */
   for (let s = 0; s < 2; s++) {
     if (sim.state.energy < 30 || sim.time.hour > 17) break;
+    if (!go('trunkdepot')) break;
     const r = step('work', () => sim.actions.work('drive', 0.5 + (day % 7) / 14));
-    if (r && r.ok) jobsRun++;
+    if (r && r.ok) jobsRun++; else break;
   }
 
   /* --- source everything the open orders need --- */
@@ -552,7 +591,9 @@ for (let day = 1; day <= 30; day++) {
     for (const o of sim.state.orders.slice()) {
       for (const it of o.items) {
         const need = it.q - sim.economy.free(it.a);
-        if (need > 0) sim.economy.buy(it.a, need);
+        /* THE COUNTER HAS TO BE OPEN. economy.buy() refuses a closed
+           venue now, so the bot checks the clock like a player would. */
+        if (need > 0 && sim.economy.venueOpenNow(sim.economy.venueOf(it.a))) sim.economy.buy(it.a, need);
       }
     }
   });
@@ -615,7 +656,7 @@ for (let day = 1; day <= 30; day++) {
 
   /* --- travel somewhere real so travel/fares get exercised. Rotate
          through the modes rather than always taking the last one:
-         that used to mean an Uber every single day, which at the new
+         that used to mean a Yoober every single day, which at the new
          fares is a shift's pay for a walk Wally could have taken. --- */
   step('wander', () => {
     const dests = LOCATIONS.filter((l) => sim.known(l.id) && l.id !== sim.state.loc);
@@ -629,8 +670,9 @@ for (let day = 1; day <= 30; day++) {
   });
 
   peakMoney = Math.max(peakMoney, sim.state.money);
-  if (sim.state.hunger > 70) step('eat2', () => sim.actions.eat(6, 34));
-  step('sleep', () => sim.actions.sleep());
+  if (sim.state.hunger > 70) feed();
+  /* and home to bed, because that is where the bed is */
+  step('sleep', () => { go('apartment'); return sim.actions.sleep(); });
 }
 
 eq(errors.length, 0, '30 days ran without throwing', errors.slice(0, 4).join(' | '));
@@ -651,7 +693,12 @@ ok(sim.quests.progress().done >= 4, 'the story advanced', JSON.stringify(sim.que
 
 /* --- the opening, as it actually played out over thirty days --- */
 ok(boughtBike, 'the bot bought a bicycle');
-ok(sim.state.bike.owned && sim.state.bike.equipped, 'and it is owned and equipped in the save');
+ok(sim.state.rides.owned.bike, 'and the bicycle is owned in the save', JSON.stringify(sim.state.rides));
+ok(!!sim.state.rides.equipped, 'and something is equipped to ride', sim.state.rides.equipped);
+ok(sim.state.bike.owned === sim.state.rides.owned.bike
+   && sim.state.bike.equipped === (sim.state.rides.equipped === 'bike'),
+  'the legacy state.bike mirror agrees with state.rides',
+  JSON.stringify(sim.state.bike) + ' vs ' + JSON.stringify(sim.state.rides));
 ok(sim.state.flags.dispatchShift, 'a shift was worked at Dispatch');
 ok(sideStarted, 'meeting Otto at the cafe started the side quest');
 ok(sideDone, 'and the side quest was completed', JSON.stringify(sim.quests.sideProgress()));
@@ -745,6 +792,7 @@ T('save → export → import → load');
     const v5 = JSON.parse(JSON.stringify(before));
     v5.version = 5;
     delete v5.bike;                 // v5 had no bicycle record…
+    delete v5.rides;                // …and certainly no rides table…
     delete v5.sides;                // …and no side quests
     v5.travel = 'bike';             // …and handed you a bicycle for free
     const m6 = sim.importSave(JSON.stringify(v5));
@@ -799,6 +847,7 @@ T('quest reachability');
   S.stadium = { step: 10, restored: true, fanVote: 1, group: 1 };
   S.clients.maple.met = true;
   S.visited.goldenheights = true;
+  S.seen.broker = true;
   S.home = 'penthouse';
   for (const a of ASSETS) { S.inv[a.id] = { qty: 1, cost: a.v, locked: 0 }; S.tokenized[a.id] = true; }
 
@@ -855,6 +904,7 @@ T('clients + taste matching');
   const g = createGame({ seed: 13, autosave: false });
   g.state.rep = 80;
   g.state.money = 200000;
+  g.state.time = 12 * 60;                    // every venue in the city is open at noon
   for (const c of COURSES) g.state.skills[c.id] = true;
   for (const k of ['exchange', 'treasury', 'farmcoop', 'mineral', 'stadiumoffice']) g.state.unlocks[k] = true;
 
@@ -953,6 +1003,12 @@ T('the opening story beats');
   g.clients.dailyOffers();
   eq(g.state.arrivals.length, 0, 'and neither seeding nor the daily roll can conjure one');
 
+  /* AND IT IS WORKED AT DISPATCH. work() used to take the key and
+     nothing else — you could drive a shift from your own bed. */
+  const fromBed = g.actions.work('drive', 0.8);
+  ok(!fromBed.ok, 'a Dispatch shift cannot be worked from the apartment', JSON.stringify(fromBed));
+  ok(/Dispatch/.test(fromBed.why), 'and the refusal names the place', fromBed.why);
+  ok(g.enter('trunkdepot').ok, 'so he walks into Dispatch');
   const w = g.actions.work('drive', 0.8);
   ok(w.ok, 'a shift at Dispatch can be worked on day one', w.why);
   ok(g.state.flags.dispatchShift, 'it sets flags.dispatchShift');
@@ -962,9 +1018,23 @@ T('the opening story beats');
   ok(g.state.quests.q_first_job, 'the objective closed');
   eq(g.quests.current().id, 'q_first_client', 'and the next one is the first client order');
 
-  /* --- b. the cafe: a SIDE quest, alongside the main chain --- */
+  /* --- b. the cafe: a SIDE quest, alongside the main chain ---
+
+     AND THE PLAYER IS NOW SENT THERE. The opening message says "come
+     and find me at the Bent Spoon"; until this pass nothing in the
+     game pointed at it, so q_side_otto_meet arms the moment the phone
+     is read and puts the cafe in the side slot. */
   const mainBefore = g.quests.current().id;
-  eq(g.quests.sideCurrent(), null, 'no side quest is running yet');
+  ok(!!g.quests.sideCurrent(), 'reading the message opened a side objective');
+  eq(g.quests.sideCurrent().id, 'q_side_otto_meet', 'and it is the one that points at the cafe');
+  eq(g.quests.questLoc('q_side_otto_meet'), 'cafe', 'questLoc() resolves it to the Bent Spoon');
+  ok(g.known('cafe'), 'which is a place he has heard of, so the pointer has a target');
+  /* AND OTTO IS ACTUALLY IN THE ROOM. clients.at() used to place every
+     client by their HOME zone, and Otto lives in Rusty Row — so the
+     friend you are told to meet on Main Street was never there. */
+  ok(g.clients.postsAt('cafe').some((c) => c.id === 'otto'), 'Otto is posted at the Bent Spoon');
+  ok(g.whoIsAt('cafe').some((c) => c.id === 'otto'), 'and whoIsAt() reports him there');
+  ok(!g.whoIsAt('cafe').find((c) => c.id === 'otto').waiting === false, 'flagged as waiting for you');
   g.state.energy = 100;
   const trip = g.travel('cafe', 'walk');
   ok(trip.ok, 'you can walk to the cafe', trip.why);
@@ -1007,6 +1077,8 @@ T('the opening story beats');
   /* THE DESK IS WIPED EVERY MORNING. A story order must not be.
      Without this the side quest can become permanently unfinishable
      simply because the player slept on it. */
+  ok(!g.actions.sleep().ok, 'you cannot sleep in the cafe');
+  g.enter('apartment');
   g.actions.sleep();
   ok(g.state.arrivals.some((x) => x.client === 'otto'), "a night's sleep does not lose the friend's order");
   ok(g.state.arrivals.find((x) => x.client === 'otto').keep, 'because it is marked to keep');
@@ -1018,6 +1090,7 @@ T('the opening story beats');
   /* finishing Otto's order completes the side quest, and only it */
   const o = g.state.arrivals.find((x) => x.client === 'otto');
   g.state.money = 50000;
+  g.state.time = 12 * 60;                    // the shops he buys from are open at noon
   g.economy.acceptOrder(o);
   for (const it of o.items) g.economy.buy(it.a, it.q);
   g.travel(g.officeLoc(), 'walk');
@@ -1026,7 +1099,7 @@ T('the opening story beats');
   ok(sideEvents.includes('side:complete:q_side_otto'), 'the side quest completed', sideEvents.join(','));
   eq(g.quests.sideStatus('q_side_otto'), 'done', 'state.sides records it as done');
   eq(g.quests.sideCurrent(), null, 'and it leaves the active slot');
-  eq(g.quests.sideProgress().done, 1, 'sideProgress counts it');
+  eq(g.quests.sideProgress().done, 2, 'sideProgress counts it, and the meeting before it');
   eq(badNumbers(g.state).length, 0, 'the whole opening produced no NaNs');
 
   /* orders read as trade tickets */
@@ -1097,40 +1170,436 @@ T('the bicycle gates on ownership');
   eq(badNumbers(g.state).length, 0, 'buying and equipping a bicycle produced no NaNs');
 }
 
+
+/* ============================================================
+   10b. THE FRIEND'S MESSAGE — the user's words, verbatim
+
+   The fiction: WALLY GREW UP IN BULL BEAR CITY and is coming BACK
+   to it. He is not a newcomer. He is new as a TRADER, which is why
+   Happy's "you're the new trader in town, right?" still holds — but
+   nothing may say he is new to the CITY.
+   ============================================================ */
+T("the friend's opening message");
+{
+  const WANT =
+    'WALLY! Welcome back to Bull Bear City, which is louder and broker than you left it as a kid. '
+    + 'After you put the mattress down, come and find me at the Bent Spoon on Main Street. '
+    + 'The coffee is bad in a way I have grown to respect. '
+    + 'There is also a small thing I could use your help with. Small. Bring the sunglasses.';
+
+  eq(OPENING_MESSAGE.text, WANT, 'the opening message is the replacement text, character for character');
+  eq(OPENING_MESSAGE.from, 'Otto', 'and it is still from the friend');
+
+  /* it is on the phone before the player has touched anything */
+  const fresh = newState(mulberry32(3));
+  eq(fresh.msgs.length, 1, 'exactly one message is waiting on day 1');
+  eq(fresh.msgs[0].text, WANT, 'and it is that one');
+  eq(fresh.msgs[0].read, false, 'unread');
+  ok(Object.isFrozen(OPENING_MESSAGE) && fresh.msgs[0] !== OPENING_MESSAGE,
+    'it was cloned, not pushed by reference, so `read` stays writable');
+
+  /* it still points at the cafe, and the cafe still starts the SIDE quest */
+  ok(/Bent Spoon/.test(WANT), 'it names the Bent Spoon');
+  ok(LOC_BY_ID.cafe.n === 'The Bent Spoon' && LOC_BY_ID.cafe.see === 0,
+    'which is a real place, on the map from the first minute');
+  {
+    const g = createGame({ seed: 31, autosave: false });
+    g.actions.readMessages();
+    g.enter('cafe');
+    ok(g.quests.isSideActive('q_side_otto') || g.quests.isSideDone('q_side_otto'),
+      'walking into the cafe after reading it still starts the cafe side quest');
+    ok(g.state.flags.metFriend, 'and the friend has been met');
+    ok(g.quests.current() && g.quests.current().id !== 'q_side_otto',
+      'and the main objective is untouched by it');
+  }
+
+  /* THE FICTION CHECK. Nothing in the opening may call him new to the
+     city. Walked over every authored string the player can read in
+     the first act, not just the message. */
+  const NEWCOMER = /\b(new (in|to) town|new to the city|just moved (in|here)|never been here|first time in (this )?city)\b/i;
+  const opening = [
+    OPENING_MESSAGE.text,
+    ...QUESTS.filter((q) => q.act <= 1).flatMap((q) => [q.t, q.d, q.hint]),
+    ...SIDE_QUESTS.filter((q) => q.act <= 1).flatMap((q) => [q.t, q.d, q.hint]),
+    ...Object.values(TIPS).flatMap((t) => [t.t, t.d]),
+    ...DATA.wallynetGood, ...DATA.wallynetBad,
+    ...MORNING_NOTES.map((m) => m.msg),
+    ...LOCATIONS.filter((l) => l.see === 0).map((l) => l.desc),
+    CLIENT_BY_ID.otto.intro,
+  ].filter((x) => typeof x === 'string');
+  const contradicts = opening.filter((t) => NEWCOMER.test(t));
+  eq(contradicts.length, 0, 'nothing in the opening says Wally is new to the city', contradicts.join(' | '));
+  ok(/welcome back|left it as a kid/i.test(OPENING_MESSAGE.text), 'and the message says he is coming back');
+}
+
+/* ============================================================
+   10c. THE BROKER HAND-OFF
+
+   "Once the order is picked up at the desk, the objective should
+   update to have Wally go to the business broker."
+
+   Three things have to be true at once, and the third is the one
+   that is easy to miss: the objective must move, it must name the
+   broker, and the broker must be a place Wally has HEARD OF — hud.js
+   refuses to draw the yellow pointer at an unknown location, so an
+   objective pointing somewhere undiscovered is an objective with no
+   arrow.
+   ============================================================ */
+T('the objective advances to the broker after the desk pickup');
+{
+  const g = createGame({ seed: 37, autosave: false });
+  g.state.energy = 100;
+  g.state.hunger = 10;
+
+  g.actions.readMessages();                    // beat 1
+  g.actions.metHappy();                        // beat 2
+  g.enter('trunkdepot');                       // the shift is worked where the shift is
+  const shift = g.actions.work('drive', 0.55); // beat 3 — unlocks arrivals
+  ok(shift.ok, 'a shift at Dispatch was worked', shift.why);
+  ok(g.clients.ordersUnlocked(), 'which unlocks client orders');
+
+  ok(g.state.arrivals.length > 0, 'somebody is waiting at the desk', g.state.arrivals.length);
+  eq(g.hud().objective.id, 'q_first_client', 'the objective is to take that order');
+  ok(!g.known('broker'), 'and the Business Broker is not on the map yet');
+
+  g.enter('apartment');
+  const acc = g.actions.accept(g.state.arrivals[0]);
+  ok(acc.ok, 'the order is picked up at the desk', acc.why);
+
+  const obj = g.hud().objective;
+  eq(obj.id, 'q_broker', 'and the objective advances to the broker');
+  ok(/broker/i.test(obj.t), 'which reads naturally in the strip', obj.t);
+  ok(obj.t.length <= 44, 'and is short enough for the strip', `${obj.t.length} chars`);
+  eq(g.quests.questLoc('q_broker'), 'broker', 'questLoc() resolves it to the broker');
+  eq(LOC_BY_ID.broker.z, 'marketsq', 'which is in Market Square');
+  ok(g.known('broker'), 'and it is now a place Wally has heard of, so the pointer has a target');
+  ok(g.hud().objective !== g.hud().sideObjective, 'the side slot is still its own thing');
+
+  /* and it closes by turning up */
+  ok(!g.quests.done('q_broker'), 'it is not complete before he goes');
+  g.enter('broker');
+  g.quests.check();
+  ok(g.quests.done('q_broker'), 'walking in completes it');
+  eq(g.hud().objective.id, 'q_first_fee', 'and the chain carries on to delivering the order');
+  eq(badNumbers(g.state).length, 0, 'the hand-off produced no NaNs');
+
+  /* the flag is set in the one place an order is ever taken */
+  const h = createGame({ seed: 38, autosave: false });
+  ok(!h.state.flags.orderTaken, 'a fresh game has not taken an order');
+  ok(!h.quests.ruleMet(LOC_BY_ID.broker.see), "and does not know the broker's discovery rule");
+  h.state.rep = 12;
+  ok(h.quests.ruleMet(LOC_BY_ID.broker.see), 'the reputation arm of the `any` rule still works on its own');
+}
+
+/* ============================================================
+   10d. THE RIDES — bicycle, scooter, motorcycle
+   ============================================================ */
+T('the rides table');
+{
+  eq(RIDE_LIST.length, 3, 'three rides');
+  for (const id of ['bike', 'scooter', 'motorcycle']) ok(!!RIDES[id], `ride '${id}' exists`, id);
+  eq(RIDE_ORDER[0], 'motorcycle', 'the fastest is the head of RIDE_ORDER');
+
+  for (const r of RIDE_LIST) {
+    eq(r.id, RIDES[r.id].id, `${r.id}: the key and the id agree`);
+    ok(typeof r.name === 'string' && r.name.length > 2, `${r.id}: has a name`, r.name);
+    ok(typeof r.short === 'string' && r.short.length > 2, `${r.id}: has a short name`, r.short);
+    ok(Number.isFinite(r.speed) && r.speed > 0, `${r.id}: has a real speed`, r.speed);
+    ok(Number.isFinite(r.effort) && r.effort > 0 && r.effort <= 1, `${r.id}: effort is a 0..1 multiplier`, r.effort);
+    ok(r.unlock && (r.unlock.kind === 'buy' || r.unlock.kind === 'quest'), `${r.id}: unlock is buy or quest`, r.unlock && r.unlock.kind);
+    if (r.unlock.kind === 'buy') {
+      eq(r.price, r.unlock.price, `${r.id}: price mirrors unlock.price`);
+      eq(r.questId, null, `${r.id}: a bought ride has no quest`);
+      ok(r.unlock.locs.length > 0 && r.unlock.locs.every((l) => !!LOC_BY_ID[l]),
+        `${r.id}: is sold at real places`, r.unlock.locs.join(', '));
+    } else {
+      eq(r.price, 0, `${r.id}: a quest ride has no price`);
+      eq(r.questId, r.unlock.questId, `${r.id}: questId mirrors unlock.questId`);
+      ok(!!SIDE_QUEST_BY_ID[r.questId], `${r.id}: and that quest exists`, r.questId);
+    }
+  }
+
+  /* THE SPEED RATIOS — the whole reason the table exists. */
+  eq(RIDES.bike.speed, 1, 'the bicycle is the unit of speed');
+  eq(RIDES.scooter.speed, RIDES.bike.speed * 1.5, 'the scooter is 50% faster than the bicycle');
+  eq(RIDES.motorcycle.speed, RIDES.scooter.speed * 2, 'the motorcycle is twice the scooter');
+  eq(RIDES.motorcycle.speed, RIDES.bike.speed * 3, 'and therefore three times the bicycle');
+
+  /* folded into the travel table: a real journey, at each speed */
+  const far = (() => {
+    for (const A of LOCATIONS) for (const B of LOCATIONS) if (hops(A.id, B.id) === 5) return [A.id, B.id];
+    return ['apartment', 'exchange'];
+  })();
+  const bk = rideFare('bike', far[0], far[1]);
+  const sc = rideFare('scooter', far[0], far[1]);
+  const mc = rideFare('motorcycle', far[0], far[1]);
+  eq(fare('bike', far[0], far[1]).mins, bk.mins, 'fare() with no ride is still the plain bicycle');
+  ok(sc.mins < bk.mins && mc.mins < sc.mins, 'each ride is quicker than the last',
+    `${bk.mins}m / ${sc.mins}m / ${mc.mins}m`);
+  ok(Math.abs(bk.mins / sc.mins - 1.5) < 0.12, 'the scooter is ~1.5x the bicycle on the clock',
+    (bk.mins / sc.mins).toFixed(2));
+  ok(Math.abs(sc.mins / mc.mins - 2) < 0.2, 'and the motorcycle ~2x the scooter',
+    (sc.mins / mc.mins).toFixed(2));
+  eq(bk.cost + sc.cost + mc.cost, 0, 'none of them costs a fare to run');
+  ok(sc.energy < bk.energy && mc.energy <= sc.energy, 'a motor does the pedalling', `${bk.energy}/${sc.energy}/${mc.energy}`);
+
+  /* THE SCOOTER IS NOT FOR SALE AT ANY PRICE. */
+  eq(RIDES.scooter.unlock.kind, 'quest', 'the scooter is quest-unlocked');
+  eq(RIDES.scooter.price, 0, 'it has no price');
+  {
+    const g = createGame({ seed: 43, autosave: false });
+    g.state.money = 10000000;
+    g.state.rep = 100;
+    for (const loc of LOCATIONS) {
+      g.state.known[loc.id] = true;
+      g.enter(loc.id);
+      if (g.actions.canBuyRide('scooter').ok) { ok(false, 'the scooter must not be purchasable at ' + loc.id); break; }
+    }
+    ok(!g.actions.canBuyRide('scooter').ok, 'with unlimited money and reputation it cannot be bought anywhere');
+    ok(/not for sale/i.test(g.actions.canBuyRide('scooter').why), 'and it says so plainly',
+      g.actions.canBuyRide('scooter').why);
+    ok(!g.actions.buyRide('scooter').ok, 'buyRide() refuses it');
+    ok(!g.state.rides.owned.scooter, 'and nothing was bought');
+    eq(g.actions.ridesFor('trunkdepot').filter((r) => r.id === 'scooter').length, 0,
+      'it is in no shop list');
+  }
+
+  /* THE MOTORCYCLE — a genuine late-game goal. */
+  eq(RIDES.motorcycle.unlock.kind, 'buy', 'the motorcycle is bought');
+  ok(RIDES.motorcycle.price > 0, 'its price is set', RIDES.motorcycle.price);
+  ok(RIDES.motorcycle.price >= RIDES.bike.price * 15, 'and it is an order of magnitude beyond the bicycle',
+    `$${RIDES.motorcycle.price} vs $${RIDES.bike.price}`);
+  ok(RIDES.motorcycle.price > OFFICE_STAGES[1].cost, 'more than the Shared Desk costs',
+    `$${RIDES.motorcycle.price} vs $${OFFICE_STAGES[1].cost}`);
+  ok(RIDES.motorcycle.unlock.rep >= 45, 'and it is gated on late-game reputation', RIDES.motorcycle.unlock.rep);
+  {
+    const g = createGame({ seed: 47, autosave: false });
+    g.state.money = RIDES.motorcycle.price * 4;
+    g.enter('trunkdepot');
+    ok(!g.actions.canBuyRide('motorcycle').ok, 'a rich nobody still cannot buy one');
+    ok(/reputation/i.test(g.actions.canBuyRide('motorcycle').why), 'because of reputation',
+      g.actions.canBuyRide('motorcycle').why);
+    g.state.rep = RIDES.motorcycle.unlock.rep;
+    g.enter('apartment');
+    ok(!g.actions.canBuyRide('motorcycle').ok, 'and not from the flat');
+    g.enter('trunkdepot');
+    g.state.money = RIDES.motorcycle.price - 1;
+    ok(!g.actions.canBuyRide('motorcycle').ok, 'nor a dollar short');
+    g.state.money = RIDES.motorcycle.price + 100;
+    const r = g.actions.buyRide('motorcycle');
+    ok(r.ok, 'but reputable, standing at Dispatch, with the money: yes', r.why);
+    eq(g.state.money, 100, 'and it costs exactly its price');
+    ok(g.state.rides.owned.motorcycle && g.state.rides.equipped === 'motorcycle',
+      'you own it and you are on it');
+    ok(!g.actions.buyRide('motorcycle').ok, 'you cannot buy a second one');
+  }
+
+  /* ONE AT A TIME. */
+  {
+    const g = createGame({ seed: 53, autosave: false });
+    g.state.money = 999999;
+    g.state.rep = 99;
+    g.enter('trunkdepot');
+    ok(g.actions.buyRide('bike').ok, 'buy the bicycle');
+    eq(g.state.rides.equipped, 'bike', 'which equips itself');
+    ok(g.actions.grantRide('scooter').ok, 'a quest hands over the scooter');
+    eq(g.state.rides.equipped, 'scooter', 'and the better ride takes over');
+    ok(g.state.rides.owned.bike, 'the bicycle is still owned, just not under him');
+    eq(g.actions.rides().filter((r) => r.equipped).length, 1, 'exactly one ride is equipped');
+    ok(g.actions.equipRide('bike').ok, 'you may go back to the bicycle');
+    eq(g.state.rides.equipped, 'bike', 'and that is the one equipped');
+    eq(g.actions.rides().filter((r) => r.equipped).length, 1, 'still exactly one');
+    ok(!g.actions.equipRide('motorcycle').ok, 'you cannot equip one you do not own');
+    ok(g.actions.equipRide(null).ok, 'and you can leave everything behind');
+    eq(g.state.rides.equipped, null, 'walking again');
+    eq(g.actions.rides().filter((r) => r.equipped).length, 0, 'nothing equipped');
+    ok(!g.actions.grantRide('scooter').ok, 'granting a ride you already own is a no-op');
+
+    /* the fare board follows whatever is under him */
+    g.state.known.noodlecart = true;
+    const rideRow = () => g.fares('noodlecart').find((f) => f.mode === 'bike');
+    g.actions.equipRide('bike');
+    eq(rideRow().ride, 'bike', 'the bike row is the bicycle');
+    eq(rideRow().n, 'Bicycle', 'and reads as one');
+    const bmins = rideRow().mins;
+    g.actions.equipRide('scooter');
+    eq(rideRow().ride, 'scooter', 'and the scooter when he is on the scooter');
+    eq(rideRow().n, 'Scooter', 'reading as a scooter, not a bicycle');
+    ok(rideRow().mins <= bmins, 'and quoting the quicker journey', `${rideRow().mins}m vs ${bmins}m`);
+    ok(rideRow().ok, 'and it is takeable');
+    eq(badNumbers(g.state).length, 0, 'none of that produced a NaN');
+  }
+
+  /* THE SCOOTER'S QUEST sits in the mid-game chain and pays the ride. */
+  {
+    const q = SIDE_QUEST_BY_ID[RIDES.scooter.questId];
+    ok(!!q, 'the scooter quest exists', RIDES.scooter.questId);
+    eq(q.ride, 'scooter', 'and it pays out the scooter');
+    ok(!!q.arm, 'it arms itself on a rule rather than waiting for a caller');
+    const g = createGame({ seed: 59, autosave: false });
+    ok(!g.quests.isSideActive(q.id), 'dormant on day 1');
+    g.state.office = 1;                       // the Shared Desk: mid-game
+    g.quests.check();
+    ok(g.quests.isSideActive(q.id), 'and arms once you are off the folding table');
+    ok(!g.state.rides.owned.scooter, 'the scooter is not yours yet');
+    g.state.clients.barnaby.done = 1;         // the favour, returned
+    g.quests.check();
+    ok(g.quests.isSideDone(q.id), 'doing the favour completes it');
+    ok(g.state.rides.owned.scooter, 'and hands over the scooter');
+    eq(g.state.rides.equipped, 'scooter', 'already under him');
+    ok(g.quests.current() && g.quests.current().id !== q.id, 'a side quest never becomes the main objective');
+  }
+}
+
+T('an old save keeps its bicycle');
+{
+  /* A REAL v6 FILE: state.bike, no state.rides. The player paid $180
+     for that bicycle and must not lose it to a refactor. */
+  const g = createGame({ seed: 61, autosave: false });
+  g.state.money = 4321;
+  g.state.rep = 9;
+  g.state.day = 12;
+  g.economy.add('gold', 2, 100);
+  const v6 = JSON.parse(JSON.stringify(g.state));
+  v6.version = 6;
+  delete v6.rides;
+  v6.bike = { owned: true, equipped: true };
+
+  const m = g.importSave(JSON.stringify(v6));
+  ok(!!m, 'a v6 save loads');
+  eq(m.version, CONFIG.version, 'and lands on the current version');
+  ok(!!m.rides && !!m.rides.owned, 'it has a rides record now');
+  eq(m.rides.owned.bike, true, 'THE BICYCLE SURVIVED');
+  eq(m.rides.equipped, 'bike', 'and is still the thing he is riding');
+  eq(m.rides.owned.scooter, false, 'it did not invent a scooter');
+  eq(m.rides.owned.motorcycle, false, 'nor a motorcycle');
+  eq(m.money, 4321, 'money survived');
+  eq(m.day, 12, 'and the day');
+  ok(m.inv.gold && m.inv.gold.qty === 2, 'and the holdings');
+  eq(m.bike.owned, true, 'the legacy mirror agrees');
+  eq(m.bike.equipped, true, 'on both fields');
+  g.state.known.noodlecart = true;
+  ok(g.fares('noodlecart').find((f) => f.mode === 'bike').ok, 'and the migrated bicycle can be ridden');
+
+  /* owned but left at home */
+  const v6b = JSON.parse(JSON.stringify(v6));
+  v6b.bike = { owned: true, equipped: false };
+  const m2 = g.importSave(JSON.stringify(v6b));
+  eq(m2.rides.owned.bike, true, 'a v6 bicycle left at home is still owned');
+  eq(m2.rides.equipped, null, 'and nothing is equipped');
+
+  /* never bought one */
+  const v6c = JSON.parse(JSON.stringify(v6));
+  v6c.bike = { owned: false, equipped: false };
+  const m3 = g.importSave(JSON.stringify(v6c));
+  eq(m3.rides.owned.bike, false, 'a v6 save that never bought one gets nothing');
+  eq(m3.travel, 'walk', 'and walks');
+
+  /* nonsense is repaired, not trusted */
+  const v7bad = JSON.parse(JSON.stringify(g.state));
+  v7bad.rides = { owned: { bike: false, scooter: 'yes', ghost: true }, equipped: 'motorcycle' };
+  const m4 = g.importSave(JSON.stringify(v7bad));
+  eq(m4.rides.equipped, null, 'you cannot be riding something you do not own');
+  eq(m4.rides.owned.scooter, true, 'a truthy ownership flag is coerced to a boolean');
+  ok(!('ghost' in m4.rides.owned), 'and a ride that does not exist is dropped');
+  eq(badNumbers(m4).length, 0, 'the repaired save has no NaNs');
+}
+
+/* ============================================================
+   10e. NOTHING THE PLAYER READS SAYS "UBER"
+
+   The taxi mode is called YOOBER. The MODE ID is still 'trunk' —
+   it is in save files (state.travel), in ui/menus.js's icon map and
+   in tools/traveltest.mjs, and renaming it would break all three
+   for no gain. Only the display name changed.
+   ============================================================ */
+T('the taxi is Yoober, everywhere the player can see');
+{
+  eq(TRAVEL.trunk.id, 'trunk', 'the mode id is unchanged');
+  eq(TRAVEL.trunk.n, 'Yoober', 'and the display name is Yoober');
+
+  /* every string in the whole content bundle */
+  const strings = [];
+  (function walk(o, seen = new Set()) {
+    if (o == null) return;
+    if (typeof o === 'string') { strings.push(o); return; }
+    if (typeof o !== 'object' || seen.has(o)) return;
+    seen.add(o);
+    for (const k of Object.keys(o)) walk(o[k], seen);
+  })(DATA);
+  const dirty = strings.filter((t) => /uber/i.test(t));
+  eq(dirty.length, 0, 'no string in the content tables says Uber', dirty.slice(0, 3).join(' | '));
+  ok(strings.some((t) => /Yoober/.test(t)), 'and at least one says Yoober');
+
+  /* the live fare board, the tips and the hud */
+  const g = createGame({ seed: 67, autosave: false });
+  g.state.known.exchange = true;
+  const board = g.fares('exchange');
+  const taxi = board.find((f) => f.mode === 'trunk');
+  eq(taxi.n, 'Yoober', 'the fare board calls it Yoober');
+  const live = board.flatMap((f) => [f.n, f.note, f.why, f.warn]).filter((x) => typeof x === 'string');
+  eq(live.filter((t) => /uber/i.test(t)).length, 0, 'and nothing on the board says Uber');
+  eq(Object.values(DATA.tips).filter((t) => /uber/i.test(t.d + t.t)).length, 0, 'nor any tip');
+
+  /* and the source files this agent owns carry no stray occurrence */
+  const gameDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'game');
+  const offenders = readdirSync(gameDir).filter((f) => f.endsWith('.js'))
+    .filter((f) => /uber/i.test(readFileSync(join(gameDir, f), 'utf8')));
+  eq(offenders.length, 0, 'and no file in src/game mentions Uber at all', offenders.join(', '));
+}
+
 T('a broke, exhausted player is never hard-locked');
 {
-  /* THE FLOOR. No money, no bicycle, no energy, the small hours so the
-     Metro is not running: walking must still be offered, from every
-     location the player knows to every other one. Otherwise the game
-     ends without saying so. */
+  /* THE FLOOR, RESTATED. Walking is still free, still always
+     available and still never refused — but a locked door is now
+     locked, so the guarantee is precisely this: with no money, no
+     bicycle, no energy and no trains, every place that is OPEN is
+     still reachable on foot, and his own bed is open 00:00–24:00, so
+     there is never a night he cannot end. */
   const g = createGame({ seed: 31, autosave: false });
   g.state.money = 0;
   g.state.energy = 0;
-  g.state.time = 3 * 60;                 // 03:00 — no Metro
+  g.state.time = 3 * 60;                 // 03:00 — no Metro, most of the city shut
   for (const l of LOCATIONS) g.state.known[l.id] = true;
 
-  let stuck = [];
+  const stuck = [];
+  const shut = [];
   for (const l of LOCATIONS) {
     if (l.id === g.state.loc) continue;
     const opts = g.fares(l.id);
-    if (!opts.some((o) => o.ok)) stuck.push(l.id);
     const walk = opts.find((o) => o.mode === 'walk');
-    if (!walk || !walk.ok) stuck.push(l.id + ':walk');
+    if (g.isOpen(l.id)) { if (!walk || !walk.ok) stuck.push(l.id); }
+    else if (walk.ok) shut.push(l.id);
   }
-  eq(stuck.length, 0, 'with $0 and 0 energy at 03:00, every known place is still reachable on foot',
+  eq(stuck.length, 0, 'with $0 and 0 energy at 03:00, every OPEN place is still reachable on foot',
     stuck.slice(0, 4).join(', '));
+  eq(shut.length, 0, 'and every closed one refuses, on every mode', shut.slice(0, 4).join(', '));
 
-  const far = g.fares('exchange').find((o) => o.mode === 'walk');
-  ok(far.trudge, 'setting off on empty is flagged as a trudge');
-  ok(typeof far.warn === 'string' && far.warn.length > 0, 'with a warning the UI can show', far.warn);
-  ok(far.mins > fare('walk', g.state.loc, 'exchange').mins, 'and it takes longer than a fresh walk',
-    `${far.mins}m vs ${fare('walk', g.state.loc, 'exchange').mins}m`);
-  ok(!g.fares('exchange').find((o) => o.mode === 'train').ok, 'the Metro is genuinely shut at 03:00');
-  ok(!g.fares('exchange').find((o) => o.mode === 'trunk').ok, 'and an Uber is genuinely unaffordable');
+  /* THE BED IS THE FLOOR UNDER THE FLOOR. */
+  ok(g.isOpen('apartment'), 'his own front door is open at 03:00');
+  ok(LOC_BY_ID.apartment.acts.includes('sleep'), 'and the bed is behind it');
+  const home = g.fares('apartment').find((o) => o.mode === 'walk');
+  ok(!home || home.ok || g.state.loc === 'apartment', 'and he can always walk to it');
 
-  const t = g.travel('exchange', 'walk');
+  /* the trudge is unchanged, measured on somewhere that is open */
+  g.enter('apartment');
+  const far = g.fares('noodlecart').find((o) => o.mode === 'walk');
+  ok(!g.isOpen('noodlecart'), 'the noodle cart is shut at 03:00');
+  g.state.time = 8 * 60;                 // …and open at 08:00
+  const open = g.fares('noodlecart').find((o) => o.mode === 'walk');
+  ok(open.ok, 'at 08:00 he can walk to it with nothing in his pockets', open.why);
+  ok(open.trudge, 'setting off on empty is flagged as a trudge');
+  ok(typeof open.warn === 'string' && open.warn.length > 0, 'with a warning the UI can show', open.warn);
+  ok(open.mins > fare('walk', g.state.loc, 'noodlecart').mins, 'and it takes longer than a fresh walk',
+    `${open.mins}m vs ${fare('walk', g.state.loc, 'noodlecart').mins}m`);
+  g.state.time = 3 * 60;
+  ok(!g.fares('trunkdepot').find((o) => o.mode === 'train').ok, 'the Metro is genuinely shut at 03:00');
+  g.state.time = 8 * 60;
+  ok(!g.fares('noodlecart').find((o) => o.mode === 'trunk').ok, 'and a Yoober is genuinely unaffordable');
+
+  const t = g.travel('noodlecart', 'walk');
   ok(t.ok, 'he walks it anyway', t.why);
-  eq(g.state.loc, 'exchange', 'and he gets there');
+  eq(g.state.loc, 'noodlecart', 'and he gets there');
   ok(g.state.energy >= 0, 'energy never goes negative', g.state.energy);
   eq(badNumbers(g.state).length, 0, 'the trudge produced no NaNs');
 }
@@ -1189,6 +1658,873 @@ T('world queries the 3D builder needs');
 }
 
 /* ============================================================
+   11. THE CLOCK — one in-game minute per two real seconds
+
+   CONFIG.minutesPerSecond was 4 and, more to the point, was read by
+   nobody: time only moved when Wally acted, so every opening hour in
+   the game was decoration. It is 0.5 now and game.update(dt) drives
+   it.
+   ============================================================ */
+T('the clock runs, at one minute per two real seconds');
+{
+  eq(CONFIG.minutesPerSecond, 0.5, 'the rate is half an in-game minute per real second');
+  eq(1 / CONFIG.minutesPerSecond, 2, '…which is one in-game minute per TWO real seconds');
+  eq(CONFIG.forceSleepMin, 25 * 60, 'the day is re-tuned to end at 01:00, not 02:00');
+  ok(CONFIG.forceSleepMin > CONFIG.dayStartMin, 'and it ends after it begins');
+
+  const g = createGame({ seed: 101, autosave: false });
+  eq(g.time.rate, CONFIG.minutesPerSecond, 'time.rate publishes it');
+  ok(g.time.live, 'the clock is live by default');
+  eq(g.time.realSecondsPerHour, 120, 'an in-game hour is two real minutes');
+
+  /* it actually ticks */
+  const t0 = g.time.minutes;
+  for (let i = 0; i < 120; i++) g.update(1 / 60);      // two real seconds of frames
+  const moved = g.time.minutes - t0;
+  ok(Math.abs(moved - 1) < 0.3, 'two real seconds move the clock one in-game minute', moved.toFixed(2));
+
+  /* an hour of real time is thirty in-game minutes per real minute */
+  const t1 = g.time.minutes;
+  for (let i = 0; i < 60 * 60; i++) g.update(1 / 60);  // sixty real seconds
+  const perRealMinute = g.time.minutes - t1;
+  ok(Math.abs(perRealMinute - 30) < 1, 'one real minute is thirty in-game minutes', perRealMinute.toFixed(1));
+
+  /* THE DAY, IN REAL TIME. 07:00 -> 01:00 is 18 in-game hours, which
+     at this rate is 36 real minutes of standing perfectly still. */
+  const dayMins = CONFIG.forceSleepMin - CONFIG.dayStartMin;
+  eq(dayMins, 18 * 60, 'the playable day is 18 in-game hours');
+  const realMinutes = dayMins / CONFIG.minutesPerSecond / 60;
+  ok(realMinutes > 25 && realMinutes < 45, 'which is about 36 real minutes if he never does anything',
+    realMinutes.toFixed(0) + ' real minutes');
+
+  /* HUNGER PER REAL MINUTE. 3.4/hour at 30 in-game minutes per real
+     minute is 1.7 an hour of wall clock: a full day's idling is one
+     meal, which is the rhythm the re-tune is aiming at. */
+  const hungerPerRealMin = CONFIG.hungerPerHour * (CONFIG.minutesPerSecond * 60) / 60;
+  ok(Math.abs(hungerPerRealMin - 1.7) < 0.01, 'hunger climbs 1.7 per real minute', hungerPerRealMin);
+  const perDay = dayMins / 60 * CONFIG.hungerPerHour;
+  ok(perDay > 50 && perDay < 70, 'a whole day of it is about one meal short of maximum', perDay.toFixed(0));
+
+  /* THE ALT-TAB GUARD */
+  const h = createGame({ seed: 102, autosave: false });
+  const before = h.time.minutes;
+  h.update(3600);                                     // a one-hour frame
+  ok(h.time.minutes - before <= CONFIG.idleMaxMinutes + 0.01,
+    'one enormous frame cannot advance more than the cap', h.time.minutes - before);
+
+  /* pause and live are separate switches, and both stop it */
+  const k = createGame({ seed: 103, autosave: false });
+  k.time.pause(true);
+  const p0 = k.time.minutes;
+  for (let i = 0; i < 300; i++) k.update(1 / 60);
+  eq(k.time.minutes, p0, 'a paused clock does not move (the UI holds this while a menu is open)');
+  k.time.resume();
+  for (let i = 0; i < 300; i++) k.update(1 / 60);
+  ok(k.time.minutes > p0, 'and resuming starts it again');
+  k.time.setLive(false);
+  const p1 = k.time.minutes;
+  for (let i = 0; i < 300; i++) k.update(1 / 60);
+  eq(k.time.minutes, p1, 'setLive(false) stops it dead — this is what the screenshot rig uses');
+
+  /* ambient time is hunger, not exhaustion */
+  const m = createGame({ seed: 104, autosave: false });
+  m.state.energy = 50;
+  const e0 = m.state.energy, hu0 = m.state.hunger;
+  for (let i = 0; i < 60 * 60; i++) m.update(1 / 60);
+  eq(m.state.energy, e0, 'standing about costs no energy');
+  ok(m.state.hunger > hu0, 'but it does make him hungry', m.state.hunger.toFixed(1));
+
+  /* and the collapse still catches him */
+  const n = createGame({ seed: 105, autosave: false });
+  n.state.time = CONFIG.forceSleepMin - 2;
+  n.state.hunger = 10;
+  const day0 = n.state.day;
+  for (let i = 0; i < 60 * 30; i++) n.update(1 / 60);
+  eq(n.state.day, day0 + 1, 'and the clock rolls him into the next day at 01:00');
+  eq(badNumbers(n.state).length, 0, 'a live clock produced no NaNs');
+}
+
+/* ============================================================
+   12. MAX HUNGER LOCKS EVERYTHING EXCEPT EATING
+   ============================================================ */
+T('maximum hunger locks everything but eating');
+{
+  const g = createGame({ seed: 111, autosave: false });
+  for (const l of LOCATIONS) g.state.known[l.id] = true;
+  g.state.money = 20000;
+  g.state.energy = 100;
+  g.state.time = 12 * 60;
+  g.state.rep = 40;
+  g.state.skills.inspection = true;
+  g.enter('trunkdepot');
+  g.state.hunger = CONFIG.hungerLockAt;
+
+  eq(CONFIG.hungerLockAt, 100, 'the lock is at maximum hunger');
+  ok(g.needs().starving, 'needs() reports him starving');
+  eq(g.needs().lockedBy, 'hunger', 'and names what is holding him');
+  ok(/hungry/i.test(g.needs().why), 'with a sentence the UI can print', g.needs().why);
+  ok(!!g.needs().food && !!g.needs().food.n, 'and the nearest food attached', JSON.stringify(g.needs().food?.n));
+
+  /* EVERY ACTION REFUSES, AND SAYS WHY */
+  const locked = [
+    ['work a shift', g.actions.work('drive', 0.8)],
+    ['buy an asset', g.economy.buy('wheat', 1)],
+    ['sell an asset', g.economy.sell('wheat', 1)],
+    ['take an order', g.actions.accept({ id: 'x', client: 'otto', items: [] })],
+    ['deliver an order', g.actions.deliver('x')],
+    ['buy a bicycle', g.actions.buyRide('bike')],
+    ['upgrade the office', g.actions.upgradeOffice()],
+    ['move house', g.actions.moveHome('studio')],
+    ['hire anybody', g.actions.hire('pim')],
+    ['tokenize', g.economy.tokenize('wheat')],
+    ['race the Mayor', g.race.canStart()],
+  ];
+  for (const [what, r] of locked) {
+    ok(r && r.ok === false, `too hungry to ${what}`, JSON.stringify(r));
+    ok(r.kind === 'hunger', `…and it is hunger that says no (${what})`, r.kind + ' / ' + r.why);
+    ok(/hungry/i.test(r.why), `…in words (${what})`, r.why);
+  }
+  /* the refusal POINTS AT THE FOOD, which is the whole point of it */
+  const why = g.actions.work('drive').why;
+  ok(/Noodle Cart|Bent Spoon|Market Hall|food/i.test(why), 'the refusal names the nearest food', why);
+
+  /* GETTING TO FOOD STILL WORKS — otherwise he is bricked */
+  ok(g.fares('noodlecart').find((f) => f.mode === 'walk').ok, 'he may still walk to food');
+  ok(g.travel('noodlecart', 'walk').ok, 'and travelling there is allowed');
+  eq(g.state.loc, 'noodlecart', 'and he arrives');
+  /* but nowhere else */
+  const nope = g.travel('school', 'walk');
+  ok(!nope.ok && nope.kind === 'hunger', 'travelling anywhere that is not food or a bed is refused', JSON.stringify(nope));
+
+  /* EATING WORKS */
+  const meal = g.mealsAt('noodlecart')[0];
+  ok(!!meal, 'the noodle cart sells food');
+  const ate = g.actions.eatAct(meal.act);
+  ok(ate.ok, 'and he can eat it', ate.why);
+  ok(g.state.hunger < CONFIG.hungerLockAt, 'which unlocks the game again', g.state.hunger);
+  ok(g.actions.work('drive').ok === false, 'he still cannot drive from a noodle cart');
+  ok(!/hungry/i.test(g.actions.work('drive').why), '…but not because he is hungry any more',
+    g.actions.work('drive').why);
+}
+
+T('broke AND starving still has a way out');
+{
+  /* THE DEADLOCK CHECK. No money, maximum hunger, the small hours, and
+     every meal in the city costs something. If this path did not
+     exist the hunger lock would be a game over with no message. */
+  const g = createGame({ seed: 113, autosave: false });
+  for (const l of LOCATIONS) g.state.known[l.id] = true;
+  g.state.money = 0;
+  g.state.hunger = 100;
+  g.state.energy = 4;
+  g.state.time = 2 * 60;                       // 02:00: even the noodle cart is shut
+  g.enter('apartment');
+
+  ok(g.needs().starving, 'starving');
+  ok(!g.economy.afford(4), 'and broke — the cheapest bowl in the city is beyond him');
+  ok(!g.actions.eatAct('food:4:26').ok, 'he cannot eat in his own flat');
+  ok(!g.slateOffer().ok, 'and the slate is not offered where there is no counter');
+
+  /* step 1: the bed. It is open 00:00–24:00 and sleeping is exempt. */
+  ok(g.isOpen('apartment'), 'his flat is open at 02:00');
+  const slept = g.actions.sleep();
+  ok(slept.ok, 'so he can always go to bed', slept.why);
+  eq(g.time.hour, 7, 'and wake at 07:00');
+  ok(g.state.hunger >= 99, 'still starving in the morning', g.state.hunger);
+
+  /* step 2: walk to food, which the lock allows */
+  const t = g.travel('noodlecart', 'walk');
+  ok(t.ok, 'and walk to the noodle cart with nothing in his pockets', t.why);
+
+  /* step 3: the slate */
+  const offer = g.slateOffer();
+  ok(offer.ok, 'the slate is offered', offer.why);
+  const bowl = g.actions.eatAct('food:4:26');
+  ok(bowl.ok && bowl.slate, 'and a bowl arrives anyway', JSON.stringify(bowl));
+  ok(g.state.hunger < 100, 'he is fed', g.state.hunger);
+  eq(g.state.money, 0, 'and it cost him nothing, because he had nothing');
+  ok(g.actions.work('drive').ok === false, 'he still has to walk to Dispatch to earn');
+
+  /* it cannot be farmed */
+  g.state.hunger = 100;
+  ok(!g.slateOffer().ok, 'the slate is once a day', g.slateOffer().why);
+  g.state.money = 500;
+  g.state.hunger = 100;
+  g.state.slateDay = 0;
+  ok(!g.slateOffer().ok, 'and never while he can pay', g.slateOffer().why);
+  eq(badNumbers(g.state).length, 0, 'no NaNs anywhere in that');
+}
+
+/* ============================================================
+   13. CLOSED IS CLOSED — the rules layer is the authority
+   ============================================================ */
+T('closed locations are actually closed');
+{
+  const g = createGame({ seed: 121, autosave: false });
+  for (const l of LOCATIONS) g.state.known[l.id] = true;
+  g.state.money = 100000;
+  g.state.energy = 100;
+  g.state.rep = 90;
+  for (const c of COURSES) g.state.skills[c.id] = true;
+  g.state.time = 4 * 60;                       // 04:00
+
+  eq(g.isOpen('exchange'), false, 'the Stock Exchange is shut at 04:00');
+  eq(g.isOpen('apartment'), true, 'a 00:00–24:00 place is never shut');
+
+  /* THE THREE DOORS */
+  const trav = g.travel('exchange', 'walk');
+  ok(!trav.ok, 'travelling to a closed venue is refused', JSON.stringify(trav));
+  eq(trav.kind, 'hours', 'and the reason is the hours');
+  ok(/opens at 09:00/.test(trav.why), 'and it names the opening time', trav.why);
+
+  const ent = g.enter('exchange');
+  ok(!ent.ok, 'and so is walking in through the door from the 3D world', JSON.stringify(ent));
+  ok(/opens at 09:00/.test(ent.why), 'with the same sentence', ent.why);
+  eq(g.state.loc, 'apartment', 'he did not get in');
+
+  /* every mode on the fare board says so, so no UI can offer one */
+  const board = g.fares('exchange');
+  eq(board.filter((f) => f.ok).length, 0, 'every travel mode is refused while it is shut');
+  ok(board.every((f) => f.closed), 'and every row is flagged closed for the UI');
+
+  /* THE ACTS OF A CLOSED VENUE */
+  ok(!g.economy.buy('trnk', 1).ok, 'you cannot buy a share at 04:00');
+  eq(g.economy.buy('trnk', 1).kind, 'hours', 'because the venue is shut');
+  ok(!g.economy.sell('trnk', 1).ok, 'nor sell one');
+
+  /* the shifts, the classes, the counters */
+  g.state.time = 4 * 60;
+  g.state.loc = 'cafe';
+  const shift = g.actions.work('cafe', 0.8);
+  ok(!shift.ok && shift.kind === 'hours', 'a café shift at 04:00 is refused', JSON.stringify(shift));
+  ok(/opens at 06:00/.test(shift.why), 'and says when they open', shift.why);
+  g.state.loc = 'school';
+  ok(!g.actions.enrol('negotiation', 0.9).ok, 'the school is shut at 04:00');
+  g.state.loc = 'library';
+  ok(!g.actions.study().ok, 'so is the library');
+  g.state.loc = 'bank';
+  ok(!g.actions.borrow(50).ok, 'and the bank');
+  g.state.loc = 'pawnshop';
+  ok(!g.actions.pawnBuy(g.actions.pawnStock()[0].id).ok, "and Vic's");
+
+  /* AND THEY OPEN AGAIN */
+  g.state.time = 10 * 60;
+  g.state.loc = 'apartment';
+  ok(g.travel('exchange', 'walk').ok, 'at 10:00 the Exchange lets him travel there');
+  ok(g.economy.buy('trnk', 1).ok, 'and trade');
+  g.state.loc = 'cafe';
+  ok(g.actions.work('cafe', 0.8).ok, 'the café takes its shift');
+
+  /* THE OTHER HALF OF THE RULE: an act belongs to a place. */
+  g.state.time = 12 * 60;
+  g.enter('apartment');
+  const wrong = g.actions.work('cafe', 0.8);
+  ok(!wrong.ok && wrong.kind === 'place', 'a café shift cannot be worked from the flat', JSON.stringify(wrong));
+  ok(/Bent Spoon/.test(wrong.why), 'and the refusal names where it is', wrong.why);
+  ok(!g.actions.study().ok, 'nor can he read the library from bed');
+  ok(!g.actions.farmHarvest().ok, 'nor harvest a farm he is not standing in');
+  ok(!g.actions.mineDig().ok, 'nor dig a mine he is not standing in');
+
+  /* openInfo() is the one description everything shares */
+  const info = g.openInfo('exchange');
+  eq(info.span, '09:00–16:00', 'openInfo() spells out the hours');
+  eq(g.opensAt('exchange'), '09:00', 'opensAt() gives the opening time');
+  ok(g.openInfo('apartment').always, 'and knows an always-open door when it sees one');
+
+  /* every location in the game has enforceable hours */
+  const bad = LOCATIONS.filter((l) => !Array.isArray(l.hours) || l.hours[0] > l.hours[1]);
+  eq(bad.length, 0, 'every one of the 28 locations carries usable hours', bad.map((l) => l.id).join(','));
+  /* and the venue hours agree with the hours of the building they are in */
+  const mismatched = Object.keys(VENUES).filter((v) => {
+    const l = LOC_BY_ID[VENUE_LOC[v]];
+    return l && (l.hours[0] !== VENUES[v].hours[0] || l.hours[1] !== VENUES[v].hours[1]);
+  });
+  eq(mismatched.length, 0, 'every venue keeps the same hours as its building', mismatched.join(','));
+}
+
+/* ============================================================
+   14. REPUTATION TITLES AND THE DEADLINE PENALTY
+   ============================================================ */
+T('reputation carries a title');
+{
+  ok(REP_TITLES.length >= 8 && REP_TITLES.length <= 12, 'a ladder of 8–12 rungs', REP_TITLES.length);
+  eq(REP_TITLES[0].t, 'A Little Calf', 'it starts as A Little Calf');
+  eq(REP_TITLES[REP_TITLES.length - 1].t, 'Tokenization Legend', 'and ends as Tokenization Legend');
+  eq(REP_TITLES[0].rep, 0, 'the first rung is rep 0, so there is always a title');
+  for (let i = 1; i < REP_TITLES.length; i++) {
+    ok(REP_TITLES[i].rep > REP_TITLES[i - 1].rep, `rung ${i + 1} is above rung ${i}`,
+      `${REP_TITLES[i - 1].rep} -> ${REP_TITLES[i].rep}`);
+  }
+  const dupTitles = new Set(REP_TITLES.map((r) => r.t));
+  eq(dupTitles.size, REP_TITLES.length, 'every title is distinct');
+  ok(REP_TITLES.every((r) => r.d && r.d.length > 12), 'and every one has a line under it');
+  /* spread over the WHOLE progression, not the first week */
+  const questRep = QUESTS.reduce((t, q) => t + (q.rep || 0), 0);
+  ok(REP_TITLES[REP_TITLES.length - 1].rep > questRep * 0.5,
+    'the last rung is a full run away, not a fortnight', `${REP_TITLES[REP_TITLES.length - 1].rep} vs ${questRep} from quests alone`);
+
+  /* the three things the UI shows */
+  const p0 = DATA.repProgress(0);
+  eq(p0.title, 'A Little Calf', 'day one: the title');
+  eq(p0.next, 'Errand Elephant', '…the next one');
+  eq(p0.toNext, 8, '…and the distance to it');
+  eq(p0.pct, 0, 'with progress at zero');
+  const mid = DATA.repProgress(13);
+  eq(mid.title, 'Errand Elephant', 'halfway up a rung keeps the lower title');
+  eq(mid.pct, 50, 'and reports the progress through it', mid.pct);
+  const top = DATA.repProgress(99999);
+  eq(top.title, 'Tokenization Legend', 'the top of the ladder');
+  eq(top.next, null, 'has nothing after it');
+  eq(top.pct, 100, 'and is complete');
+  ok(DATA.repProgress(-5).title === 'A Little Calf', 'a negative reputation is still a calf');
+
+  /* live, through the game handle and the HUD */
+  const g = createGame({ seed: 131, autosave: false });
+  eq(g.rep().title, 'A Little Calf', 'game.rep() reports it');
+  eq(g.hud().title.title, 'A Little Calf', 'and hud().title carries it for the strip');
+  ok(g.hud().title.next && g.hud().title.toNext > 0, 'with the next rung and the gap');
+  const promotions = [];
+  g.bus.on('rep', (p) => { if (p.promoted) promotions.push(p.title); });
+  g.economy.add('gold', 1, 0);
+  while (g.state.rep < 40) g.quests.complete(g.quests.current());
+  ok(promotions.length >= 2, 'climbing fires a promotion per rung', promotions.join(' → '));
+  eq(promotions[0], 'Errand Elephant', 'in order', promotions.join(' → '));
+  ok(g.rep().title !== 'A Little Calf', 'and the title moved with him', g.rep().title);
+}
+
+T('missing a deadline costs reputation, scaled to the order');
+{
+  eq(DATA.orderFailRep({ budget: 0, fee: 0 }), 2, 'the old flat 2 is now the floor');
+  ok(DATA.orderFailRep({ budget: 3800, fee: 200 }) > DATA.orderFailRep({ budget: 180, fee: 20 }),
+    'a bigger promise costs more when you break it');
+  ok(DATA.orderFailRep({ budget: 1e9, fee: 0 }) <= DATA.orderFail.cap, 'and it is capped', DATA.orderFail.cap);
+  ok(DATA.orderFailRep({ budget: 2000, fee: 0, type: 'fund' }) > DATA.orderFailRep({ budget: 2000, fee: 0 }),
+    'a fund mandate — somebody’s savings — costs half again');
+
+  const g = createGame({ seed: 133, autosave: false });
+  g.state.rep = 60;
+  g.state.time = 12 * 60;
+  g.state.money = 500000;
+  const small = { id: 'o1', client: 'otto', type: 'deliver', items: [], budget: 150, fee: 30, deadline: 1, made: 1 };
+  const big = { id: 'o2', client: 'vance', type: 'deliver', items: [], budget: 7000, fee: 900, deadline: 1, made: 1 };
+  g.state.orders.push(small, big);
+
+  const before = g.state.rep;
+  const failedEvents = [];
+  g.bus.on('client', (p) => { if (p.kind === 'fail') failedEvents.push(p); });
+  g.economy.failOrder(small);
+  const afterSmall = before - g.state.rep;
+  const mid = g.state.rep;
+  g.economy.failOrder(big);
+  const afterBig = mid - g.state.rep;
+
+  ok(afterSmall >= 2, 'failing a small order costs at least the old penalty', afterSmall);
+  ok(afterBig > afterSmall * 2, 'and failing a big one costs a lot more',
+    `small −${afterSmall}, big −${afterBig}`);
+  eq(g.state.stats.ordersFailed, 2, 'both were counted');
+  ok(g.state.stats.repLost > 0, 'and the reputation lost is tracked', g.state.stats.repLost);
+  ok(failedEvents.every((e) => e.rep < 0), "the 'client' event carries the cost", JSON.stringify(failedEvents.map((e) => e.rep)));
+
+  /* and the live path — an order that runs out of days */
+  const h = createGame({ seed: 134, autosave: false });
+  h.state.rep = 40;
+  h.state.time = 12 * 60;
+  h.state.flags.dispatchShift = true;
+  const o = h.clients.makeOrder('mabel');
+  o.deadline = h.state.day;
+  h.economy.acceptOrder(o);
+  const rep0 = h.state.rep;
+  h.enter('apartment');
+  h.actions.sleep();                                  // the deadline passes overnight
+  ok(h.state.rep < rep0, 'sleeping through a deadline costs reputation', `${rep0} -> ${h.state.rep}`);
+  eq(h.state.orders.length, 0, 'and the order is gone');
+  eq(badNumbers(h.state).length, 0, 'no NaNs');
+}
+
+/* ============================================================
+   15. THE MAYOR'S DASH
+   ============================================================ */
+T('the Mayor is Ken Jones and he wants a race');
+{
+  eq(CLIENT_BY_ID.tusk.n, 'Mayor Ken Jones', 'the mayor is Mayor Ken Jones');
+  eq(CLIENT_BY_ID.tusk.id, 'tusk', "…and keeps the id 'tusk', so old saves and orders still resolve");
+  eq(RACE.mayor, 'tusk', 'the race points at him by id');
+  const strings = [];
+  (function walk(o, seen = new Set()) {
+    if (o == null) return;
+    if (typeof o === 'string') { strings.push(o); return; }
+    if (typeof o !== 'object' || seen.has(o)) return;
+    seen.add(o);
+    for (const k of Object.keys(o)) walk(o[k], seen);
+  })(DATA);
+  eq(strings.filter((t) => /Mayor Tusk/.test(t)).length, 0, 'nothing the player reads still says Mayor Tusk');
+
+  /* THE ROUTE */
+  ok(RACE.route.length >= 4, 'the route has at least four points', RACE.route.length);
+  ok(RACE.route.every((id) => !!LOC_BY_ID[id]), 'every checkpoint is a real place', RACE.route.join(','));
+  eq(RACE.route[0], RACE.route[RACE.route.length - 1], 'and it finishes where it started');
+  const zones = new Set(RACE.route.map((id) => LOC_BY_ID[id].z));
+  ok(zones.size >= 3, 'it goes through at least three districts', [...zones].join(', '));
+
+  const g = createGame({ seed: 141, autosave: false });
+  const route = g.race.route();
+  eq(route.length, RACE.route.length, 'race.route() hands the UI one row per checkpoint');
+  ok(route.every((r) => Number.isFinite(r.world.x) && Number.isFinite(r.world.z)),
+    'each with a world position to draw a ring at');
+  ok(route[route.length - 1].total > 400 && route[route.length - 1].total < 1600,
+    'the lap is a few hundred metres of town', route[route.length - 1].total + ' m');
+  eq(g.race.metres(), route[route.length - 1].total, 'race.metres() agrees with the route');
+
+  /* THE ONLY WAY TO WIN IS THE SCOOTER OR THE MOTORCYCLE */
+  eq(RACE.qualifies.join(','), 'scooter,motorcycle', 'only two rides can win');
+  const onFoot = g.race.projection('foot');
+  const onBike = g.race.projection('bike');
+  const onScoot = g.race.projection('scooter');
+  const onMoto = g.race.projection('motorcycle');
+  ok(onFoot.seconds > onBike.seconds && onBike.seconds > onScoot.seconds && onScoot.seconds > onMoto.seconds,
+    'each ride is quicker round the lap',
+    `${onFoot.seconds}s / ${onBike.seconds}s / ${onScoot.seconds}s / ${onMoto.seconds}s`);
+  ok(!onFoot.qualified && !onBike.qualified, 'feet and the bicycle do not qualify');
+  ok(onScoot.qualified && onMoto.qualified, 'the scooter and the motorcycle do');
+
+  /* THE STATE MACHINE */
+  eq(g.race.status(), 'locked', 'it starts locked');
+  ok(!g.race.canStart().ok, 'and cannot be started before he is asked');
+  const events = [];
+  g.bus.on('race', (p) => events.push(p.kind));
+  const offer = g.race.offer();
+  ok(offer.ok && offer.first, 'the Mayor steps in', JSON.stringify(offer));
+  eq(g.race.status(), 'offered', 'and the race is on the table');
+  ok(events.includes('offer'), "which emits bus 'race' {kind:'offer'}");
+  ok(RACE.route.every((id) => g.known(id)), 'and every corner of his route is now on the map');
+  ok(g.clients.met('tusk'), 'and Wally has met the Mayor');
+  eq(g.race.offer().first, false, 'offering twice changes nothing');
+
+  /* start conditions */
+  g.state.energy = 100;
+  g.state.hunger = 10;
+  g.state.time = 10 * 60;
+  g.state.loc = 'apartment';
+  ok(!g.race.canStart().ok, 'you cannot start it from the wrong end of town');
+  ok(/start line/i.test(g.race.canStart().why), 'and it says where the start line is', g.race.canStart().why);
+  g.state.loc = RACE.route[0];
+  g.state.time = 3 * 60;
+  ok(!g.race.canStart().ok, 'nor at three in the morning');
+  g.state.time = 10 * 60;
+  ok(g.race.canStart().ok, 'at ten, outside the Bent Spoon, he can go', g.race.canStart().why);
+
+  /* ON FOOT HE LOSES */
+  const paceFoot = g.race.pace();
+  eq(paceFoot.qualified, false, 'on foot he does not qualify');
+  const started = g.race.start();
+  ok(started.ok, 'the race starts', started.why);
+  eq(g.race.status(), 'running', 'and it is running');
+  ok(started.mayorSeconds > 0 && started.mps > 0, 'the UI is handed the Mayor’s pace', JSON.stringify({ s: started.mayorSeconds, mps: started.mps }));
+  ok(started.mayorSeconds < paceFoot.rideSeconds, 'which on foot is faster than Wally can possibly run',
+    `${started.mayorSeconds}s vs his best ${paceFoot.rideSeconds}s`);
+  const cp = g.race.checkpoint(1);
+  ok(cp.ok, 'checkpoints tick over', JSON.stringify(cp));
+  ok(!g.race.checkpoint(5).ok, 'and they cannot be taken out of order');
+  const lost = g.race.finish(paceFoot.mayorSeconds + 20);
+  ok(lost.ok && !lost.won, 'and he loses', JSON.stringify(lost));
+  eq(g.race.status(), 'lost', 'the race is lost');
+  eq(g.state.race.losses, 1, 'and the loss is counted');
+
+  /* EVEN A PERFECT RUN ON FOOT LOSES — the rule is absolute */
+  g.state.energy = 100;
+  g.race.start();
+  const cheated = g.race.finish(1);
+  ok(!cheated.won, 'a one-second lap on foot still loses — the ride is the rule', JSON.stringify(cheated));
+
+  /* RETRY AS OFTEN AS HE LIKES */
+  g.state.energy = 100;
+  ok(g.race.canStart().ok, 'he may go again', g.race.canStart().why);
+  ok(g.race.start().ok, 'and again');
+  g.race.abandon();
+  eq(g.race.status(), 'lost', 'abandoning is just another loss');
+
+  /* THE BICYCLE IS NOT ENOUGH EITHER */
+  g.actions.grantRide('bike');
+  g.actions.equipRide('bike');
+  g.state.energy = 100;
+  const paceBike = g.race.pace();
+  eq(paceBike.qualified, false, 'the bicycle does not qualify');
+  ok(paceBike.mayorSeconds < paceBike.rideSeconds, 'and the Mayor still out-paces it',
+    `${paceBike.mayorSeconds}s vs ${paceBike.rideSeconds}s`);
+  g.race.start();
+  ok(!g.race.finish(paceBike.mayorSeconds - 1).won, 'so the bicycle loses');
+
+  /* THE SCOOTER WINS */
+  g.actions.grantRide('scooter');
+  g.actions.equipRide('scooter');
+  g.state.energy = 100;
+  const paceScoot = g.race.pace();
+  ok(paceScoot.qualified, 'the scooter qualifies');
+  ok(paceScoot.mayorSeconds > paceScoot.rideSeconds, 'and the Mayor is catchable on it',
+    `${paceScoot.mayorSeconds}s vs ${paceScoot.rideSeconds}s`);
+  g.race.start();
+  const won = g.race.finish(paceScoot.rideSeconds);
+  ok(won.ok && won.won, 'and he wins', JSON.stringify(won));
+  eq(g.race.status(), 'won', 'the race is won');
+  ok(g.race.won(), 'race.won() says so');
+  ok(events.includes('finish'), "and the finish went out on the bus");
+  ok(!g.race.canStart().ok, 'and there is nothing left to race for');
+  eq(badNumbers(g.state).length, 0, 'the whole race produced no NaNs');
+}
+
+T('the scooter hint is occasional, earned, and never in the objective');
+{
+  /* NOT IN THE OBJECTIVE TEXT. The player has to work it out. */
+  const exq = QUEST_BY_ID.q_exchange;
+  ok(!/scooter|motorcycle|moped|vehicle|faster/i.test(exq.t + ' ' + exq.d + ' ' + exq.hint),
+    'the Exchange objective never mentions a vehicle', exq.d);
+  const anyQuest = QUESTS.concat(SIDE_QUESTS)
+    .filter((q) => /scooter/i.test(q.t + ' ' + q.d) && q.id !== 'q_side_scooter');
+  eq(anyQuest.length, 0, 'and no other objective gives it away', anyQuest.map((q) => q.id).join(','));
+  ok(RACE.hints.some((h) => h.text === 'You might want to get a scooter to go faster!'),
+    'the hint the user asked for is in the pool, word for word');
+
+  const g = createGame({ seed: 147, autosave: false });
+  g.race.offer();
+  g.state.energy = 100;
+  g.state.hunger = 5;
+  const hints = [];
+  g.bus.on('race', (p) => { if (p.kind === 'hint') hints.push({ day: g.state.day, text: p.text }); });
+
+  /* first loss: never a hint */
+  g.state.loc = RACE.route[0];
+  g.state.time = 10 * 60;
+  g.race.start();
+  g.race.finish(9999);
+  eq(hints.length, 0, 'no hint after the first loss — he is allowed to be confused');
+
+  /* many more losses, on many days */
+  let attempts = 0;
+  for (let day = 0; day < 30; day++) {
+    g.state.energy = 100;
+    g.state.hunger = 5;
+    g.state.time = 10 * 60;
+    g.state.loc = RACE.route[0];
+    if (!g.race.canStart().ok) break;
+    g.race.start();
+    g.race.finish(9999);
+    attempts++;
+    g.enter('apartment');
+    g.actions.sleep();
+  }
+  ok(hints.length >= 1, 'but somebody eventually mutters it', `${hints.length} hints in ${attempts} losses`);
+  ok(hints.length < attempts, 'and not on every single loss', `${hints.length} of ${attempts}`);
+  const days = hints.map((h) => h.day);
+  eq(new Set(days).size, days.length, 'never twice in one day', days.join(','));
+  ok(hints.every((h) => /scooter/i.test(h.text)), 'and the hint points at a scooter', hints[0].text);
+  eq(g.state.race.hints, hints.length, 'state.race counts them');
+}
+
+T('the race is an ADDITIONAL gate on the Stock Exchange');
+{
+  const g = createGame({ seed: 151, autosave: false });
+  for (const l of LOCATIONS) g.state.known[l.id] = true;
+  g.state.money = 100000;
+  g.state.energy = 100;
+  g.state.time = 10 * 60;
+
+  const steps = () => g.actions.exchangeGate().steps;
+  eq(steps().length, 4, 'four conditions on the door');
+  eq(steps().map((s) => s.key).join(','), 'fundamentals,badge,race,fee', 'and the race is one of them, not all of them');
+
+  /* the OLD path still has to be satisfied */
+  g.enter('exchange');
+  let gate = g.actions.exchangeGate();
+  ok(!gate.ok, 'no class, no membership', gate.why);
+  ok(/Market Fundamentals/.test(gate.why), 'and it says which class', gate.why);
+  g.state.skills.inspection = true;
+  g.state.skills.fundamentals = true;
+  gate = g.actions.exchangeGate();
+  ok(!gate.ok && /orders/.test(gate.why), 'the trader badge is still three client orders', gate.why);
+  g.state.stats.ordersDone = CONFIG.exchangeOrders;
+
+  /* NOW THE MAYOR */
+  gate = g.actions.exchangeGate();
+  ok(!gate.ok, 'paperwork in order and the door is still shut', gate.why);
+  eq(gate.kind, 'race', 'because of the race');
+  const purse = g.state.money;
+  const tried = g.actions.unlockExchange();
+  ok(!tried.ok, 'and paying will not get you past him', tried.why);
+  ok(!g.state.unlocks.exchange, 'the Exchange is not unlocked');
+  /* nothing was DEDUCTED (meeting the Mayor can close an old objective
+     and pay it out, so this is >=, not ===) */
+  ok(g.state.money >= purse, 'and no fee was taken', `${purse} -> ${g.state.money}`);
+  eq(g.race.status(), 'offered', 'trying is what puts him in the doorway');
+
+  /* the IPO path cannot walk round him either */
+  const h = createGame({ seed: 152, autosave: false });
+  h.state.money = 500000;
+  h.state.rep = 60;
+  h.state.office = 3;
+  h.state.energy = 100;
+  h.state.time = 11 * 60;
+  for (const c of COURSES) h.state.skills[c.id] = true;
+  for (const l of LOCATIONS) h.state.known[l.id] = true;
+  h.enter('ipooffice');
+  for (let i = 0; i < IPO_STEPS.length; i++) {
+    h.state.energy = 100;
+    h.state.time = 11 * 60;                          // the Listings Office keeps hours now
+    const r = h.actions.ipoAdvance('wflw', 0.95);
+    ok(r.ok, 'IPO step ' + (i + 1) + ' of ' + IPO_STEPS.length, r.why);
+  }
+  ok(h.state.stats.ipos >= 1, 'a company was listed', h.state.stats.ipos);
+  ok(!h.state.unlocks.exchange, 'and listing it did NOT hand over the Exchange — the Mayor is still waiting');
+  ok(h.race.status() !== 'locked', 'in fact it summoned him', h.race.status());
+
+  /* win the race and the door opens on the old terms */
+  g.actions.grantRide('scooter');
+  g.state.loc = RACE.route[0];
+  g.state.energy = 100;
+  g.state.time = 10 * 60;
+  g.race.start();
+  ok(g.race.finish(g.race.pace().rideSeconds).won, 'he beats the Mayor');
+  g.travel('exchange', 'walk');
+  gate = g.actions.exchangeGate();
+  ok(gate.ok, 'and now the door is open to him', gate.why);
+  const money0 = g.state.money;
+  const unl = g.actions.unlockExchange();
+  ok(unl.ok, 'the membership goes through', unl.why);
+  eq(money0 - g.state.money, CONFIG.exchangeFee, 'and it costs the $1,500 access fee');
+  ok(g.state.unlocks.exchange, 'the Exchange is unlocked');
+  ok(g.economy.buy('trnk', 1).ok, 'and he can finally buy a share');
+  ok(g.state.quests.q_exchange, 'which closes the act-3 objective');
+  ok(!g.actions.unlockExchange().ok, 'you cannot pay twice');
+  eq(badNumbers(g.state).length, 0, 'no NaNs');
+}
+
+/* ============================================================
+   16. THE MOTORCYCLE COSTS TEN CLIENT ORDERS
+   ============================================================ */
+T('the motorcycle is priced in client orders');
+{
+  /* MEASURED, not asserted from a comment: build the state a player is
+     in when the shop will sell them one, roll real orders for all 24
+     clients through clients.makeOrder(), and price the thing at ten of
+     them. */
+  const g = createGame({ seed: 161, autosave: false });
+  g.state.rep = RIDES.motorcycle.unlock.rep;
+  g.state.money = 5e6;
+  g.state.time = 12 * 60;
+  for (const c of COURSES) g.state.skills[c.id] = true;
+  for (const k of ['exchange', 'treasury', 'farmcoop', 'mineral', 'stadiumoffice']) g.state.unlocks[k] = true;
+  for (const cid of Object.keys(g.state.clients)) { g.state.clients[cid].met = true; g.state.clients[cid].trust = 3; }
+
+  let profit = 0, n = 0;
+  for (let i = 0; i < 20; i++) {
+    for (const c of CLIENTS) {
+      const o = g.clients.makeOrder(c.id);
+      if (!o || o.type === 'fund') continue;
+      const outlay = o.items.reduce((t, it) => t + g.economy.buyPrice(it.a) * it.q, 0);
+      profit += o.budget + o.fee - outlay;
+      n++;
+    }
+  }
+  const perOrder = profit / n;
+  ok(n > 300, 'a big enough sample of real orders', n);
+  ok(perOrder > 200 && perOrder < 500, 'a delivered order nets a few hundred dollars at that reputation',
+    '$' + perOrder.toFixed(0));
+
+  const orders = RIDES.motorcycle.price / perOrder;
+  ok(orders >= 7 && orders <= 14, 'and the motorcycle is roughly ten of them',
+    `$${RIDES.motorcycle.price} / $${perOrder.toFixed(0)} = ${orders.toFixed(1)} orders`);
+
+  /* …or a great many shifts */
+  const shift = (k, s = 0.5) => JOBS[k].base + s * JOBS[k].mult;
+  const driveShifts = RIDES.motorcycle.price / shift('drive');
+  const cafeShifts = RIDES.motorcycle.price / shift('cafe');
+  ok(driveShifts > 40, 'or a great many Dispatch shifts', driveShifts.toFixed(0));
+  ok(cafeShifts > driveShifts, 'and even more café ones', cafeShifts.toFixed(0));
+
+  /* and it is still a late-game purchase, gated and sold in one place */
+  ok(RIDES.motorcycle.unlock.rep >= 45, 'the reputation gate is late-game', RIDES.motorcycle.unlock.rep);
+  eq(DATA.repProgress(RIDES.motorcycle.unlock.rep).title, 'Ledger Keeper',
+    'you are a Ledger Keeper before Dispatch will sell you one');
+  eq(RIDES.motorcycle.unlock.locs.join(','), 'trunkdepot', 'and only Dispatch sells it');
+}
+
+/* ============================================================
+   17. SHIFTS PAY LESS — and CRUMB takes longer
+   ============================================================ */
+T('the café and Dispatch shifts pay less');
+{
+  const pay = (k, s = 0.5) => JOBS[k].base + s * JOBS[k].mult;
+  /* the two day-one shifts, cut */
+  ok(pay('cafe') < 45, 'a café shift is under $45', '$' + pay('cafe'));
+  ok(pay('drive') < 55, 'a Dispatch shift is under $55', '$' + pay('drive'));
+  ok(pay('nightdrive') < 80, 'and the night shift under $80', '$' + pay('nightdrive'));
+  /* the shifts you have to be discovered to work now pay best */
+  ok(pay('warehouse') > pay('drive'), 'sorting a warehouse beats driving', `$${pay('warehouse')} vs $${pay('drive')}`);
+  ok(pay('cleanup') > pay('cafe'), 'and the stadium beats the café', `$${pay('cleanup')} vs $${pay('cafe')}`);
+  for (const k of Object.keys(JOBS)) {
+    ok(pay(k, 0) > 0 && pay(k, 1) > pay(k, 0), `shift ${k} still pays on performance`);
+  }
+
+  /* THE FIRST ASSET FROM CRUMB. Crumb & Co. Bakery is $380 at the
+     business broker's 8 % spread. The count is: how many shifts, on
+     top of the $250 you start with, until you can pay for one unit. */
+  const g = createGame({ seed: 171, autosave: false });
+  const crumb = g.economy.findByTicker('CRUMB');
+  eq(crumb.id, 'bakery', 'CRUMB is the bakery');
+  const price = g.economy.buyPrice('bakery');
+  const need = Math.max(0, price - CONFIG.startMoney);
+  const shiftsFor = (k) => Math.ceil(need / pay(k));
+  const nowCafe = shiftsFor('cafe');
+  const nowDrive = shiftsFor('drive');
+  /* the pay it used to be, so the comparison is in the test and not
+     only in a report nobody re-runs */
+  const WAS = { cafe: 48 + 0.5 * 64, drive: 56 + 0.5 * 78 };
+  const wasCafe = Math.ceil(need / WAS.cafe);
+  const wasDrive = Math.ceil(need / WAS.drive);
+  ok(nowCafe > wasCafe, 'CRUMB takes more café shifts than it used to', `${wasCafe} -> ${nowCafe}`);
+  ok(nowDrive > wasDrive, 'and more Dispatch shifts', `${wasDrive} -> ${nowDrive}`);
+  ok(nowCafe >= 4 && nowCafe <= 8, 'four to eight café shifts is the target', nowCafe);
+  ok(nowDrive >= 3 && nowDrive <= 6, 'three to six at Dispatch', nowDrive);
+
+  /* and it is still affordable inside the first week, not the first month */
+  const perDay = pay('drive') * 2;                    // two shifts is a comfortable day
+  ok(need / perDay < 4, 'a couple of days of proper work, not a fortnight', (need / perDay).toFixed(1) + ' days');
+}
+
+/* ============================================================
+   18. OTTO IS AT THE BENT SPOON — the whole beat, simulated
+   ============================================================ */
+T('Otto is actually at the Bent Spoon, end to end');
+{
+  const g = createGame({ seed: 181, autosave: false });
+  const beats = [];
+  g.bus.on('story', (p) => beats.push(p.beat));
+
+  /* 1. the message arrives, and it names the place */
+  eq(g.state.msgs[0].from, 'Otto', 'the message is from Otto');
+  ok(/Bent Spoon on Main Street/.test(g.state.msgs[0].text), 'and it says where to find him');
+  eq(LOC_BY_ID.cafe.n, 'The Bent Spoon', 'which is a real place');
+  eq(LOC_BY_ID.cafe.z, 'mainstreet', 'on Main Street');
+
+  /* 2. reading it points him at the CAFE — this is the fix */
+  g.actions.readMessages();
+  const side = g.quests.sideCurrent();
+  ok(!!side, 'reading it opens a side objective');
+  eq(side.id, 'q_side_otto_meet', 'to go and find him');
+  eq(g.quests.questLoc(side.id), 'cafe', 'AT THE CAFE, not at the office');
+  eq(SIDE_QUEST_BY_ID.q_side_otto_meet.loc, 'cafe', 'the declaration says cafe');
+  eq(SIDE_QUEST_BY_ID.q_side_otto.loc, 'office', "…and the DELIVERY step still says office, because that is where the desk is");
+  eq(g.hud().objective.id, 'q_first_job', 'the main objective is the Dispatch shift, untouched by any of this');
+
+  /* 3. and Otto is standing in the room */
+  ok(g.clients.postsAt('cafe').some((c) => c.id === 'otto'), 'Otto is posted at the cafe');
+  ok(g.whoIsAt('cafe').some((c) => c.id === 'otto'), 'whoIsAt() puts him there for the NPC layer');
+  ok(g.whoIsAt('cafe').find((c) => c.id === 'otto').line.length > 20, 'with a line to say');
+  ok(!g.whoIsAt('trunkdepot').some((c) => c.id === 'otto'), 'and he is not simultaneously at Dispatch');
+
+  /* 4. travel there — the cafe is open and known from the first minute */
+  ok(g.known('cafe'), 'the cafe is on the map from the first minute');
+  ok(g.isOpen('cafe'), 'and open at 07:00');
+  g.state.energy = 100;
+  const trip = g.travel('cafe', 'walk');
+  ok(trip.ok, 'he can walk there', trip.why);
+  eq(g.state.loc, 'cafe', 'and he is in the cafe');
+
+  /* 5. he is THERE: the beat fires, the order lands, the quest starts */
+  ok(beats.includes('cafe'), 'the meeting fires');
+  ok(g.state.flags.metFriend, 'they have met');
+  ok(g.clients.met('otto'), 'and Otto is a client now');
+  ok(g.quests.isSideDone('q_side_otto_meet'), 'the "find him" step closed by finding him');
+  ok(g.quests.isSideActive('q_side_otto'), 'and the order step opened');
+  eq(g.quests.questLoc('q_side_otto'), g.officeLoc(), 'pointing at the desk, wherever the desk currently is');
+  const order = g.state.arrivals.find((o) => o.client === 'otto');
+  ok(!!order, 'his order is on the desk', JSON.stringify(g.state.arrivals.map((a) => a.client)));
+  /* he has stopped waiting, because he has been met */
+  ok(!g.clients.postsAt('cafe').some((c) => c.id === 'otto'), 'and he is no longer waiting there');
+
+  /* 6. it does not disturb the main objective */
+  eq(g.hud().objective.id, 'q_first_job', 'the main chain is exactly where it was');
+  ok(!g.state.quests.q_side_otto && !g.state.quests.q_side_otto_meet, 'and state.quests never sees either step');
+
+  /* 7. finish it: buy the thing, take it to the desk */
+  g.state.money = 5000;
+  g.state.time = 12 * 60;
+  g.actions.accept(order);
+  for (const it of order.items) {
+    const r = g.economy.buy(it.a, it.q);
+    ok(r.ok, 'the thing he asked for can be bought', r.why);
+  }
+  g.travel(g.officeLoc(), 'walk');
+  const del = g.actions.deliver(order);
+  ok(del.ok, 'and delivered at the desk', del.why);
+  ok(g.quests.isSideDone('q_side_otto'), 'which finishes the errand');
+  eq(g.quests.sideProgress().done, 2, 'both halves of the beat are done');
+  eq(badNumbers(g.state).length, 0, 'the whole beat produced no NaNs');
+}
+
+/* ============================================================
+   19. THE PRODUCER UPGRADES — what they actually do
+   ============================================================ */
+T('the farm and mine upgrades do something you can point at');
+{
+  const g = createGame({ seed: 191, autosave: false });
+  for (const l of LOCATIONS) g.state.known[l.id] = true;
+  g.state.money = 500000;
+  g.state.time = 10 * 60;
+  g.state.farm = { ...g.state.farm, owned: true, lvl: 1, irrigation: true };
+  g.state.mine = { ...g.state.mine, owned: true, lvl: 1, elevator: true, safety: true, rights: true };
+
+  const f1 = g.actions.producer('farm');
+  ok(!!f1, 'actions.producer("farm") answers the question');
+  eq(f1.level, 1, 'at level 1');
+  ok(f1.nextPerAction > f1.perAction, 'the next level yields MORE PER HARVEST — which it did not before',
+    `${f1.perAction} -> ${f1.nextPerAction}`);
+  eq(f1.nextPerAction - f1.perAction, 1, 'exactly one more crop token per harvest');
+  ok(f1.lines.length === 3 && f1.lines.every((l) => /\d/.test(l)), 'and it is stated in numbers the UI can print',
+    f1.lines.join(' | '));
+  ok(/Tilda/.test(f1.lines[2]), 'including the part that only pays if Tilda is hired', f1.lines[2]);
+  eq(f1.dailyIncome, 0, 'because without her the daily income really is zero');
+  ok(f1.dailyIfHired > 0, 'and with her it would be $' + f1.dailyIfHired + ' a day');
+
+  /* the yield claim is TRUE, measured through the real action */
+  g.enter('farm');
+  g.state.energy = 100; g.state.time = 10 * 60;
+  const h1 = g.actions.farmHarvest(0.5);
+  ok(h1.ok, 'a harvest at level 1', h1.why);
+  g.state.farm.lvl = 3;
+  g.state.energy = 100; g.state.time = 10 * 60;      // the farm shuts at 19:00
+  const h3 = g.actions.farmHarvest(0.5);
+  ok(h3.ok, 'and one at level 3', h3.why);
+  ok(h3.qty > h1.qty, 'the level really does put more in the basket', `${h1.qty} -> ${h3.qty}`);
+  eq(h3.qty - h1.qty, 2, 'two levels, two more tokens');
+
+  /* the same for the mine */
+  g.state.time = 10 * 60;
+  g.enter('mine');
+  g.state.energy = 100;
+  const d1 = g.actions.mineDig(0.5);
+  ok(d1.ok, 'a dig at level 1', d1.why);
+  g.state.mine.lvl = 3;
+  g.state.energy = 100; g.state.time = 10 * 60;      // and the mine at 18:00
+  const d3 = g.actions.mineDig(0.5);
+  ok(d3.ok, 'and one at level 3', d3.why);
+  ok(d3.qty > d1.qty, 'and the mine level does the same', `${d1.qty} -> ${d3.qty}`);
+
+  const m1 = g.actions.producer('mine');
+  ok(/Bruno/.test(m1.lines[2]), 'the mine names Bruno', m1.lines[2]);
+  eq(m1.manager, 'bruno', 'by id, so the UI can link to him');
+  ok(m1.cost > 0 && Number.isFinite(m1.cost), 'and the next level has a price', m1.cost);
+
+  /* the OTHER real effect, the one nobody ever stated: the tier */
+  const lvl0 = g.actions.producer('farm');
+  ok(lvl0.tier >= 1 && lvl0.tier <= DATA.producers.farm.maxTier, 'a level maps to a crop tier', lvl0.tier);
+  ok(DATA.producers.farm.effect.length > 20 && DATA.producers.mine.effect.length > 20,
+    'and data.js carries a plain description of both effects for the UI');
+  ok(/only while/i.test(DATA.producers.farm.daily), 'which is honest about the employee condition',
+    DATA.producers.farm.daily);
+  ok(!g.actions.producer('nonsense'), 'an unknown producer is null, not a crash');
+}
+
+/* ============================================================
    REPORT
    ============================================================ */
 console.log('');
@@ -1202,7 +2538,8 @@ console.log(`PASS — ${pass} assertions green.`);
 console.log(`  ${ASSETS.length} assets · ${CLIENTS.length} clients · ${LOCATIONS.length} locations · ` +
   `${Object.keys(ZONES).length} zones · ${QUESTS.length} quests + ${SIDE_QUESTS.length} side`);
 console.log(`  ${ASSETS.length} unique tickers · ${Object.keys(TRAVEL).length} travel modes ` +
-  `(${Object.keys(TRAVEL).map((m) => TRAVEL[m].n).join(', ')}) · bicycle $${BIKE.cost}`);
+  `(${Object.keys(TRAVEL).map((m) => TRAVEL[m].n).join(', ')}) · `
+  + `${RIDE_LIST.length} rides (${RIDE_ORDER.slice().reverse().map((id) => RIDES[id].short + ' x' + RIDES[id].speed).join(', ')})`);
 console.log(`  30-day run: day ${sim.state.day}, $${sim.state.money}, rep ${sim.state.rep}, ` +
   `${sim.state.stats.ordersDone} orders, ${sim.state.stats.jobsDone} shifts, ` +
   `${sim.economy.cityPct()}% tokenized, ${sim.quests.progress().done}/${QUESTS.length} quests`);

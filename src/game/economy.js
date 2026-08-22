@@ -13,9 +13,9 @@
    ============================================================ */
 
 import {
-  CONFIG, ASSETS, ASSET_BY_ID, ASSET_BY_TICK, VENUES, CLIENT_BY_ID, OFFICE_STAGES,
-  HOME_BY_ID, EMPLOYEE_BY_ID, NEWS_POOL, WALLYNET_GOOD, WALLYNET_BAD,
-  byTicker, assetIdOf, assetLabel, tickerQty, searchAssets, normTicker,
+  CONFIG, ASSETS, ASSET_BY_ID, ASSET_BY_TICK, VENUES, VENUE_LOC, CLIENT_BY_ID, OFFICE_STAGES,
+  HOME_BY_ID, EMPLOYEE_BY_ID, NEWS_POOL, WALLYNET_GOOD, WALLYNET_BAD, LOC_BY_ID,
+  byTicker, assetIdOf, assetLabel, tickerQty, searchAssets, normTicker, orderFailRep,
 } from './data.js';
 import { round2, clamp } from './state.js';
 
@@ -137,11 +137,46 @@ export function createEconomy(env) {
     return true;
   }
 
+  /* ---------- THE COUNTER IS SHUT WHEN THE BUILDING IS SHUT ----------
+     Every venue carries hours and every venue lives in a building that
+     carries the same hours, and until now neither was enforced
+     anywhere but in the UI's own greying-out: economy.buy() would sell
+     you gold at four in the morning. tradeGate() is the rules-layer
+     answer, and it is also where maximum hunger stops trading.
+
+       venue given   the venue's own hours (VENUES[v].hours)
+       venue null    an off-market deal — the pawn shop is the only
+                     one — so the hours are the ones on the counter
+                     he is actually standing at.
+     ------------------------------------------------------------ */
+  function tradeGate(venue, what) {
+    /* max hunger locks trading like everything else (game.js gate) */
+    const hg = env.gate ? env.gate('trade', { loc: null }) : { ok: true };
+    if (!hg.ok) return hg;
+    const st = S();
+    if (venue && VENUES[venue]) {
+      if (!venueOpenNow(venue)) {
+        const h = VENUES[venue].hours;
+        return { ok: false, kind: 'hours', venue,
+          why: VENUES[venue].name + ' is closed — it opens at ' + String(h[0]).padStart(2, '0') + ':00.' };
+      }
+      return { ok: true };
+    }
+    /* off-market: whatever counter he is standing at */
+    const loc = LOC_BY_ID[st.loc];
+    if (loc && env.isOpenLoc && !env.isOpenLoc(st.loc)) {
+      return { ok: false, kind: 'hours', why: env.closedLine ? env.closedLine(st.loc) : loc.n + ' is closed.' };
+    }
+    return { ok: true };
+  }
+
   /* ---------- buy / sell ---------- */
   function buy(id, qty = 1, venue = undefined, unitOverride = null) {
     id = idOf(id);
     if (!ASSET_BY_ID[id]) return { ok: false, why: 'No such asset' };
     if (venue === undefined) venue = venueOf(id);
+    const gate = tradeGate(venue, 'buy');
+    if (!gate.ok) return gate;
     const unit = unitOverride != null ? unitOverride : buyPrice(id, venue);
     const total = round2(unit * qty);
     if (!M().afford(total)) return { ok: false, why: 'Not enough money' };
@@ -155,6 +190,8 @@ export function createEconomy(env) {
     id = idOf(id);
     if (!ASSET_BY_ID[id]) return { ok: false, why: 'No such asset' };
     if (venue === undefined) venue = venueOf(id);
+    const gate = tradeGate(venue, 'sell');
+    if (!gate.ok) return gate;
     if (free(id) + 1e-4 < qty) return { ok: false, why: 'Those units are locked in a client fund' };
     const unit = sellPrice(id, venue);
     const total = round2(unit * qty);
@@ -206,10 +243,18 @@ export function createEconomy(env) {
   function acceptOrder(o) {
     const st = S();
     if (!o) return { ok: false, why: 'No order' };
+    const hg = env.gate ? env.gate('order', { loc: null }) : { ok: true };
+    if (!hg.ok) return hg;
     if (st.orders.length >= orderSlots()) return { ok: false, why: 'No free order slots — upgrade the office' };
     st.orders.push(o);
     st.clients[o.client].met = true;
     st.arrivals = st.arrivals.filter((x) => x.id !== o.id);
+    /* PICKING AN ORDER UP AT THE DESK IS A STORY BEAT, not just a
+       transaction: it closes q_first_client, it makes the Business
+       Broker a place Wally has heard of (LOCATIONS.broker `see`), and
+       q_broker — the next objective — sends him there. One flag, set
+       in the one place an order is ever taken. */
+    st.flags.orderTaken = true;
     bus.emit('client', { kind: 'accept', client: o.client, order: o });
     M().note('good', 'Order accepted from ' + CLIENT_BY_ID[o.client].n);
     env.quests?.check();
@@ -254,20 +299,32 @@ export function createEconomy(env) {
     return { ok: true, late };
   }
 
+  /* MISSING A DEADLINE COSTS REPUTATION, AND IT SCALES.
+
+     This is the only order-failure path in the game — newDay() calls
+     it the morning after the deadline passes — and it used to take a
+     flat 2 points whether the client had been promised a $180 pair of
+     sneakers or a $12,000 basket of their savings. data.js
+     orderFailRep() scales it with what was promised and caps it at 14;
+     a fund mandate costs half again. The client's own trust penalty
+     is unchanged. */
   function failOrder(o, silent) {
     const st = S();
     const cs = st.clients[o.client];
+    const repCost = orderFailRep(o);
     cs.failed++;
     cs.trust = Math.max(0, cs.trust - 2);
-    M().addRep(-2);
+    M().addRep(-repCost);
     st.stats.ordersFailed++;
+    st.stats.repLost = Math.round(((st.stats.repLost || 0) + repCost) * 10) / 10;
     const i = st.orders.indexOf(o);
     if (i >= 0) st.orders.splice(i, 1);
     if (!silent) {
-      M().note('bad', CLIENT_BY_ID[o.client].n + ' gave up waiting');
+      M().note('bad', CLIENT_BY_ID[o.client].n + ' gave up waiting · −' + repCost + ' reputation');
       if (env.rng() < 0.6) postWallyNet(false, CLIENT_BY_ID[o.client].n);
     }
-    bus.emit('client', { kind: 'fail', client: o.client, order: o });
+    bus.emit('client', { kind: 'fail', client: o.client, order: o, rep: -repCost });
+    return { rep: -repCost };
   }
 
   function postWallyNet(good, who) {
@@ -315,6 +372,8 @@ export function createEconomy(env) {
   }
   function tokenize(id) {
     id = idOf(id);
+    const hg = env.gate ? env.gate('trade', { loc: null }) : { ok: true };
+    if (!hg.ok) return hg;
     const chk = canTokenize(id);
     if (!chk.ok) return chk;
     const st = S();
@@ -452,7 +511,7 @@ export function createEconomy(env) {
     buy, sell, venueOpen, sourceable,
     /* orders + funds */
     orderSlots, fundCap, acceptOrder, canComplete, completeOrder, failOrder, dissolveFund,
-    postWallyNet,
+    failRep: orderFailRep, tradeGate, postWallyNet,
     /* tokenization */
     tokenizeCost, canTokenize, tokenize, cityPct,
     /* day */

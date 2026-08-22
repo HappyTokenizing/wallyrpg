@@ -75,7 +75,7 @@ export class HumanAnim {
     this.walkPhase = rng() * Math.PI * 2;
 
     this.mode = 'idle';
-    this.w = { walk: 0, talk: 0, sit: 0, work: 0, wave: 0 };
+    this.w = { walk: 0, run: 0, talk: 0, sit: 0, work: 0, wave: 0 };
     this.speed = 0;
     this.turn = 0;
     this.rootY = 0;
@@ -115,6 +115,14 @@ export class HumanAnim {
     const moving = (loco?.speed || 0) > 0.22;
     const W = this.w;
     W.walk = damp(W.walk, moving ? 1 : 0, 9, dt);
+    /* RUN IS A WEIGHT ON THE WALK, NOT A SECOND CYCLE. A run and a walk
+       are the same four limbs on the same phase; what separates them is
+       stride length, knee lift, elbow fold, forward lean and a flight
+       phase — five numbers, every one of which the walk cycle already
+       authors. A second cycle would carry its own phase and would pop on
+       the crossfade, which is the one thing a Mayor accelerating away
+       from the start line cannot do. */
+    W.run = damp(W.run, m === 'run' ? 1 : 0, 4.5, dt);
     W.talk = damp(W.talk, m === 'talk' ? 1 : 0, 5, dt);
     W.sit = damp(W.sit, m === 'sit' ? 1 : 0, 4.5, dt);
     W.work = damp(W.work, m === 'work' ? 1 : 0, 4.5, dt);
@@ -195,19 +203,32 @@ export class HumanAnim {
    */
   walk(e, w, dt, t) {
     const sp = Math.max(this.speed, 0.3);
-    const freq = (1.55 + sp * 0.42) * this.gait;
+    /* THE RUN, as five deltas on the walk. `R` is the run weight; at 0
+       every line below is the walk cycle that four hundred people have
+       always used, to the digit. */
+    const R = this.w.run;
+    /* A RUNNER LENGTHENS THE STRIDE MORE THAN HE QUICKENS IT — the same
+       law the walk already states, applied again. 30 % more cadence and
+       45 % more thigh is a 1.4 m stride at 4 Hz, which is a run; going
+       at it with cadence alone gives a fast-forwarded walk, which is
+       what a first pass looks like every time. */
+    const freq = (1.55 + sp * 0.42) * this.gait * (1 + R * 0.30);
     this.walkPhase += dt * freq * Math.PI * 2;
     if (this.walkPhase > Math.PI * 4) this.walkPhase -= Math.PI * 4;
     const p = this.walkPhase;
-    const amp = w * clamp(0.55 + sp * 0.34, 0.5, 1.18);
+    const amp = w * clamp(0.55 + sp * 0.34, 0.5, 1.18) * (1 + R * 0.16);
 
     const s = Math.sin(p), c = Math.cos(p);
     /* thighs — 0.66 rad each way is a 0.98 m stride on a 0.74 m leg,
        which is a walk with somewhere to be rather than a shuffle */
-    e[B.legL0 * 3 + 0] += -s * 0.66 * amp;
-    e[B.legR0 * 3 + 0] += s * 0.66 * amp;
-    /* knees — flex under the body and again at the top of the swing */
-    const kn = (x) => (0.10 + 0.80 * Math.max(0, Math.sin(x + 1.85)) ** 1.4) * amp;
+    const thigh = 0.66 + R * 0.30;
+    e[B.legL0 * 3 + 0] += -s * thigh * amp;
+    e[B.legR0 * 3 + 0] += s * thigh * amp;
+    /* knees — flex under the body and again at the top of the swing.
+       The knee is where a run is actually READ at forty metres: a
+       walking silhouette's shin stays under the body, a running one
+       folds the heel up behind the thigh. */
+    const kn = (x) => (0.10 + (0.80 + R * 0.62) * Math.max(0, Math.sin(x + 1.85)) ** 1.4) * amp;
     const knL = kn(p), knR = kn(p + Math.PI);
     e[B.legL1 * 3 + 0] += knL;
     e[B.legR1 * 3 + 0] += knR;
@@ -223,38 +244,68 @@ export class HumanAnim {
        is the actual gait: heel strike as the leg reaches forward, toe
        off as it leaves the ground behind. */
     const roll = (x) => 0.34 * Math.max(0, -Math.sin(x)) - 0.20 * Math.max(0, Math.sin(x + 0.8));
-    e[B.footL * 3 + 0] += s * 0.66 * amp - knL + roll(p) * amp;
-    e[B.footR * 3 + 0] += -s * 0.66 * amp - knR + roll(p + Math.PI) * amp;
+    e[B.footL * 3 + 0] += s * thigh * amp - knL + roll(p) * amp;
+    e[B.footR * 3 + 0] += -s * thigh * amp - knR + roll(p + Math.PI) * amp;
 
-    /* arms, opposite the legs */
-    e[B.armL0 * 3 + 0] += s * 0.46 * amp;
-    e[B.armR0 * 3 + 0] += -s * 0.46 * amp;
-    e[B.armL1 * 3 + 0] += -(0.08 + 0.26 * Math.max(0, s)) * amp;
-    e[B.armR1 * 3 + 0] += -(0.08 + 0.26 * Math.max(0, -s)) * amp;
+    /* arms, opposite the legs. A run drives them from a FOLDED elbow —
+       0.72 rad of extra fold is the pumping forearm, and without it the
+       arms windmill straight and the figure reads as panicking rather
+       than as running. */
+    e[B.armL0 * 3 + 0] += s * (0.46 + R * 0.30) * amp;
+    e[B.armR0 * 3 + 0] += -s * (0.46 + R * 0.30) * amp;
+    e[B.armL1 * 3 + 0] += -(0.08 + R * 0.72 + (0.26 + R * 0.30) * Math.max(0, s)) * amp;
+    e[B.armR1 * 3 + 0] += -(0.08 + R * 0.72 + (0.26 + R * 0.30) * Math.max(0, -s)) * amp;
     /* counter-rotation and bob */
-    e[B.hips * 3 + 1] += s * 0.10 * amp;
-    e[B.chest * 3 + 1] += -s * 0.14 * amp;
+    e[B.hips * 3 + 1] += s * (0.10 + R * 0.05) * amp;
+    e[B.chest * 3 + 1] += -s * (0.14 + R * 0.07) * amp;
     e[B.hips * 3 + 2] += -c * 0.05 * amp;
-    e[B.chest * 3 + 0] += 0.045 * amp + Math.max(0, this.speed - 1.6) * 0.05;
-    this.rootY = -0.020 * amp * (0.5 - 0.5 * Math.cos(p * 2));
+    /* THE LEAN. A runner's mass is in front of his feet; 0.20 rad of
+       chest pitch is what says "this is effort" from a hundred metres,
+       where no limb is more than three pixels. The head takes most of it
+       back off, because a runner looks where he is going. */
+    e[B.chest * 3 + 0] += 0.045 * amp + Math.max(0, this.speed - 1.6) * 0.05 + R * 0.20;
+    e[B.spine * 3 + 0] += R * 0.06 * amp;
+    e[B.head * 3 + 0] -= R * 0.17 * amp;
+    /* the flight phase: twice the bob of a walk, and a lift that peaks
+       between footfalls rather than at them */
+    this.rootY = -(0.020 + R * 0.026) * amp * (0.5 - 0.5 * Math.cos(p * 2));
     /* lean into a turn */
     const tl = clamp(this.turn, -1.6, 1.6);
     e[B.chest * 3 + 2] += tl * 0.10;
     e[B.hips * 3 + 2] += tl * 0.05;
   }
 
+  /**
+   * Talking with the hands.
+   *
+   * `talkOpen` (0..1, default 0) swings the gesture OUT instead of up.
+   * At 0 — every one of the four hundred people in this city — the
+   * forearm folds to 58 degrees and the hand lives in front of the
+   * chest, which is what a person gesturing at someone beside them
+   * actually does, and what the crowd has always done.
+   *
+   * At 1 the shoulder abducts, the elbow opens and the palm ends out to
+   * the side and low. Two reasons it exists and they agree: it is the
+   * gesture in ref/happy-ref.webp — one hand open, mid-sentence — and
+   * the closed version parks a forearm across the chest for the whole
+   * eleven seconds of the walk-up line, which is precisely where the
+   * open blazer, the white tee and the printed mark are. A costume
+   * nobody can see during the only scene it appears in is not a
+   * costume.
+   */
   talk(e, w, t) {
     const g = this.energy;
     const a = this.handed > 0 ? B.armR0 : B.armL0;
     const f = this.handed > 0 ? B.armR1 : B.armL1;
     const s = this.handed;
+    const o = this.talkOpen || 0;
     const beat = Math.sin(t * 2.35) * 0.5 + Math.sin(t * 3.9) * 0.3;
-    e[a * 3 + 0] = lerp(e[a * 3 + 0], -0.62 + beat * 0.24 * g, w);
-    e[a * 3 + 2] = lerp(e[a * 3 + 2], -0.34 * s + beat * 0.12, w);
-    e[f * 3 + 0] = lerp(e[f * 3 + 0], -1.02 + beat * 0.42 * g, w);
-    e[f * 3 + 1] = lerp(e[f * 3 + 1], beat * 0.28 * s, w);
+    e[a * 3 + 0] = lerp(e[a * 3 + 0], (-0.62 + o * 0.30) + beat * 0.24 * g, w);
+    e[a * 3 + 2] = lerp(e[a * 3 + 2], (-0.34 - o * 0.36) * s + beat * 0.12, w);
+    e[f * 3 + 0] = lerp(e[f * 3 + 0], (-1.02 + o * 0.60) + beat * 0.42 * g, w);
+    e[f * 3 + 1] = lerp(e[f * 3 + 1], beat * 0.28 * s * (1 - o * 0.5), w);
     e[B.head * 3 + 0] += Math.sin(t * 2.6) * 0.055 * w * g;
-    e[B.chest * 3 + 1] += Math.sin(t * 1.35) * 0.05 * w;
+    e[B.chest * 3 + 1] += Math.sin(t * 1.35) * 0.05 * w * (1 - o * 0.4);
   }
 
   wave(e, w, t) {
@@ -342,6 +393,103 @@ export function createCrowd(ctx, host) {
      per frame would be 2.3 ms of nothing. */
   const roadLift = host?.roadLift || (() => 0);
 
+  /* ==================================================================
+     THE DOORWAYS ARE NOT STANDING ROOM.
+
+     "Barnaby and other NPCs are too close to some of the entrances to
+     the buildings and interfere." Two separate mechanisms put them
+     there and this is the second of them. The road network's location
+     nodes sit ON the forecourt — that is what makes them worth walking
+     to — and `steer` gives an agent arriving at one a 42 % chance of
+     standing there for up to eighteen seconds. On a narrow Main Street
+     frontage the forecourt IS the doorstep, so the wanderer parks in
+     the threshold, the player's walk-to point is inside him, and the
+     approach camera photographs the back of a stranger's head.
+
+     What every door needs is a KEEP-CLEAR: a disc at the door itself
+     and a corridor reaching out along the way the facade faces, wide
+     enough for an elephant to walk down. This is that volume, as a
+     force. It is not a collision — a wanderer crossing the frontage
+     still crosses it, at walking pace, and simply does not stop in it —
+     because a hard wall around every door would make the crowd flow
+     visibly around invisible obstacles, which is worse than the defect.
+
+     COST. The doors are static, so they are bucketed ONCE into 8 m
+     cells at build time and each one is written into the nine cells
+     that its influence can reach. An agent then does exactly one Map
+     lookup per frame and, in the overwhelming majority of frames,
+     finds nothing and returns. npc.js supplies the list — it is the
+     module that has ctx.city and the location table.
+     ================================================================== */
+  const DOOR_R = 2.30;        // keep-clear disc centred on the door
+  const DOOR_LEN = 3.60;      // how far the approach corridor reaches out
+  const DOOR_HALF = 1.25;     // corridor half-width
+  const DCELL = 8;
+  const doors = host?.doors || [];
+  const doorGrid = new Map();
+  const dkey = (i, j) => ((i * 83492791) ^ (j * 29418343)) | 0;
+  for (const d of doors) {
+    const ci = Math.floor(d.x / DCELL), cj = Math.floor(d.z / DCELL);
+    for (let i = -1; i <= 1; i++) {
+      for (let j = -1; j <= 1; j++) {
+        const k = dkey(ci + i, cj + j);
+        let b = doorGrid.get(k);
+        if (!b) { b = []; doorGrid.set(k, b); }
+        b.push(d);
+      }
+    }
+  }
+
+  /* Where a point is being pushed, and how hard. 0 means "not in
+     anybody's doorway", which is the answer nearly every time. */
+  const _push = { x: 0, z: 0 };
+  function doorPush(x, z) {
+    _push.x = 0; _push.z = 0;
+    if (!doors.length) return 0;
+    const b = doorGrid.get(dkey(Math.floor(x / DCELL), Math.floor(z / DCELL)));
+    if (!b) return 0;
+    let best = 0;
+    for (let i = 0; i < b.length; i++) {
+      const d = b[i];
+      const dx = x - d.x, dz = z - d.z;
+      const along = dx * d.ax + dz * d.az;        // out from the facade
+      const side = dx * d.az - dz * d.ax;         // across the corridor
+      let k = 0, px = 0, pz = 0;
+      if (along > -0.8 && along < DOOR_LEN && Math.abs(side) < DOOR_HALF) {
+        /* inside the corridor: leave it SIDEWAYS, by the short way out.
+           Pushing them straight back out of the door would send them
+           through the wall behind. */
+        k = 1 - Math.abs(side) / DOOR_HALF;
+        const s = side >= 0 ? 1 : -1;
+        px = d.az * s; pz = -d.ax * s;
+        /* plus a nudge outward, so a body pinned against the door does
+           not slide along the step */
+        const fwd = 1 - clamp(along / DOOR_LEN, 0, 1);
+        px += d.ax * fwd * 0.45; pz += d.az * fwd * 0.45;
+      }
+      const r = Math.hypot(dx, dz);
+      if (r < DOOR_R) {
+        /* the disc: radially away from the door, whichever side of it
+           they are on */
+        const kr = 1 - r / DOOR_R;
+        if (kr > k) {
+          k = kr;
+          const inv = 1 / (r || 1e-3);
+          px = dx * inv; pz = dz * inv;
+          /* dead on the door point there is no direction to leave by;
+             take the facade's own outward normal */
+          if (r < 1e-2) { px = d.ax; pz = d.az; }
+        }
+      }
+      if (k > best) {
+        best = k;
+        const l = Math.hypot(px, pz) || 1;
+        _push.x = px / l; _push.z = pz / l;
+      }
+    }
+    return best;
+  }
+
   /* ---- the walkable graph, straight off the road network ---- */
   const nodes = world?.paths?.nodes || [];
   const edges = (world?.paths?.edges || []).filter((e) => e.points && e.points.length > 1);
@@ -412,6 +560,18 @@ export function createCrowd(ctx, host) {
       a.pause -= dt;
       a.speed = damp(a.speed, 0, 8, dt);
       if (a.pause <= 0) a.mode = 'walk';
+      /* LOITERING IS WHERE THE DEFECT ACTUALLY LIVES. A wanderer
+         crossing a threshold is traffic; a wanderer who stops in one is
+         a door that cannot be used. So a paused agent keeps drifting —
+         slowly, 0.55 m/s, under the same force — until he is out of the
+         corridor, and then stops. It reads as somebody shuffling aside,
+         which is what a person standing in a doorway does. */
+      const k = doorPush(a.pos.x, a.pos.z);
+      if (k > 0.02) {
+        const v = 0.55 * Math.min(1, k * 2.2);
+        a.pos.x += _push.x * v * dt;
+        a.pos.z += _push.z * v * dt;
+      }
       return;
     }
     if (!a.edge) { if (!startEdge(a, a.node, null)) return; }
@@ -478,6 +638,11 @@ export function createCrowd(ctx, host) {
       }
     }
     ux += sx * 0.55; uz += sz * 0.55;
+    /* and out of anybody's doorway. Weighted a shade under the
+       separation term: it must be enough to bend a path around a
+       threshold and never enough to stop somebody walking past one. */
+    const dk = doorPush(a.pos.x, a.pos.z);
+    if (dk > 0) { ux += _push.x * dk * 0.85; uz += _push.z * dk * 0.85; }
     const ul = Math.hypot(ux, uz) || 1;
     ux /= ul; uz /= ul;
 
@@ -511,6 +676,15 @@ export function createCrowd(ctx, host) {
   return {
     agents,
     nodes, edges, walkable,
+    doors,
+
+    /** How far into a doorway keep-clear a point is: 0 outside any,
+        1 dead on a door. npc.js scores standing spots with it and the
+        verifier measures the fix with it. */
+    doorClearance(x, z) {
+      const k = doorPush(x, z);
+      return { k, out: { x: _push.x, z: _push.z } };
+    },
 
     /** Somewhere sensible to put a new wanderer. */
     randomNode() {

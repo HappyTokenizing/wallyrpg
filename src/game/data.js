@@ -57,18 +57,42 @@
    ============================================================ */
 
 /* ---------------- CONFIG ---------------- */
+/* THE CLOCK. `minutesPerSecond` used to be a dead number: nothing read
+   it, and time only moved when Wally did something. It is now the rate
+   of a REAL clock that game.js ticks every frame, and the user set it:
+   ONE in-game minute per TWO real seconds, i.e. 0.5. That is eight
+   times slower than the old 4, and it is matched to the 3D island —
+   Wally runs at 5.9 m/s, so crossing the ~790 m of built city on foot
+   costs him about an in-game hour, the same order as the walk fare.
+
+   WHAT THE NEW RATE RE-TUNED:
+     forceSleepMin  26:00 -> 25:00. At 0.5 min/s the old 19-hour day is
+                    38 real minutes of standing still; 18 hours is 36,
+                    and 01:00 still leaves the Metro's 00:00–05:00
+                    blackout inside a playable day.
+     hungerLockAt   maximum hunger now LOCKS every action but eating
+                    (game.gate). 3.4/hour over an 18-hour day is 61
+                    hunger, so one meal a day is the rhythm.
+     idleMaxMinutes one frame may never advance more than this, so an
+                    alt-tab or a stalled tab cannot eat a day. */
 export const CONFIG = Object.freeze({
-  version: 6,
-  saveKey: 'wally_rpg_save_v6',
-  legacyKeys: Object.freeze(['wally_rpg_save_v5', 'wally_city_of_assets_save_v4']),
-  minutesPerSecond: 4,
+  version: 7,
+  saveKey: 'wally_rpg_save_v7',
+  legacyKeys: Object.freeze(['wally_rpg_save_v6', 'wally_rpg_save_v5', 'wally_city_of_assets_save_v4']),
+  minutesPerSecond: 0.5,       // ONE in-game minute per TWO real seconds
+  liveClock: true,             // game.update() ticks it; time.setLive(false) stops it
+  idleMaxMinutes: 4,           // hard cap on in-game minutes added by one frame
   dayStartMin: 7 * 60,
-  forceSleepMin: 26 * 60,      // 02:00
+  forceSleepMin: 25 * 60,      // 01:00 — was 02:00, see the note above
   rentAmount: 90,
   rentEveryDays: 7,
   startMoney: 250,
   hungerPerHour: 3.4,
+  hungerWarnAt: 84,
+  hungerLockAt: 100,           // AT MAX HUNGER, nothing works but eating
   energyPerStep: 0.0032,
+  exchangeFee: 1500,           // the Stock Exchange access fee
+  exchangeOrders: 3,           // …and the trader-badge order count
   totalAssets: 69,
   totalClients: 24,
   totalLocations: 28,
@@ -305,7 +329,12 @@ export const CLIENTS = [
     intro: "Everyone says art isn't an asset. Everyone is also broke, so." },
   { id: 'bolt', n: 'Bolt', role: 'Tech founder', fav: ['Stocks', 'Infrastructure'], hate: ['Bonds'], patience: 2, budget: 3, hue: '#4A7BC4', skin: 'olive', face: 'oval', hair: 'quiff', hairCol: 'darkbrown', beard: 'stubble', specs: 'square', age: 0, mood: '', hat: 'none', home: 'innovation',
     intro: 'I have twelve minutes. Actually nine. Make them count.' },
-  { id: 'tusk', n: 'Mayor Tusk', role: 'City mayor', fav: ['Infrastructure', 'Transport'], hate: [], patience: 4, budget: 3, hue: '#8A6C3E', skin: 'warm', face: 'square', hair: 'receding', hairCol: 'grey', beard: 'moustache', specs: 'none', age: 2, mood: 'warm', hat: 'top', home: 'mainstreet',
+  /* THE MAYOR IS MAYOR KEN JONES. His id stays 'tusk' — it is in save
+     files (state.clients.tusk), in the 3D crowd tables and in every
+     order that was ever written for him — and only the name the player
+     reads changed. He is also the man who blocks the Stock Exchange
+     until you have raced him: see RACE below. */
+  { id: 'tusk', n: 'Mayor Ken Jones', role: 'City mayor', fav: ['Infrastructure', 'Transport'], hate: [], patience: 4, budget: 3, hue: '#8A6C3E', skin: 'warm', face: 'square', hair: 'receding', hairCol: 'grey', beard: 'moustache', specs: 'none', age: 2, mood: 'warm', hat: 'top', home: 'mainstreet',
     intro: "I don't need the details, Wally. I need a ribbon to cut." },
   { id: 'penny', n: 'Penny', role: 'Collector', fav: ['Culture'], hate: ['Bonds'], patience: 2, budget: 1, hue: '#D08A2B', skin: 'fair', face: 'long', hair: 'braids', hairCol: 'auburn', beard: 'none', specs: 'round', age: 1, mood: '', hat: 'flat', home: 'marketsq',
     intro: "That's your price? That's your FIRST price, surely." },
@@ -397,6 +426,114 @@ export const HOMES = [
 export const HOME_BY_ID = {};
 for (const h of HOMES) HOME_BY_ID[h.id] = h;
 
+/* ============================================================
+   REPUTATION TITLES — 12 rungs, "A Little Calf" to "Tokenization
+   Legend".
+
+   Reputation was a bare number with nothing attached to it. It now
+   carries a TITLE, and the UI shows three things: the one he holds,
+   the one after it, and how far through the gap he is. Everything
+   comes out of repProgress() below — nobody should be indexing this
+   table by hand.
+
+   THE THRESHOLDS ARE SPREAD OVER THE WHOLE PROGRESSION, not over the
+   first week. The main chain alone pays 513 reputation; a 30-day
+   working run lands around 200. So the ladder is dense where the
+   early game is (0 / 8 / 18 / 32) and stretches out through the acts,
+   and the last rung is a full run's work rather than a fortnight's.
+
+     rung   rep    where you are
+     1        0    day one, nobody knows you
+     2        8    the first shift and the first errand
+     3       18    the Shared Desk is in reach (office 1 needs 12)
+     4       32    act 2, the farm and the Treasury
+     5       50    the Exchange and the motorcycle
+     6       70    act 3, the mine, the penthouse gate is visible
+     7       95    act 4, the Professional Office (rep 55) is behind you
+     8      125    Wally Tower's reputation bar is 95; this is past it
+     9      160    act 5 opens (the Stampede want you at 42, but by
+                   here you are the reason they are still in the city)
+    10      200    what a hard-working month actually reaches
+    11      250    the back half of the tokenization run
+    12      320    everything
+   ============================================================ */
+export const REP_TITLES = Object.freeze([
+  Object.freeze({ rep: 0,   t: 'A Little Calf',       d: 'Nobody in this city knows your name. They will.' }),
+  Object.freeze({ rep: 8,   t: 'Errand Elephant',     d: 'You fetch, you carry, you turn up. It counts for more than it sounds.' }),
+  Object.freeze({ rep: 18,  t: 'Known At The Cafe',   d: 'Dot starts your coffee when she sees you through the window.' }),
+  Object.freeze({ rep: 32,  t: 'Trusted With Keys',   d: 'Small keys. Real ones, though, and to other people’s things.' }),
+  Object.freeze({ rep: 50,  t: 'Ledger Keeper',       d: 'Your numbers added up twice in a row. Mr. Ledger noticed the second time.' }),
+  Object.freeze({ rep: 70,  t: 'Broker Of Note',      d: 'People say your name in rooms you are not standing in.' }),
+  Object.freeze({ rep: 95,  t: 'Tokenization Wonk',   d: 'You have opinions about filing fees now. Strong ones. At parties.' }),
+  Object.freeze({ rep: 125, t: 'Market Fixture',      d: 'The Exchange floor nods when you come in. The floor does not nod often.' }),
+  Object.freeze({ rep: 160, t: 'Pillar Of Bull Bear', d: 'A district would notice if you left. Two of them would say so out loud.' }),
+  Object.freeze({ rep: 200, t: 'City Financier',      d: 'The Mayor returns your calls. Eventually, and always from a ribbon-cutting.' }),
+  Object.freeze({ rep: 250, t: 'Legend In Progress',  d: 'They are already telling the story wrong, which is how you know it is one.' }),
+  Object.freeze({ rep: 320, t: 'Tokenization Legend', d: 'Every asset in Bull Bear City, connected, and your name on the whole of it.' }),
+]);
+
+/* The rung he is on. Never returns null — rep 0 is a rung. */
+export function repTitleIndex(rep) {
+  const r = Number.isFinite(rep) ? rep : 0;
+  let i = 0;
+  for (let k = 0; k < REP_TITLES.length; k++) if (r >= REP_TITLES[k].rep) i = k;
+  return i;
+}
+export function repTitle(rep) { return REP_TITLES[repTitleIndex(rep)]; }
+export function repNextTitle(rep) { return REP_TITLES[repTitleIndex(rep) + 1] || null; }
+
+/* Everything the UI needs in one object: the title, the next one, and
+   the progress toward it. `pct` is 0..100 through the CURRENT gap, and
+   is 100 at the top of the ladder. */
+export function repProgress(rep) {
+  const r = Math.max(0, Number.isFinite(rep) ? rep : 0);
+  const i = repTitleIndex(r);
+  const cur = REP_TITLES[i];
+  const next = REP_TITLES[i + 1] || null;
+  const span = next ? next.rep - cur.rep : 0;
+  const into = r - cur.rep;
+  return {
+    rep: Math.round(r * 10) / 10,
+    title: cur.t, desc: cur.d, at: cur.rep,
+    index: i, rung: i + 1, total: REP_TITLES.length,
+    next: next ? next.t : null,
+    nextDesc: next ? next.d : null,
+    nextAt: next ? next.rep : null,
+    toNext: next ? Math.round((next.rep - r) * 10) / 10 : 0,
+    pct: next ? Math.max(0, Math.min(100, Math.round((into / span) * 100))) : 100,
+    top: !next,
+  };
+}
+
+/* ============================================================
+   MISSING A DEADLINE COSTS REPUTATION, SCALED TO THE ORDER.
+
+   economy.failOrder() used to take a flat 2 points whether the order
+   was a $180 pair of sneakers or a $12,000 basket. It now scales with
+   what the client was promised: base + (budget + fee) / per, capped,
+   and a fund mandate — which is a client's savings, not a shopping
+   list — costs half again.
+
+     order value    rep lost      order value    rep lost
+        $200          2.2            $4,000         6.4
+        $800          2.9            $8,000        10.9
+      $2,000          4.2           $16,000+        14 (cap)
+   ============================================================ */
+export const ORDER_FAIL = Object.freeze({
+  base: 2,        // the old flat penalty is now the floor
+  per: 900,       // one extra point per $900 promised
+  cap: 14,        // and it stops there
+  fundMult: 1.5,  // a fund mandate is somebody's savings
+  trust: 2,       // trust lost with that client (unchanged)
+});
+export function orderFailRep(order) {
+  if (!order) return ORDER_FAIL.base;
+  const value = Math.max(0, (+order.budget || 0) + (+order.fee || 0));
+  const raw = ORDER_FAIL.base + value / ORDER_FAIL.per;
+  const mult = order.type === 'fund' ? ORDER_FAIL.fundMult : 1;
+  return Math.round(Math.min(ORDER_FAIL.cap, raw * mult) * 10) / 10;
+}
+
 /* ---------------- 10 ZONES ----------------
    x/y are 2D-map coords on the original 1000x660 board.
    `elev` is the district's base ground height in metres.
@@ -466,7 +603,13 @@ export const LOCATIONS = [
   { id: 'bazaar', n: 'Culture Bazaar', z: 'marketsq', x: 406, y: 256, ico: '🎭', see: { stat: 'ordersDone', n: 1 }, kit: 'market', dy: 0.4,
     hours: [11, 21], desc: 'Sneakers, paintings, and one very loud watch dealer.',
     acts: ['market:bazaar'] },
-  { id: 'broker', n: 'Business Broker', z: 'marketsq', x: 512, y: 262, ico: '🤝', see: { rep: 12 }, kit: 'interior', tint: '#6A5E48', dy: 1.1,
+  /* see: an `any` rule (quests.ruleMet) — EITHER you have taken your
+     first order at the desk, which is what sends you here (q_broker),
+     OR you got reputable enough to hear about it on your own. Without
+     the first arm the objective would point at a place the player has
+     never heard of, and hud.js refuses to draw the pointer at an
+     unknown location. */
+  { id: 'broker', n: 'Business Broker', z: 'marketsq', x: 512, y: 262, ico: '🤝', see: { any: [{ flag: 'orderTaken' }, { rep: 12 }] }, kit: 'interior', tint: '#6A5E48', dy: 1.1,
     hours: [9, 18], desc: 'Whole businesses, sold like second-hand cars.',
     acts: ['market:broker'] },
   { id: 'markethall', n: 'Market Hall', z: 'marketsq', x: 456, y: 346, ico: '🥘', see: { stat: 'ordersDone', n: 1 }, kit: 'market', dy: -0.3,
@@ -657,6 +800,12 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
      WALK   trades time and energy for money. Free, always available,
             never refused — this is the floor that stops a broke,
             exhausted player from being hard-locked. See game.fares().
+            ONE CAVEAT, ADDED WITH THE HOURS RULE: free and never
+            refused has never meant "into a locked building". A
+            destination that is CLOSED refuses every mode, walking
+            included (game.canEnter). The floor is unchanged in the
+            way that matters — his own flat is open 00:00–24:00, so
+            there is no hour at which he cannot walk home and sleep.
      BIKE   the reward for investing early. Free like walking, less
             than half the time, a third of the energy — but you have
             to OWN it (BIKE below, $180) and have it EQUIPPED.
@@ -664,13 +813,16 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
             Wally down: platforms, stairs, standing, crowds. Per
             MINUTE it is roughly twice as tiring as walking. No trains
             00:00–05:00.
-     UBER   trades MONEY for energy and time. Always expensive, never
+     YOOBER trades MONEY for energy and time. Always expensive, never
             cheap even for one hop, and the price climbs faster than
             the distance (a per-hop term AND a hop² surge).
 
    cost   = base + per·h + surge·h²
-   mins   = max(3, minBase + min·h)
-   energy = enBase + energy·h
+   mins   = max(3, (minBase + min·h) / ride.speed)
+   energy = (enBase + energy·h) · ride.effort
+
+   ride.speed and ride.effort are 1 for every mode except 'bike',
+   which is the RIDES row you have equipped — see RIDES below.
 
    THE TABLE, at 1 / 3 / 5 / 8 hops (8 is the widest trip on the
    island — apartment to Golden Heights is 7):
@@ -679,41 +831,295 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
      walk    $0      15m  4.2e  $0      41m 12.6e  $0      67m 21.0e  $0      106m 33.6e
      bike    $0       6m  1.5e  $0      16m  4.5e  $0      26m  7.5e  $0       41m 12.0e
      metro   $3.50    9m  5.7e  $6.50   15m 10.1e  $9.50   21m 14.5e  $14.00   30m 21.1e
-     uber    $24.20   5m  0.1e  $51.80   9m  0.4e  $89.00  13m  0.8e  $162.80  19m  1.2e
+     yoober  $24.20   5m  0.1e  $51.80   9m  0.4e  $89.00  13m  0.8e  $162.80  19m  1.2e
+
+   The 'bike' row above is the BICYCLE, speed 1. A scooter does the
+   same trip in 1/1.5 of those minutes, a motorcycle in 1/3 of them:
+
+     ride        1 hop   3 hops   5 hops   8 hops
+     bicycle       6m      16m      26m      41m
+     scooter       4m      11m      17m      27m
+     motorcycle    3m       5m       9m      14m
 
    Read the columns, not the rows: walking one hop is fifteen minutes
    you did not have to pay for; the metro across town is nine dollars
-   and a quarter of your day's energy; an Uber anywhere is a shift's
+   and a quarter of your day's energy; a Yoober anywhere is a shift's
    pay. Money buys energy back, energy buys money back, and the bike
    quietly wins both once you have bought it.
 
    MODE IDS ARE STABLE. 'train' and 'trunk' keep their ids — they are
    in save files (state.travel), in ui/menus.js's icon map and in
-   tools/traveltest.mjs — and only their DISPLAY names changed to
-   Metro and Uber. 'walk' is promoted from a special case inside
-   game.fares() to a first-class mode here. 'bike' is unchanged as an
-   id but is now gated on ownership.
+   tools/traveltest.mjs — and only their DISPLAY names changed, to
+   Metro and (since v7, to stay well clear of a trademark) YOOBER.
+   'walk' is promoted from a special case inside game.fares() to a
+   first-class mode here. 'bike' is unchanged as an id but is now
+   gated on ownership AND stands for whichever RIDE is equipped.
    ============================================================ */
 export const TRAVEL = {
   walk:  { id: 'walk',  n: 'On foot', ico: '🐘', base: 0,  per: 0,   surge: 0,   minBase: 2, min: 13, enBase: 0,   energy: 4.2,  note: 'Free, always. Slow, and your legs know it.' },
-  bike:  { id: 'bike',  n: 'Bicycle', ico: '🚲', base: 0,  per: 0,   surge: 0,   minBase: 1, min: 5,  enBase: 0,   energy: 1.5,  needs: 'bike', note: 'Free once it is yours. Squeaks. Worth every dollar.' },
+  bike:  { id: 'bike',  n: 'Bicycle', ico: '🚲', base: 0,  per: 0,   surge: 0,   minBase: 1, min: 5,  enBase: 0,   energy: 1.5,  needs: 'ride', note: 'Free once it is yours. Squeaks. Worth every dollar.' },
   train: { id: 'train', n: 'Metro',   ico: '🚈', base: 2,  per: 1.5, surge: 0,   minBase: 6, min: 3,  enBase: 3.5, energy: 2.2,  hours: [5, 24], note: 'Costs almost nothing and takes it out of you. Runs 05:00–00:00.' },
-  trunk: { id: 'trunk', n: 'Uber',    ico: '🚕', base: 14, per: 9,   surge: 1.2, minBase: 3, min: 2,  enBase: 0,   energy: 0.15, note: 'Door to door, no effort, and the fare grows faster than the distance.' },
+  trunk: { id: 'trunk', n: 'Yoober',  ico: '🚕', base: 14, per: 9,   surge: 1.2, minBase: 3, min: 2,  enBase: 0,   energy: 0.15, note: 'Door to door, no effort, and the fare grows faster than the distance.' },
 };
 
-/* THE BICYCLE — an item you buy, not a mode you are handed.
-   Owning it and riding it are separate: state.bike = {owned, equipped}.
-   Sold at Dispatch (a rideshare depot has beaters going spare) and at
-   Vic's pawn shop — both in Rusty Row, both reachable on day one. The
-   'bike' act string on those two locations is how the UI finds it. */
+/* ============================================================
+   RIDES — the things Wally travels the city ON.
+
+   Until v7 this was one frozen BIKE record and one pair of booleans,
+   state.bike = {owned, equipped}. Two more vehicles were coming, and
+   a second and third hard-coded flag pair does not scale, so a ride
+   is now a ROW IN A TABLE and ownership is state.rides:
+
+     state.rides = { owned: {bike:bool, scooter:bool, motorcycle:bool},
+                     equipped: 'bike'|'scooter'|'motorcycle'|null }
+
+   ONE AT A TIME. `equipped` holds at most one id — you cannot ride a
+   bicycle and a motorcycle to the same meeting.
+
+   The columns:
+     id        stable and save-visible. Never renamed.
+     name / n  what the player reads (both keys, same string: `n` is
+               the house style everywhere else in this file)
+     short     the one-word name for a fare row
+     speed     RELATIVE TO THE BICYCLE, and the whole point of the
+               table. bicycle 1 · scooter 1.5 (50 % faster) ·
+               motorcycle 3 (twice the scooter). fare() divides the
+               bicycle's minutes by this.
+     effort    energy multiplier on the bicycle's cost — a motor does
+               the pedalling, so the scooter and motorcycle are nearly
+               free on energy. Money and time are what they cost.
+     unlock    {kind:'buy', price, locs[], rep} — money buys it, at
+               those places, once you are reputable enough (rep 0 for
+               the bicycle: it is a day-one purchase)
+               {kind:'quest', questId} — it cannot be bought at ANY
+               price; a quest hands it over
+     price     mirror of unlock.price. 0 for a quest ride.
+     questId   mirror of unlock.questId. null for a bought ride.
+
+   THE INVARIANT THE WHOLE TABLE SITS UNDER: none of this is ever
+   required. Walking is free, always available and never refused
+   (game.fares()), so a player with no money, no energy and no ride
+   is slow, not stuck.
+   ============================================================ */
+export const RIDES = Object.freeze({
+  bike: Object.freeze({
+    id: 'bike',
+    name: 'Second-hand Bicycle', n: 'Second-hand Bicycle', short: 'Bicycle',
+    ico: '🚲',
+    speed: 1,
+    effort: 1,
+    unlock: Object.freeze({ kind: 'buy', price: 180, rep: 0, locs: Object.freeze(['trunkdepot', 'pawnshop']) }),
+    price: 180,
+    questId: null,
+    desc: 'One gear, two brakes, one of which works. Halves every journey in this city and costs nothing to run.',
+    line: 'It is a bicycle. It is not a good bicycle. It is, however, yours.',
+  }),
+  /* THE SCOOTER IS NOT FOR SALE. Barnaby drove route 6 for thirty
+     years and has a dead Vespa-shaped thing behind Dispatch; he signs
+     it over to the one person in this city who did him a favour. It
+     arms itself once you are off the folding table (office stage 1),
+     which puts it squarely mid-game — after the bicycle has stopped
+     feeling like an upgrade and long before the motorcycle is
+     affordable. See SIDE_QUESTS q_side_scooter. */
+  scooter: Object.freeze({
+    id: 'scooter',
+    name: "Barnaby's Scooter", n: "Barnaby's Scooter", short: 'Scooter',
+    ico: '🛵',
+    speed: 1.5,
+    effort: 0.3,
+    unlock: Object.freeze({ kind: 'quest', questId: 'q_side_scooter' }),
+    price: 0,
+    questId: 'q_side_scooter',
+    desc: 'Half a litre of engine and thirty years of route knowledge in the pannier. Fifty per cent faster than the bicycle, and it does the pedalling.',
+    line: 'Barnaby hands you the key on a bit of string. "Route 6 is yours now. Do not embarrass it."',
+  }),
+  /* AND THE MOTORCYCLE IS FOR SALE AND NOTHING ELSE — no quest, no
+     favour, no shortcut.
+
+     THE PRICE IS TEN CLIENT ORDERS, MEASURED. It was $16,000, on the
+     stated intent that it should cost "roughly ten more client
+     orders". It did not: run clients.makeOrder() over all 24 clients
+     at the reputation you buy it at and a delivered order nets
+     budget + fee - what you pay to source it = $323 (rep 50, trust 3;
+     $290 at rep 40, $368 at rep 55). Ten of those is $3,228, so
+     $16,000 was fifty orders, or — at the new shift pay — three
+     hundred and forty shifts. The price is now $3,300: 10.2 orders,
+     72 Dispatch shifts, 89 café shifts. Rep 50 puts that squarely in
+     Act 4, where it always belonged. Full arithmetic in the report
+     and asserted in tools/test-game.mjs. */
+  motorcycle: Object.freeze({
+    id: 'motorcycle',
+    name: 'Thunderhead 900', n: 'Thunderhead 900', short: 'Motorcycle',
+    ico: '🏍️',
+    speed: 3,
+    effort: 0.25,
+    unlock: Object.freeze({ kind: 'buy', price: 3300, rep: 50, locs: Object.freeze(['trunkdepot']) }),
+    price: 3300,
+    questId: null,
+    desc: 'The bike Dispatch retired because nobody could be trusted with it. Three times the bicycle, across the whole island, before the coffee goes cold.',
+    line: 'It starts on the first press. Somewhere in Rusty Row, a window rattles in sympathy.',
+  }),
+});
+export const RIDE_LIST = Object.freeze(Object.values(RIDES));
+export const RIDE_BY_ID = RIDES;
+/* Fastest first — "your best ride" is the head of this list. */
+export const RIDE_ORDER = Object.freeze(RIDE_LIST.map((r) => r.id).sort((a, b) => RIDES[b].speed - RIDES[a].speed));
+
+/* Back-compat: BIKE was the export before the table existed, and
+   tools/test-game.mjs plus anything written against v6 still reads
+   BIKE.cost / BIKE.locs / BIKE.line. It is now a view of RIDES.bike
+   and there is exactly one source of truth behind it. */
 export const BIKE = Object.freeze({
   id: 'bike',
-  n: 'Second-hand Bicycle',
-  ico: '🚲',
-  cost: 180,
-  locs: Object.freeze(['trunkdepot', 'pawnshop']),
-  desc: 'One gear, two brakes, one of which works. Halves every journey in this city and costs nothing to run.',
-  line: 'It is a bicycle. It is not a good bicycle. It is, however, yours.',
+  n: RIDES.bike.n,
+  ico: RIDES.bike.ico,
+  cost: RIDES.bike.price,
+  locs: RIDES.bike.unlock.locs,
+  desc: RIDES.bike.desc,
+  line: RIDES.bike.line,
+});
+
+/* ============================================================
+   THE MAYOR'S DASH — the race that gates the Stock Exchange.
+
+   Mayor Ken Jones (CLIENTS 'tusk') steps in front of the Exchange
+   door the first time Wally turns up with the paperwork in order and
+   says he wants to see him move. It is an ADDITIONAL gate: Market
+   Fundamentals, the trader badge and the $1,500 access fee all still
+   have to be satisfied (see game.actions.exchangeGate).
+
+   THE ONLY WAY TO WIN IS THE SCOOTER OR THE MOTORCYCLE, and the
+   player is never told that. Two mechanisms enforce it and they agree
+   with each other:
+
+     1  `qualifies` — the rules layer will not award a win to a rider
+        who is on foot or on the bicycle, whatever the clock says.
+     2  the Mayor's PACE is set from the ride under Wally, at
+        `edge` (0.86) of an unqualified rider's best realistic time
+        and `slack` (1.18) of a qualified one's. So he pulls away from
+        a runner, edges a bicycle, and is caught by a scooter — the
+        race LOOKS like what the rule says, rather than the rule
+        contradicting the race.
+
+   `street` is metres per second at a full run on each ride and is the
+   same table as RIDE_TUNE in character/wally.js — if that file
+   retunes, this must follow it or the pacing lies. `efficiency` is
+   how much of a top speed a real racing line through five corners
+   actually keeps.
+
+   THE HINT IS OCCASIONAL AND EARNED. Never on the first loss, never
+   in the objective text, at most one a day, and then only about a
+   third of the time. game.race.finish() attaches it.
+   ============================================================ */
+export const RACE = Object.freeze({
+  id: 'mayor',
+  n: "The Mayor's Dash",
+  mayor: 'tusk',                        // CLIENTS id; reads as Mayor Ken Jones
+  /* five legs, ~790 m, through Main Street, Market Square and Rusty
+     Row and back to the start line outside the Bent Spoon */
+  route: Object.freeze(['cafe', 'bank', 'markethall', 'noodlecart', 'trunkdepot', 'cafe']),
+  hours: Object.freeze([8, 18]),        // he has a city to run
+  mins: 25,                             // in-game minutes an attempt costs
+  energy: 9,
+  qualifies: Object.freeze(['scooter', 'motorcycle']),
+  street: Object.freeze({ foot: 5.9, bike: 8.8, scooter: 13.2, motorcycle: 26.4 }),
+  efficiency: 0.72,
+  slack: 1.18,
+  edge: 0.86,
+  retries: Infinity,                    // as often as he likes
+  hintAfter: 1,                         // losses before a hint may drop
+  hintChance: 0.34,
+  hintCooldownDays: 1,
+  hints: Object.freeze([
+    { from: 'Barnaby', text: 'You might want to get a scooter to go faster!' },
+    { from: 'Dot',     text: 'You might want to get a scooter to go faster! Just a thought. From a barista.' },
+    { from: 'Fenn',    text: 'No offence, but he was on wheels and you were on feet. You might want to get a scooter to go faster!' },
+  ]),
+  lines: Object.freeze({
+    offer: 'Mayor Ken Jones is standing in the doorway with his coat already off. "Before you go in there and start moving other people’s money about, Wally, I want to see you MOVE. Once round the town. My route."',
+    start: '"Bent Spoon, the bank, the Market Hall, the noodle carts, Dispatch, back here. Try to keep up."',
+    won:   '"Well," says the Mayor, hands on knees, "that is the fastest anyone has ever agreed with me." He waves you at the Exchange door.',
+    lost:  'The Mayor is already back at the Bent Spoon, unhurried, ordering. "Again whenever you like. I am not going anywhere. Obviously."',
+    unqualified: 'He was never going to lose that on the Main Street straight.',
+    blocked: 'Mayor Ken Jones is between you and that door, and he has not had his race yet.',
+  }),
+});
+
+/* ============================================================
+   WHERE PEOPLE STAND — clients who wait somewhere that is not home.
+
+   clients.at() placed everyone by their home ZONE, which is why Otto
+   never appeared at the Bent Spoon: his home is 'rustyrow', the cafe
+   is in 'mainstreet', so nothing in the game ever put him in the room
+   the opening message sends you to. A post is an explicit "this
+   person is standing HERE, until X".
+
+     client   who
+     loc      where they wait
+     until    a state flag that ends the vigil (set = gone)
+     line     what the world/NPC agent should have them say
+   ============================================================ */
+export const NPC_POSTS = Object.freeze([
+  Object.freeze({
+    client: 'otto', loc: 'cafe', until: 'metFriend',
+    line: 'Otto is at the corner table with two coffees, one of which has gone cold waiting for you.',
+  }),
+]);
+
+/* ============================================================
+   THE SLATE — the food floor.
+
+   Walking is never refused, so a broke player is slow rather than
+   stuck (see TRAVEL). Eating needs the same floor, because maximum
+   hunger now locks every other action: a player who is starving AND
+   cannot afford the cheapest bowl in the city would otherwise have no
+   move at all. So the noodle cart feeds him on the slate — once a
+   day, only at maximum hunger, and only when he genuinely cannot pay.
+   ============================================================ */
+export const SLATE_MEAL = Object.freeze({
+  fill: 34, mins: 30, cost: 0,
+  line: 'The woman at the cart puts a bowl down, waves your empty hands away and chalks a mark on the board. "Friday."',
+  note: 'A bowl on the slate. Pay it back when you can.',
+});
+
+/* ============================================================
+   THE PRODUCER UPGRADES — what they ACTUALLY do.
+
+   The question was "is it +1 additional per day when mining or
+   farming, or am I wrong? What does it do? It's unclear." The honest
+   answer, before this change, was: NO. A level did two things and
+   neither was +1 a day. It widened the POOL of things a harvest or a
+   dig could turn up (tier <= lvl + 1), and it added $30/day (farm) or
+   $40/day (mine) to overnight income — but ONLY if Tilda or Bruno was
+   on the payroll, which the panel never said. Yield per harvest did
+   not move at all. That is weak and it is invisible, so the fix is
+   both: the level now adds +1 unit to every harvest and every dig
+   from level 2 up, and every effect is stated here in numbers the UI
+   can print. See game.actions.producer('farm'|'mine').
+   ============================================================ */
+export const PRODUCERS = Object.freeze({
+  farm: Object.freeze({
+    id: 'farm', n: "Maple's Farm", loc: 'farm', act: 'Harvest', unit: 'crop token',
+    upgrade: 'Field Expansion',
+    cost: Object.freeze({ base: 2000, per: 2000 }),   // next level = base * (lvl + 1)
+    manager: 'tilda',
+    dailyBase: 40, dailyPerLevel: 30,
+    maxTier: 4,
+    baseYield: 1, barnBonus: 1, yieldPerLevel: 1,
+    effect: '+1 crop token on every harvest, and one more tier of crop becomes possible.',
+    daily: 'Adds $30 a day to overnight income — but only while Tilda the farm manager is on the payroll.',
+  }),
+  mine: Object.freeze({
+    id: 'mine', n: 'Old Bull Bear Mine', loc: 'mine', act: 'Dig', unit: 'mineral token',
+    upgrade: 'Seam Development',
+    cost: Object.freeze({ base: 3600, per: 3600 }),
+    manager: 'bruno',
+    dailyBase: 55, dailyPerLevel: 40,
+    maxTier: 3,
+    baseYield: 1, barnBonus: 0, yieldPerLevel: 1,
+    effect: '+1 mineral token on every dig, and one more tier of seam becomes possible.',
+    daily: 'Adds $40 a day to overnight income — but only while Bruno the mine supervisor is on the payroll.',
+  }),
 });
 
 /* distance in "hops", from the 2D map (the 3D island preserves it) */
@@ -723,18 +1129,31 @@ export function hops(a, b) {
   if (!A || !B) return 3;
   return Math.max(1, Math.round(Math.hypot(A.x - B.x, A.y - B.y) / 115));
 }
-export function fare(mode, a, b) {
+/* fare(mode, from, to, rideId)
+
+   `rideId` only means anything for mode 'bike', which is the one
+   mode you supply the vehicle for: it picks the RIDES row and folds
+   that row's speed and effort into the minutes and the energy.
+   Omit it and you get the plain bicycle, which is what every caller
+   written before v7 expects. */
+export function fare(mode, a, b, rideId) {
   const t = TRAVEL[mode], h = hops(a, b);
-  if (!t) return { cost: 0, mins: 0, energy: 0, hops: 0 };
-  if (!h) return { cost: 0, mins: 0, energy: 0, hops: 0 };
+  if (!t) return { cost: 0, mins: 0, energy: 0, hops: 0, ride: null };
+  const r = mode === 'bike' ? (RIDES[rideId] || RIDES.bike) : null;
+  if (!h) return { cost: 0, mins: 0, energy: 0, hops: 0, ride: r ? r.id : null };
+  const speed = r ? r.speed : 1;
+  const effort = r ? r.effort : 1;
   const cost = t.base + t.per * h + (t.surge || 0) * h * h;
   return {
     cost: Math.round(cost * 100) / 100,
-    mins: Math.max(3, Math.round((t.minBase || 0) + t.min * h)),
-    energy: +((t.enBase || 0) + t.energy * h).toFixed(1),
+    mins: Math.max(3, Math.round(((t.minBase || 0) + t.min * h) / speed)),
+    energy: +(((t.enBase || 0) + t.energy * h) * effort).toFixed(1),
     hops: h,
+    ride: r ? r.id : null,
   };
 }
+/* The same journey on a named ride. rideFare('motorcycle', a, b). */
+export function rideFare(rideId, a, b) { return fare('bike', a, b, rideId); }
 /* straight-line 3D walking distance, for the world module's pathing */
 export function worldDistance(a, b) {
   const A = LOC_BY_ID[a], B = LOC_BY_ID[b];
@@ -742,11 +1161,29 @@ export function worldDistance(a, b) {
   return Math.hypot(A.world.x - B.world.x, A.world.z - B.world.z);
 }
 
-/* ---------------- JOBS ---------------- */
+/* ---------------- JOBS ----------------
+   pay = base + score * mult, where score is the mini-game result 0..1.
+
+   THE TWO DAY-ONE SHIFTS PAY LEAST. The café and Dispatch are the two
+   places open to a nobody on day one, and they used to pay more per
+   hour than the shifts you have to earn your way into — which made
+   the first asset from CRUMB (Crumb & Co. Bakery, $410 at the broker's
+   spread) two shifts' work. They are now cut by ~55 %:
+
+     shift        was @0.5   now @0.5   $/hour
+     cafe            $80        $37      12.3
+     drive           $95        $47      15.7
+     nightdrive     $138        $68      17.0
+
+   so CRUMB is five café shifts or four at Dispatch — see the report.
+   The three shifts you have to be discovered to work (warehouse,
+   night sorting, the stadium) are untouched and are now the better
+   money, which is the shape this ladder should always have had.
+--------------------------------------------- */
 export const JOBS = {
-  drive:      { t: 'Drive a TRUNK shift', d: '3 hours · pays on performance', ico: '🚕', mg: 'drive',     hrs: 3, en: 16, base: 56, mult: 78 },
-  nightdrive: { t: 'Night shift',         d: '4 hours · pays more, costs more', ico: '🌙', mg: 'drive',     hrs: 4, en: 26, base: 78, mult: 120, night: true },
-  cafe:       { t: 'Work a café shift',   d: '3 hours · steady, friendly',    ico: '☕', mg: 'cafe',      hrs: 3, en: 14, base: 48, mult: 64 },
+  drive:      { t: 'Drive a TRUNK shift', d: '3 hours · pays on performance', ico: '🚕', mg: 'drive',     hrs: 3, en: 16, base: 28, mult: 38 },
+  nightdrive: { t: 'Night shift',         d: '4 hours · pays more, costs more', ico: '🌙', mg: 'drive',     hrs: 4, en: 26, base: 40, mult: 56, night: true },
+  cafe:       { t: 'Work a café shift',   d: '3 hours · steady, friendly',    ico: '☕', mg: 'cafe',      hrs: 3, en: 14, base: 22, mult: 30 },
   warehouse:  { t: 'Sort the warehouse',  d: '3 hours · heavy, sometimes lucky', ico: '📦', mg: 'warehouse', hrs: 3, en: 20, base: 52, mult: 70 },
   nightsort:  { t: 'Night sorting',       d: '4 hours · nobody else wants it', ico: '🌃', mg: 'warehouse', hrs: 4, en: 28, base: 72, mult: 104, night: true },
   cleanup:    { t: 'Clean the stadium',   d: '3 hours · and a look around',   ico: '🧹', mg: 'cleanup',   hrs: 3, en: 18, base: 44, mult: 62 },
@@ -861,6 +1298,15 @@ export const QUESTS = [
     check: (S) => !!S.flags.dispatchShift, rep: 2, money: 0 },
   { id: 'q_first_client', act: 1, loc: 'office', t: 'Take your first client order', d: 'A shift at Dispatch put your name about. Someone will come to your desk.', hint: 'Your desk',
     check: (S) => S.orders.length > 0 || S.stats.ordersDone >= 1, rep: 2, money: 0 },
+  /* PICKING THE ORDER UP AT THE DESK IS WHAT SENDS HIM HERE.
+     economy.acceptOrder() sets flags.orderTaken, which (a) closes
+     q_first_client and (b) makes 'broker' a place Wally has heard of
+     (see its `see` rule), so this becomes the live objective with a
+     known location and the yellow pointer has something to aim at.
+     `seen.broker` is set by state.setLoc, so walking in finishes it
+     however you got there. */
+  { id: 'q_broker', act: 1, loc: 'broker', t: 'Go and see the Business Broker', d: 'Order in hand. The broker on Market Square knows who is buying, who is selling, and what everything in this city is actually worth.', hint: 'Market Square',
+    check: (S) => !!S.seen.broker, rep: 3, money: 0 },
   { id: 'q_first_fee', act: 1, loc: 'office', t: 'Complete an order at your desk', d: 'Buy what the client asked for, then deliver it from your apartment desk.', hint: "Wally's Apartment",
     check: (S) => S.stats.ordersDone >= 1, rep: 4, money: 60 },
   { id: 'q_first_course', act: 1, loc: 'school', t: 'Take a class at the School of Assets', d: 'The Learning Quarter is north of Main Street.', hint: 'Business School',
@@ -877,7 +1323,11 @@ export const QUESTS = [
     check: (S) => !!S.farm.owned, rep: 10, money: 0 },
   { id: 'q_fund', act: 2, loc: 'office', t: 'Build your first client fund', d: 'Take Fund Construction, then assemble a basket at the office.', hint: 'Office → Funds',
     check: (S) => S.funds.length >= 1, rep: 10, money: 200 },
-  { id: 'q_exchange', act: 3, loc: 'exchange', t: 'Unlock the Stock Exchange', d: 'Market Fundamentals class, trader badge exam, access fee.', hint: 'Stock Exchange',
+  /* THE RACE IS NOT SPELLED OUT HERE ON PURPOSE. The objective may say
+     the Mayor wants a word — he does, loudly, in the doorway — but it
+     must never say what beats him. The player works that out, or an
+     NPC eventually drops a hint. See RACE.hints. */
+  { id: 'q_exchange', act: 3, loc: 'exchange', t: 'Unlock the Stock Exchange', d: 'Market Fundamentals class, trader badge exam, access fee — and Mayor Ken Jones wants a word before he lets you through that door.', hint: 'Stock Exchange',
     check: (S) => !!S.unlocks.exchange, rep: 12, money: 0 },
   { id: 'q_mine', act: 3, loc: 'mine', t: 'Reopen the Old Bull Bear Mine', d: 'Goldie has the records. The elevator has opinions.', hint: 'Old Bull Bear Mine',
     check: (S) => !!S.mine.owned, rep: 14, money: 0 },
@@ -916,25 +1366,68 @@ for (const q of QUESTS) QUEST_BY_ID[q.id] = q;
    person who asked.
 --------------------------------------------- */
 export const SIDE_QUESTS = [
+  /* OTTO AT THE BENT SPOON — the beat the opening message promises.
+
+     THE BUG THIS FIXES. The message says "come and find me at the Bent
+     Spoon on Main Street", and game.js's cafeBeat() has always been
+     waiting there — but NOTHING EVER SENT THE PLAYER, and nothing ever
+     put Otto in the room. There was one Otto side quest, it did not
+     exist until after you had already found him, and it pointed at
+     'office' (correctly: it is the DELIVERY step, "bring it to your
+     desk"). So the arrow pointed at the desk, clients.at('cafe')
+     placed Otto in Rusty Row where he lives, and a player who never
+     wandered into the cafe never met him at all.
+
+     Two fixes, both here: this quest, which arms itself the moment the
+     phone is read and points at the CAFE, and NPC_POSTS above, which
+     is what actually stands Otto in the Bent Spoon until you turn up.
+     The delivery step below keeps `loc: 'office'`, which is right. */
+  { id: 'q_side_otto_meet', side: true, act: 1, loc: 'cafe', from: 'otto',
+    t: 'Find Otto at the Bent Spoon', d: 'Main Street. He is at the corner table with two coffees and a small favour to ask.',
+    hint: 'The Bent Spoon',
+    arm: { flag: 'readMentor' },
+    check: (S) => !!S.flags.metFriend, rep: 1, money: 0 },
   { id: 'q_side_otto', side: true, act: 1, loc: 'office', from: 'otto',
     t: "Fill Otto's order", d: 'He asked for one thing over coffee. Buy it, bring it to your desk.',
     hint: 'Your desk',
     check: (S) => !!(S.clients.otto && S.clients.otto.done >= 1), rep: 3, money: 40 },
+  /* THE SCOOTER QUEST — the only way that vehicle is ever obtained.
+     `arm` is a discovery-style rule (quests.ruleMet); quests.check()
+     starts the quest by itself the moment it is true, so no other
+     agent has to remember to call startSide. Office stage 1 is the
+     Shared Desk: $1,200 and rep 12, comfortably mid-game, by which
+     point the bicycle has stopped feeling like an upgrade.
+     `ride` is the payout — quests.completeSide() hands it over. */
+  { id: 'q_side_scooter', side: true, act: 3, loc: 'office', from: 'barnaby',
+    t: 'Do Barnaby a favour', d: 'Route 6 for thirty years, and now he wants one thing bought properly. Fill an order for Barnaby and the scooter behind Dispatch is yours.',
+    hint: 'Your desk',
+    arm: { office: 1 },
+    ride: 'scooter',
+    check: (S) => !!(S.clients.barnaby && S.clients.barnaby.done >= 1), rep: 6, money: 0 },
 ];
 export const SIDE_QUEST_BY_ID = {};
 for (const q of SIDE_QUESTS) SIDE_QUEST_BY_ID[q.id] = q;
 
 /* ---------------- THE OPENING MESSAGE ----------------
    On the phone the moment the game starts. Otto has run the Pixel
-   Palace arcade in Rusty Row for years; Wally has just moved back.
-   Cloned into state.msgs by newState() — never pushed by reference,
-   because this table is deep-frozen and `read` has to be writable.
+   Palace arcade in Rusty Row for years; WALLY GREW UP IN THIS CITY
+   and is coming BACK to it, which is the fiction every other line in
+   the opening has to agree with. (Happy's "you're the new trader in
+   town, right?" still holds: he is new as a TRADER, not as a
+   resident.) Cloned into state.msgs by newState() — never pushed by
+   reference, because this table is deep-frozen and `read` has to be
+   writable.
+
+   THE TEXT IS THE USER'S, VERBATIM. Do not tidy it, do not re-punctuate
+   it, do not "improve" the rhythm. tools/test-game.mjs asserts it
+   character for character.
 --------------------------------------------- */
 export const OPENING_MESSAGE = Object.freeze({
   from: 'Otto',
-  text: 'WALLY. You actually came back. Welcome to Bull Bear City, which is louder and broker than you left it and is now, unfortunately, yours as well. '
-      + 'When you have put the mattress down, come and find me at the Bent Spoon on Main Street — the coffee is bad in a way I have grown to respect. '
-      + "I am buying, and I will not be saying that again. There is also a small thing I could use your help with. Small. Bring the sunglasses.",
+  text: 'WALLY! Welcome back to Bull Bear City, which is louder and broker than you left it as a kid. '
+      + 'After you put the mattress down, come and find me at the Bent Spoon on Main Street. '
+      + 'The coffee is bad in a way I have grown to respect. '
+      + 'There is also a small thing I could use your help with. Small. Bring the sunglasses.',
 });
 
 /* ---------------- TOKENIZATION MILESTONES ---------------- */
@@ -944,7 +1437,7 @@ export const MILESTONES = [
   { p: 20,  t: 'The Treasury takes you seriously', from: 'Treasury Clerk',    msg: 'Your file has been upgraded. Faintly.' },
   { p: 30,  t: 'The Exchange knows your name',     from: 'Mr. Ledger',        msg: 'Membership mentioned you. Favourably, even.' },
   { p: 40,  t: 'Iron Hills is humming',            from: 'Goldie',            msg: 'The hills are loud again, Wally.' },
-  { p: 50,  t: 'Half the city',                    from: 'Mayor Tusk',        msg: 'Half! I have ordered a ribbon. Do not ask what it cost.' },
+  { p: 50,  t: 'Half the city',                    from: 'Mayor Ken Jones',   msg: 'Half! I have ordered a ribbon. Do not ask what it cost.' },
   { p: 60,  t: 'The Waterfront lights up',         from: 'Pearl',             msg: 'Boats. Actual boats. That was you.' },
   { p: 70,  t: 'The Wally Swap era',               from: 'Kite',              msg: "It works on everyone's machine now. Terrifying." },
   { p: 80,  t: 'Institutional money arrives',      from: 'Silas Vance',       msg: 'Slowly, then all at once. Come and see me.' },
@@ -954,13 +1447,14 @@ export const MILESTONES = [
 
 /* ---------------- ONE-TIME TIPS ---------------- */
 export const TIPS = {
-  map:      { t: 'Getting around', d: 'Four ways across town, and each one charges you differently. Walking is free and always available — it costs you the morning. The Metro costs pennies and costs energy. An Uber costs a shift’s pay and costs you nothing else.' },
+  map:      { t: 'Getting around', d: 'Four ways across town, and each one charges you differently. Walking is free and always available — it costs you the morning. The Metro costs pennies and costs energy. A Yoober costs a shift’s pay and costs you nothing else.' },
   bike:     { t: 'Buy a bicycle',  d: 'A second-hand bike is $180 at Dispatch or Vic’s. Half the time of walking, a third of the energy, free forever after. It is the best money you will spend this week.' },
+  rides:    { t: 'Something faster', d: 'The bicycle is the first of three. A scooter is half again as quick and cannot be bought at any price — somebody has to give it to you. A motorcycle is three times the bicycle and costs about ten client orders. Only one of them comes with you at a time.' },
   ticker:   { t: 'Tickers',        d: 'Every asset in the city has a symbol — GOLD, WHEAT, B5Y, TEAM. Orders are written in them, and you can search by symbol or by name.' },
   office:   { t: 'Your office',    d: 'This is your desk. Clients turn up here through the day with a job, a budget and a deadline. Take the ones you can actually finish.' },
   order:    { t: 'Filling an order', d: 'You have an order. Travel to wherever that asset is sold, buy it, then come back here and deliver.' },
-  hours:    { t: 'Opening hours',  d: 'Places open and close. Check Phone → Places if you are not sure whether it is worth the fare.' },
-  hunger:   { t: 'Looking after Wally', d: 'Eating and sleeping are not optional. A cheap bowl at the noodle cart resets most of a bad morning.' },
+  hours:    { t: 'Opening hours',  d: 'Places open and close, and closed means closed — you cannot travel to one, walk into one, or trade with one. Check Phone → Places before you spend the fare. Your own flat is open all night.' },
+  hunger:   { t: 'Looking after Wally', d: 'Eating and sleeping are not optional. At maximum hunger Wally will not do anything at all except go and eat — a cheap bowl at the noodle cart resets most of a bad morning, and if you are broke as well as starving they will put it on the slate.' },
   tokenize: { t: 'Tokenizing',     d: 'Tokenizing splits something you own into pieces anyone can hold. It is how the city gets connected — and how you reach 100%.' },
 };
 
@@ -994,10 +1488,13 @@ export const DATA = deepFreeze({
   courses: COURSES, courseById: COURSE_BY_ID,
   offices: OFFICE_STAGES,
   homes: HOMES, homeById: HOME_BY_ID,
+  repTitles: REP_TITLES, repTitle, repNextTitle, repProgress, repTitleIndex,
+  orderFail: ORDER_FAIL, orderFailRep,
+  race: RACE, npcPosts: NPC_POSTS, slate: SLATE_MEAL, producers: PRODUCERS,
   zones: ZONES,
   locations: LOCATIONS, locationById: LOC_BY_ID,
   map: MAP, world: WORLD,
-  travel: TRAVEL, bike: BIKE,
+  travel: TRAVEL, bike: BIKE, rides: RIDES, rideList: RIDE_LIST, rideOrder: RIDE_ORDER,
   jobs: JOBS,
   employees: EMPLOYEE_POOL, employeeById: EMPLOYEE_BY_ID,
   ipos: IPOS, ipoSteps: IPO_STEPS,
@@ -1010,7 +1507,7 @@ export const DATA = deepFreeze({
   milestones: MILESTONES,
   tips: TIPS,
   morningNotes: MORNING_NOTES,
-  hops, fare, worldDistance,
+  hops, fare, rideFare, worldDistance,
 });
 
 export default DATA;

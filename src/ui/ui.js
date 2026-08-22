@@ -143,19 +143,66 @@ export async function init(ctx) {
       const same = stack.find((s) => s.name === name);
       if (same) return same.el;
     }
+    /* the same ELEMENT must never sit in the stack twice, whatever it
+       is called: two entries pointing at one node leaves one of them
+       permanently undismissable */
+    const dup = stack.findIndex((s) => s.el === el);
+    if (dup >= 0) stack.splice(dup, 1);
     stack.push({ name, el });
     panels.append(el);
     syncModal();
     return el;
   }
-  function popSheet() {
-    const top = stack.pop();
-    if (!top) return false;
-    top.el.classList.add('out');
-    const el = top.el;
+
+  /* The one exit, so a panel dismissed from the top, by name or by
+     element all leave the same way. */
+  function retire(el) {
+    if (!el) return false;
+    el.classList.add('out');
     setTimeout(() => { el.classList.remove('out'); el.remove(); }, 300);
     syncModal();
     return true;
+  }
+
+  /* ------------------------------------------------------------
+     WHICH BOX THE ✕ BELONGS TO.
+
+     popSheet() dismisses the TOP of the stack. That is right for Esc
+     and for a click on the scrim, and wrong for every close button
+     printed on a panel: open a place card, travel, open a second card
+     over it, then reach back and press the OLDER card's ✕ — and the
+     newer one vanished instead, because the button popped the stack
+     instead of closing the thing it was drawn on.
+
+     Everything bound to a particular panel goes through closeSheet().
+     It takes the panel, or any node inside it, finds THAT entry
+     wherever it sits in the stack, and removes it and nothing else.
+     ------------------------------------------------------------ */
+  function sheetRoot(node) {
+    if (!node) return null;
+    if (typeof node.closest === 'function') {
+      const own = node.closest('.w-sheet, .w-phone, .w-pause');
+      if (own) return own;
+    }
+    return node;
+  }
+  function closeSheet(node) {
+    const el = sheetRoot(node);
+    if (!el) return popSheet();
+    const i = stack.findIndex((s) => s.el === el);
+    if (i < 0) {
+      /* not in the stack (or already gone): take the node out rather
+         than punishing whatever happens to be on top for it */
+      if (el.isConnected && el.parentNode === panels) return retire(el);
+      return false;
+    }
+    stack.splice(i, 1);
+    return retire(el);
+  }
+  function popSheet() {
+    const top = stack.pop();
+    if (!top) return false;
+    return retire(top.el);
   }
   function closeAll() {
     while (stack.length) stack.pop().el.remove();
@@ -484,6 +531,126 @@ export async function init(ctx) {
      until he gets there. Null hands it back to the objective. */
   const setDestination = (locId) => hud.setDestination(locId);
 
+  /* ============================================================
+     THE MAYOR'S DASH — the half that happens on screen.
+
+     game.race owns the rules, the route, the pace and the verdict.
+     This owns the only two things the rules layer cannot see: WHERE
+     WALLY ACTUALLY IS, and HOW LONG HE HAS BEEN RUNNING. So the loop
+     below is the whole of the race as the player experiences it —
+     touch each corner in order, and the clock we hand to
+     race.finish() is the clock the result is judged on.
+
+     THE MAYOR IS NOT SIMULATED, HE IS PACED. race.pace() gives his
+     target time for this attempt and the metres-per-second that goes
+     with it, so a marker travelling at `mps` along the same route is
+     exactly the opponent the rules layer will compare against. A
+     marker that agreed with the rule two thirds of the time would be
+     worse than no marker at all.
+
+     LOSING IS SHOWN AS A GAP, NOT A WALL. Every leg is split against
+     his even pace and handed to the result card, so a loss reads as
+     "you lost four seconds on the run to Dispatch" — a number to beat
+     next time. Nothing here mentions the scooter.
+     ============================================================ */
+  const RACE_CORNER = 9;        // metres: how near counts as touched
+  let race = null;
+  let pendingSplits = null;     // handed to the result card by raceTick
+
+  function raceBegin(p) {
+    const g = ctx.game;
+    if (!g || !ctx.wally) return;
+    const route = p.route || g.race.route();
+    if (!route || route.length < 2) return;
+    race = {
+      route,
+      metres: p.metres || g.race.metres(),
+      mayorSeconds: p.mayorSeconds || 1,
+      mps: p.mps || 1,
+      elapsed: 0, cp: 0, legT: 0, splits: [],
+    };
+    closeAll();
+    dlg.close(null);
+    banner("THE MAYOR'S DASH", route[1].n + ' first · ' + Math.round(race.mayorSeconds) + 's to beat');
+    sfx('quest.start');
+    racePaint(0);
+  }
+
+  function raceStop() {
+    race = null;
+    hud.setRace(null);
+    hud.removePrompt('race');
+  }
+
+  /* progress along the route, 0..1, from his real position */
+  function raceProgress() {
+    const r = race;
+    const done = r.route[r.cp].total;               // metres banked at the last corner
+    const next = r.route[r.cp + 1];
+    const p = ctx.wally.position;
+    const d = Math.hypot(p.x - next.world.x, p.z - next.world.z);
+    const leg = Math.max(1, next.metres);
+    const into = Math.max(0, Math.min(leg, leg - d));
+    return { frac: Math.min(1, (done + into) / Math.max(1, r.metres)), dist: d, next };
+  }
+
+  function racePaint(dt) {
+    const r = race;
+    const { frac, dist, next } = raceProgress();
+    const his = Math.min(1, (r.mps * r.elapsed) / Math.max(1, r.metres));
+    /* seconds: how long HE would have taken to get where you are */
+    const mine = (frac * r.metres) / r.mps;
+    hud.setRace({
+      elapsed: r.elapsed, cp: r.cp, of: r.route.length - 1,
+      next: next.n, dist, target: r.mayorSeconds,
+      mine: frac, his, delta: r.elapsed - mine,
+    });
+    hud.addPrompt({
+      id: 'race', pos: { x: next.world.x, y: next.world.y + 4.2, z: next.world.z },
+      key: next.finish ? '🏁' : String(r.cp + 1),
+      text: next.n, sub: Math.round(dist) + ' m',
+    });
+  }
+
+  function raceTick(dt) {
+    if (!race || !ctx.wally) return;
+    const r = race;
+    r.elapsed += dt;
+    const { dist, next } = raceProgress();
+    if (dist < RACE_CORNER) {
+      const res = ctx.game.race.checkpoint(r.cp + 1);
+      if (res && res.ok) {
+        const legHis = next.metres / r.mps;
+        const legMine = r.elapsed - r.legT;
+        r.splits.push({
+          i: r.cp + 1, n: next.n, t: r.elapsed,
+          mine: legMine, his: legHis, lost: legMine - legHis,
+        });
+        r.legT = r.elapsed;
+        r.cp++;
+        if (r.cp >= r.route.length - 1) {
+          const secs = r.elapsed;
+          /* SET BEFORE FINISHING. race.finish() emits 'race' straight
+             back at the listener below, so the splits have to be
+             parked before the call, not after it. */
+          pendingSplits = r.splits.slice();
+          raceStop();
+          ctx.game.race.finish(secs);
+          return;
+        }
+        sfx('bell.small');
+      }
+    }
+    racePaint(dt);
+  }
+  function raceAbandon() {
+    if (!race) return false;
+    raceStop();
+    try { ctx.game.race.abandon(); } catch (e) {}
+    toast('You stopped running. He did not.', 'bad');
+    return true;
+  }
+
   /* The one "confirm" verb — E on a keyboard, the round button on a
      phone. Advance the conversation if someone is talking, otherwise
      use whatever door Wally is standing at. */
@@ -550,12 +717,13 @@ export async function init(ctx) {
     hide(name) {
       if (!name) { popSheet(); return api; }
       if (name === 'dialogue') { dlg.close(null); return api; }
-      const i = stack.findIndex((s) => s.name === name);
+      /* the LAST panel with that name, so two markets open at once
+         close newest-first by name and by their own ✕ individually */
+      let i = -1;
+      for (let k = stack.length - 1; k >= 0; k--) if (stack[k].name === name) { i = k; break; }
       if (i < 0) return api;
       const [t] = stack.splice(i, 1);
-      t.el.classList.add('out');
-      setTimeout(() => { t.el.classList.remove('out'); t.el.remove(); }, 300);
-      syncModal();
+      retire(t.el);
       return api;
     },
     toast, banner,
@@ -592,9 +760,24 @@ export async function init(ctx) {
     talkTo: (c) => menus.talkTo(c),
     addPrompt: hud.addPrompt, removePrompt: hud.removePrompt,
     pushSheet, popSheet, closeAll, refresh, rebuildTop,
+    /** Close THIS panel — pass the panel or any node inside it. Every
+        close button on a panel must use this, never popSheet(). */
+    closeSheet,
+    /** The Mayor's Dash: the start card, and quitting mid-race. */
+    openRace: () => pushSheet(menus.raceCard(), 'race'),
+    raceAbandon,
+    get racing() { return !!race; },
+    /** A hunger or hours refusal, with the route out printed on it.
+        Takes a gate() result: {kind:'hunger'|'hours', why, food|loc}. */
+    showBlocked: (r) => menus.blocked(r),
     renderSettings: (el) => menus.renderSettings(el),
     /** The fare board, so the phone and the map quote fares identically. */
     renderTravelModes: (el, locId, onDone) => menus.travelModes(el, locId, onDone),
+    /** One ride, as a row. The garage, a shop counter and the fare
+        board all render the same object from the same data table. */
+    renderRide: (r, opts) => menus.rideRow(r, opts),
+    /** Every ride, fastest first — the phone's garage. */
+    renderRides: (el, opts) => { for (const row of menus.rideList(opts)) el.append(row); },
     /** The map at full size. */
     openMap: (locId) => pushSheet(menus.bigMap(locId), 'map'),
 
@@ -625,6 +808,9 @@ export async function init(ctx) {
       /* Before the visibility gate: a cinematic that hides the HUD must
          not strand a half-landed arrival behind a black screen. */
       tickArrival(dt);
+      /* the race runs whether or not the HUD is showing: a cinematic
+         must not silently stop the clock the result is judged on */
+      raceTick(dt);
       if (!visible) return;
       hud.update(dt);
       dlg.update(dt);
@@ -721,7 +907,46 @@ export async function init(ctx) {
      travel ends here: menus.js's fare board, the Places app (via goto),
      the HUD's objective jump, game.enter() from a door in the world, and
      a bare ctx.game.travel() from anywhere at all. */
-  on('travel', (t) => { if (t && t.to) arrive(t.to); });
+  on('travel', (t) => {
+    /* you cannot take the train round a footrace */
+    if (race) raceAbandon();
+    if (t && t.to) arrive(t.to);
+  });
+
+  /* ---- THE MAYOR'S DASH ---- */
+  on('race', (r) => {
+    if (!r) return;
+    switch (r.kind) {
+      case 'offer': {
+        const m = ctx.game.race.mayor();
+        const L = ctx.game.data.race.lines;
+        api.dialogue({
+          speaker: m.n, role: m.role, portrait: m.id,
+          text: [L.offer, L.start],
+          choices: [
+            { label: 'Say when', value: 'go', kind: 'prim', icon: 'play',
+              onPick: () => api.openRace() },
+            { label: 'Let me look at the route', value: 'route',
+              onPick: () => api.openRace() },
+            { label: 'Not right now', value: null, kind: 'ghost' },
+          ],
+        });
+        break;
+      }
+      case 'start': raceBegin(r); break;
+      case 'finish': {
+        const splits = pendingSplits;
+        pendingSplits = null;
+        raceStop();
+        sfx(r.won ? 'fanfare' : 'ui.error');
+        pushSheet(menus.raceResult({ ...r, splits }), 'race');
+        break;
+      }
+      case 'abandon': raceStop(); break;
+      default: break;
+    }
+    hud.refresh(true);
+  });
   on('endgame', () => api.dialogue({
     speaker: 'The City', role: 'Bull Bear City',
     text: ['Every asset. Every field, every seam, every seat in that stadium — connected, and held by the people who live beside them.',
@@ -871,6 +1096,57 @@ export async function init(ctx) {
     d.uiBanner = (t, s) => { banner(t || 'TOKENIZED', s || '3% of the city is connected'); return true; };
     d.uiPrompt = (t) => { demoPrompt(t); return true; };
     d.uiHide = () => { closeAll(); dlg.close(null); return true; };
+
+    /* --- the Mayor's Dash, and the two refusals, for screenshots --- */
+    /** 'card' the start line · 'live' the running readout ·
+        'won'/'lost' the result card. Poses the UI only — the rules
+        layer's state is untouched except by 'card', which offers. */
+    d.uiRace = (what = 'card') => {
+      closeAll();
+      const g = ctx.game;
+      if (what === 'card') { g.race.offer('debug'); dlg.close(null); api.openRace(); return 'race card'; }
+      const v = g.race.view();
+      if (what === 'live') {
+        raceStop();
+        race = { route: v.route, metres: v.metres, mayorSeconds: v.pace.mayorSeconds,
+          mps: v.pace.mps, elapsed: 31.4, cp: 2, legT: 0, splits: [] };
+        racePaint(0);
+        return 'race live';
+      }
+      const won = what === 'won';
+      const t = won ? v.pace.mayorSeconds - 7 : v.pace.mayorSeconds + 9;
+      const splits = v.route.slice(1).map((r, i) => ({
+        i: i + 1, n: r.n, mine: r.metres / (v.pace.mps * (won ? 1.14 : 0.86)),
+        his: r.metres / v.pace.mps,
+        lost: r.metres / (v.pace.mps * (won ? 1.14 : 0.86)) - r.metres / v.pace.mps,
+      }));
+      pushSheet(menus.raceResult({
+        won, seconds: t, mayorSeconds: v.pace.mayorSeconds, splits,
+        line: won ? g.data.race.lines.won : g.data.race.lines.lost,
+        hint: won ? null : g.data.race.hints[0],
+      }), 'race');
+      return 'race ' + what;
+    };
+    /** 'hunger' or 'hours' — the refusal card with its way out. */
+    d.uiBlocked = (kind = 'hunger') => {
+      closeAll();
+      const g = ctx.game;
+      if (kind === 'hunger') {
+        const n = g.needs();
+        menus.blocked({ ...n, kind: 'hunger', why: n.why
+          || 'Wally is too hungry for anything else. There is food right here.' });
+      } else {
+        const loc = g.state.loc;
+        menus.blocked({ kind: 'hours', loc, why: g.closedLine(loc) });
+      }
+      return kind;
+    };
+    /** The farm or the mine, so the upgrade card can be shot. */
+    d.uiProducer = (which = 'farm') => {
+      closeAll();
+      pushSheet(which === 'mine' ? menus.mine() : menus.farm());
+      return which;
+    };
   }
 
   return api;

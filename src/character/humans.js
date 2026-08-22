@@ -50,7 +50,7 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { CLAY } from '../core/palette.js';
-import { clamp, lerp } from '../core/contracts.js';
+import { clamp, lerp, smoothstep } from '../core/contracts.js';
 
 /* ==================================================================
    0. The human palette.
@@ -1686,6 +1686,106 @@ function hairField(style) {
       prims.push(esph([-F.rx * 0.44, cy + F.ry * 0.68, F.rz * 0.44], [0.062, 0.032, 0.062]));
       hairline(S.hairline + 0.008, 0.80); nape(S.eyeY - 0.030);
       break;
+    /* SHORT, PARTED, AND SWEPT OVER — the cut in ref/happy-ref.webp, and
+       not something `side` or `quiff` could be dialled into. `quiff` is
+       symmetric and stands UP; `side` is a 62 mm bump on an otherwise
+       even cap. What a real side parting looks like is a mass that is
+       thick on one side of a line and thin on the other, carried
+       FORWARD over the temple as it crosses the crown — an asymmetric
+       silhouette, which is the only version of this that survives being
+       looked at from the side, and the side is where a walk-up NPC is
+       first seen.
+
+       THE PARTING IS A CARVE, NOT A COLOUR CHANGE. A 32 mm channel is
+       two cells at CELL_HAIR, which is exactly enough for surface nets
+       to put a soft valley in — narrower and the mesher bridges it and
+       the parting silently disappears. It runs from the front hairline
+       back over the crown on the +x side, which is his left. */
+    case 'sidepart': {
+      cap(0.017);
+      /* THE FRINGE IS ONE TAPERED ROLL ACROSS THE FOREHEAD, and that
+         one primitive is the whole style. It runs from the heavy temple
+         to the light one, 40 mm thick where the parting is and 20 mm
+         where it lands: a mass of hair combed from one side of a line
+         to the other, which is what a side parting IS. Flattened in z
+         (kz 0.55) so it lies ON the forehead instead of standing off it
+         like a quiff.
+
+         WHY NOT A PARTING GROOVE. Two versions of this had a carved
+         channel along the parting. The hair is a SOLID dome standing
+         17 mm proud of an opaque skull (see the block comment above),
+         so a carve wide enough for surface nets to resolve at the
+         13.8 mm cell — 32 mm — cuts 16 mm and reaches the skull: it
+         does not make a groove, it makes a HOLE, and the render showed
+         a teardrop of scalp on the crown. A parting does not need to be
+         cut anyway. It reads from the asymmetry: thick on one side of
+         the line, thin on the other, and the terminator crossing the
+         roll draws the line for free. */
+      prims.push(tube(
+        [F.rx * 0.66, cy + F.ry * 0.50, F.rz * 0.50],
+        [-F.rx * 0.58, cy + F.ry * 0.64, F.rz * 0.42],
+        0.040, 0.020, 1, 0.55));
+      /* the crown, a little higher on the heavy side */
+      prims.push(esph([F.rx * 0.24, cy + F.ry * 0.88, F.rz * 0.06], [0.070, 0.028, 0.072]));
+      /* A NORMAL FOREHEAD. `hairline + 0.016` was worth trying and it is
+         wrong: it opened the face to nearly half the height of the head
+         and the asymmetry then read as a comb-over rather than a
+         parting. `+0.004` with a wide box (0.90 clears the temples,
+         where the cap was otherwise left standing) is a short cut on an
+         ordinary hairline, which is what the photograph shows. The nape
+         is lifted, because the cache is meshed on the ROUND cranium and
+         buildHead stretches it 7 % taller onto an oval face — so a
+         station authored at 'short's -0.034 lands over the ear. */
+      hairline(S.hairline + 0.004, 0.90);
+      nape(S.eyeY + 0.010);
+      break;
+    }
+    /* A FULL HEAD OF WHITE HAIR, SWEPT BACK — Mayor Ken Jones, from the
+       reference description, and the first thing you recognise about
+       him at any distance. It is not `receding` (a 22 mm skullcap with
+       the front carved off — a balding man) and it is not `quiff` (a
+       symmetric mass standing UP at the front). What the description
+       says is THICK, swept BACK, slightly tousled, receding a LITTLE at
+       the temples, and those are four separate primitives:
+
+         cap 0.030   half again `short`'s thickness. On a silhouette
+                     this is the difference between hair and scalp
+                     paint, and his silhouette is what has to read at
+                     forty metres in a race.
+         the sweep   one tapered roll climbing from the front hairline
+                     over the crown and thickening as it goes back, so
+                     the mass sits BEHIND the high point rather than
+                     over the brow. That direction is the whole style.
+         tousle      two off-centre lumps of different size, plus a
+                     break over the nape. A swept cut with a smooth
+                     crown is a helmet; the asymmetry is what makes it
+                     hair that somebody ran a hand through.
+         hairline    high AND wide (0.94). The wide box is what takes
+                     the temples back — a narrow one opens the middle of
+                     the forehead and leaves the corners covered, which
+                     is the opposite of receding. */
+    case 'swept':
+      cap(0.030);
+      prims.push(tube(
+        [0, cy + F.ry * 0.68, F.rz * 0.52],
+        [0, cy + F.ry * 1.00, -F.rz * 0.44],
+        0.024, 0.058, 1, 1.10));
+      prims.push(esph([F.rx * 0.42, cy + F.ry * 0.92, -F.rz * 0.14], [0.052, 0.034, 0.058]));
+      prims.push(esph([-F.rx * 0.48, cy + F.ry * 0.82, F.rz * 0.04], [0.042, 0.028, 0.050]));
+      /* the break over the nape sits ABOVE the ear, not beside it. At
+         cy - ry*0.10 it hung to the jaw and the whole style rendered as
+         a bonnet with the ears inside it — measured on
+         shots/x-mayor-solo.png, first pass. */
+      prims.push(esph([0, cy + F.ry * 0.20, -F.rz * 0.84], [0.070, 0.050, 0.042]));
+      /* AND THE EARS HAVE TO BE OUT. `nape` is the flat cut under them;
+         at eyeY - 0.026 (where `short` puts it) the 30 mm cap reaches
+         the jaw hinge and fuses with the beard, so the face came out as
+         one continuous white ring. Above the eye line the ear is clear,
+         the beard is a separate mass, and the silhouette gets the notch
+         at the temple that makes a receding hairline legible. */
+      hairline(S.hairline + 0.030, 1.00);
+      nape(S.eyeY + 0.030);
+      break;
     case 'quiff':
       cap(0.021);
       prims.push(esph([0, cy + F.ry * 0.92, F.rz * 0.40], [0.070, 0.050, 0.058]));
@@ -2115,6 +2215,106 @@ function faceGeo(F, mood, age) {
     occ.push(esph([S.eyeX * s, S.eyeY - 0.0182, ez - 0.0032], [0.0212, 0.0064, 0.0152]));
   }
   return mergeTagged(parts, occField);
+}
+
+/* ==================================================================
+   THE TEE PRINT — Wally's own mark, in low relief on a chest.
+
+   ref/happy-ref.webp puts a dark elephant on a white crew-neck tee with
+   lettering above it and below it, and the elephant is Wally: the mark
+   in ref/wally-logo.png, front on, ears out, glasses, trunk down between
+   two tusks. So it is reused rather than reinvented — the proportions
+   below are read straight off that file, normalised to the print's own
+   width and height.
+
+   WHY RELIEF AND NOT A TEXTURE. Everything in this game is procedural
+   and there is not one image file loaded at runtime, so a print is
+   either a canvas texture and a second material with an alpha test, or
+   it is geometry. Geometry wins three times over: it takes the SHARED
+   clay material (colour rides in the vertex attribute, which is how
+   every other part of a person is coloured), it therefore dissolves
+   with him when npc.js fades him out instead of hanging in the air as
+   an opaque logo, and 2.4 mm of proud surface gives the mark its own
+   soft AO edge — which is the difference between a print ON a shirt and
+   a sticker floating over one.
+
+   IT IS 96 mm WIDE, and at conversational distance (1.95 m, the range
+   the walk-up line is delivered from) that is 68 px in a 1400-wide
+   frame: comfortably readable. At six metres it is 22 px, which is
+   still an elephant. Below that it is a dark patch on a white tee,
+   which is what a graphic tee looks like at six metres.
+
+   ~470 triangles, one person in the game, and it is skipped entirely
+   unless a spec asks for it.
+   ================================================================== */
+const TEE_INK = 0x24312f;      // the mark's near-black, §7: never 0x000000
+function teePrintGeo(W = 0.096) {
+  const H = W * 1.34;
+  const parts = [];
+  /* flat: 2.4 mm of relief, and the z half-axis is what makes it a
+     print rather than a row of beads glued to a chest */
+  const T = 0.0024;
+  const blobAt = (x, y, rx, ry, seg = 8) => {
+    const g = new THREE.SphereGeometry(1, seg, Math.max(5, seg - 3));
+    g.scale(rx * W, ry * H, T);
+    g.translate(x * W, y * H, 0);
+    g.userData = { part: PART.HAIRDK };
+    parts.push(g);
+  };
+  /* THE MARK IS THREE MASSES AND A WAIST, and that is the whole design
+     brief for something that has to survive being thirty pixels tall: a
+     WIDE top (two ear fans and the cranium, one continuous shape, twice
+     as wide as it is tall), a NARROW middle (the trunk, with white
+     showing either side of it — those two notches are the elephant),
+     and a WIDE bottom (the body on two stubby legs).
+
+     The first pass had the head, the trunk and the body all touching
+     down the centre line with 2 mm between them: no notches, so no
+     waist, so no elephant — it rendered as one dark totem. The gap is
+     now 9 mm of white either side of a 10 mm trunk, which is two mesh
+     cells of the shirt showing through and is exactly what the eye
+     needs to separate the head from the body. */
+  blobAt(-0.34, 0.28, 0.24, 0.26, 9);
+  blobAt(0.34, 0.28, 0.24, 0.26, 9);
+  blobAt(0, 0.26, 0.25, 0.24, 10);
+  /* the brow bar of the glasses across the head — §1.4's identity */
+  blobAt(0, 0.20, 0.235, 0.042, 7);
+  /* the trunk, hanging between the two masses */
+  blobAt(0, 0.00, 0.050, 0.17, 7);
+  /* the body, and two front legs under it */
+  blobAt(0, -0.30, 0.260, 0.24, 10);
+  blobAt(-0.15, -0.52, 0.075, 0.09, 6);
+  blobAt(0.15, -0.52, 0.075, 0.09, 6);
+  /* AND THE LETTERING, AS TWO BARS. The reference has a word above the
+     elephant and a phrase below it. At this size neither could be read
+     at any distance the player is ever at, and a row of unreadable
+     glyphs is noise — but the BLOCK is legible as "there is type here",
+     which is what makes it a printed tee instead of an animal stencil.
+     Clear of the mark at both ends so they read as separate lines. */
+  blobAt(0, 0.62, 0.30, 0.028, 7);
+  blobAt(0, -0.70, 0.36, 0.024, 7);
+
+  let nv = 0, ni = 0;
+  for (const g of parts) { nv += g.attributes.position.count; ni += g.index.count; }
+  const pos = new Float32Array(nv * 3);
+  const nor = new Float32Array(nv * 3);
+  const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
+  let vo = 0, io = 0;
+  for (const g of parts) {
+    const c = g.attributes.position.count;
+    pos.set(g.attributes.position.array.subarray(0, c * 3), vo * 3);
+    nor.set(g.attributes.normal.array.subarray(0, c * 3), vo * 3);
+    const gi = g.index.array;
+    for (let i = 0; i < gi.length; i++) idx[io + i] = gi[i] + vo;
+    io += gi.length; vo += c;
+    g.dispose();
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setIndex(new THREE.BufferAttribute(idx, 1));
+  out.userData.triangles = ni / 3;
+  return out;
 }
 
 /* ------------------------------------------------------------------
@@ -2626,18 +2826,38 @@ export function createHumans(ctx) {
      Colour resolution — spec + part id -> vColor
      ------------------------------------------------------------ */
   function palette(spec, rng) {
-    const sk = HUMAN.skin[spec.skin] || HUMAN.skin.warm;
+    /* `skinTone` IS AN OVERRIDE, NOT A NINTH TABLE ROW. Mayor Ken Jones
+       is a ruddy, pink-toned complexion and all eight stock tones run
+       yellow-warm, so he needs one the table does not have. It cannot be
+       ADDED to the table: randomSpec picks a skin with
+       `Object.keys(HUMAN.skin)[rng() * n]`, so a ninth row silently
+       re-rolls the complexion of every anonymous person in the city and
+       every screenshot ever taken of one. A per-spec {b,s,d,l} costs
+       nobody else anything. */
+    const sk = spec.skinTone || HUMAN.skin[spec.skin] || HUMAN.skin.warm;
     const hc = HUMAN.hair[spec.hairCol] ?? HUMAN.hair.brown;
-    const shirt = srgb(hexOf(spec.hue || 0x5e6880));
+    /* THE OVERRIDES EXIST FOR ONE PERSON AT A TIME. Everything here
+       still resolves from `hue` plus the seeded rng for the four hundred
+       anonymous city-dwellers, which is what makes a crowd a crowd. But
+       a NAMED character who has to look like a specific human being —
+       Happy, from ref/happy-ref.webp: charcoal blazer, white tee, cream
+       trousers — cannot be a hue and a dice roll. So a spec may name any
+       garment outright, and if it names none, nothing whatsoever changes
+       for anybody. */
+    const shirt = srgb(hexOf(spec.shirtCol ?? spec.hue ?? 0x5e6880));
     const neutral = HUMAN.neutral[Math.floor(rng() * HUMAN.neutral.length)];
     /* 0.78 toward one of seven near-identical slates gave a crowd whose
        legs were all the same mud. Pulling almost all the way to the
        neutral and then lightening a third of them puts denim, khaki and
        charcoal in the same street. */
-    const trouser = rng() < 0.26
-      ? shade(neutral, 0.20 + rng() * 0.20)
-      : mixCol(shirt, neutral, 0.90);
-    const shoeC = noBlack(srgb(HUMAN.shoe[Math.floor(rng() * HUMAN.shoe.length)]));
+    const trouser = spec.trouserCol != null
+      ? srgb(hexOf(spec.trouserCol))
+      : (rng() < 0.26
+        ? shade(neutral, 0.20 + rng() * 0.20)
+        : mixCol(shirt, neutral, 0.90));
+    const shoeC = spec.shoeCol != null
+      ? noBlack(srgb(hexOf(spec.shoeCol)))
+      : noBlack(srgb(HUMAN.shoe[Math.floor(rng() * HUMAN.shoe.length)]));
     const hat = HUMAN.hat[spec.hat] || HUMAN.hat.cap;
     return {
       skin: srgb(sk.b),
@@ -2653,7 +2873,17 @@ export function createHumans(ctx) {
       beard: noBlack(mixCol(hc, sk.d, 0.20), 0.038),
       brow: noBlack(mixCol(shade(hc, -0.20), sk.s, 0.24), 0.034),
       shirt,
-      shirtDk: shade(hexOf(spec.hue || 0x5e6880), -0.28),
+      /* THE COLLAR AND THE BELT ARE THE SHIRT'S OWN DARK, and this line
+         used to read `spec.hue`. For the four hundred people whose
+         shirt IS their hue that is the same number, which is why it
+         never showed; for a named character who names a garment
+         outright it is a different one, and Mayor Ken Jones came out of
+         the first render in a navy shirt with a BROWN collar — his
+         brand hue is #8A6C3E, and his card colour has no business being
+         his collar. (Happy is unaffected either way: he wears a jacket,
+         and every branch that reads shirtDk is a branch the jacket
+         takes instead.) */
+      shirtDk: shade(hexOf(spec.shirtCol ?? spec.hue ?? 0x5e6880), -0.28),
       trouser,
       shoe: shoeC,
       hatA: srgb(hat.a),
@@ -2693,6 +2923,57 @@ export function createHumans(ctx) {
       collar: 1.238,
       bootTop: 0.11 + rng() * 0.11,
       cuff: rng() < 0.35,
+
+      /* ---- THE JACKET ----
+         A garment that COVERS another garment, which is a thing no
+         city-dweller in this crowd has ever worn: everyone else is one
+         shirt colour above a hem and one trouser colour below it, and
+         all four hundred of them still are. `spec.jacket` opens a
+         second layer.
+
+         IT IS PAINT, NOT GEOMETRY, AND THAT IS THE RIGHT ANSWER HERE.
+         An open blazer over a tee is two surfaces 6 mm apart. The body
+         is meshed once, cached, and shared by every person in the game
+         at a 21.5 mm cell — a 6 mm shell cannot be resolved on it at
+         all (the beard block above works through the same limit), and a
+         SECOND mesh for one character costs a draw call, a skin bind
+         and a whole second cache tier for a jacket seen at two metres
+         for eleven seconds. What the eye actually reads at that
+         distance is the LAPEL LINE: a dark field, a bright V down the
+         middle, and a rolled edge between them catching light. All
+         three are colour and occlusion, both of which this pass already
+         resolves per vertex, per person, with the height AND now the
+         width of every vertex in hand.
+
+         `openTop` / `openLow` are the half-width of the visible tee at
+         the collar and at the hem — the V of an unbuttoned jacket. The
+         lapel is a band of the jacket's LIT tone just outside that line
+         (a lapel is a fold, so it faces the sky differently from the
+         chest beside it) and jacketAO dips the boundary, which is what
+         stops the whole thing reading as a decal (§1.5). */
+      jacket: spec.jacket != null ? srgb(hexOf(spec.jacket)) : null,
+      jacketLit: spec.jacket != null ? shade(hexOf(spec.jacket), 0.16) : null,
+      jacketDk: spec.jacket != null ? shade(hexOf(spec.jacket), -0.22) : null,
+      openTop: spec.jacketOpen?.[0] ?? 0.042,
+      openLow: spec.jacketOpen?.[1] ?? 0.078,
+      lapel: 0.030,
+
+      /* ---- THE PLACKET ----
+         What makes a shirt a BUTTON-UP rather than a jersey is one
+         vertical band down the centre front: doubled cloth, so it stands
+         a millimetre proud, catches the key a shade brighter than the
+         chest either side of it, and sits in its own hairline shadow.
+         Nobody in the crowd has one — `spec.placket` opens it — and it
+         is paint for exactly the reason the jacket is (see above): a
+         1.5 mm fold cannot be resolved on a 21.5 mm shared cell, and
+         what the eye reads at four metres is the stripe and its two
+         creases, both of which this pass already resolves per vertex.
+         It is the reference photograph's navy button-up in the only
+         terms this mesh has. */
+      placket: spec.placket
+        ? shade(hexOf(spec.shirtCol ?? spec.hue ?? 0x5e6880), 0.13)
+        : null,
+      placketW: typeof spec.placket === 'number' ? spec.placket : 0.021,
     };
   }
 
@@ -2707,6 +2988,8 @@ export function createHumans(ctx) {
      hand. 14 mm wide, 22 % deep, smooth: the same soft-and-wide law
      §1.2 states for clay, not a hard contact line. */
   const SEAM_W = 0.014;
+  /* scratch for the jacket's two-ramp blend — see bodyColors */
+  const _g1 = new THREE.Color();
   function seamAO(y, stations) {
     let k = 1;
     for (let i = 0; i < stations.length; i++) {
@@ -2719,10 +3002,20 @@ export function createHumans(ctx) {
   function bodyColors(B, pal) {
     const n = B.nv;
     const bodyPart = B.part, bodyY = B.y, bodyAO = B.ao;
+    const pos = B.pos.array;
     const arr = new Float32Array(n * 4);
     const torsoSeams = [pal.collar, pal.hem];
     const armSeams = [pal.sleeve];
     const legSeams = [pal.bootTop];
+    const J = pal.jacket;
+    /* The V, as a half-width at this height. Linear between the two
+       stations and clamped outside them, so the neck opening above the
+       collar and the skirt of the jacket below the hem both behave. */
+    const span = Math.max(pal.collar - pal.hem, 1e-3);
+    const openAt = (y) => {
+      const t = clamp((pal.collar - y) / span, 0, 1);
+      return pal.openTop + (pal.openLow - pal.openTop) * t;
+    };
     for (let i = 0; i < n; i++) {
       const p = bodyPart[i], y = bodyY[i];
       let c;
@@ -2731,6 +3024,10 @@ export function createHumans(ctx) {
         case PART.HAND: c = pal.skin; break;
         case PART.FOOT: c = pal.shoe; break;
         case PART.ARM:
+          /* A JACKET SLEEVE RUNS TO THE WRIST and does not have a
+             shirt's cuff station: `sleeve` stops meaning anything the
+             moment there is a coat over the top of it. */
+          if (J) { c = y > pal.bootTop ? J : pal.skin; break; }
           c = y > pal.sleeve
             ? (pal.cuff && y < pal.sleeve + 0.030 ? pal.shirtDk : pal.shirt)
             : pal.skin;
@@ -2741,14 +3038,65 @@ export function createHumans(ctx) {
              They are the whole difference between a dressed figure and a
              two-colour sock puppet, and they cost nothing — the shared
              mesh already carries the height of every vertex. */
+          if (J && y > pal.hem - 0.030) {
+            const x = Math.abs(pos[i * 3]), z = pos[i * 3 + 2];
+            const g = openAt(y);
+            /* FRONT ONLY, and z > 0.02 is what "front" means on a
+               flattened barrel: the flank curves away from 0.02 within a
+               centimetre of the side seam, so nothing on the back or
+               under the arm can be caught by the width test alone. */
+            if (z <= 0.020) { c = y > pal.collar ? pal.jacketDk : J; break; }
+            /* AND THE TWO EDGES ARE RAMPS, NOT TESTS. This surface is
+               sampled on a 21.5 mm grid, so a hard `x < g` puts the
+               boundary wherever the nearest vertex happens to be and the
+               lapel comes out as a staircase — measured on the first
+               render, and unmissable. Ramping over ±16 mm spreads it
+               across a vertex and a half, which the interpolator then
+               draws as the soft edge of a folded cloth. Nothing about the
+               garment moved; only how the boundary is sampled. */
+            const e = 0.016;
+            const t1 = smoothstep(g - e, g + e, x);
+            const t2 = smoothstep(g + pal.lapel - e, g + pal.lapel + e, x);
+            _g1.copy(y > pal.collar ? pal.shirtDk : pal.shirt).lerp(pal.jacketLit, t1);
+            c = _g1.lerp(y > pal.collar ? pal.jacketDk : J, t2);
+            break;
+          }
           c = y > pal.collar ? pal.shirtDk
             : y > pal.hem ? pal.shirt
               : (y > pal.hem - 0.030 ? pal.shirtDk : pal.trouser);
+          /* the button placket, on the front of the shirt only. Ramped
+             over ±8 mm for the same reason the lapel is: a hard test on
+             a 21.5 mm grid puts the edge wherever the nearest vertex
+             happens to be and draws a staircase. */
+          if (pal.placket && y > pal.hem && y < pal.collar && pos[i * 3 + 2] > 0.020) {
+            const t = smoothstep(pal.placketW + 0.008, pal.placketW - 0.008,
+              Math.abs(pos[i * 3]));
+            if (t > 0.001) c = _g1.copy(c).lerp(pal.placket, t);
+          }
       }
       let a = bodyAO[i];
-      if (p === PART.ARM) a *= seamAO(y, armSeams);
+      if (p === PART.ARM) a *= J ? 1 : seamAO(y, armSeams);
       else if (p === PART.LEG) a *= seamAO(y, legSeams);
-      else if (p === PART.TORSO) a *= seamAO(y, torsoSeams);
+      else if (p === PART.TORSO) {
+        a *= seamAO(y, J ? [pal.hem] : torsoSeams);
+        /* THE LAPEL EDGE IS A CREASE, AND A CREASE IS AO. Without it the
+           jacket and the tee meet as two flat fields with identical
+           shading either side — the painted-on decal §1.5 forbids. The
+           dip runs along the OPENING, so it is a distance in x rather
+           than in y, and it is the same soft-and-wide 14 mm / 22 % the
+           hems use. */
+        if (J && y > pal.hem - 0.030 && pos[i * 3 + 2] > 0.014) {
+          const d = Math.abs(Math.abs(pos[i * 3]) - openAt(y)) / SEAM_W;
+          if (d < 1) a *= 1 - 0.26 * (1 - d * d) * (1 - d * d);
+        }
+        /* AND SO IS THE PLACKET EDGE. Same soft-and-wide dip, run down
+           both sides of the band — without it the stripe is two flat
+           fields meeting, which is the decal §1.5 forbids. */
+        if (pal.placket && !J && y > pal.hem && y < pal.collar && pos[i * 3 + 2] > 0.014) {
+          const d = Math.abs(Math.abs(pos[i * 3]) - pal.placketW) / SEAM_W;
+          if (d < 1) a *= 1 - 0.24 * (1 - d * d) * (1 - d * d);
+        }
+      }
       arr[i * 4] = c.r; arr[i * 4 + 1] = c.g; arr[i * 4 + 2] = c.b;
       arr[i * 4 + 3] = a;
     }
@@ -2955,20 +3303,72 @@ export function createHumans(ctx) {
        shape they were given — a few per cent, well inside what a shared
        skin can take without creasing at the joints. Stature stays a
        uniform scale on the root. */
+    /* ---- the tee print ----
+       Parented to the CHEST BONE, not to the body mesh: the body is a
+       shared skinned geometry and this is one person's shirt. The chest
+       bone is where the print would be sewn, so it inherits the breath
+       and the talk gesture for free, exactly the way the head does.
+       Geometry authored in world-standing space and shifted into that
+       bone's frame — the same two lines buildHead ends with. */
+    let tee = null;
+    if (spec.tee) {
+      const g = teePrintGeo(spec.teeWidth ?? 0.096);
+      const nvT = g.attributes.position.count;
+      const ink = noBlack(srgb(spec.tee === true ? TEE_INK : hexOf(spec.tee)), 0.030);
+      const col = new Float32Array(nvT * 4);
+      for (let i = 0; i < nvT; i++) {
+        col[i * 4] = ink.r; col[i * 4 + 1] = ink.g; col[i * 4 + 2] = ink.b;
+        /* THE PRINT SITS IN A DIP OF ITS OWN. 0.86 against the tee's
+           ~1.0 is the soft wide shadow §1.2 asks for at every edge, and
+           without it a 2.4 mm relief on a matte surface has no edge at
+           all under a two-band ramp — it reads as paint. */
+        col[i * 4 + 3] = 0.86;
+      }
+      g.setAttribute('color', new THREE.BufferAttribute(col, 4));
+      /* On the chest, just proud of the front surface. PROP.torso puts
+         the chest at half-width 0.162 and depth ratio 0.76, so the front
+         skin is at z 0.123; 0.126 clears it without floating. */
+      g.translate(0, spec.teeY ?? 1.132, 0.1255);
+      const cw = BONES[BONE_INDEX.chest].w;
+      g.translate(-cw[0], -cw[1], -cw[2]);
+      tee = new THREE.Mesh(g, material);
+      tee.name = root.name + '.tee';
+      tee.castShadow = false;      // 2.4 mm of relief casts nothing real
+      tee.receiveShadow = true;
+      tee.frustumCulled = false;
+      rig.byName.chest.add(tee);
+    }
+
     const b = clamp((spec.build ?? 1) / B.S.g, 0.90, 1.12);
-    const st = clamp(spec.stature ?? 1, 0.86, 1.16);
+    /* THE CEILING WENT 1.16 -> 1.26 FOR ONE PERSON. The crowd draws
+       0.88..1.14 and every named client sits between 0.955 and 1.055, so
+       nothing that existed before this line changed moves by a
+       millimetre. It moved because "noticeably taller than the other
+       NPCs" is a gameplay requirement and not a flourish: the Mayor has
+       to be identifiable as the Mayor at the far end of a street while
+       he is racing you, and 1.16 (1.95 m) is inside the crowd's own tall
+       tail — measured against a 1.70 m median it is a big man, which is
+       not the same as a recognisable one. Stature is a UNIFORM scale on
+       the root group, so there is no mesh limit being approached here;
+       the clamp is a sanity rail and this is where it now sits. */
+    const st = clamp(spec.stature ?? 1, 0.86, 1.26);
     rig.byName.hips.scale.set(b, 1, b);
     rig.byName.spine.scale.set(1 + (b - 1) * 0.8, 1, 1 + (b - 1) * 0.8);
     rig.byName.chest.scale.set(1 + (b - 1) * 0.6, 1, 1 + (b - 1) * 0.6);
     root.scale.setScalar(st);
 
     return {
-      spec, root, body, head, pal,
+      spec, root, body, head, tee, pal,
       bones: rig.bones, byName: rig.byName, skeleton: rig.skeleton,
       height: H * st,
+      /** Every mesh of this person that carries the shared clay
+          material, so a caller swapping it (for the dissolve) cannot
+          miss one and leave a logo hanging in the air. */
+      get meshes() { return tee ? [body, head, tee] : [body, head]; },
       dispose() {
         bodyGeo.dispose();
         headG.dispose();
+        tee?.geometry.dispose();
         root.removeFromParent();
       },
     };

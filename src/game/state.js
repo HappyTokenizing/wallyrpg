@@ -13,7 +13,7 @@
    plain node, and tools/test-game.mjs must be able to import us.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, OPENING_MESSAGE } from './data.js';
+import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, OPENING_MESSAGE, repProgress } from './data.js';
 
 /* --- tiny local maths, mirrored from core/contracts.js --- */
 export const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -51,10 +51,19 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     /* The last mode used. WALKING, not the bicycle — you do not own a
        bicycle yet. See TRAVEL and BIKE in data.js. */
     travel: 'walk',
-    /* THE BICYCLE. owned and equipped are separate: buying it is a
-       decision, riding it is a different one. game.fares() refuses the
-       'bike' mode unless both are true. Persisted; forward-filled by
-       save.js for any save written before v6. */
+    /* THE RIDES. One table in data.js (RIDES), one ownership record
+       here. Owning and riding are separate — buying a thing is a
+       decision, taking it with you is a different one — and AT MOST
+       ONE is equipped, because you cannot ride two vehicles at once.
+       game.fares() refuses the 'bike' mode unless something is owned
+       AND equipped, and prices it at that ride's speed.
+       Persisted; forward-filled and migrated by save.js. */
+    rides: { owned: { bike: false, scooter: false, motorcycle: false }, equipped: null },
+    /* LEGACY MIRROR, WRITTEN NEVER READ (except by the v6 migration
+       and by old harnesses that poke it directly — tools/traveltest.mjs
+       does). state.rides is the source of truth; game.js reconciles
+       this pair against it on every fare and every ride action, so a
+       v6 save and a v6-era tool both still work. */
     bike: { owned: false, equipped: false },
     arrivals: [],
     seen: { apartment: true },
@@ -76,6 +85,17 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     ipo: {},
     swap: { unlocked: false, pools: {} },
 
+    /* THE MAYOR'S DASH. One record, persisted, repaired by save.js on
+       every load. status walks 'locked' -> 'offered' -> 'running' ->
+       'lost'|'won' and never leaves 'won'. See data.js RACE and
+       game.race.*. */
+    race: {
+      status: 'locked', attempts: 0, losses: 0, wins: 0,
+      best: 0, startedAt: 0, cp: 0, day: 0, hintDay: 0, hints: 0,
+    },
+    /* the day the noodle cart last fed him on the slate (SLATE_MEAL) */
+    slateDay: 0,
+
     pawnDay: 0, pawnStock: [],
     /* Otto's welcome is on the phone before the player touches
        anything — cloned, because OPENING_MESSAGE is deep-frozen and
@@ -91,7 +111,7 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     stats: {
       jobsDone: 0, ordersDone: 0, tokenized: 0, ipos: 0, earned: 0, spent: 0,
       daysPlayed: 1, negotiations: 0, ordersFailed: 0, meals: 0, classes: 0,
-      minigames: 0, trips: 0, metres: 0,
+      minigames: 0, trips: 0, metres: 0, repLost: 0,
     },
     settings: {
       music: 0.16, sfx: 0.35, speed: 1, relaxed: false,
@@ -128,7 +148,7 @@ export function createState(env) {
       env.setState(next);
       bus.emit('state', next);
       bus.emit('money', { money: next.money, delta: 0, why: 'load' });
-      bus.emit('rep', { rep: next.rep, delta: 0 });
+      bus.emit('rep', { rep: next.rep, delta: 0, ...repProgress(next.rep), progress: repProgress(next.rep) });
       bus.emit('day', { day: next.day, weather: next.weather });
       return next;
     },
@@ -146,12 +166,26 @@ export function createState(env) {
     },
     afford(n) { return env.state.money >= n; },
 
-    /* --- reputation --- */
+    /* --- reputation ---
+       REPUTATION CARRIES A TITLE (data.js REP_TITLES). The event now
+       always carries the current title and its progress, and sets
+       `promoted` on the one delta that crossed a threshold — which is
+       the cue the UI banners. Demotion is reported too: rep can go
+       down, and it should say so quietly rather than silently. */
     addRep(n) {
       const S = env.state;
       if (!Number.isFinite(n) || n === 0) return S.rep;
+      const was = repProgress(S.rep);
       S.rep = Math.max(0, Math.round((S.rep + n) * 10) / 10);
-      bus.emit('rep', { rep: S.rep, delta: n });
+      const now = repProgress(S.rep);
+      const promoted = now.index > was.index;
+      const demoted = now.index < was.index;
+      if (promoted) api.banner(now.title.toUpperCase(), now.desc);
+      bus.emit('rep', {
+        rep: S.rep, delta: n,
+        title: now.title, next: now.next, toNext: now.toNext, pct: now.pct,
+        progress: now, promoted, demoted, from: was.title,
+      });
       return S.rep;
     },
 

@@ -329,6 +329,71 @@ const RIG = {
   orbitHold:   0.70,    // lambda easing onto a solved portrait azimuth
   steerHold:   1.35,    // seconds of manual steering respected
 
+  /* ------------------------------------------------------------------
+     THE LATCH — why that orbit stops dead while a direction is held.
+
+     Movement is CAMERA-RELATIVE: character/wally.js builds the stick
+     basis from ctx.camera.getWorldDirection() every frame (its
+     camRelative(), "the one place the camera basis is applied"). So
+     this rig's azimuth is not a view, it is the player's definition of
+     "forward". Auto-orbiting it while a direction is held rotates that
+     definition out from under them and turns a held key into an arc.
+     Measured with tools/drifttest.mjs before this block existed: hold W
+     for six seconds and the world-space path bent 16.6 deg; hold W+A
+     and it bent 111 deg in the same six seconds — he walked a circle.
+
+     AND IT WAS NOT A TUNING ERROR, IT WAS A FEEDBACK LOOP. The orbit
+     chases his TRAVEL heading. His travel heading is camera-forward.
+     And camera-forward is not the boom azimuth: the lateral framing
+     (`shoulder` / `shoulderPos`, the whole reason he is not centred)
+     aims the lens ~4-6 deg off the boom, and any stick that is not dead
+     ahead adds its own angle on top. So the orbit chases a target that
+     its own motion pushes away at exactly the rate it closes on it, and
+     the entire system rotates at lambda * that offset for ever. It
+     measured 3 deg/s on a straight walk and 22 deg/s on W+A. Lowering
+     the lambda only slows the spiral down; it does not remove it.
+
+     THE CURE IS NOT A SMALLER LAMBDA — IT IS THAT THE ORBIT CANNOT HELP
+     HERE. With a direction held, his facing is camera-forward plus the
+     stick angle BY CONSTRUCTION, so the geometry between the lens and
+     the character is invariant under the orbit: rotating the boom does
+     not improve the framing by one degree, it only rotates the world
+     under the player. There is nothing to gain and a bent path to lose,
+     so while he is driving, the basis is latched and the orbit is off.
+
+     Every other way this rig re-derives an azimuth is untouched, which
+     is what keeps "the camera settles behind him when he is idle":
+
+       stick released or centred   the orbit is back the same frame,
+                                   with his travel heading as its target
+       standstill                  idleT, portraitDelay and the portrait
+                                   hold run exactly as before
+       wedged against a wall       the relief solve outranks the latch,
+                                   as it already outranked the orbit
+       vista / manual steer /      unchanged; all three still own the
+       warp / snap / reframe       yaw when they are active
+
+     `stickDead` is the magnitude that counts as driving — the touch
+     thumbstick is analogue, so this cannot be a boolean.
+
+     `stickStall` is the safety valve: a stick held against a wall, or
+     an input source that has stopped updating, must not latch the rig
+     for ever, so after that long held with nothing to show for it the
+     latch lets go and the pre-existing behaviour — portrait hold
+     included — comes back.
+
+     AND THE VALVE MEASURES GROUND COVERED, NOT SPEED, because the
+     controller's velocity lies in exactly the case the valve is for.
+     Walked into a building and held there, planarSpeed reads 0.58 m/s
+     for as long as you lean on it: the collision solver clamps the
+     POSITION and leaves the velocity pointing into the wall. Keyed off
+     speed the valve never opened. Keyed off distance travelled it is
+     unambiguous — a real walk covers `stickStallDist` in 0.14 s and
+     resets the timer over and over, a wall covers nothing. */
+  stickDead:   0.12,    // |stick| that counts as "the player is driving"
+  stickStall:  0.80,    // seconds of held stick going nowhere before it lets go
+  stickStallDist: 0.35, // metres of ground that counts as "going somewhere"
+
   /* THE PORTRAIT HOLD — see the note over `distance`.
 
      WHILE HE IS MOVING the boom belongs behind him: that is what makes
@@ -569,6 +634,11 @@ export async function init(ctx) {
   let holdPending = false;          // re-solve holdYaw next follow frame
   let idleT = 0;                    // seconds he has been standing still
   let unhold = 0;                   // 1 -> 0 while the boom leaves a hold
+  let latched = false;              // the player is driving: orbit is off
+  let latchYaw = 0;                 // the azimuth they started driving on
+  let stallT = 0;                   // seconds of held stick going nowhere
+  let stallReady = false;
+  const stallPos = new THREE.Vector3();   // where he was when it started
   let vistaT = 0;                   // seconds of vista left, Infinity = held
   let vistaPoint = null;            // optional world point to face
 
@@ -757,7 +827,12 @@ export async function init(ctx) {
     pos: new THREE.Vector3(),
     vel: new THREE.Vector3(),
     yaw: 0, speed: 0, gait: 0, grounded: true, height: 1.6,
+    /* THE STICK — see RIG's latch note. `stick` is its magnitude and
+       `stickYaw` its angle IN CAMERA SPACE, i.e. what the player is
+       actually pressing. */
+    stick: 0, stickYaw: 0,
   };
+  const _basis = new THREE.Vector3();
   function readSubject() {
     const t = followTarget || ctx.wally;
     if (!t) return false;
@@ -772,9 +847,35 @@ export async function init(ctx) {
       subj.gait = clamp(c.gait ?? subj.speed / 5.9, 0, 1);
       subj.grounded = c.grounded !== false;
       subj.yaw = c.yaw;
+      /* THE STICK, RECOVERED FROM WORLD SPACE.
+
+         controller.input is the wish direction in WORLD space, because
+         wally.js has already applied the camera basis to it before
+         handing it over — it is the same vector for every input source
+         (WASD, the touch thumbstick, anything game.js installs), which
+         is exactly why this rig reads it there and not from a keyboard.
+
+         Undoing the basis the lens had WHEN HE READ IT recovers the
+         raw stick. main.js runs wally (stage 8) before cam (stage 9),
+         so at this point `cam` still holds the transform we committed
+         last frame — the very one his camRelative() just used. Camera
+         space is also the only frame in which "the player changed
+         direction" means anything: in world space a perfectly steady
+         stick appears to turn whenever the boom does, and that
+         phantom turn is the feedback the latch exists to break. */
+      const i = c.input;
+      if (i && (typeof i.x === 'number')) {
+        subj.stick = Math.min(1, Math.hypot(i.x, i.z));
+        if (subj.stick > 1e-4) {
+          cam.getWorldDirection(_basis);
+          subj.stickYaw = wrapPi(Math.atan2(i.x, i.z) -
+            Math.atan2(_basis.x, _basis.z));
+        }
+      } else subj.stick = 0;
     } else {
       subj.vel.set(0, 0, 0);
       subj.speed = 0; subj.gait = 0; subj.grounded = true;
+      subj.stick = 0;
       subj.yaw = t.rotation ? t.rotation.y : (t.root?.rotation.y ?? subj.yaw);
     }
     return true;
@@ -1289,7 +1390,27 @@ export async function init(ctx) {
        portraitDelay and the boom swings round to the three-quarter
        front and stays; take one step and it swings back behind you,
        with unholdBoost so the swing back is not slower than the run. */
-    const moving = subj.speed > 0.4;
+    /* IS THE PLAYER DRIVING? — the latch. See the long note in RIG.
+       `stallT` is the safety valve, and it is fed by GROUND COVERED
+       rather than by the controller's speed, which reports half a metre
+       a second into a wall it is not moving through. */
+    if (subj.stick > RIG.stickDead) {
+      if (!stallReady) { stallPos.copy(subj.pos); stallReady = true; stallT = 0; }
+      else if (stallPos.distanceToSquared(subj.pos) > RIG.stickStallDist * RIG.stickStallDist) {
+        stallPos.copy(subj.pos); stallT = 0;
+      } else stallT += dt;
+    } else { stallT = 0; stallReady = false; }
+    const driving = subj.stick > RIG.stickDead && stallT < RIG.stickStall;
+    if (driving !== latched) {
+      latched = driving;
+      if (driving) latchYaw = boomYaw;    // the basis he is now steering by
+    }
+
+    /* `driving` counts as moving for the idle/portrait timers too:
+       walking into a wall is not standing still, and the boom must not
+       swing round to his face — rotating the basis — while he is
+       leaning on the stick trying to get past it. */
+    const moving = subj.speed > 0.4 || driving;
     if (moving) {
       idleT = 0;
       if (holdYaw !== null) { holdYaw = null; unhold = 1; }
@@ -1302,7 +1423,13 @@ export async function init(ctx) {
 
     if (steerT > 0) steerT -= dt;
     else if (wedgeT > 0.7) { /* relief owns the yaw this frame */ }
-    else {
+    else if (driving) {
+      /* LATCHED. The player owns "forward" while they are holding a
+         direction, so the boom keeps the azimuth it had when they
+         pressed it and the orbit does not run. It is back the frame
+         they let go — see the note in RIG for why orbiting here could
+         never have improved the shot in the first place. */
+    } else {
       const want = moving ? Math.atan2(subj.vel.x, subj.vel.z)
         : (holdYaw ?? subj.yaw);
       const lam = (!moving && holdYaw !== null)
@@ -1965,6 +2092,8 @@ export async function init(ctx) {
       wedgeT = 0; reliefT = 0; reliefYaw = null;
       steerT = 0; pitchOffset = 0;
       holdYaw = null; holdPending = false; idleT = 0; unhold = 0;
+      latched = false; latchYaw = 0;               // a latch on the old basis
+      stallT = 0; stallReady = false;              // and a stall 900 m away
       vistaT = 0; vistaPoint = null; vistaS.set(0);
       trauma = 0; roll = 0;
       anchorReady = false;          // re-seed at the new place, do not damp to it
@@ -2065,6 +2194,14 @@ export async function init(ctx) {
         trauma: +trauma.toFixed(3),
         vista: +vistaS.value.toFixed(3),
         letterbox: +boxS.value.toFixed(3),
+        /* The latch, so tools/drifttest.mjs can measure it rather than
+           infer it: `latched` is the orbit standing down for a held
+           direction, `stick` is that direction in camera space (0 =
+           straight ahead), `latchYaw` the azimuth it was pressed on. */
+        latched,
+        stick: +(subj.stick > 0 ? subj.stickYaw / DEG : 0).toFixed(1),
+        latchYaw: +(latchYaw / DEG).toFixed(1),
+        stall: +stallT.toFixed(2),
       };
     },
 

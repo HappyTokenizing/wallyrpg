@@ -15,7 +15,7 @@
    minutes between 08:00 and 20:00.
    ============================================================ */
 
-import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID, tickerQty } from './data.js';
+import { CLIENTS, CLIENT_BY_ID, ASSET_BY_ID, NPC_POSTS, tickerQty } from './data.js';
 
 const FUND_NAMES = {
   Stocks: 'Growth', Bonds: 'Safe City', Farm: 'Farm & Food', Minerals: 'Deep Earth',
@@ -59,12 +59,43 @@ export function createClients(env) {
   function trustedCount(bar = 6) {
     return CLIENTS.filter((c) => trust(c.id) >= bar).length;
   }
-  /* who is standing around a given location right now */
+  /* ---------- who is standing here ----------
+     THE BUG THIS FIXES. at() placed every client by their home ZONE
+     and nothing else, so Otto — who lives in Rusty Row — was never in
+     The Bent Spoon on Main Street, which is the one room the opening
+     message sends the player to. The friend you are told to meet was
+     in a different district for the whole of act one.
+
+     A POST is an explicit "this person is waiting HERE, until this
+     flag is set" (data.js NPC_POSTS). Posts come first in the list and
+     carry `waiting: true` plus the line the world agent should use, so
+     the NPC layer can stand them in the right room and give them
+     something to say. */
+  function postsAt(locId) {
+    const st = S();
+    return NPC_POSTS
+      .filter((p) => p.loc === locId && !st.flags[p.until] && CLIENT_BY_ID[p.client])
+      .map((p) => ({ ...CLIENT_BY_ID[p.client], waiting: true, post: p.loc, line: p.line, until: p.until }));
+  }
+  /* Is this person waiting at this exact place right now? */
+  function waitingAt(clientId, locId) {
+    return postsAt(locId).some((c) => c.id === clientId);
+  }
   function at(locId) {
     const st = S();
     const loc = env.data.locationById[locId];
     if (!loc) return [];
-    return CLIENTS.filter((c) => c.home === loc.z && (st.clients[c.id].met || c.budget === 1));
+    const posted = postsAt(locId);
+    const seen = new Set(posted.map((c) => c.id));
+    /* SOMEBODY WAITING SOMEWHERE IS NOT ALSO AT HOME. Otto's post is
+       the Bent Spoon; until he has been met he must not also turn up
+       in Rusty Row, or the player meets him in the wrong room. */
+    const elsewhere = new Set(NPC_POSTS
+      .filter((p) => p.loc !== locId && !st.flags[p.until])
+      .map((p) => p.client));
+    const locals = CLIENTS.filter((c) => !seen.has(c.id) && !elsewhere.has(c.id) && c.home === loc.z
+      && (st.clients[c.id].met || c.budget === 1));
+    return posted.concat(locals);
   }
 
   /* ---------- taste matching ---------- */
@@ -228,7 +259,7 @@ export function createClients(env) {
   function resetClock() { arrivalClock = 0; }
 
   return {
-    all, get, stateOf, trust, met, meet, addTrust, trustedCount, at,
+    all, get, stateOf, trust, met, meet, addTrust, trustedCount, at, postsAt, waitingAt,
     likes, ceilingFor, makeOrder, ticket,
     arrivals, hasArrival, addArrival, removeArrival, candidates, ordersUnlocked,
     newArrival, seedArrivals, dailyOffers, tick, resetClock,
