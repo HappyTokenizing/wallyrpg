@@ -1180,7 +1180,9 @@ export async function init(ctx) {
     }
     console.log(`[city] wired ${collideQueue.length} collision volumes, ` +
       `${propCols}/${props.colliders.length} prop colliders ` +
-      `(${props.colliders.length - propCols} vetoed at doorways), ${cloths.length} cloths`);
+      `(${props.colliders.length - propCols} vetoed at doorways), ` +
+      `${bermQueue.length} berms (${bermTris} tris), ${signCols}/${signs.length} sign boards, ` +
+      `${cloths.length} cloths`);
   }
 
   /* ONE CLOTH. Lifted out of wirePhysics because the player's home is
