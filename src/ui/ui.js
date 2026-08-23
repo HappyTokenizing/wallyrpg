@@ -48,7 +48,11 @@ import { createHud } from './hud.js';
 import { createDialogue } from './dialogue.js';
 import { createPhone } from './phone.js';
 import { createMenus } from './menus.js';
-import { createTouch, shouldEnable } from './touch.js';
+/* actionPhrase() is how anything in here TELLS the player to do
+   something — 'press E' with a keyboard, 'tap Enter' under a thumb.
+   Nothing in this file names a key directly; see the input-mode header
+   in touch.js for why that is one mechanism and not seven literals. */
+import { createTouch, shouldEnable, actionPhrase } from './touch.js';
 import { createOrient } from './orient.js';
 import { createNotify } from './notify.js';
 import { createEnding } from './ending.js';
@@ -152,6 +156,177 @@ export async function init(ctx) {
     }
   }
 
+  /* ============================================================
+     THE DIALOG ROUND TRIP — a sheet that opens must TAKE the keyboard
+     deliberately, and a sheet that closes must GIVE IT BACK.
+
+     THE DEFECT, measured with real Input.dispatchKeyEvent at 390x844:
+
+       Tab to Menu  -> BUTTON.w-abtn.sm[Menu]
+       press P      -> BODY            (the phone opened)
+       press Escape -> BODY            (it never came back)
+
+     and the mutation that did it, caught with a MutationObserver
+     watching the focus holder's ancestor chain:
+
+       DIV.w-touch  class "w-touch" -> "w-touch hidden"   display:none
+
+     THAT IS NOT A BUG IN THE PAD. touch.js hides the whole cluster
+     while `ui.modal` is true and it is right to: the pad sits UNDER a
+     modal panel, and leaving its buttons in the tab order behind a
+     scrim is the classic focus-trap failure. The bug is that this
+     layer opened a modal dialog over the player's place in the
+     document and then did nothing with the place at all — no take, no
+     hand back. The focus was not moved, it was DROPPED, which is the
+     one outcome touch.js goes to some length never to cause: blur()
+     was rejected there precisely because sending activeElement to
+     <body> restarts sequential navigation from the top of the
+     document, and this achieved the same thing one keystroke later by
+     accident. `driving` is false throughout; the intent flag is not
+     involved and never was.
+
+     SO THE CONTRACT, which is just the standard dialog one:
+
+       ON OPEN   remember whoever had the keyboard, then focus the
+                 PANEL ROOT.
+       ON CLOSE  if the keyboard was inside the panel being removed,
+                 hand it to the panel underneath, or — when the stack
+                 empties — back to whoever opened the first one.
+
+     WHY THE ROOT AND NOT THE FIRST BUTTON. The APG allows either, and
+     the root is the gentler half: role="dialog" plus the panel's own
+     heading gives a screen reader the box's NAME on arrival, Tab then
+     starts at the top of the panel instead of one item into it, and
+     nothing is left armed — a Space arriving at a focused root does
+     nothing, where a Space arriving at a focused "Resume" (or, on some
+     sheets, something with a price on it) does something the player
+     did not ask for. `tabindex="-1"` makes the root a legal target
+     without adding it to the tab order.
+
+     WHY A RESTORE CAN'T JUST CALL focus() AND BE DONE. The element it
+     is handing back to is usually a pad button, and the pad is STILL
+     display:none at that instant: touch.js un-hides on the next frame
+     of its own update(), after `api.modal` has gone false. focus() on
+     a display:none element is a silent no-op, so the hand-back is
+     retried for a few frames and then dropped. Bounded, and quiet if
+     it loses — never worse than the behaviour it replaces.
+
+     WHY THIS DOES NOT PUT A RING ON A TOUCH PLAYER'S SCREEN. The
+     hand-back only fires if there was a real focus to displace when
+     the stack first opened. A thumb press on the pad deliberately
+     never focuses anything (touch.js preventDefaults its pointerdown),
+     so for a player who has NEVER TOUCHED A KEYBOARD IN THIS SESSION
+     `focusReturn` is null and this path really is inert. Asserted as
+     PANEL-1..PANEL-6.
+
+     AND HERE IS THE CORRECTION, BECAUSE THE PARAGRAPH ABOVE USED TO
+     STOP ONE CLAUSE EARLIER AND WAS FALSE. It said "so for a player
+     using their thumbs focusReturn is null and this whole path is
+     inert", and a breaker took it apart with a single-variable
+     measurement: ONE Tab, ever, then nothing but fingers.
+
+     A thumb press never TAKES focus — but touch.js also deliberately
+     never RELEASES it. blur() was rejected there because sending
+     activeElement to <body> destroys a screen-reader player's place in
+     the document, which is the whole point of the paragraphs above. So
+     after one Tab the active element stays parked on that pad button
+     for the REST OF THE SESSION, the banked value is non-null for
+     every thumb-opened sheet after it, and "using their thumbs" was
+     never the same condition as "focusReturn is null".
+
+     WHAT THAT COST. The hand-back fired focus() on a pad button, the
+     pad saw focusin, read it as the player focusing the button, and
+     cleared `driving` — so the next Space belonged to the button.
+     Thumb Jump, thumb Menu, thumb Resume, press Space meaning jump,
+     get the pause menu. The path was not inert; it was the bug.
+
+     AND IT AGREES WITH THE PAD'S OWN RULE, WHICH IS WHERE THE FIX IS.
+     The pad's sentence — a pad button refuses a keyboard activation
+     only if the player touched the pad AFTER focusing it — is right
+     and unchanged. What was wrong is that a focus the PLAYER performed
+     and a focus this layer RESTORED were the same event to the pad,
+     and a script focus()'s focusin is `isTrusted: true`, so the pad
+     could not tell them apart on its own. handBack() now says which it
+     is, per attempt, via touch.uiWillFocus(). A real Escape-then-Tab
+     player still clears the flag and still gets their Space; a
+     restored bookmark no longer speaks for them. Asserted as PANEL-7
+     and PAD-41.
+     ============================================================ */
+  const FOCUSABLE = 'button,[href],input,select,textarea,[tabindex]';
+  /** Can this element actually take the keyboard right now? */
+  function focusable(el) {
+    return !!el && el.isConnected && !el.disabled
+      && typeof el.focus === 'function' && el.getClientRects().length > 0;
+  }
+  /** Whoever had the keyboard when the modal stack last left empty. */
+  let focusReturn = null;
+  /** Give `el` the keyboard as soon as it can hold it. A few frames,
+      then give up — see the note above. */
+  let lastRestore = null;          // debug: how the last hand-back went
+  function handBack(el) {
+    if (!el) return;
+    /* THE ATTEMPT COUNT IS NOT DECORATION. The retry below is the part
+       of this that a signature applied in the wrong place would slip
+       through, so the suite has to be able to see that a real close
+       really did take more than one frame — otherwise PANEL-7 would be
+       green on a page where the pad happened to be visible already and
+       the retry branch was never entered at all. */
+    const rec = lastRestore = {
+      to: el.getAttribute?.('aria-label') || el.className || el.tagName,
+      attempts: 0, landed: false, signed: false,
+    };
+    attemptHandBack(el, 6, rec);
+  }
+  function attemptHandBack(el, tries, rec) {
+    rec.attempts++;
+    if (focusable(el)) {
+      /* SIGN IT, AND SIGN EVERY ATTEMPT — see A FOCUS THE PLAYER
+         PERFORMED AND A FOCUS THE UI RESTORED in touch.js, and the
+         correction three paragraphs up. This focus() is very often
+         aimed at a pad button, and to the pad a restored focus looked
+         exactly like the player picking that button up again: it
+         cleared `driving` and handed the next Space to the button, so
+         a player on his thumbs pressed Space to jump and got the pause
+         sheet. The pad cannot tell the two apart from the event — a
+         script focus()'s focusin carries isTrusted TRUE, measured —
+         so the only honest answer is for the caller to say which it
+         is. Inside the `focusable` branch and NOT around the call to
+         handBack(), because that is the retry-proofing: this function
+         re-enters itself on rAF for up to six frames (the pad is still
+         display:none the instant a sheet closes and focus() on it is a
+         silent no-op), and a signature applied once outside would
+         cover the first attempt — the one that always fails — and
+         leave the attempt that lands unsigned. */
+      try { rec.signed = touch.uiWillFocus?.(el) === true; } catch (e) {}
+      try { el.focus({ preventScroll: true }); } catch (e) {}
+      rec.landed = true;
+      return;
+    }
+    if (tries <= 0) return;
+    requestAnimationFrame(() => attemptHandBack(el, tries - 1, rec));
+  }
+  /** The keyboard is somewhere inside this panel. */
+  const holdsFocus = (el) => {
+    const a = document.activeElement;
+    return !!a && !!el && a !== document.body && el.contains(a);
+  };
+  /** Called just before a panel leaves the stack, with the stack
+      already spliced, so `stack` is what will be left behind. */
+  function releaseFocus(el) {
+    if (!holdsFocus(el)) return;                 // not ours to hand on
+    const under = stack.length ? stack[stack.length - 1].el : null;
+    if (under) { handBack(under); return; }
+    const back = focusReturn;
+    focusReturn = null;
+    /* `back` is null whenever nothing held the keyboard at the moment
+       the stack opened — which is every session driven by a thumb,
+       because a pad press deliberately never focuses. Then this does
+       nothing, the node goes, and the browser drops focus to <body>:
+       exactly where it went before any of this existed. No worse, and
+       no teleport handed to a player who never asked for one. */
+    if (back) handBack(back);
+  }
+
   function pushSheet(el, name = 'sheet') {
     if (!el) return null;
     if (name === 'phone' || name === 'pause') {
@@ -163,9 +338,36 @@ export async function init(ctx) {
        permanently undismissable */
     const dup = stack.findIndex((s) => s.el === el);
     if (dup >= 0) stack.splice(dup, 1);
+    /* BEFORE the append, while activeElement is still the opener and
+       before anything reparents. Only the FIRST panel banks a return
+       address: a second panel's opener is the first panel, and the
+       chain in releaseFocus() already walks that. */
+    const opener = document.activeElement;
+    if (!stack.length) {
+      focusReturn = (opener && opener !== document.body && opener.isConnected
+        && !panels.contains(opener)) ? opener : null;
+    }
     stack.push({ name, el });
     panels.append(el);
+    /* A dialog a keyboard cannot land on is not a dialog. `role` is
+       set here rather than in menus.js so a panel this layer did not
+       build — phone.root — gets the same contract. */
+    if (!el.getAttribute('role')) el.setAttribute('role', 'dialog');
+    if (!el.hasAttribute('tabindex')) el.setAttribute('tabindex', '-1');
+    el.setAttribute('aria-modal', 'true');
+    /* AND NO RING ON THE BOX ITSELF, which is a measurement and not a
+       taste. With the root focused, Chrome matched :focus-visible and
+       painted `outline: auto 1px rgb(0,95,204)` — the browser's own
+       blue — around the whole pause panel, on a touchscreen, for a
+       player who had tapped Menu with a thumb and never touched a
+       keyboard. This root is tabindex="-1": it is never a tab stop and
+       never a control, so there is no keyboard-operable component
+       losing its indicator here, and the thing that tells the player
+       where they are is the panel filling the screen over a scrim.
+       Every real control inside it keeps its own ring untouched. */
+    el.style.outline = 'none';
     syncModal();
+    handBack(el);
     return el;
   }
 
@@ -173,6 +375,14 @@ export async function init(ctx) {
      element all leave the same way. */
   function retire(el) {
     if (!el) return false;
+    /* FIRST, and not in the 300 ms timeout below. The panel spends its
+       fade-out still in the document, so a keyboard left inside it can
+       Tab around a box that is on its way off screen; and once the node
+       does go, the browser drops the focus to <body> and the hand-back
+       has nothing left to read. Every caller — closeSheet, popSheet,
+       hide(name), the scrim — has already spliced the stack by here,
+       so `stack` is the panel underneath. */
+    releaseFocus(el);
     el.classList.add('out');
     setTimeout(() => { el.classList.remove('out'); el.remove(); }, 300);
     syncModal();
@@ -220,7 +430,14 @@ export async function init(ctx) {
     return retire(top.el);
   }
   function closeAll() {
+    /* the whole stack goes at once, so the hand-back is the outermost
+       one — the element that had the keyboard before any of this
+       opened. Read before the nodes leave the document. */
+    const inside = stack.some((s) => holdsFocus(s.el));
     while (stack.length) stack.pop().el.remove();
+    const back = focusReturn;
+    focusReturn = null;
+    if (inside && back) handBack(back);
     syncModal();
   }
   const topName = () => (stack.length ? stack[stack.length - 1].name : null);
@@ -677,11 +894,35 @@ export async function init(ctx) {
 
   /* The one "confirm" verb — E on a keyboard, the round button on a
      phone. Advance the conversation if someone is talking, otherwise
-     use whatever door Wally is standing at. */
+     use whatever door Wally is standing at.
+
+     EVERY PATH THROUGH HERE LEAVES A REASON. The middle line is a
+     SILENT refusal — a sheet is open, so the verb does nothing at all —
+     and a silent refusal is indistinguishable from an input path that
+     is broken. One activation was measured looking exactly like that:
+     handler entered, click detail 0, inside the pad, and no panel and
+     no toast, immediately after a stacked phone-plus-desk pair was
+     closed. Read the answer back with WALLY.debug.interact(); the door
+     half of the story is in hud.js under A REFUSAL HAS TO SAY WHY. */
+  let lastInteract = { path: 'none', ok: false, why: 'interact() has not been called yet' };
+  const noteInteract = (path, ok, why) => {
+    lastInteract = {
+      path, ok, why,
+      at: Math.round(typeof performance !== 'undefined' ? performance.now() : 0),
+      panels: stack.map((s) => s.name),
+      dialogue: dlg.isOpen,
+      near: hud.nearLocation?.id ?? null,
+    };
+    return ok;
+  };
   function interact() {
-    if (dlg.isOpen) { dlg.advance(); return true; }
-    if (stack.length) return false;
-    return hud.interact();
+    if (dlg.isOpen) { dlg.advance(); return noteInteract('dialogue', true, 'advanced the card'); }
+    if (stack.length) {
+      return noteInteract('panel', false,
+        `refused: ${stack.length} sheet(s) open, top is "${topName()}"`);
+    }
+    const ran = hud.interact();
+    return noteInteract('door', ran, hud.interactWhy);
   }
 
   function refresh() {
@@ -719,7 +960,16 @@ export async function init(ctx) {
      objective and still steers the compass arrow every frame, and
      touch.js still measures the strip's box to dock the toasts. The
      way back out is Settings, which the pause menu opens — Esc on a
-     keyboard, the gear on the pad, both untouched by this. */
+     keyboard, the gear on the pad, both untouched by this.
+
+     ON TOUCH THERE IS A SECOND STAGE, and it rides this switch rather
+     than owning one of its own: after a few seconds with no character
+     movement the thumbstick and the whole .w-acts cluster fade out too,
+     and a double tap anywhere brings them back. Adjusting the camera
+     neither wakes them nor resets the clock — that is the point of it.
+     It lives entirely in src/ui/touch.js (which polls `api.hideUI`
+     every frame, so turning this off restores everything), and nothing
+     of it exists on a desktop. */
   let hideUI = false;
   const setHideUI = (on) => {
     hideUI = !!on;
@@ -815,7 +1065,12 @@ export async function init(ctx) {
       if (!text) { hud.removePrompt(opts.id || 'ui'); return null; }
       return hud.addPrompt({
         id: opts.id || 'ui', text, pos: worldPos,
-        key: opts.key || 'E', sub: opts.sub, action: opts.action,
+        /* `act` names what the chip is FOR and hud.js words it for the
+           active input. `key` stays available for chips that are not
+           keyboard keys at all — the race prints checkpoint numbers
+           through it. */
+        act: opts.act || 'interact', key: opts.key,
+        sub: opts.sub, action: opts.action,
         ttl: opts.ttl ?? Infinity,
       });
     },
@@ -1041,6 +1296,15 @@ export async function init(ctx) {
     if (t && t.to) arrive(t.to);
   });
 
+  /* A ROUTED leg is not a journey the UI has to stage — it is a heading.
+     travel() emits 'route' instead of 'travel' for the four self-powered
+     modes, and without this the arrow only ever aims when the player goes
+     through the travel board: game.travel(x, 'walk') called from anywhere
+     else would mount the ride and point at nothing. */
+  on('route', (r) => {
+    if (r && r.kind === 'set' && r.to) setDestination(r.to);
+  });
+
   /* ---- THE MAYOR'S DASH ---- */
   on('race', (r) => {
     if (!r) return;
@@ -1110,7 +1374,8 @@ export async function init(ctx) {
     hud.refresh(true);
     const st = ctx.game?.state;
     if (st && !st.flags.readMentor && !ctx.flags?.shot) {
-      setTimeout(() => toast('Your phone buzzed. Press P.', 'token'), 1400);
+      setTimeout(() => toast('Your phone buzzed. '
+        + actionPhrase('phone', { cap: true }) + '.', 'token'), 1400);
     }
   });
 
@@ -1169,7 +1434,7 @@ export async function init(ctx) {
     hud.addPrompt({
       id: 'demo',
       pos: { x: p.x + Math.sin(yaw) * 2.4, y: p.y + (w.height || 1.7) * 1.2, z: p.z + Math.cos(yaw) * 2.4 },
-      key: 'E',
+      act: 'interact',
       text: text || (near ? near.loc.n : 'Your Apartment'),
       sub: near && near.dist > 30 ? Math.round(near.dist) + ' m away' : '',
     });
@@ -1223,9 +1488,62 @@ export async function init(ctx) {
       if (!touch.enabled) api.setTouch(true);
       return touch.demo(nx, ny);
     };
-    d.touchState = () => ({ enabled: touch.enabled, active: touch.active, ...touch.axes });
+    /* `jump` carries the OWNING CONTACT as well as the held flag: with
+       two thumbs on Jump the flag alone cannot tell "he let go" from
+       "the wrong finger let go for him". See PAD-31 in touchtest.mjs. */
+    d.touchState = () => ({ enabled: touch.enabled, active: touch.active,
+      ...touch.axes, jump: touch.jump });
+    /** WHY THE LAST interact() DID WHAT IT DID. The pad's Enter, the
+        keyboard's E and an assistive-technology activation all land on
+        the same function, and two of its paths do nothing visible on
+        purpose — so "nothing happened" needs a reason attached or a
+        broken input path looks exactly like a correct refusal. See the
+        block above interact() and A REFUSAL HAS TO SAY WHY in hud.js. */
+    d.interact = () => lastInteract;
+    /** WHO OWNS THE NEXT SPACE. The pad's shortcuts answer a detail-0
+        click so a keyboard or screen-reader player can activate them,
+        and that inference goes stale the moment the player picks the
+        game up and drives it with their thumbs -- focus does not move,
+        because nothing on the pad is allowed to take it away. Reads
+        `driving` (the player is on their thumbs), where the keyboard's
+        bookmark actually sits, and the one sentence that matters:
+        would a Space fire the focused button or reach the game? See
+        THE FOCUS OUTLIVES THE MODALITY in src/ui/touch.js and PAD-35..
+        PAD-37 in tools/touchtest.mjs. */
+    d.padKeyboard = () => touch.keyboard;
+    /** HOW THE LAST SHEET HAND-BACK WENT — `to` the element it aimed
+        at, `attempts` how many frames it took (the pad is display:none
+        the instant a sheet closes, so a real close is always > 1),
+        `landed` whether focus() was finally called, and `signed`
+        whether that landing attempt announced itself to the pad. The
+        signature has to be applied PER ATTEMPT; without `attempts` a
+        test cannot tell a retry that was signed from a page where the
+        retry never happened. See PANEL-7 in tools/touchtest.mjs. */
+    d.focusRestore = () => (lastRestore ? { ...lastRestore } : null);
+    /** THE SIGNATURE, REACHABLE ON ITS OWN. The end-to-end path
+        (PANEL-7) proves the fix as the player meets it, but it cannot
+        reach the three BOUNDS on the signature — element identity,
+        single use, and the 50 ms deadline — because a real close never
+        misses on all six frames. Those bounds are the difference
+        between a fix and a pad that has gone deaf to a genuine focus,
+        so PAD-41c..PAD-41e drive them directly through here. Debug
+        only; nothing ships through this. */
+    d.padSignFocus = (el) => touch.uiWillFocus(el);
+    /** Turn the lostpointercapture re-take off, restoring the old
+        "a capture loss is a release" behaviour, so tools/touchtest.mjs
+        can measure the dead-drag rate before and after on ONE page at
+        ONE load. Debug only; shipping value is on. */
+    d.padCaptureRetry = (on = true) => touch.setCaptureRetry(on);
     /** Hide UI, for the screenshots and tools/touchtest.mjs. */
     d.hideUI = (on = true) => { setHideUI(!!on); return hideUI; };
+    /** HIDE UI STAGE TWO — the idle auto-hide clock (src/ui/touch.js).
+        `d.idle()` reads it; `d.idle(sec)` shortens the window so a test
+        can drive every branch without waiting five seconds a time.
+        `d.idle(null)` puts the shipping value back. */
+    d.idle = (sec) => {
+      if (sec !== undefined) touch.setIdleDelay(sec);
+      return touch.idle;
+    };
     /** What the top clusters and the kept layers are actually doing. */
     d.uiLayers = () => {
       const box = (sel) => {
@@ -1248,6 +1566,9 @@ export async function init(ctx) {
         act: box('.w-abtn.act'), jump: box('.w-abtn.jump'),
         toasts: box('.w-toasts'), prompt: box('.w-promptlayer'),
         hints: box('.w-hints'), race: box('.w-race'),
+        /* stage two: the faded bottom cluster and the one mark that
+           survives it. `idle` is the clock that drives them. */
+        seam: box('.w-idleseam'), idle: touch.idle,
       };
     };
     /* --- landscape play, for the verifier and tools/shot.mjs ---

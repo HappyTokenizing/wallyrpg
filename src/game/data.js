@@ -975,7 +975,30 @@ export const LOC_BY_ID = {};
 for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
 
 /* ============================================================
-   TRAVEL — four modes, four different currencies.
+   TRAVEL — four modes, and only TWO of them are fast travel.
+
+   THE LINE THAT RUNS THROUGH THIS WHOLE TABLE, and it was not here
+   before v8: a mode either CARRIES him or it POINTS him.
+
+     FAST TRAVEL (`fast: true`) — the Metro and the Yoober. Somebody
+       else does the driving. You pay, the clock jumps, you arrive.
+       game.travel() moves state.loc and emits 'travel'.
+     SELF-POWERED (`fast: false`) — on foot, and every RIDE under
+       him: bicycle, scooter, motorcycle. Nobody is driving but
+       Wally. Choosing one of these SETS A ROUTE — it aims the HUD
+       arrow, and choosing a ride also puts that ride under him —
+       and then he goes there himself, in real time, through the
+       actual streets. game.travel() does NOT move him for these;
+       it returns {ok:true, moved:false, routed:true} and
+       game.enter() closes the journey when he reaches the door.
+
+     WHY. A bicycle that teleports you is not a bicycle, it is a taxi
+     with a bell. The player's words: "the only true fast travel is
+     metro or yoober". Extended here to the scooter and the
+     motorcycle by inference — a personal ride is a personal ride —
+     and that inference is the one thing in this block that is easy
+     to overrule: flip `fast` on those rows and the rules layer
+     follows, because game.js reads this flag and nothing else.
 
    THE TRADE-OFF EACH ONE MAKES
      WALK   trades time and energy for money. Free, always available,
@@ -985,18 +1008,48 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
             refused has never meant "into a locked building". A
             destination that is CLOSED refuses every mode, walking
             included (game.canEnter). The floor is unchanged in the
-            way that matters — his own flat is open 00:00–24:00, so
-            there is no hour at which he cannot walk home and sleep.
+            way that matters — his own flat is open 00:00–24:00, and
+            his energy floors at 0 rather than locking anything, so
+            the door home is never shut and he is never stranded. That
+            floor is state.js addEnergy()'s clamp and it is on purpose:
+            at 0 the next metre is free, so an empty elephant still
+            walks home. The full argument is written at the clamp.
+            THE CLOCK IS A DIFFERENT MATTER, and the old line here
+            ("there is no hour at which he cannot walk home and
+            sleep") was written when walking home was a 106-minute
+            LUMP charged by travel(). It is a real journey now: from
+            the far side of the island a cruise-walk is ~164 minutes,
+            so setting off much after 22:15 means CONFIG.forceSleepMin
+            catches him on the road — he collapses at 25:00, loses a
+            rep point and wakes hungrier. That is a lost evening and a
+            fair one; it is not a lock, and a ride or the Metro is the
+            answer to it. Leaving it late has a price now.
      BIKE   the reward for investing early. Free like walking, less
-            than half the time, a third of the energy — but you have
-            to OWN it (BIKE below, $180) and have it EQUIPPED.
+            than half the time, a little over a third of the energy
+            (1.5 against 4.2, 35.7 %, flat at every hop) — but you have
+            to OWN it (BIKE below, $180) and have it EQUIPPED. It
+            still wins both currencies; it just wins them on the road
+            now instead of on arrival.
      METRO  trades ENERGY for money. Almost free, quick, and it grinds
             Wally down: platforms, stairs, standing, crowds. Per
             MINUTE it is roughly twice as tiring as walking. No trains
             00:00–05:00.
      YOOBER trades MONEY for energy and time. Always expensive, never
-            cheap even for one hop, and the price climbs faster than
-            the distance (a per-hop term AND a hop² surge).
+            cheap even for one hop, and EACH EXTRA HOP COSTS MORE THAN
+            THE LAST (a per-hop term AND a hop² surge: the second hop
+            adds $12.60, the eighth adds $27.00).
+            SAY IT THAT WAY AND NOT "the price climbs faster than the
+            distance", because that is only true of the MARGINAL fare
+            and the table below disproves it for the AVERAGE. The $14
+            base is a lump you pay for opening the door, so the price
+            per hop FALLS before it climbs — $24.20 at one hop, $17.27
+            at three, $17.80 at five, $20.35 at eight — and never gets
+            back to where it started. Over 1 → 8 hops the fare grows
+            6.73x against 8x the distance, so the long ride is the
+            better VALUE and simply the bigger bill. If you ever want
+            the average to climb too, drop `base` to 0 and raise
+            `surge` — but that is an ECONOMY CHANGE, not a wording
+            one, and it makes short Yoober hops affordable.
 
    cost   = base + per·h + surge·h²
    mins   = max(3, (minBase + min·h) / ride.speed)
@@ -1005,8 +1058,13 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
    ride.speed and ride.effort are 1 for every mode except 'bike',
    which is the RIDES row you have equipped — see RIDES below.
 
-   THE TABLE, at 1 / 3 / 5 / 8 hops (8 is the widest trip on the
-   island — apartment to Golden Heights is 7):
+   THE TABLE, at 1 / 3 / 5 / 8 hops. 8 IS THE WIDEST TRIP ON THE
+   ISLAND and there are exactly two of them, both from his own front
+   door: the flat to the City Treasury (7.755 raw) and the flat to
+   Golden Heights Residences (7.585). The 7s in that same district are
+   the Bull Bear Stock Exchange and Vance & Partners — so "apartment
+   to Golden Heights" is 7 or 8 depending which pin you mean, and the
+   two residential ones round up:
 
      mode    1 hop            3 hops            5 hops            8 hops
      walk    $0      15m  4.2e  $0      41m 12.6e  $0      67m 21.0e  $0      106m 33.6e
@@ -1022,11 +1080,86 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
      scooter       4m      11m      17m      27m
      motorcycle    3m       5m       9m      14m
 
+   WHAT THOSE NUMBERS MEAN NOW, AND IT IS NOT THE SAME THING FOR ALL
+   FOUR MODES. On the two fast rows they are a PRICE: advance() spends
+   them in a lump and the journey is over. On the four self-powered
+   rows they are a FORECAST of a journey the player actually makes —
+   and it is a measured one, not a wish. One hop is 104 m of real
+   island (HOP_METRES, measured off LOCATIONS below: 100–110 m at
+   every hop count from 1 to 8). The live clock runs at
+   CONFIG.minutesPerSecond = 0.5, one in-game minute per two real
+   seconds. So a one-hop trip at the speeds character/wally.js
+   actually moves him at:
+
+     ride         m/s (cruise → flat out)   real s     game minutes   table
+     on foot          2.45 → 5.90           42 → 18      21 → 9        15
+     bicycle          5.10 → 8.80           20 → 12      10 → 6         6
+     scooter          7.65 → 13.20          14 →  8       7 → 4         4
+     motorcycle      15.30 → 26.40           7 →  4       3 → 2         3
+
+   THE MINUTES ARE NOT CHARGED AGAIN on a self-powered leg — the live
+   clock collects them by itself while he rides, and charging the fare
+   on top would bill him twice for one journey.
+
+   BUT THE TABLE IS A DIFFERENT KIND OF ESTIMATE FOR WALKING THAN IT
+   IS FOR THE RIDES, and the column above says so if you read it. On
+   foot, 15 is a fair midpoint of the 21 → 9 the road really takes.
+   On every RIDE the table's figure is the FLAT-OUT one: the board
+   quotes 6 minutes for a one-hop bicycle leg that takes 10 at cruise,
+   and ~26 minutes for a five-hop leg that takes ~50. So the ride rows
+   are a best case and a player who pedals along will spend more of
+   the day than the board suggested. That is the honest reading of the
+   numbers; if it ever needs to stop being true, the fix is TRAVEL's
+   `min` per mode, not a second table.
+
+   THE ENERGY IS CHARGED, per metre covered, by game.stride():
+
+     strideCost(mode, ride) = (energy · effort) / HOP_METRES
+
+              e/m       one hop     across town (8 hops)
+     foot     0.0404      4.2 e         33.6 e
+     bicycle  0.0144      1.5 e         12.0 e
+     scooter  0.0043      0.45 e         3.6 e
+     moto     0.0036      0.38 e         3.0 e
+
+   which is the table's own energy, spread over the road instead of
+   dropped on the doorstep — the same relative economy, kept by
+   construction rather than by a second set of tuned numbers.
+
+   EVERY METRE HE COVERS HIMSELF IS CHARGED, whether or not he tapped
+   the fare board first. This is the rule and the previous round did
+   not have it: stride() returned 0 with no live route, so the board's
+   rows billed him and walking the identical road without asking for
+   directions was free — measured at 535 m and 0.00 energy, and at
+   89 game-minutes across the island for nothing. It made the fare
+   board a self-imposed tax next to the phone's free "Point me", and
+   it left the Metro's bargain ("almost no money, a quarter of your
+   day's energy") with nothing to trade against.
+
+   AND THE QUOTE IS NOT A CAP. It used to be — "the journey still
+   never costs more energy than the board said it would" — and that
+   promise cannot survive a player who wanders: it made the cheapest
+   quote on the board a season ticket (76 m to the pawnshop for 4.2 e,
+   then 900 m on the same 4.2, an 11.8x discount), and once the road
+   is charged route or no route it would make ROUTING cheaper than not
+   routing, which is the same hole facing the other way. The quote is
+   a FORECAST of the direct line and an honest one by construction:
+   strideCost is this table's own per-hop energy divided by
+   HOP_METRES, so walking straight there costs what the board said to
+   within the hop-to-metre rounding. Go round by the harbour to look
+   at the gulls and you pay for the harbour.
+
+   Standing still still costs nothing, same as ambient time — waiting
+   is not tiring, MOVING is, and now that is the whole rule.
+
    Read the columns, not the rows: walking one hop is fifteen minutes
    you did not have to pay for; the metro across town is nine dollars
    and a quarter of your day's energy; a Yoober anywhere is a shift's
    pay. Money buys energy back, energy buys money back, and the bike
-   quietly wins both once you have bought it.
+   quietly wins both once you have bought it. The one thing money can
+   now buy that nothing else can is SKIPPING THE JOURNEY — that is
+   what the Metro and the Yoober are selling, and it is why they cost
+   money and the bicycle does not.
 
    MODE IDS ARE STABLE. 'train' and 'trunk' keep their ids — they are
    in save files (state.travel), in ui/menus.js's icon map and in
@@ -1037,11 +1170,39 @@ for (const l of LOCATIONS) LOC_BY_ID[l.id] = l;
    gated on ownership AND stands for whichever RIDE is equipped.
    ============================================================ */
 export const TRAVEL = {
-  walk:  { id: 'walk',  n: 'On foot', ico: '🐘', base: 0,  per: 0,   surge: 0,   minBase: 2, min: 13, enBase: 0,   energy: 4.2,  note: 'Free, always. Slow, and your legs know it.' },
-  bike:  { id: 'bike',  n: 'Bicycle', ico: '🚲', base: 0,  per: 0,   surge: 0,   minBase: 1, min: 5,  enBase: 0,   energy: 1.5,  needs: 'ride', note: 'Free once it is yours. Squeaks. Worth every dollar.' },
-  train: { id: 'train', n: 'Metro',   ico: '🚈', base: 2,  per: 1.5, surge: 0,   minBase: 6, min: 3,  enBase: 3.5, energy: 2.2,  hours: [5, 24], note: 'Costs almost nothing and takes it out of you. Runs 05:00–00:00.' },
-  trunk: { id: 'trunk', n: 'Yoober',  ico: '🚕', base: 14, per: 9,   surge: 1.2, minBase: 3, min: 2,  enBase: 0,   energy: 0.15, note: 'Door to door, no effort, and the fare grows faster than the distance.' },
+  walk:  { id: 'walk',  n: 'On foot', ico: '🐘', fast: false, base: 0,  per: 0,   surge: 0,   minBase: 2, min: 13, enBase: 0,   energy: 4.2,  note: 'Free, always. You walk it yourself, and your legs know it.' },
+  bike:  { id: 'bike',  n: 'Bicycle', ico: '🚲', fast: false, base: 0,  per: 0,   surge: 0,   minBase: 1, min: 5,  enBase: 0,   energy: 1.5,  needs: 'ride', note: 'Free once it is yours. You still do the riding. Squeaks.' },
+  train: { id: 'train', n: 'Metro',   ico: '🚈', fast: true,  base: 2,  per: 1.5, surge: 0,   minBase: 6, min: 3,  enBase: 3.5, energy: 2.2,  hours: [5, 24], note: 'Costs almost nothing and takes it out of you. Runs 05:00–00:00.' },
+  trunk: { id: 'trunk', n: 'Yoober',  ico: '🚕', fast: true,  base: 14, per: 9,   surge: 1.2, minBase: 3, min: 2,  enBase: 0,   energy: 0.15, note: 'Door to door, no effort, and every extra hop costs more than the last.' },
 };
+
+/* The two halves of that table, by id, so nothing has to hardcode a
+   list of mode names to know which kind it is holding. */
+export const FAST_MODES = Object.freeze(Object.keys(TRAVEL).filter((m) => TRAVEL[m].fast));
+export const SELF_MODES = Object.freeze(Object.keys(TRAVEL).filter((m) => !TRAVEL[m].fast));
+/** Does this mode carry him, or only point him? */
+export function isFastTravel(mode) { return !!(TRAVEL[mode] && TRAVEL[mode].fast); }
+
+/* HOW LONG A HOP IS, IN METRES OF REAL ISLAND — measured, not chosen.
+   `hops()` is a 2D-map abstraction and worldDistance() is the ground
+   truth the player's feet cross; this is the exchange rate between
+   them, taken as the median over every pair of locations so one
+   outlying pin cannot move it. It comes out at ~104 m and it is flat
+   across hop counts (109 at 1 hop, 100 at 8), which is what makes
+   the per-metre energy below honest at any distance. */
+export const HOP_METRES = (() => {
+  const per = [];
+  for (let i = 0; i < LOCATIONS.length; i++) {
+    for (let j = i + 1; j < LOCATIONS.length; j++) {
+      const a = LOCATIONS[i], b = LOCATIONS[j];
+      const h = Math.max(1, Math.round(Math.hypot(a.x - b.x, a.y - b.y) / 115));
+      const d = Math.hypot(a.world.x - b.world.x, a.world.z - b.world.z);
+      if (d > 1) per.push(d / h);
+    }
+  }
+  per.sort((x, y) => x - y);
+  return per.length ? Math.round(per[per.length >> 1] * 10) / 10 : 104;
+})();
 
 /* ============================================================
    RIDES — the things Wally travels the city ON.
@@ -1335,6 +1496,29 @@ export function fare(mode, a, b, rideId) {
 }
 /* The same journey on a named ride. rideFare('motorcycle', a, b). */
 export function rideFare(rideId, a, b) { return fare('bike', a, b, rideId); }
+
+/* strideCost(mode, rideId) — ENERGY PER METRE under his own power.
+
+   The four self-powered modes no longer drop their energy on the
+   doorstep; game.stride() charges this per metre of road actually
+   covered — ROUTE OR NO ROUTE, at the rate of whatever is under him —
+   so the ride is what tires him and not the arrival. It is derived
+   from the SAME per-hop numbers as fare() — energy · effort, divided
+   by the length of a hop — so the fare board's quote and the road
+   agree without a second set of tuned constants: cover exactly one
+   hop's worth of ground and you have paid exactly one hop's worth of
+   energy. That identity is the whole reason the quote can stop being
+   a cap without becoming a lie.
+
+   Zero for the Metro and the Yoober: nothing about sitting in one is
+   measured in metres, and their energy is charged in full by
+   game.travel() the moment you pay. */
+export function strideCost(mode, rideId) {
+  const t = TRAVEL[mode];
+  if (!t || t.fast) return 0;
+  const r = mode === 'bike' ? (RIDES[rideId] || RIDES.bike) : null;
+  return +(((t.energy || 0) * (r ? r.effort : 1)) / HOP_METRES).toFixed(5);
+}
 /* straight-line 3D walking distance, for the world module's pathing */
 export function worldDistance(a, b) {
   const A = LOC_BY_ID[a], B = LOC_BY_ID[b];
@@ -1653,8 +1837,8 @@ export const HAPPY_ENDING = Object.freeze({
 
 /* ---------------- ONE-TIME TIPS ---------------- */
 export const TIPS = {
-  map:      { t: 'Getting around', d: 'Four ways across town, and each one charges you differently. Walking is free and always available — it costs you the morning. The Metro costs pennies and costs energy. A Yoober costs a shift’s pay and costs you nothing else.' },
-  bike:     { t: 'Buy a bicycle',  d: 'A second-hand bike is $180 at Dispatch or Vic’s. Half the time of walking, a third of the energy, free forever after. It is the best money you will spend this week.' },
+  map:      { t: 'Getting around', d: 'Only two things in this city carry you: the Metro and a Yoober. Pay, and you are there. Everything else — your feet, and whatever you have on wheels — points you at the place and leaves the going to you. Walking is free and always available, and it costs you the morning.' },
+  bike:     { t: 'Buy a bicycle',  d: 'A second-hand bike is $180 at Dispatch or Vic’s. It does not skip the journey — nothing free does — but it makes it less than half as long and a third as tiring, forever, for nothing. It is the best money you will spend this week.' },
   rides:    { t: 'Something faster', d: 'The bicycle is the first of three. A scooter is half again as quick and cannot be bought at any price — somebody has to give it to you. A motorcycle is three times the bicycle and costs about ten client orders. Only one of them comes with you at a time.' },
   ticker:   { t: 'Tickers',        d: 'Every asset in the city has a symbol — GOLD, WHEAT, B5Y, TEAM. Orders are written in them, and you can search by symbol or by name.' },
   office:   { t: 'Your office',    d: 'This is your desk. Clients turn up here through the day with a job, a budget and a deadline. Take the ones you can actually finish.' },
@@ -1702,7 +1886,8 @@ export const DATA = deepFreeze({
   zones: ZONES,
   locations: LOCATIONS, locationById: LOC_BY_ID,
   map: MAP, world: WORLD,
-  travel: TRAVEL, bike: BIKE, rides: RIDES, rideList: RIDE_LIST, rideOrder: RIDE_ORDER,
+  travel: TRAVEL, fastModes: FAST_MODES, selfModes: SELF_MODES, hopMetres: HOP_METRES,
+  bike: BIKE, rides: RIDES, rideList: RIDE_LIST, rideOrder: RIDE_ORDER,
   jobs: JOBS,
   employees: EMPLOYEE_POOL, employeeById: EMPLOYEE_BY_ID,
   ipos: IPOS, ipoSteps: IPO_STEPS,
@@ -1716,7 +1901,7 @@ export const DATA = deepFreeze({
   happyEnding: HAPPY_ENDING,
   tips: TIPS,
   morningNotes: MORNING_NOTES,
-  hops, fare, rideFare, worldDistance,
+  hops, fare, rideFare, worldDistance, strideCost, isFastTravel,
 });
 
 export default DATA;

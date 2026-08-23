@@ -20,7 +20,13 @@
    ============================================================ */
 
 import { mulberry32 } from '../core/contracts.js';
-import { h, clear, icon, portrait, glyphAvatar, wallyMark, hueFor } from './style.js';
+import { h, clear, icon, portrait, glyphAvatar, wallyAvatar, hueFor } from './style.js';
+/* THE 'E CONTINUE' CHIP. This card printed a hard-coded 'E' keycap
+   beside CONTINUE — on a phone, at the one moment the player is most
+   certainly looking at the screen. What advances a conversation now
+   comes from the action table in touch.js, which knows what the
+   player is holding; see the header there. */
+import { paintChip, onInputMode, touchUI } from './touch.js';
 
 /* jitter for the talk-blip cadence — seeded, so a screenshot run is
    byte-identical between builds (Math.random is banned) */
@@ -28,18 +34,21 @@ const blipRng = mulberry32(0x7a11ed);
 
 const CPS = 62;          // characters per second
 const BLIP_EVERY = 3;    // characters between talk blips
-/* the key ui.js binds to dlg.advance() — printed, not implied */
-const ADVANCE_KEY = 'E';
 
 export function createDialogue(ctx, ui) {
   const root = h('div.w-dlgroot');
   let card = null;
   let live = null;
+  /* the live card's "there is more" row, so a mid-session input-mode
+     change repaints the card the player is reading right now */
+  let repaintMore = null;
+  const offInputMode = onInputMode(() => { repaintMore?.(); });
 
   function close(value) {
     if (!live) return;
     const l = live;
     live = null;
+    repaintMore = null;
     l.el.classList.add('out');
     setTimeout(() => l.el.remove(), 280);
     card = null;
@@ -69,7 +78,7 @@ export function createDialogue(ctx, ui) {
        card is already the size it will end at and does not reflow a
        line at a time while the typewriter runs. The live span is
        absolutely positioned on top of it. */
-    let ghost = null, lv = null;
+    let ghost = null, lv = null, moreLabel = null;
 
     const el = h('div.w-dlg.w-paper.w-pe', { role: 'dialog', 'aria-live': 'polite' },
       h('div.w-dlg-in', null, por, h('div.w-grow', null, nm, rl, tx)),
@@ -88,6 +97,7 @@ export function createDialogue(ctx, ui) {
 
     live = { el, resolve: () => {}, pages, page: -1, chars: 0, full: '', typing: false, blip: 0 };
     const promise = new Promise((res) => { live.resolve = res; });
+    repaintMore = () => { if (moreLabel) setMore(moreLabel); };
 
     nextPage();
 
@@ -109,13 +119,22 @@ export function createDialogue(ctx, ui) {
       lv.firstChild.nodeValue = live.full.slice(0, Math.floor(live.chars));
     }
 
-    /* null clears the row; otherwise a key glyph + a verb, in the
-       same treatment as the world-space prompt. */
+    /* null clears the row; otherwise "how to see the rest", in the same
+       treatment as the world-space prompt.
+
+       ON A KEYBOARD that is a keycap and a verb: [E] Continue.
+       UNDER A THUMB the keycap goes entirely rather than being
+       translated — the whole card advances on tap, so the row says so
+       in words and stops pretending there is a key to press. */
     function setMore(label) {
+      moreLabel = label || null;
       clear(more);
       if (!label) { more.style.display = 'none'; return; }
       more.style.display = '';
-      more.append(h('span.key', { text: ADVANCE_KEY }), h('span', { text: label }));
+      const chip = paintChip(h('span.key'), 'advance', { hideOnTouch: true });
+      more.append(chip, h('span', {
+        text: touchUI() ? 'Tap to ' + String(label).toLowerCase() : label,
+      }));
     }
 
     function complete() {
@@ -190,10 +209,12 @@ export function createDialogue(ctx, ui) {
     close,
     get open_() { return !!live; },
     get isOpen() { return !!live; },
-    /** Complete the line, then the page, then dismiss — for Esc/E. */
+    /** Complete the line, then the page, then dismiss. Reached from the
+        keyboard's interact key and from the pad's corner button alike —
+        ui.interact() is the one door both go through. */
     advance() { live?.advance(); },
     update(dt) { live?.tick(dt); },
-    dispose() { root.remove(); },
+    dispose() { offInputMode(); root.remove(); },
   };
 }
 
@@ -205,19 +226,15 @@ function makeAvatar(ctx, spec, speaker) {
   if (spec.portrait && spec.portrait !== 'wally' && byId) c = byId[spec.portrait];
   if (!c && byId) c = Object.values(byId).find((x) => x.n === speaker) || null;
 
-  if (spec.portrait === 'wally' || /^wally$/i.test(speaker)) {
-    const wrap = h('div', {
-      style: {
-        width: '100%', height: '100%', borderRadius: '99px',
-        background: 'linear-gradient(165deg,#7fb9e8,#4a8fd0)',
-        display: 'grid', placeItems: 'center', overflow: 'hidden',
-      },
-    });
-    const m = wallyMark(62);
-    m.style.transform = 'translateY(4%)';
-    wrap.append(m);
-    return wrap;
-  }
+  /* HIS PORTRAIT IS THE SAME OBJECT AS EVERYONE ELSE'S. This branch
+     used to hand-build a disc — a two-stop blue gradient with the mark
+     dropped in and nudged down 4 % — which beside portrait(c, 66) in
+     the same card read as a logo that had wandered into a cast list:
+     no white keyline ring, no ground shadow, nothing running off the
+     bottom edge the way a portrait's neck does. style.js draws that
+     disc for the phone already; this is the same call, at the same 66
+     the client branch below uses, so the two can never diverge again. */
+  if (spec.portrait === 'wally' || /^wally$/i.test(speaker)) return wallyAvatar(66);
   if (c) return portrait(c, 66);
   return glyphAvatar((speaker[0] || '?').toUpperCase(), hueFor(speaker), 66);
 }

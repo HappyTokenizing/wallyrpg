@@ -185,7 +185,13 @@ function windowRow(K, S, rng, o) {
 /** A doorway with frame, threshold, lintel and a recessed leaf. */
 function doorway(K, S, rng, o) {
   const dw = o.w ?? 1.5, dh = o.h ?? 2.5;
-  const M = faceMatOff(o.face ?? 0, o.bw, o.bd, o.u ?? 0, dh / 2 + 0.05, 0.02, o.oz || 0);
+  /* `y0` is the floor this door opens onto. It defaults to the
+     building's own base plane, which is right everywhere except on a
+     pier: those stand on piles with a deck 1.15 m up, and the door was
+     being built at plot level — buried to its lower rail in its own
+     decking, with the rail moulding then reading as the walkable
+     surface 0.55 m above the planks. */
+  const M = faceMatOff(o.face ?? 0, o.bw, o.bd, o.u ?? 0, (o.y0 ?? 0) + dh / 2 + 0.05, 0.02, o.oz || 0);
   const push = (part, g, m, col) => K.add(part, g, new THREE.Matrix4().multiplyMatrices(M, m), col);
   const wallC = o.wall ?? S.wall[0];
 
@@ -221,6 +227,33 @@ function doorway(K, S, rng, o) {
   push('stone', boxRound(dw + 0.9, 0.22, rv + 0.62, 0.06, 1), TRS(0, -(dh / 2 + 0.07), rv * 0.5 + 0.16), o.step ?? S.trim);
   if (o.steps) {
     push('stone', boxRound(dw + 1.4, 0.20, 1.1, 0.06, 1), TRS(0, -(dh / 2 + 0.25), rv * 0.5 + 0.46), o.step ?? S.trim);
+  }
+  /* THE DOORSTEP IS A STEP, AND IT WAS THE LAST THING AT A DOOR THAT
+     THE COLLISION WORLD DID NOT HAVE.
+
+     A worn stone 2.4 m wide standing 0.09 m proud of the floor line, on
+     the one square metre of every building on the island the player
+     walks onto on purpose, with nothing under it. He walks THROUGH his
+     own front step — which is precisely what the surface test reports
+     at the Apartment (-0.140 m) and the Trunk Depot (-0.276 m, whose
+     door has two of them) now that the berm underneath them agrees.
+
+     It is a box, so a box proxy is exact — no dome to float over its
+     own rim. At 0.22 m it is well inside the controller's 0.35 m step
+     offset, so he mounts it like a kerb instead of being stopped by
+     it. Tagged `step` because the player's home is REBUILT at runtime
+     and its doorstep has to travel with the tier: see wireHomeSteps()
+     in city.js. */
+  if (o.collide) {
+    const _sp = new THREE.Vector3();
+    const face = o.face ?? 0;
+    const ry = face === 0 ? 0 : face === 1 ? PI : face === 2 ? PI / 2 : -PI / 2;
+    const stepBox = (bw, bh, bd, ly, lz) => {
+      _sp.set(0, ly, lz).applyMatrix4(M);
+      o.collide.push({ w: bw, h: bh, d: bd, x: _sp.x, y: _sp.y, z: _sp.z, ry, step: true });
+    };
+    stepBox(dw + 0.9, 0.22, rv + 0.62, -(dh / 2 + 0.07), rv * 0.5 + 0.16);
+    if (o.steps) stepBox(dw + 1.4, 0.20, 1.1, -(dh / 2 + 0.25), rv * 0.5 + 0.46);
   }
 }
 
@@ -453,6 +486,7 @@ function formShop(ctx, K, loc, S, rng, meta) {
     });
   }
   doorway(K, S, rng, {
+    collide: meta.collide,
     face: 0, bw: w, bd: d, u: doorU, w: 1.55, h: 2.55,
     wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.5), step: S.trim, steps: !!S.feat.step,
   });
@@ -541,15 +575,50 @@ function formShop(ctx, K, loc, S, rng, meta) {
     }
   }
 
+  /* Everything this form hangs off its own front elevation, so the
+     nameboard at the bottom can be put somewhere a reader can see it.
+     A shopfront carries a porch and an awning over the very bay the
+     board wants, and both project further than any bracket. */
+  const front = [];
+
   /* --- an open porch over the door, on some of them. Two houses of the
      same size and colour still read as two houses if one has a porch
      and the other has a doorstep. --- */
   if (S.porch && !flat && w > 6.5) {
     const pw = 2.5 + rng() * 1.1, ph = Math.min(fh * 0.80, 2.9), pd = 1.15 + rng() * 0.5;
+    /* what this puts in front of the frontage, for the nameboard solve
+       at the bottom of this form: a porch roof projects 2.4 m and no
+       bracket reaches past it. */
+    front.push({ x0: doorU - (pw + 0.8) / 2 - 0.2, x1: doorU + (pw + 0.8) / 2 + 0.2, top: 0.5 + ph + 0.66 });
     const pc = mixHex(S.trim, S.wall[0], 0.25);
     for (const sx of [-1, 1]) {
       K.add('wood', post(0.10, ph, 0.015, 7), TRS(doorU + sx * pw * 0.5, ph / 2 + 0.5, d / 2 + pd), pc);
+      /* THE POST STANDS ON A STONE PAD AND THE PAD HAD NO BODY.
+
+         Two porch posts per shopfront, each on a 0.36 m block of laid
+         stone whose top sits at 0.71 — a third of a metre above the
+         apron it stands on, a metre and a half either side of the door,
+         with nothing under it. Both of the threshold defects handed on
+         from the last round are this one object:
+
+           trunkdepot (-279.06, 146.26)  city.berm 8.101 == the drawn
+             skirt at 8.101, and a drawn face at 8.247 with n.y 0.98
+             — this pad, 0.146 m proud of the berm it is bedded in
+           apartment (-364.28, 201.53)   city.step 7.156 == the drawn
+             porch apron, and a drawn face at 7.466 with n.y 1.00
+             — the same pad on the home tier, 0.310 m proud of it
+
+         Both read as him standing a third of a metre inside laid stone.
+         It is a box, so a box proxy is exact; at 0.22 m it is inside
+         the controller's 0.35 m step offset, so it is a kerb he mounts
+         and not a wall he stops against, and it is `step` for the same
+         reason the doorstep and the apron are — the player's home is
+         rebuilt per tier and its porch has to travel with it. */
       K.add('stone', boxRound(0.36, 0.22, 0.36, 0.06, 1), TRS(doorU + sx * pw * 0.5, 0.60, d / 2 + pd), S.trim);
+      meta.collide.push({
+        w: 0.36, h: 0.22, d: 0.36,
+        x: doorU + sx * pw * 0.5, y: 0.60, z: d / 2 + pd, step: true,
+      });
       K.add('wood', boxRound(0.34, 0.14, 0.42, 0.04, 1),
         TRS(doorU + sx * pw * 0.42, 0.5 + ph - 0.22, d / 2 + pd * 0.55, 0, 1, 1, 1, 0, -sx * 0.7), shadeHex(pc, 0.88));
     }
@@ -560,6 +629,17 @@ function formShop(ctx, K, loc, S, rng, meta) {
     }), TRS(doorU, 0.5 + ph + 0.16, d / 2 + pd * 0.52, PI / 2), S.roof);
     K.add('stone', boxRound(pw + 0.7, 0.20, pd * 2 + 0.5, 0.05, 1),
       TRS(doorU, 0.30, d / 2 + pd * 0.52), shadeHex(S.trim, 0.94));
+    /* THE PORCH APRON IS A PAD YOU STAND ON. Four metres by three of
+       laid stone, its top 0.40 m above the plot floor and 0.14 m proud
+       of the earth in front of the Apartment — the last drawn surface
+       at the player's own front door with nothing under it. Same
+       reasoning as the doorstep in doorway(): it is a box, so a box
+       proxy is exact, and at 0.20 m it is a kerb the controller mounts
+       rather than a wall it stops against. */
+    meta.collide.push({
+      w: pw + 0.7, h: 0.20, d: pd * 2 + 0.5,
+      x: doorU, z: d / 2 + pd * 0.52, y: 0.30, step: true,
+    });
   }
 
   /* --- Rusty Row: patches, lean-tos, pipes, laundry --- */
@@ -617,6 +697,7 @@ function formShop(ctx, K, loc, S, rng, meta) {
     K.add('metal', cyl(0.04, 0.04, w * 0.62, 6, false),
       TRS(-w * 0.30 + w * 0.31, ay - 0.54, d / 2 + 1.38, 0, 1, 1, 1, 0, PI / 2), C.lead);
     K.add('metal', boxRound(w * 0.66, 0.14, 0.20, 0.05, 1), TRS(-w * 0.30 + w * 0.31, ay + 0.10, d / 2 + 0.10), C.lead);
+    front.push({ x0: -w * 0.30 - 0.2, x1: -w * 0.30 + w * 0.62 + 0.2, top: ay + 0.26 });
   }
   if (S.feat.laundry) {
     meta.cloths.push({
@@ -630,7 +711,52 @@ function formShop(ctx, K, loc, S, rng, meta) {
 
   meta.eaveY = eaveY;
   meta.doorU = doorU;
-  meta.signAnchor.set(doorU, Math.min(0.5 + fh * 0.95, eaveY - 0.4), d / 2 + 0.30);
+  /* A SHOPFRONT IS ONLY ONE STOREY TALL and the nameboard has to clear
+     a head inside it, so the ceiling here is the first-floor SILLS, not
+     the eaves: a board that keeps rising covers the windows above the
+     shop, which is a worse picture than a board a shade smaller. */
+  const sill1 = storeys > 1
+    ? 0.5 + fh * 1.52 - Math.min(fh * 0.56, 1.9) / 2
+    : Infinity;
+  meta.signCeil = Math.min(sill1 - 0.14, eaveY - 0.30);
+
+  /* WHERE ON THE FRONTAGE. Over the door is the obvious answer and it
+     is the wrong one on this form: the door is exactly where the porch
+     roof and the awning are, and a board behind either of them is a
+     board nobody reads. There is no vertical escape — the first-floor
+     sills are 0.6 m above a porch ridge — so the board moves sideways
+     instead, onto the open bay of the same frontage, which is where a
+     shop of this age would have carried its name anyway. Only if the
+     frontage is too narrow to hold it clear does it go up instead, and
+     then it goes above the taller of the two. */
+  const signW = clamp(w * 0.34, 2.4, 3.6);
+  const half = Math.max(0, w / 2 - signW / 2 - 0.25);
+  const hits = (x) => front.filter((f) => x + signW / 2 > f.x0 && x - signW / 2 < f.x1);
+  let signX = clamp(doorU, -half, half);
+  if (hits(signX).length) {
+    let best = null;
+    for (const f of front) {
+      for (const cand of [f.x0 - signW / 2 - 0.1, f.x1 + signW / 2 + 0.1]) {
+        const x = clamp(cand, -half, half);
+        if (hits(x).length) continue;
+        if (!best || Math.abs(x - doorU) < Math.abs(best - doorU)) best = x;
+      }
+    }
+    if (best !== null) signX = best;
+    else {
+      /* An 8 m frontage with a 4.4 m porch on it has no clear bay, so
+         the board goes over the canopy instead — and it has to be
+         ALLOWED over it: wedged between a porch ridge and the
+         first-floor sills there is 0.35 m of wall, which is a fifth of
+         a sign. It becomes a projecting first-floor board on its
+         bracket, standing proud of the facade rather than flat on it,
+         which is what a real street does with a name over a canopy.
+         (0.407 is the painted face's aspect — see ASPECT in signs.js.) */
+      meta.signSill = Math.max(...hits(signX).map((f) => f.top)) + 0.12;
+      meta.signCeil = Math.max(meta.signCeil, meta.signSill + 0.19 + signW * 0.407);
+    }
+  }
+  meta.signAnchor.set(signX, Math.min(0.5 + fh * 0.95, eaveY - 0.4), d / 2 + 0.30);
   meta.door.set(doorU, 0, d / 2 + 1.5);
   meta.interior.set(0, 1.5, 0);
   meta.collide.push({ w, h: wallH, d, y: wallH / 2 });
@@ -738,6 +864,7 @@ function formTerrace(ctx, K, loc, S, rng, meta) {
         TRS(bx + bw * 0.02 + 0.39, 0.6 + hb * 0.34 + 0.29, rearZ - 0.26), mixHex(S.trim, BRAND.paper, 0.22));
       if (b === Math.floor(bays / 2)) {
         doorway(K, S, rng, {
+          collide: meta.collide,
           face: 1, bw: w, bd: d, u: -bx, w: 1.35, h: 2.35,
           wall: col, frame: S.trim, door: shadeHex(mixHex(BUILD.woodDark, S.tint, 0.4), 0.88), step: S.trim,
         });
@@ -758,6 +885,7 @@ function formTerrace(ctx, K, loc, S, rng, meta) {
 
   /* the grand entrance in the middle bay */
   doorway(K, S, rng, {
+    collide: meta.collide,
     face: 0, bw: w, bd: d, u: 0, w: 2.0, h: 3.2, steps: true,
     wall: base, frame: S.trim, door: mixHex(BUILD.woodDark, S.tint, 0.4), step: S.trim,
   });
@@ -917,6 +1045,7 @@ function formStall(ctx, K, loc, S, rng, meta) {
   /* the door, in the gap the bays leave */
   const doorU = nHatch > 1 ? (hatchX[0] + hatchX[1]) / 2 : hatchX[0] + openW * 0.5 + 1.2;
   doorway(K, S, rng, {
+    collide: meta.collide,
     face: 0, bw: w, bd: bodyD, oz: bodyZ, u: clamp(doorU, -w * 0.44, w * 0.44),
     w: 1.5, h: Math.min(2.5, fh * 0.72),
     wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.5), step: S.trim,
@@ -982,6 +1111,7 @@ function formStall(ctx, K, loc, S, rng, meta) {
     K.add('wood', boxRound(Math.min(w * 0.46, 9.0) + 0.3, 0.14, 0.34, 0.05, 1),
       TRS(0, eaveY - 0.50, rz - 0.18), shadeHex(S.trim, 0.80));
     doorway(K, S, rng, {
+      collide: meta.collide,
       face: 1, bw: w, bd: bodyD, oz: bodyZ, u: jit(rng, w * 0.24), w: 1.3, h: 2.25,
       wall: base, frame: S.trim, door: shadeHex(mixHex(BUILD.woodDark, S.tint, 0.4), 0.88), step: S.trim,
     });
@@ -1096,6 +1226,19 @@ function formStall(ctx, K, loc, S, rng, meta) {
 
   meta.eaveY = eaveY;
   meta.signAnchor.set(0, Math.min(eaveY - 0.60, ptop + 0.62), frontZ + 0.16);
+  /* THE VERANDA IS IN THE WAY OF ITS OWN NAME. The lean-to springs off
+     this wall and runs two or three metres out over the customers, so a
+     board hung anywhere below its ridge is read by nobody — no bracket
+     reaches past a market porch. The board goes ABOVE the lean-to, in
+     the gable between the porch roof and the eaves, which is where a
+     market hall has always carried its name. */
+  meta.signSill = ptop + 0.12;
+  /* and it has to be allowed UP there: the eaves line leaves 0.46 m
+     between the lean-to ridge and the gutter, which is half a board.
+     The gable above the eaves is the only wall a market hall has that
+     its own porch is not standing in front of, so the ceiling goes up
+     into it. */
+  meta.signCeil = eaveY + Math.min(roofH * 0.62, 1.15);
   meta.door.set(0, 0, d / 2 + 1.6);
   meta.interior.set(0, 1.5, bodyZ);
   meta.collide.push({ w, h: bodyH, d: bodyD, z: bodyZ, y: sill + bodyH / 2 });
@@ -1251,7 +1394,7 @@ function formMine(ctx, K, loc, S, rng, meta) {
         faceMat(face, w, d, u, 0.45 + shedH / 2, 0.06), i % 3 === 0 ? C.rustPale : S.wall[1]);
     }
   }
-  doorway(K, S, rng, { face: 0, bw: w, bd: d, u: -w * 0.24, w: 1.6, h: 2.5, wall: S.wall[0], frame: BUILD.woodDark, door: C.rust, step: LAND.rock });
+  doorway(K, S, rng, { collide: meta.collide, face: 0, bw: w, bd: d, u: -w * 0.24, w: 1.6, h: 2.5, wall: S.wall[0], frame: BUILD.woodDark, door: C.rust, step: LAND.rock });
   windowRow(K, S, rng, { face: 0, w, d, y: 0.45 + shedH * 0.62, count: 2, win: { w: 0.9, h: 0.9, sillCol: BUILD.woodDark, mullion: true }, skip: (u) => u < -w * 0.06 });
   roofOn(K, S, rng, { w, d, y: 0.45 + shedH, wallH: shedH, ridge: clamp(Math.min(w, d) * 0.36, 1.8, 5), kind: 'corrugated', along: 'x' });
 
@@ -1355,6 +1498,14 @@ function formPier(ctx, K, loc, S, rng, meta) {
       K.add('wood', post(0.25, deckY + 1.6, 0.02, 7), TRS(x, (deckY - 1.6) / 2 + 0.1, z, 0, 1, 1, 1, jit(rng, 0.04), jit(rng, 0.04)), mixHex(BUILD.woodDark, SEA.wet, 0.22));
     }
   }
+  /* A DECK IS BOARDS ON SOMETHING. They are laid with 9 cm gaps and
+     there was nothing behind them: you could see the seabed between the
+     planks, and a probe dropped down a gap fell 1.15 m to the terrain.
+     A dark sub-deck just under the plank faces closes it and reads as
+     the deck's own thickness. */
+  K.add('woodH', boxRound(w + 2.2, 0.26, d + 5.2, 0.03, 1),
+    TRS(0, deckY - 0.06, 2.2), shadeHex(C.seaDeck, 0.62));
+
   /* decking boards, laid with gaps */
   const boards = Math.round((d + 5) / 0.62);
   for (let i = 0; i < boards; i++) {
@@ -1375,7 +1526,11 @@ function formPier(ctx, K, loc, S, rng, meta) {
     K.add('wood', boxRound(1.5, 2.85, 0.14, 0.05, 1), TRS(-w * 0.2 + sx * 0.79, deckY + 1.68, d / 2 + 0.16), S.trim);
     K.add('wood', boxRound(1.35, 0.14, 0.10, 0.04, 1), TRS(-w * 0.2 + sx * 0.79, deckY + 2.7, d / 2 + 0.25), shadeHex(S.trim, 0.85));
   }
-  doorway(K, S, rng, { face: 0, bw: w, bd: d, u: w * 0.26, w: 1.5, h: 2.4, wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.4), step: C.seaDeck });
+  /* y0 = the DECK, not the deck plus the wall's own base course: the
+     threshold step stands 0.09 m proud of whatever y0 is, and putting
+     it on the base course left a 0.15 m stone lip lying on the planks
+     with no body under it. */
+  doorway(K, S, rng, { collide: meta.collide, face: 0, bw: w, bd: d, u: w * 0.26, y0: deckY, w: 1.5, h: 2.4, wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.4), step: C.seaDeck });
   for (let s = 0; s < storeys; s++) {
     /* the seaward elevation counts too — it is the one every boat and
        every camera coming in off the water actually sees */
@@ -1434,10 +1589,29 @@ function formPier(ctx, K, loc, S, rng, meta) {
 
   meta.eaveY = eaveY;
   meta.ground = deckY;
+  /* the reader stands on the DECK, so that is what headroom is measured
+     from — the seabed under the piles is not a floor */
+  meta.signBase = deckY + 0.08;
   meta.signAnchor.set(w * 0.26, deckY + 3.1, d / 2 + 0.32);
   meta.door.set(w * 0.26, deckY, d / 2 + 1.6);
   meta.interior.set(0, deckY + 1.5, 0);
-  meta.collide.push({ w: w + 2.2, h: 0.4, d: d + 5.2, y: deckY - 0.1 });
+  /* THE BOX HAS TO BE THE DECK YOU CAN SEE. The planks run from
+     -d/2-0.4 to d/2+4.8 and this box was centred on the plot, so it
+     stood 2.2 m of invisible deck off the back of every pier and left
+     2.2 m of visible plank with nothing under it.
+
+     ATTRIBUTION — THIS LINE AND THE SUB-DECK ABOVE ARE WHAT FIXED THE
+     PIER PROBES, and neither was written as a surface fix. Run the
+     surface test against HEAD and both pier discs fail at +1.150 m of
+     "float"; run it here and they read +0.030. 1.150 m is deckY: the
+     probe stands on collision decking, the ray finds no drawn plank
+     under it and sails through to the sand. There were two ways for
+     that to happen and both are closed above — the collision box
+     reaching 2.2 m past the drawn planks off the stern (this line),
+     and the 9 cm gaps BETWEEN the planks with open water behind them
+     (the sub-deck). Anyone measuring a pier approach and wondering
+     where the metre went: it went here. */
+  meta.collide.push({ w: w + 2.2, h: 0.4, d: d + 5.2, z: 2.2, y: deckY - 0.1 });
   meta.collide.push({ w, h: wallH, d, y: deckY + wallH / 2 });
   meta.props.push({ type: 'lamp', x: -w * 0.44, z: d / 2 + 2.4, y: deckY });
   meta.top = meta.top || top;
@@ -1512,7 +1686,7 @@ function formGlass(ctx, K, loc, S, rng, meta) {
   }
 
   /* entrance: a glass canopy on slim posts */
-  doorway(K, S, rng, { face: 0, bw: w, bd: d, u: 0, w: 2.2, h: 2.7, wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.35), step: mixHex(base, BRAND.paper, 0.4) });
+  doorway(K, S, rng, { collide: meta.collide, face: 0, bw: w, bd: d, u: 0, w: 2.2, h: 2.7, wall: base, frame: S.trim, door: mixHex(S.trim, S.tint, 0.35), step: mixHex(base, BRAND.paper, 0.4) });
   K.add('glassCool', boxRound(4.6, 0.10, 2.4, 0.04, 1), TRS(0, 3.35, d / 2 + 1.1, 0, 1, 1, 1, -0.06), 0xffffff);
   K.add('wood', boxRound(4.8, 0.16, 0.22, 0.05, 1), TRS(0, 3.44, d / 2 + 0.12), S.trim);
   for (const sx of [-1, 1]) {
@@ -1556,15 +1730,65 @@ function formTemple(ctx, K, loc, S, rng, meta) {
   const stone = S.wall[0];
   const gold = S.feat.goldtrim ? C.gold : S.trim;
 
-  /* stepped podium */
-  const steps = 4;
+  /* stepped podium
+
+     A STAIR DRAWN AS FOUR TREADS AND COLLIDED AS ONE BLOCK.
+
+     The four bands below inset 0.25 m a side in w and 0.325 m a side in
+     d as they rise, so the podium reads from every approach as a flight
+     you walk up. The collision world had one box — the BOTTOM step's
+     plan, extruded to the TOP step's height (see the push that used to
+     sit beside the body box at the foot of this form). Two things fall
+     out of that and both were measured:
+
+       he stands on the flat top of that box out to the bottom step's
+       edge, so everywhere over the tread band his feet are a whole
+       step — or three — above the stone he can see. At the Business
+       School 119 of 1712 columns in the door forecourt, worst 0.576 m;
+       at Bull Bear Mutual 123 of 1704, worst 0.382 m. That is four to
+       five times the sink this suite calls visible, over a hundred
+       columns at the front door of two civic buildings.
+
+       and what the outer face of that box presents is a single vertical
+       rise the height of the WHOLE podium — 0.98 m at Bull Bear Mutual,
+       1.5 m at the Treasury — where the drawing offers four. Whether
+       that is also what stops him walking up is NOT measured here: a
+       groundAt() profile along the door axis is answered by the
+       nameboard hanging over the forecourt long before it reaches the
+       stone, so the approach was not established either way. What is
+       established is the surface disagreement below.
+
+     A tread is a box, so a box proxy is exact. One per band, same plan,
+     same height, same z, and the stack is solid because every lower
+     step is wider than the one above it.
+
+     AND FIVE TREADS WHERE FOUR WOULD BE TOO TALL TO CLIMB.
+
+     podium is min(1.5, H*0.07), so every temple over 20 m tall gets the
+     full 1.5 m — which over four treads is a rise of 0.375 m against
+     the controller's 0.35 m step offset. Walked with the per-step
+     boxes above and measured in the building's own frame, the Exchange
+     and the Residences both stop dead at 0.754 m, which is two treads
+     exactly: he mounts the first two and the third refuses him. Those
+     are two of the three buildings in Golden Heights and there is no
+     other way onto their podium.
+
+     Splitting the same 1.5 m over five treads puts the rise at 0.30 m
+     and inside the offset. Nothing else moves — same total height, same
+     footprint, same inset per tread as a fraction of the flight — and
+     the three shorter podiums (0.98, 1.19, 0.63) are all already under
+     4 x 0.34 and keep their four. */
+  const steps = Math.max(4, Math.ceil(podium / 0.34));
   for (let i = 0; i < steps; i++) {
     const t = i / steps;
+    const sw = w + 2.4 - t * 2.0, sd = d + 3.2 - t * 2.6;
+    const sh = podium / steps;
+    const sy = (podium * (i + 0.5)) / steps, sz = (1.0 - t * 0.8) * 0.4;
     band(K, {
-      part: 'stone', w: w + 2.4 - t * 2.0, h: podium / steps, d: d + 3.2 - t * 2.6,
-      y: (podium * (i + 0.5)) / steps, z: (1.0 - t * 0.8) * 0.4,
+      part: 'stone', w: sw, h: sh, d: sd, y: sy, z: sz,
       color: i % 2 ? shadeHex(stone, 0.94) : stone,
     });
+    meta.collide.push({ w: sw, h: sh, d: sd, y: sy, z: sz });
   }
 
   /* body */
@@ -1671,6 +1895,7 @@ function formTemple(ctx, K, loc, S, rng, meta) {
     }
   }
   doorway(K, S, rng, {
+    collide: meta.collide,
     face: 0, bw: w, bd: d, u: 0, w: 2.4, h: Math.min(4.0, bodyH * 0.7), steps: false,
     wall: stone, frame: gold, door: mixHex(C.goldDeep, BRAND.ink, 0.45), head: gold, step: C.marble,
   });
@@ -1719,7 +1944,8 @@ function formTemple(ctx, K, loc, S, rng, meta) {
   meta.door.set(0, podium, d / 2 + 3.0);
   meta.interior.set(0, podium + 1.6, 0);
   meta.collide.push({ w, h: bodyH, d, y: podium + bodyH / 2 });
-  meta.collide.push({ w: w + 2.4, h: podium, d: d + 3.2, y: podium / 2 });
+  /* the podium is FOUR boxes now, pushed beside the bands they proxy at
+     the top of this form — not one block the size of the bottom step */
   meta.top = top;
 }
 
@@ -1894,6 +2120,13 @@ export function buildLocation(ctx, loc, S, rng) {
   const meta = {
     door: new THREE.Vector3(0, 0, loc.size.d / 2 + 1.4),
     signAnchor: new THREE.Vector3(0, 3, loc.size.d / 2 + 0.3),
+    /* signs.js solves the nameboard's height from these two: signBase
+       is the local y of the ground the reader stands on under it (a
+       pier names itself from its deck, not from the seabed), signCeil
+       the architectural line its top may not cross. Left null, the
+       solve falls back to the eaves, which is right for every form
+       whose whole frontage is fair game. */
+    signBase: 0, signCeil: null,
     interior: new THREE.Vector3(0, 1.5, 0),
     collide: [], cloths: [], props: [], top: loc.size.h, ground: 0,
   };

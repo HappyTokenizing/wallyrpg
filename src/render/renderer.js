@@ -624,6 +624,14 @@ export async function init(ctx) {
   dbg.nanLog = () => nanLog.slice();
   dbg.nanProbe = () => post.probe(rtScene, rtND);
   dbg.nanSelfTest = (mode) => post.probeSelfTest(mode);
+  /* THE CONTROL FOR ALL OF THE ABOVE. `finiteGuard(false)` compiles the
+     firewall out of bloomPreMat and compositeMat, which puts the frame
+     back exactly where the user's report came from: the sky's stray
+     NaN texel reaches the bloom pyramid and arrives on screen as a
+     black block. `tools/blacksquares.mjs --noguard` asserts it comes
+     back; the plain gate asserts it does not. A guard nobody can turn
+     off is a guard nobody can prove is doing anything. */
+  dbg.finiteGuard = (on) => post.setFiniteGuard(on !== false);
   /* THE LANDSCAPE CHECK. `viewport()` is the whole sizing chain in one
      object; `inSync:false` is the hard-edged frame the user shot. */
   dbg.viewport = () => viewportState();

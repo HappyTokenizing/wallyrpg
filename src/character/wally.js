@@ -44,7 +44,7 @@ import {
 import { Animator, CLIPS, CLIP_NAMES, BIKE_SEAT } from './anim.js';
 import { Expression, EXPRESSION_NAMES } from './expression.js';
 import { Secondary } from './secondary.js';
-import { createBike } from './bike.js';
+import { createBike, solveParkPose, PARK_PITCH_MAX } from './bike.js';
 import { createScooter, createMotorcycle, triangleCost } from './rides.js';
 
 const _e = new THREE.Euler(0, 0, 0, 'XYZ');
@@ -1174,12 +1174,543 @@ export async function init(ctx) {
   }
   const buildBike = () => buildProp(rideId);
 
-  /** Exactly one prop is visible, ever. Called on every equip. */
+  /* WHICH MACHINE IS THIS PROP? Asked of the OBJECT, never of `rideId`.
+
+     `rideId` is a wish, not a fact. bikeSync() rewrites it twice a
+     second from ctx.game.actions.bike().id, and that call falls back to
+     bestRide() the instant nothing is equipped — so a player who also
+     owns the scooter has rideId flipped to 'scooter' partway through
+     the 0.54 s dismount of his BICYCLE, before parkProp() runs at the
+     end of it. Measured, with the scooter owned: the bicycle correctly
+     detached, leaned and standing at [-362.80, 7.02, 201.13] while
+     bikeState.parked read [{id:'scooter', at:[0,0,0], visible:false}].
+     Mounting the scooter then deleted that phantom record, and
+     showProp's hide loop — which exempts machines in `parkedIds` — no
+     longer saw the bicycle as parked and switched it off. A raycast
+     through the bicycle's own screen point hit the scooter and no
+     bicycle at all.
+
+     Own only the bicycle and the whole path works, because then
+     bestRide() answers 'bike' and the wrong key happens to be right.
+     That is why it shipped.
+
+     Three entries, a linear scan, once per dismount and once per frame
+     while something is parked. The alternative is an id stored on the
+     prop, which is one more copy that can disagree with `props` — and
+     two ids disagreeing is the entire bug. */
+  const propKey = (p) => {
+    if (!p) return null;
+    for (const k in props) if (props[k] === p) return k;
+    return null;
+  };
+
+  /**
+   * Exactly one prop is visible ON HIM, ever. Called on every equip.
+   *
+   * A PARKED MACHINE IS EXEMPT, and that exemption is the whole point
+   * of the parked feature. The hide loop used to be unconditional, so
+   * leaving the bicycle at the cafe door and then getting on the
+   * scooter set visible=false on the bicycle and it stayed invisible —
+   * still detached in the scene, still at its parked spot, still
+   * leaning on its stand, but not drawn — until it was re-equipped. The
+   * player left a machine somewhere and the world stopped agreeing that
+   * they had. A parked prop is no longer his; its visibility belongs to
+   * parkedCull() and to distance, not to what he happens to be riding.
+   */
   function showProp(id) {
     const key = rideKey(id) || 'bike';
-    for (const k in props) if (k !== key) props[k].group.visible = false;
+    for (const k in props) if (k !== key && !parkedIds.has(k)) props[k].group.visible = false;
     bike = buildProp(key);
     return bike;
+  }
+
+  /* ================================================================
+     PARKED — the machine is a thing in the world, not a thing on him.
+
+     park() used to be dead: nothing called park(true), the dismount hid
+     the prop outright, and the two writes park() makes (group roll and
+     crank angle) were overwritten by bikeUpdate's own rotation.set()
+     and setCrankPhase() on the very next frame. Forcing it live gave a
+     kickstand poking into the air under an upright bicycle.
+
+     It is now a STATE. When he gets off, the machine is DETACHED from
+     his root, stood on the ground where he left it, leaned onto its
+     stand, and left there. bikeUpdate skips every placement and
+     drivetrain write while `parked`, which is what makes the pose
+     survive a frame. Mounting re-parents it and takes it off the stand.
+
+     WHY THE UNEQUIP IS THE RIGHT CALL SITE. It is the only dismount the
+     game has — hud.js's door interaction warps him, it does not get him
+     off a bicycle — and "put the bicycle down and walk in" is exactly
+     what a player does at a door. Leaving it standing there is the
+     world-telling; bringing it back under him on the next mount is what
+     stops it being a way to lose your bicycle. An INSTANT dismount
+     still just hides it: that path is for cutscenes and debug hooks,
+     and a studio shot with an abandoned bicycle in it is nobody's
+     intent.
+
+     DRAW COST IS BOUNDED BY THE FRUSTUM FIRST AND BY DISTANCE SECOND,
+     and it used to be bounded by neither properly. Every mesh in the
+     prop carried frustumCulled = false — 106 of them, counting the
+     §2.2 outline hulls — on the argument that a wheel popping at the
+     frame edge is worse than a draw call. Three.js only culls a mesh
+     whose own bounding sphere is ENTIRELY outside the frustum, so that
+     pop was never on the table; what the flag actually bought was a
+     machine that kept drawing when nobody could see it. Measured by
+     differencing renderer.info with the prop toggled in and out on
+     alternate frames: a bicycle parked 12 m BEHIND the camera cost 199
+     draw calls and 30 751 triangles a frame, and one 40 m behind cost
+     163 and 25 541.
+
+     WHAT IT COSTS OFF SCREEN NOW, RE-MEASURED, because the sentence
+     that replaced those two — "with culling on, both are 53, and past
+     about 80 m they are 0" — was right in practice for the wrong
+     reason. Culling takes the MAIN pass to nothing at every range;
+     what is left is the shadow, and the shadow is not one number, it
+     is which cascades the machine falls in:
+
+     AT TIER "high", TWO CASCADES, 1280x720 AT dpr 1 — and the tier is
+     named because the ladder IS the cascade set and the cascade set is
+     the tier. The machine auto-picks "high" on the rig this was taken
+     on (WALLY.debug.renderInfo() prints both).
+
+       behind the camera, under ~16 m    106 calls   (two cascades)
+       behind the camera, ~20 m           90 calls   (the boundary)
+       behind the camera, 24 to 80 m      53 calls   (one cascade)
+       behind the camera, 100 m and out    0 calls
+
+     and parkedCull then takes the 53 to 0 itself past PARK_DRAW_M, so
+     a machine left further than 64 m away and out of shot really does
+     cost nothing. Inside 64 m it is 53 to 106 calls of shadow, which
+     is the price of a machine that still throws one.
+
+     THE ~20 m ROW IS A BOUNDARY, NOT A RUNG. The second cascade's far
+     plane sits about there, so a machine at 20 m is in it on some
+     frames and out on others as the follow camera drifts, and any
+     average across frames lands between 106 and 53 — 90.0 and 90.7 on
+     two runs. A ladder measured at one range with the boundary inside
+     it will disagree with this table for that reason alone, and a
+     ladder that came back FLAT at 53 across the whole near range was
+     measuring a prop that never entered the second cascade at all.
+     Re-measured twice, against the live loop, with a PRIVATE bicycle
+     built from bike.js and added to the scene so parkedCull cannot
+     touch it, parked and stood on the terrain at each range, by
+     differencing renderer.info across real frames with the prop
+     toggled: 105.3/106.3/106.3/106.0 at 4/8/12/16 m, 90.0 at 20 m,
+     53.0/53.0/53.0/53.3/53.0 at 24/32/48/64/80 m, 0 at 100 and 140.
+
+     (renderer.js sets renderer.shadowMap.autoUpdate = false and raises
+     needsUpdate once a frame. A tool that calls renderer.render()
+     itself and does not raise it reuses the last frame's shadow maps
+     and measures the main pass only — it reports 0 calls off screen at
+     every range, which is how this number was nearly published wrong a
+     second time.)
+
+     PARK_DRAW_M IS NOT "FOUR PIXELS TALL". That is what this note used
+     to say. It still is not four pixels — but the number that replaced
+     it was itself wrong, by exactly the device pixel ratio: "26.7 px
+     at 57 m in a 1280x720 frame" was counted in DRAWING-BUFFER pixels
+     at dpr 2. The column that replaced THAT was 3.5% high for a
+     different reason — it was measured off a vertex list that had been
+     captured by traversing the whole prop, so it carried the §2.2
+     outline shells, which are the same meshes pushed out along their
+     normals, and went on carrying them at ranges where toon.js had
+     already culled every hull.
+
+     AND THE COLUMN DEPENDS ON WHERE THE CAMERA IS AIMED, which this
+     note did not say and which is the whole of a disagreement it has
+     already caused. Painted vertices only, in CSS pixels, at 1280x720,
+     fov 50, the machine parked and standing on the terrain:
+
+       range     on the optical axis     level camera, eye 0.9 m
+       12 m            63.46 px                 63.48 px
+       32 m            23.71                    23.78
+       55 m            13.78                    13.98
+       57 m            13.30                    13.50
+       64 m (PARK_)    11.84                    12.05
+       122 m (haze)     6.21                     6.33
+       140.7 m          5.38                     5.48
+
+     ON THE AXIS a thin lens is exact and agrees to a HUNDREDTH of a
+     pixel (0.98 m of parked, leaned machine, 772 px of focal length at
+     fov 50: 0.98*772/57 = 13.28 against 13.30 measured; 0.98*772/140.7
+     = 5.38 against 5.38). OFF the axis it is not: an object below the
+     optical axis subtends tan(top) - tan(bottom), which is larger than
+     h/d, so the same machine measures about 2% taller from a level
+     camera at eye height than from one aimed at it. That 2% is the
+     difference between 5.38 and 5.48 at 140.7 m, and the 5.5 this note
+     used to print was the level-camera number quoted next to a
+     thin-lens check that only holds on the axis. Both are here now,
+     with the geometry named against each.
+
+     So the old rule popped an 11-pixel object out of existence while
+     the player was looking straight at it, which §6 forbids by name —
+     still nearly three times the "four pixels" the note before it
+     claimed, and the decision is unchanged by either correction. It
+     is now two distances and a frustum test:
+
+       within PARK_DRAW_M          always drawn — it is his, and he is
+                                   near enough to walk back to it
+       PARK_DRAW_M..PARK_FAR_M     drawn only while it is actually in
+                                   shot, which costs nothing when it is
+                                   not and never pops when it is
+       past PARK_FAR_M             gone. 140 m is past the §2.4 haze
+                                   line at 120 m, where it is 6.2 px
+                                   and washed to #B8DEF0; by 140.7 m it
+                                   is 5.4.
+
+     The frustum sphere is inflated by PARK_SHADOW_PAD so a machine just
+     outside the frame edge still casts into it.
+     ================================================================ */
+  /* PARKED IS PER MACHINE, NOT ONE BOOLEAN. He can own three and can
+     only ride one, so he can leave the bicycle at the cafe, take the
+     scooter to the docks and leave that there too. One flag could not
+     express that: mounting the scooter cleared it while the bicycle was
+     still standing at the cafe, which left the bicycle's own state
+     (detached from root, leaned, kickstand out) with nothing tracking
+     it. The set is keyed by the same ids `props` is. */
+  const parkedIds = new Set();
+  const PARK_DRAW_M = 64;
+  const PARK_FAR_M = 140;
+  /* THE SHADOW ALLOWANCE ALONE, and the name is the whole of why this
+     comment had to be fixed: it used to say "half the machine's own
+     diagonal (1.25 m) plus the longest shadow it throws", while
+     parkedCull below adds the 1.25 separately (`_psph.radius = 1.25 +
+     PARK_SHADOW_PAD`). Read as written, the pad was being double
+     counted by anyone reasoning about it. It is the longest shadow the
+     machine throws at this latitude and nothing else, so a bicycle a
+     metre outside the frame edge does not take its shadow with it. */
+  const PARK_SHADOW_PAD = 4.0;
+  const _pfr = new THREE.Frustum();
+  const _pmat = new THREE.Matrix4();
+  const _psph = new THREE.Sphere();
+  /* ------------------------------------------------------------------
+     THE PITCH CLAMP, AND WHAT IT IS ACTUALLY FOR.
+
+     It used to be 0.26 rad, described as "15 degrees — a steep street",
+     with nothing said about the streets that are steeper.
+
+     THE CONFORM INSIDE IT IS EXACT — AND THE MEASUREMENT THAT SAID SO
+     BEFORE THIS ONE WAS SAMPLING THE LATTICE. The table that stood here
+     read 0.0/0.0 at fourteen gradients from -2.19 to +47.01 degrees and
+     was quoted as "zero to the tenth of a millimetre everywhere inside
+     the clamp" over 78 869 sites. Every one of those sites was on a
+     10 m grid on an axis heading over a 2 m raster. This note used to
+     say that keeps both wheels on one terrain triangle: measured on
+     that exact grid, the two contacts are on DIFFERENT triangles at
+     5 806 of 5 806 sites. What it really does is put the machine's
+     origin exactly on a grid line, which makes the height profile along
+     the heading homogeneous about the origin and hands pass two pass
+     one's own pitch — see solveParkPose's header in bike.js for the
+     measurement and the algebra. Off the lattice the same code ran to
+     909.7 mm and buried a wheel 673.2 mm INSIDE the clamp.
+
+     RE-MEASURED THROUGH THE FIXED SOLVE, OFF THE LATTICE — 7.3 m grid,
+     0.37 m offset, five headings that are not multiples of pi/2,
+     WALLY.debug.parkProbe at every site, both contacts each, measured
+     from the prop's world matrix rather than off the probe's own
+     rounded report:
+
+                       whole island       road, restricted
+       sites           10 937                  533
+       contacts        21 874                1 066
+       over 0.1 mm     0                       0
+       worst           0.0 mm                  0.0 mm
+       ever buried     none, at any site       none
+
+     and the same for the scooter (21 870 contacts) and the motorcycle
+     (21 874), and on two further off-lattice grids — 10.3 m/1.41 and
+     3.1 m/0.83, golden-angle headings — for 153 852 bicycle contacts in
+     all, none over 0.1 mm. The clamp is a bad-sample guard, so sites
+     where it saturates are counted separately (298 of 11 235 on the
+     bicycle) and reported below.
+
+     "ROAD" IS RESTRICTED, AND IT HAS TO BE SAID EVERY TIME THE WORD IS
+     USED HERE. world.isRoad is terrain.pathAt > 0.35, a painted-surface
+     test that answers true inside building footprints and on grades a
+     player cannot walk up. Unfiltered it gives 671 sites on this grid;
+     137 of those overlap a city building's world box and one is over
+     the controller's own slope limit, leaving 533 a machine could
+     actually be left at. The count this note used to give, 1 320
+     contacts, is 660 sites — isRoad tested under the RIDER while the
+     machine it measured stands 0.62 m to his side.
+
+     Outside the clamp it saturates and the residual grows, and there
+     the numbers are about a bad sample rather than a street. NOTHING IS
+     EVER BURIED — the lift in solveParkPose sees to that, on every path
+     rather than only the saturated one, which is the half of it that
+     was wrong: the lift used to be gated on the clamp engaging, on the
+     strength of the lattice census saying the ungated case was already
+     zero.
+
+     STANDING IT UPRIGHT ON ONE SAMPLED HEIGHT INSTEAD IS STRICTLY
+     WORSE, and that is arithmetic rather than taste: at pitch 0 the
+     residual is (base/2)(tan s) with no sin term to take off it, which
+     at 37 degrees is +/-354 mm — exactly twice the error it replaces,
+     and now on a bicycle that also reads as ignoring the hill. So: no.
+
+     THE CLAMP IS A BAD-SAMPLE GUARD, NOT A STYLE LIMIT, so it belongs
+     at the steepest ground he could have been standing on when he got
+     off — the controller's own slope limit, 48 degrees (§4,
+     controller.js `slopeLimit`). Below that the conform is exact and
+     the clamp never engages; above it, the two heights did not come
+     from a street he walked onto — they came from a wall, a cliff face
+     or a building footprint in heightAt — and refusing to pitch a
+     bicycle 60 degrees on the strength of one of those is the whole
+     point. A census of the island (66 058 samples on a 3 m grid, worst
+     wheelbase-length chord at each) puts the median at 9 degrees and
+     8.8% of the land over 30; the reachable streets are the low half of
+     that and the tail is the Golden Heights cliff.
+
+     AND NOTHING GOES UNDER THE GROUND, PAST THE CLAMP OR INSIDE IT. A
+     wheel buried in the terrain reads as a bug; the same wheel a few
+     centimetres clear reads as a machine parked awkwardly on a slope,
+     which is what it is. The origin is lifted by whichever residual is
+     more negative, so the deeper contact sits ON the terrain and the
+     shallower one hovers. Wherever the iteration converged both
+     residuals are zero and the lift is a no-op, which is everywhere the
+     census found.
+
+     THE CLAMP ITSELF LIVES IN bike.js NOW, next to the solve it belongs
+     to, and both callers take it from there — the intro's copy of this
+     arithmetic shipped a generation behind with a 0.26 rad clamp on a
+     stage picker that accepts 0.42, which is exactly what two copies of
+     one number buys you.
+     ------------------------------------------------------------------ */
+  const _pv = new THREE.Vector3();
+
+  /* ------------------------------------------------------------------
+     WHICH SIDE, AND HOW FAR OUT.
+
+     HIS -X SIDE is the side the mount slides in from (RIDE_TUNE.enter.x
+     is negative on all three), so he leaves it the way he picked it up.
+     That part is fixed. The DISTANCE is not, and it used to be: parking
+     the bicycle and then, without moving a step, the scooter put both
+     machines at exactly the same point, interpenetrating. It is a
+     contrived way to stand — the feature's own example is the bicycle
+     at the cafe and the scooter at the docks — but nothing stopped it,
+     and two machines in the same 0.6 m of street is the kind of thing
+     a player screenshots.
+
+     So the offset steps outward along the same side until the spot is
+     clear of every OTHER parked machine, and gives up after four rungs
+     rather than search: the fourth is 3.9 m out, further than he could
+     plausibly have wheeled it, and a machine parked slightly too far
+     away beats a machine that never parks at all.
+
+     THE RUNG SPACING IS THE CLEARANCE, NOT A FRACTION OF THE OFFSET.
+     The first version stepped by 1.25x the 0.62 m offset — 0.775 m
+     between rungs, which is under PARK_CLEAR_M, so a machine on one
+     rung blocked BOTH of its neighbours. Measured with all three owned
+     and parked from one spot: bicycle -0.62, scooter -2.17 (it had to
+     skip a rung), motorcycle back at -0.62 on the give-up fallback,
+     interpenetrating the bicycle — the exact defect, two machines
+     later. Rungs are 1.1 * PARK_CLEAR_M apart now, so consecutive
+     machines take consecutive rungs and three of them fit inside the
+     first three.
+     ------------------------------------------------------------------ */
+  const PARK_SIDE_X = -0.62;
+  const PARK_CLEAR_M = 1.0;       // measured: the props are 0.60-0.72 m wide
+  const PARK_STEP_M = 1.1;        // > PARK_CLEAR_M, or a rung blocks its neighbour
+  function parkOffsetX(at, yaw) {
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    for (let i = 0; i < 4; i++) {
+      const ox = PARK_SIDE_X - i * PARK_STEP_M;
+      const x = at.x + cy * ox, z = at.z - sy * ox;
+      let clear = true;
+      for (const id of parkedIds) {
+        const p = props[id];
+        if (!p || p === bike) continue;
+        const q = p.group.position;
+        if (Math.hypot(q.x - x, q.z - z) < PARK_CLEAR_M) { clear = false; break; }
+      }
+      if (clear) return ox;
+    }
+    return PARK_SIDE_X;
+  }
+
+  /* WHAT parkProp ACTUALLY DID, for parkProbe to report. See the probe
+     at the foot of this file: it used to publish the chord under
+     WALLY'S FEET while the machine is parked 0.62 m to one side and
+     pitched to the chord THERE, so on sloped ground its `gradientDeg`
+     and its `clamped` flag were about a different hill from the one it
+     had just measured the wheels against. */
+  let _parkLast = null;
+
+  /**
+   * Where a wheel's contact patch sits along the machine's own z, in
+   * the prop group's frame. `w.position.y` is the axle height and
+   * therefore the rolling radius (see bike.js), and the contact is
+   * directly under the axle.
+   *
+   * It walks the parent chain because the motors put their FRONT wheel
+   * inside a steering group (rides.js), so `w.position.z` alone is the
+   * offset from the fork rather than from the machine. Parent rotations
+   * are ignored: the only one in the chain is that steer yaw, it is
+   * damped to zero before a dismount ever completes, and even at its
+   * 0.16 rad limit it shortens a 0.47 m arm by 6 mm.
+   */
+  function contactZ(w, stop) {
+    let z = 0;
+    for (let n = w; n && n !== stop; n = n.parent) z += n.position.z;
+    return z;
+  }
+
+  /**
+   * Stand the machine on the ground beside him and leave it there.
+   *
+   * IT IS PITCHED TO THE CHORD THROUGH BOTH WHEEL CONTACTS, not dropped
+   * onto one height sample. The first version took a single heightAt
+   * under the frame origin and wrote rotation (0, yaw, 0), which is
+   * exact on a flat door pad — both contacts measured 0.0000 m — and
+   * wrong by the wheelbase times the gradient everywhere else. On the
+   * hillside twelve metres from that same door the front wheel sat
+   * 114 mm UNDER the terrain and the rear 90 mm over it: a bicycle
+   * half-buried at one end and hovering at the other. The rider's feet
+   * have been conformed to the ground this way since secondary.js was
+   * written; the machine he leaves behind gets the same treatment.
+   *
+   * THE SOLVE ITSELF IS solveParkPose IN bike.js — pitch, height and
+   * roll, from terrain samples, iterated to a fixed point rather than
+   * taken in a fixed number of passes. Read its header before touching
+   * any of this: it carries the off-lattice census that showed the old
+   * two-pass version running to 909.7 mm and burying a wheel 673.2 mm
+   * inside the clamp, and the reason the census before it could not
+   * have seen that.
+   *
+   * THIS FUNCTION'S OWN JOB IS EVERYTHING AROUND THE SOLVE: which side
+   * of him the machine goes and how far out (parkOffsetX), the contact
+   * geometry the solve needs (contactZ, walking the steering group),
+   * the rotation ORDER, the parked-id bookkeeping, and handing
+   * parkProbe what was actually measured. The arithmetic lives in one
+   * place because it used to live in two and they drifted apart.
+   */
+  function parkProp() {
+    if (!bike) return;
+    const g = bike.group;
+    root.updateMatrixWorld(true);
+    root.getWorldPosition(_pv);
+    const yaw = root.rotation.y;
+    /* His -x side, stepped out if another machine is already standing
+       there. Local +x maps to world (cos y, 0, -sin y). */
+    const ox = parkOffsetX(_pv, yaw);
+    const px = _pv.x + Math.cos(yaw) * ox;
+    const pz = _pv.z - Math.sin(yaw) * ox;
+
+    const ws = bike.wheels || [];
+    const zf = ws.length > 1 ? contactZ(ws[0], g) : 0;
+    const zr = ws.length > 1 ? contactZ(ws[1], g) : 0;
+    const base = zf - zr;
+
+    const H = (x, z) => {
+      try { const h = ctx.world?.heightAt?.(x, z); if (Number.isFinite(h)) return h; } catch (e) {}
+      return NaN;
+    };
+    const sol = solveParkPose(H, {
+      x: px, z: pz, yaw, zf, zr,
+      lean: bike.parkLean,
+      /* the stand's own design contact point, published by the prop —
+         never guessed at from geometry here, which is how the last
+         kickstand defect (it was on the side away from the lean)
+         survived a whole round */
+      foot: bike.standFoot || null,
+      fallbackY: _pv.y,
+    });
+    const gy = sol.y, pitch = sol.pitch;
+    /* WHAT WAS ACTUALLY MEASURED, AND WHERE — for parkProbe, so the
+       probe reports the gradient this machine was pitched to instead of
+       the one under the rider's feet. */
+    _parkLast = {
+      /* SIX DECIMALS ON THE POSITION. A tool that models this solve has
+         to sample heightAt where the machine actually is; fed a position
+         rounded to the millimetre it samples a different hill, and on
+         a 24-degree grade half a millimetre of position is 0.2 mm of
+         height — twice the threshold the same tool then applies. */
+      at: [+px.toFixed(6), +pz.toFixed(6)], offsetX: +ox.toFixed(4),
+      base: +base.toFixed(3),
+      gradientDeg: base > 0.05 ? +(sol.rawPitch * 180 / Math.PI).toFixed(2) : null,
+      clamped: base > 0.05 && sol.clamped,
+      rollDeg: +(sol.roll * 180 / Math.PI).toFixed(2),
+      rollRawDeg: +(sol.rollRaw * 180 / Math.PI).toFixed(2),
+      leanDeg: +((bike.parkLean || 0) * 180 / Math.PI).toFixed(2),
+      rollClamped: !!sol.rollClamped,
+      pitchIters: sol.pitchIters, bisected: sol.bisected,
+      solveMM: sol.contactMM, liftMM: sol.liftMM,
+    };
+
+    if (g.parent !== ctx.scene) ctx.scene.add(g);
+    g.position.set(px, gy, pz);
+    /* ROTATION ORDER IS THE WHOLE OF WHY THIS IS THREE LINES AND NOT
+       ONE. Default 'XYZ' composes Rx*Ry*Rz, which applies the pitch
+       OUTSIDE the yaw — i.e. about the world x axis, so a machine
+       parked facing east would pitch sideways instead of nose-up.
+       'YXZ' gives Ry*Rx*Rz: yaw in the world, then pitch about the
+       machine's own lateral axis, then park()'s lean on z about its own
+       forward axis. Each rotation is then in the frame it means
+       something in. */
+    g.rotation.order = 'YXZ';
+    g.rotation.set(pitch, yaw, 0);
+    g.scale.set(1, 1, 1);
+    /* park() writes the roll on z, innermost under 'YXZ', so it is a
+       lean in the machine's own frame and not a world-space tilt,
+       exactly as the bank on `root` is. THE ROLL IS CONFORMED NOW: it
+       is the prop's own lean plus the ground's cross-slope under the
+       stand, clamped to a band around the lean. On flat ground it is
+       the lean to the bit. See solveParkPose. */
+    bike.park(true, sol.roll);
+    g.visible = true;
+    /* THE PROP THAT WAS JUST PARKED, not the id another module may have
+       rewritten mid-dismount. See propKey. */
+    const id = propKey(bike);
+    if (id) parkedIds.add(id);
+  }
+
+  /** Take it off the stand and put it back under him. */
+  function unparkProp() {
+    if (!bike) return;
+    const id = propKey(bike);
+    if (id) parkedIds.delete(id);
+    const g = bike.group;
+    bike.park(false);
+    if (g.parent !== root) root.add(g);
+    g.position.set(0, 0, 0);
+    /* Back to the order every other writer of this transform assumes.
+       bikeUpdate only ever sets y and z, which compose the same either
+       way, but leaving a non-default order on a shared object is the
+       kind of thing that is invisible until it is not. */
+    g.rotation.order = 'XYZ';
+    g.rotation.set(0, 0, 0);
+    g.scale.set(1, 1, 1);
+  }
+
+  /** Hide machines left further away than they are worth drawing.
+      Every parked one, not just the current — that is the point of
+      being able to leave more than one somewhere.
+
+      NEVER HIDE ONE THE PLAYER IS LOOKING AT. See the PARK_DRAW_M note
+      above: the old single-distance rule switched a 28-pixel bicycle
+      off in one frame in the middle of the shot. Beyond PARK_DRAW_M
+      the machine now survives exactly as long as it is in frame, which
+      costs nothing the rest of the time (its meshes are frustum-culled
+      out of every pass but the shadow) and never pops while it is. */
+  function parkedCull() {
+    const cam = ctx.camera;
+    if (parkedIds.size && cam) {
+      _pmat.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+      _pfr.setFromProjectionMatrix(_pmat);
+    }
+    for (const id of parkedIds) {
+      const p = props[id];
+      if (!p) continue;
+      if (!cam) { p.group.visible = true; continue; }
+      const d = cam.position.distanceTo(p.group.position);
+      if (d < PARK_DRAW_M) { p.group.visible = true; continue; }
+      if (d > PARK_FAR_M) { p.group.visible = false; continue; }
+      _psph.center.copy(p.group.position);
+      _psph.center.y += 0.55;                 // half its standing height
+      _psph.radius = 1.25 + PARK_SHADOW_PAD;
+      p.group.visible = _pfr.intersectsSphere(_psph);
+    }
   }
 
   function bikeSpeeds(on) {
@@ -1239,7 +1770,7 @@ export async function init(ctx) {
       anim.setRide(rideId);
       showProp(rideId);
       bike.group.visible = true;
-      bike.park(false);
+      unparkProp();
       bikeSpeeds(true);
       ikSaved = secondary.ikEnabled;
       secondary.ikEnabled = false;          // his feet are on a machine
@@ -1256,7 +1787,9 @@ export async function init(ctx) {
       if (o.instant || !bike) {
         bikePhase = 'off'; bikeT = 0; bikeRide = 0;
         anim.setBike(false, 0);
-        if (bike) bike.group.visible = false;
+        /* INSTANT MEANS PUT IT AWAY, not leave it in the street. See
+           the parked block: this path is cutscenes and debug hooks. */
+        if (bike) { unparkProp(); bike.group.visible = false; }
         bikeSpeeds(false);
         secondary.ikEnabled = ikSaved;
       } else {
@@ -1294,7 +1827,8 @@ export async function init(ctx) {
       bikeRide = 1 - clamp(bikeT / DISMOUNT_T, 0, 1);
       if (bikeT >= DISMOUNT_T) {
         bikePhase = 'off'; bikeRide = 0;
-        if (bike) bike.group.visible = false;
+        /* He is off it: stand it up where he left it. */
+        parkProp();
         bikeSpeeds(false);
         secondary.ikEnabled = ikSaved;
       }
@@ -1321,6 +1855,22 @@ export async function init(ctx) {
       : 0;
     bikeLean = damp(bikeLean, want, L.rate, dt);
     root.rotation.z = bikeLean * bikeRide;
+
+    /* PARKED IS A STATE, AND THIS LINE IS WHAT MAKES IT ONE. Everything
+       below writes the prop's placement and its drivetrain against a
+       rider who is no longer on it; the frame after parkProp() ran, the
+       lean damper is still non-zero, so bikeUpdate is still being
+       called, and without this return the kickstand pose would be
+       overwritten before it was ever drawn. That is exactly how park()
+       came to be dead code.
+
+       IT ASKS ABOUT THE PROP `bike` POINTS AT, not about `rideId`. The
+       set holds every machine he has left somewhere and the ones he is
+       not on are not this function's business — but `rideId` can name a
+       different machine from the one `bike` is, for the whole of a
+       dismount (see propKey), and then this guard lets the placement
+       writes below run over a bicycle standing in the street. */
+    if (parkedIds.has(propKey(bike))) return;
 
     if (!bike || !bike.group.visible) return;
 
@@ -1362,11 +1912,22 @@ export async function init(ctx) {
        radius, which is the only honest source when the gearing is
        inside a case nobody ever sees. */
     if (bike.crank) {
-      bike.setCrankPhase(-anim.bikePhase + CRANK_OFFSET);
-      for (const w of bike.wheels) w.rotation.x = -anim.locPhase * Math.PI * 2 * WHEEL_PER_CRANK;
-    } else {
-      bike.update(dt, speed);
+      /* NO SIGN FLIP HERE, and that is the fix for "he pedals
+         backwards". Both of these used to be negated, which made the
+         pedal mesh follow a leg solve that ran the circle the wrong way
+         and then dragged the wheels backwards to match it — a
+         drivetrain in perfect agreement with itself and in flat
+         contradiction of the direction of travel. The sign now lives
+         once, at the source, in bikeBody()'s `cr`; here the phase is
+         handed over honestly and rotation.x means what three.js says it
+         means, which is forward. */
+      bike.setCrankPhase(anim.bikePhase + CRANK_OFFSET);
     }
+    /* AND THE WHEELS COME OFF THE GROUND, NOT OFF THE CRANK — on all
+       three machines, through the same call. The crank is a gear and
+       may change ratio with the rung; the wheel is tyre-bound to the
+       road and may not. See bike.js `roll`. */
+    bike.roll(speed * dt);
   }
 
   /* Local smoothstep so this block does not depend on the import list
@@ -1375,17 +1936,37 @@ export async function init(ctx) {
     const t = clamp((x - a) / (b - a), 0, 1);
     return t * t * (3 - 2 * t);
   };
-  /* Measured, not guessed: see the CRANK note in the final report. The
-     leg's stroke bottom is at pedal phase 0 and the prop's crank arm
-     hangs straight DOWN at rotation.x 0, so the two already agree and
-     the offset is a straight sign flip for the direction of travel. */
+  /* Measured, not guessed. The leg's stroke bottom is at pedal phase 0
+     and the prop's crank arm hangs straight DOWN at rotation.x 0, so
+     the two agree with no offset at all — and now with no sign flip
+     either, since bikeBody() runs its own solve on the reversed phase.
+     VERIFIED WITH WALLY.debug.driveTrace(), and stated with both of the
+     numbers it returns rather than the flattering one. At the cruise
+     rung the ankle-to-pedal offset VECTOR wanders 23.5 mm about its own
+     mean (fitDriftMM) and the WORST GAP between ankle and pedal plate
+     is 50.2 mm (fitMaxMM, against 14.4 mm at its best). This note used
+     to quote the 23.5 as "tracks the pedal plate to within 24 mm across
+     the whole stroke", which is the drift wearing the gap's name and
+     twice as good as the truth. The gap is a foot standing on a pedal
+     with a sole between them; the drift is whether it slides. Both are
+     within tolerance; only one of them is 24 mm. */
   const CRANK_OFFSET = 0;
-  /* Wheel revolutions per crank revolution: cycle (2.6 m per crank
-       revolution, CLIPS['ride-bicycle'].cycle) divided by the wheel's
-       own circumference. A visible drivetrain ratio — the wheels
-       turning nearly twice per pedal stroke — is what stops them
-       reading as decals painted on the frame. */
-  const WHEEL_PER_CRANK = 2.6 / (Math.PI * 2 * 0.225);
+  /* THERE IS NO LONGER A WHEEL_PER_CRANK CONSTANT, and its absence is
+     the point. It was 2.6 / (2*pi*0.225) — the ride-bicycle rung's
+     cycle length over the wheel's circumference — which made the ratio
+     a property of ONE clip. The blend interpolates `cycle` between
+     rungs (2.6 at cruise, 4.4 at the sprint), so the wheels were 18%
+     slow at cruise and 41% slow flat out, and they inherited the pedal
+     phase's wrap: 1.84 turns of discontinuity, 302 degrees, which
+     against the wheel's TEN-fold spoke symmetry is a 14-degree BACKWARD
+     SNAP about 1.5 times a second. Distance has no rung and no wrap.
+
+     TEN-fold, not five. bike.js lays five spokes as full DIAMETERS at
+     36-degree spacing, so a 36-degree turn maps the wheel onto itself.
+     The conclusion is the same either way — 302 mod 36 and 302 mod 72
+     are both 14 — but this file said five-fold while bike.js said ten
+     in the same working tree, and two files disagreeing by name about a
+     measured fact is how the next reader gets misled. */
 
   /* Ownership sync. The data agent emits 'bike' on buy and on equip;
      a SAVE LOAD may restore state.bike without one, so the state is
@@ -1554,6 +2135,7 @@ export async function init(ctx) {
        legs were resolved at, and before secondary.update so the ear and
        trunk chains hang off a root that has already banked. */
     if (bikePhase !== 'off' || bikeLean !== 0) bikeUpdate(dt, speed);
+    if (parkedIds.size) parkedCull();
 
     /* ---- secondary targets, then a forced world update so the spring
        chains in phys.lateUpdate see this frame's bone transforms ---- */
@@ -1748,7 +2330,14 @@ export async function init(ctx) {
     get bikeState() {
       return { owned: bikeOwned, equipped: bikeEquipped, phase: bikePhase,
         id: rideId, ride: +bikeRide.toFixed(3), lean: +bikeLean.toFixed(3),
-        steer: +bikeSteer.toFixed(3) };
+        steer: +bikeSteer.toFixed(3),
+        /* which machines he has left standing somewhere, and where */
+        parked: [...parkedIds].map((k) => ({
+          id: k,
+          at: props[k] ? props[k].group.position.toArray().map((v) => +v.toFixed(2)) : null,
+          pitchDeg: props[k] ? +(props[k].group.rotation.x * 180 / Math.PI).toFixed(2) : null,
+          visible: props[k] ? props[k].group.visible : null,
+        })) };
     },
     get rideState() { return api.bikeState; },
 
@@ -1955,6 +2544,7 @@ export async function init(ctx) {
       secondary.dispose();
       /* every machine that was ever built, not just the one under him */
       for (const k of Object.keys(props)) { props[k].dispose(); delete props[k]; }
+      parkedIds.clear();
       bike = null;
       ctx.scene.remove(root);
       if (shadowMesh) {
@@ -2140,6 +2730,631 @@ export async function init(ctx) {
       slipPctOfGroundSpeed: +(100 * (tot / Math.max(cnt, 1)) / step).toFixed(1),
       worstSlip: +worst.toFixed(5),
       rows,
+    };
+  };
+
+  /* ================================================================
+     WALLY.debug.driveTrace(ride, speed, n)
+
+     THE DRIVETRAIN RULER. "Is he pedalling backwards" is exactly the
+     question an eye cannot answer — a crank circle looks identical
+     played either way at 24 fps — so it is answered here with numbers
+     instead. For one full cycle at a known speed it samples, in
+     ROOT-LOCAL metres (the frame the whole convention is stated in,
+     FORWARD IS +Z):
+
+       ankle   the footL bone, i.e. where the leg solve actually puts
+               the foot after every blend, IK gate and secondary pass
+       pedal   the LEFT pedal plate on the prop's own crank
+       mark    a material point on the rear wheel rim — a valve stem
+
+     and reports, for each of the three, the sign of dz at the TOP of
+     its own circle. A forward drivetrain has ALL THREE POSITIVE: the
+     top of a forward-rolling wheel moves toward +z, and so does the
+     top of a forward-turning crank and the foot on it.
+
+     THE SIGN IS ONLY A SIGN ABOVE A FLOOR, and the rule used to be
+     stated without one: "any minus sign in that row is a reversed
+     drivetrain". On a machine with no pedals that rule convicts the
+     noise. The scooter has a footboard and no crank, so the foot does
+     not travel a circle at all and `dzAtTop.ankle` reads -0.00016 m —
+     0.16 mm of residual from the secondary pass, and a minus sign. The
+     real signals on the machines that do have a drivetrain are 0.0127
+     and 0.0180 m, two orders of magnitude clear of that, so the floor
+     can sit almost anywhere between; DZ_NOISE_M is 0.001 m, six times
+     the noise and twelve times below the smallest true reading.
+
+     `driveDirection` applies it: 'fwd', 'rev', or 'none' when the
+     travel is under the floor and there is nothing to read a direction
+     from. Read THAT, not the sign of the raw millimetres, which are
+     still published beside it because a number you cannot see is a
+     number nobody can check.
+
+     `fitMax` is the ankle-to-pedal distance at its WORST over the
+     stroke and `fitDrift` is how much that offset VECTOR wanders, which
+     is the number that catches a foot sliding off the pedal as the
+     phase is re-signed. THEY ARE DIFFERENT QUESTIONS and quoting one
+     for the other has already caused trouble in this file: at the
+     shipped tuning fitDrift is 23.5 mm and fitMax is 50.2 mm, and a
+     note downstream cited the 23.5 as "the ankle tracks the pedal to
+     within 24 mm across the whole stroke", which is twice as good as
+     the truth. Drift is the SPREAD of the offset; max is the GAP.
+
+     `speed` IS A RUNG, AND IT REACHES BOTH HALVES. It pins the pose for
+     the phase sweep, and it is mapped onto the controller for the
+     travel probe the way touch.js maps a stick: pick the speed, then
+     say which gear it lives in. That mapping used to be missing — the
+     probe pushed run:false at full magnitude and always measured the
+     no-shift cruise, so driveTrace('bike', 8.8) came back byte-for-byte
+     identical to driveTrace('bike', 5.2) and the tool was blind to the
+     sprint rung, which is exactly where the wheel bug was worst at 41%
+     slow. `rungMeasured` now reports what was actually reached, so the
+     number can never be read as the rung that was asked for.
+     ================================================================ */
+  dbg.driveTrace = (rideName = 'bike', speed = 5.2, n = 48) => {
+    const wasManual = locoManual, wasS = locoSpeed, wasT = locoTurn;
+    const wasLock = anim.phaseLock, wasForced = bikeForced;
+    const key = rideKey(rideName) || 'bike';
+    bikeForced = true;
+    api.setRide(key, { instant: true });
+    api.setLocomotion(speed, 0);
+    /* PRE-ROLL, AND IT IS 2.5 s BECAUSE 0.4 s WAS NOT ENOUGH ONCE.
+       bikeRide, the lean damper and the spring chains are all
+       accumulators, and a cold first frame measures the transient. At
+       24 frames the very FIRST call after boot — the machine has never
+       been mounted, so the whole mount transition is inside the sample
+       — reported fitMaxMM 117.3 and fitDriftMM 84.4, while every call
+       after it reported 50.2 and 23.5 to the decimal. A ruler whose
+       first reading is 2.3x out and whose second is exact is a ruler
+       nobody can use once. Measured: 24 frames gives 117.3/84.4 cold,
+       72 gives 57.8/26.9, 150 gives 50.2/23.6 — the same numbers as
+       every warm call, to a tenth of a millimetre. It is 150. */
+    for (let i = 0; i < 150; i++) { update(1 / 60, i / 60); lateUpdate(1 / 60); }
+
+    const prop = bike;
+    const V = new THREE.Vector3();
+    /* the left crank arm is the one at +x — bike.js puts it at
+       rotation 0 because bikeBody gives the left leg pedal phase 0 —
+       and the pedal plate is the child hanging below it */
+    let pedalMesh = null;
+    if (prop && prop.crank) {
+      const arm = prop.crank.children.find((c) => !c.isMesh && c.position.x > 0)
+        || prop.crank.children.find((c) => c.children?.length && c.position.x > 0);
+      /* the PLATE, not the arm: the arm's own capsule also hangs at
+         -y, and measuring its midpoint measures a point at half the
+         crank radius, which reads as a working drivetrain at the wrong
+         scale. The plate is the box, and it is the thing the foot is
+         supposed to be standing on. */
+      pedalMesh = arm && (arm.children.find((c) => c.isMesh && c.geometry?.type === 'BoxGeometry')
+        || arm.children.find((c) => c.isMesh && c.position.y < 0));
+    }
+    /* the REAR wheel: wheels[0] is the front (z +AXZ), wheels[1] the
+       rear. Either tells the same story; the rear is the driven one. */
+    const wheel = prop && prop.wheels ? (prop.wheels[1] || prop.wheels[0]) : null;
+    /* the wheel group sits at y = its own radius, so its height IS the
+       radius — no module has to publish a second copy of the number */
+    const wr = wheel ? wheel.position.y : 0.225;
+
+    const local = (o, lx, ly, lz) => {
+      V.set(lx || 0, ly || 0, lz || 0);
+      o.localToWorld(V);
+      root.worldToLocal(V);
+      return [V.x, V.y, V.z];
+    };
+
+    const rows = [];
+    for (let i = 0; i <= n; i++) {
+      const ph = i / n;
+      anim.setPhaseLock(ph % 1);
+      update(1 / 60, i / 60);
+      lateUpdate(1 / 60);
+      root.updateMatrixWorld(true);
+      const r = { ph: +ph.toFixed(4) };
+      r.ankle = local(rig.byName.footL, 0, 0, 0);
+      r.pedal = pedalMesh ? local(pedalMesh, 0, 0, 0) : null;
+      /* a valve stem: wheel-LOCAL +y, so it rides round with the group */
+      r.mark = wheel ? local(wheel, 0, wr, 0) : null;
+      r.crankRot = prop && prop.crank ? prop.crank.rotation.x : null;
+      r.wheelRot = wheel ? wheel.rotation.x : null;
+      /* THE ROCK, against the foot it is supposed to be rocking onto.
+         LEFT IS +X on this rig (legL0 sits at x +0.134), and a NEGATIVE
+         spine roll tips the torso top toward +x. So "leans onto the
+         left foot" reads as spineRollDeg < 0, and it has to coincide
+         with the left ankle DESCENDING — that is the push. */
+      r.spineRollDeg = +(rig.byName.spine.rotation.z * 180 / Math.PI).toFixed(2);
+      r.ankRy = +local(rig.byName.footR, 0, 0, 0)[1].toFixed(4);
+      r.elbowLx = +(rig.byName.armL1.rotation.x * 180 / Math.PI).toFixed(2);
+      rows.push(r);
+    }
+
+    /* dz at the top of each circle, and at the bottom, from the sample
+       where that point is highest / lowest. One-sided differences, so
+       the sign is the sign of the motion and nothing else. */
+    /* 1 mm. Six times the 0.16 mm the pedal-less machines idle at, and
+       twelve times under the smallest real signal (0.0127 m). */
+    const DZ_NOISE_M = 0.001;
+    const dirOf = (v) => (v == null ? null : (Math.abs(v) < DZ_NOISE_M ? 'none' : (v > 0 ? 'fwd' : 'rev')));
+    /* ------------------------------------------------------------------
+       NO INDEX WRAP. IT CALLED A CORRECT WHEEL REVERSED, ABOUT ONCE IN
+       NINE.
+
+       This used to take the forward difference at
+       `pts[(bi + 1) % (pts.length - 1)]`. The wrap is right for the
+       ankle and the pedal, which are PERIODIC across the phase sweep —
+       index 0 and index n are the same pose, so wrapping off the end
+       lands on the neighbour. The wheel mark is not periodic: it is
+       driven by DISTANCE and turns 4.15 revolutions across the sweep,
+       so whenever the highest sample landed on the second-to-last index
+       the difference was taken across four revolutions and its sign was
+       arbitrary. Measured: the same call from the same spot, 18 times,
+       returned 'rev' for the wheel mark twice, with magnitudes the size
+       of the true signal rather than of noise, while wheelRateErrPct
+       read 0.00% throughout.
+
+       This tool exists BECAUSE the drivetrain once ran backwards under
+       a character moving forwards. A false 'reversed' is exactly the
+       alarm that gets a ruler ignored, and an ignored ruler is worse
+       than no ruler.
+
+       The wrap was never needed by the periodic pair either: `bi` is
+       searched over [0, len-2], so bi + 1 is always a real index, and
+       for a periodic series pts[n] is pts[0] to the float. One line,
+       and it is now the same line for all three.
+       ------------------------------------------------------------------ */
+    const dzAt = (key2, pick) => {
+      const pts = rows.map((r) => r[key2]).filter(Boolean);
+      if (pts.length < 3) return null;
+      let bi = 0;
+      for (let i = 1; i < pts.length - 1; i++) {
+        if (pick === 'top' ? pts[i][1] > pts[bi][1] : pts[i][1] < pts[bi][1]) bi = i;
+      }
+      return +(pts[bi + 1][2] - pts[bi][2]).toFixed(5);
+    };
+
+    let fitMax = 0, fitMin = 1e9;
+    const offs = [];
+    for (const r of rows) {
+      if (!r.pedal) break;
+      const dy = r.ankle[1] - r.pedal[1], dz = r.ankle[2] - r.pedal[2];
+      /* the fit is a SAGITTAL question: the pedal plate is offset
+         outboard on purpose (bike.js's wide chainline), so x is the
+         geometry and y/z is whether the foot is ON it */
+      const d = Math.hypot(dy - 0.10, dz);
+      fitMax = Math.max(fitMax, d); fitMin = Math.min(fitMin, d);
+      offs.push([dy, dz]);
+    }
+    const mean = offs.length
+      ? [offs.reduce((s, o) => s + o[0], 0) / offs.length, offs.reduce((s, o) => s + o[1], 0) / offs.length]
+      : [0, 0];
+    const fitDrift = offs.reduce((m, o) => Math.max(m, Math.hypot(o[0] - mean[0], o[1] - mean[1])), 0);
+
+    /* ================================================================
+       THE TRAVEL REFERENCE — the half of this tool that was dead.
+
+       It reported travelAlongOwnForward 0 at every speed, because the
+       loop above only calls update()/lateUpdate() by hand: update()
+       COPIES the controller's position onto the root, and nothing was
+       stepping the controller, so the root sat still while the legs
+       pedalled. Mutual agreement between ankle, crank and wheel with no
+       travel to compare them against is precisely the failure mode that
+       let "he pedals backwards" ship — all three agreed with each other
+       and all three were wrong.
+
+       So step the CONTROLLER. A temporary input function pushes a unit
+       wish along his current heading, controller.step() integrates it
+       through the real solver against the real collision world, and the
+       root follows because update() copies it. Position and velocity
+       are put back afterwards, so calling the ruler does not move the
+       player.
+
+       `blocked` is not a nicety either: a probe that starts two metres
+       from a wall measures a stationary bicycle and would report the
+       drivetrain as infinitely fast. If it trips, move him and re-run.
+
+       ------------------------------------------------------------------
+       IT WARMS TO A PLATEAU NOW, AND IT SAYS SO WHEN IT DID NOT.
+       ------------------------------------------------------------------
+       A FALSE ALARM FROM A MEASURING TOOL IS NOT A SMALL THING ON THIS
+       PROJECT. Three rounds went into digging a defect a tool had
+       fabricated by sampling background pixels, and the reason this
+       function was repaired at all is that it used to report zero for
+       travel. A ruler that cries wolf gets ignored, and an ignored ruler
+       is worse than no ruler.
+
+       The fixed 48-frame warm-up was one of those wolves. It is 0.8 s,
+       which is enough for a bicycle (accel 22, cruise 5.10) and nowhere
+       near enough for a motorcycle (accel 26, cruise 15.30): the sample
+       window opened at 10.65 m/s against a 15.30 target and ran to its
+       end still accelerating. The roll LAGS the ground while
+       accelerating — the wheel is driven by `speed * dt` sampled at the
+       top of the frame while the controller integrates within it — by
+       -14.7% over the accel window against -0.005% once steady, so the
+       tool reported -1.74% wheel rate error on a drivetrain that is
+       exact to five decimal places. travelBlocked could not catch it,
+       because `expected` is derived from the same average.
+
+       So warm until the speed stops changing, with a frame cap so a
+       machine pinned against a wall still returns; then check the
+       sample window itself and publish `sampledAtCruise`. A number
+       taken off a machine that is still accelerating is not a rate
+       measurement and must not be read as one.
+
+       ------------------------------------------------------------------
+       ONE FRAME OF STILLNESS IS NOT A PLATEAU
+       ------------------------------------------------------------------
+       The first version of that break-out tested |s - prevS| on a SINGLE
+       frame, and a controller scraping along a wall satisfies that
+       constantly while it is nowhere near its rung. Measured at the
+       bike's 8.2 rung outside the apartment: it broke out after 56
+       frames at warmSpeed 8.197 — which reads like the rung — then the
+       40-frame sample averaged 5.464 and it reported wheelRateErrPct
+       -1.75, the exact false alarm this whole repair exists to stop.
+       `sampledAtCruise` did catch it (false, 48.6% drift), and that half
+       worked. But the plateau must hold for PLATEAU_HOLD consecutive
+       frames before the warm-up believes it, or the warm-up hands the
+       sample window a speed the machine is about to leave.
+
+       AND travelBlocked NOW COMPARES AGAINST THE RUNG THAT WAS ASKED
+       FOR. It used to derive `expected` from `plateau` — the average of
+       the very sample it was checking — so a machine that stalled at
+       two thirds of its rung produced a two-thirds expectation and
+       matched it perfectly. It read false on every machine at every
+       rung, including rungs nothing ever got near, which makes it worse
+       than useless: it is the first flag a reader looks at when asking
+       whether a measurement was any good. It is now `want` — the
+       requested speed, clamped to what the machine can actually do —
+       and it trips on the run above.
+       ================================================================ */
+    anim.setPhaseLock(null);
+    const TAU2 = Math.PI * 2;
+    const unwrapStep = (d) => d - Math.round(d / TAU2) * TAU2;
+    /* ------------------------------------------------------------------
+       THE PLATEAU IS A TREND TEST, NOT A STILLNESS TEST, AND IT IS
+       RELATIVE TO THE RUNG.
+
+       The flag this header tells you to read first used to be wrong most
+       of the time. `reachedPlateau` judged the plateau on an ABSOLUTE
+       per-frame speed change of 1e-4 m/s held for 12 consecutive frames.
+       The ground undulates: heightAt is a 2 m raster and the controller
+       climbs and descends every cell, so planarSpeed keeps moving by
+       more than that indefinitely. Measured with an independent rig that
+       does not call driveTrace — the controller stepped by hand at the
+       bike's 5.2 rung, frames 200 to 400, i.e. long past any
+       acceleration — the per-frame |ds| is 1e-8 at the median but its
+       90th percentile is 3.0e-3 and its worst 1.6e-2, and the longest
+       run of consecutive frames under 1e-4 was 13 at one spot and 22 at
+       another. So the warm-up ran its full 300-frame cap and the flag
+       read false on samples whose rate error was exactly 0.00%. Across
+       30 runs at 5 spots it was false in 21.
+
+       It fails safe, but a flag that reads "not a rate" on a rate exact
+       to five decimals is the ignored-ruler failure again, and it is the
+       second instance of it in this one function (see the dz wrap
+       above).
+
+       So: the question is not "is the speed still" — on this terrain it
+       never is — but "has it stopped TRENDING". Mean of the last
+       PLATEAU_WIN frames against the mean of the PLATEAU_WIN before, as
+       a fraction of the rung that was asked for. Measured with the same
+       rig: at cruise that number is 0.03% to 0.06%; during the
+       acceleration it is 34.6%. Three orders of magnitude between the
+       two states, so the threshold is not a tuning parameter. The bike
+       settles at frame 95 with 5.193-5.198 m/s against a 5.20 rung; the
+       motorcycle at 15.3 settles between 148 and 217, which is why the
+       cap is no longer 300.
+       ------------------------------------------------------------------ */
+    const T_WARM_MAX = 420, T_FRAMES = 40, T_DT = 1 / 60;
+    const PLATEAU_WIN = 30;          // frames per half of the trend window
+    const PLATEAU_EPS_REL = 0.002;   // 0.2% of the rung between the halves
+    const PLATEAU_HOLD = 6;
+    let travel = 0, dist = 0, wheelRad = 0, maxStepRad = 0, backStepRad = 0, plateau = 0;
+    let warmFrames = 0, warmSpeed = 0, reachedPlateau = false;
+    let sampleS0 = 0, sampleS1 = 0;
+    /* the sample window's own series, so steadiness is judged on all of
+       it rather than on its two end frames */
+    const sampleSeries = [];
+    /* the rung the CONTROLLER was actually asked for, hoisted out of the
+       block below so travelBlocked can be about it */
+    let rungTarget = Number.isFinite(speed) ? speed : 0;
+    if (controller) {
+      const savedFn = controller._inputFn || null;
+      const savedPos = controller.simPosition.clone();
+      const savedVel = controller.velocity.clone();
+      const yaw0 = controller.yaw;
+      /* RELEASE THE FORCED LOCOMOTION FIRST. The phase sweep above pins
+         it at `speed` so the pose is the pose at that rung; leaving it
+         pinned through the travel probe would roll the wheels off a
+         number that has nothing to do with how far the controller
+         actually got, and the tool would report a 41% rate error on a
+         drivetrain that is exact. Off the leash, `speed` in update() is
+         the controller's own planarSpeed — which is the only pairing
+         where "revolutions per metre" means anything. */
+      api.setLocomotion(null);
+      /* THE RUNG, ON THE CONTROLLER. `target` inside _horizontal() is
+         (run ? runSpeed : walkSpeed) * |input|, so a requested speed has
+         to choose the GEAR and the MAGNITUDE together — the same two
+         numbers, in the same order, that touch.js picks for the stick.
+         The options are read off the controller rather than off
+         RIDE_TUNE because bikeSpeeds() has already patched them for the
+         machine that is actually mounted, and the patched pair is what
+         the solver will use.
+
+         WORLD-space wish along his own forward. camera.js documents the
+         same convention: controller.input is a world direction. */
+      const O = controller.opts || {};
+      const vWalk = O.walkSpeed || 5.10;
+      const vRun = O.runSpeed || vWalk;
+      const want = clamp(Number.isFinite(speed) ? speed : vWalk, 0, vRun);
+      rungTarget = want;
+      const useRun = want > vWalk + 1e-4;
+      const mag = clamp(want / Math.max(useRun ? vRun : vWalk, 1e-4), 0, 1);
+      controller.setInputFn(() => ({
+        x: Math.sin(yaw0) * mag, z: Math.cos(yaw0) * mag, run: useRun,
+      }));
+      /* warm-up: run it until the speed stops TRENDING, not until it
+         stops moving and not for a fixed count of frames */
+      const hist = [];
+      let held = 0, sum1 = 0, sum2 = 0;
+      for (let i = 0; i < T_WARM_MAX; i++) {
+        controller.step(T_DT);
+        controller.position.copy(controller.simPosition);
+        update(T_DT, i * T_DT);
+        lateUpdate(T_DT);
+        warmFrames++;
+        const s = controller.planarSpeed;
+        /* two running sums over the last 2*PLATEAU_WIN frames: the newer
+           half against the older one */
+        hist.push(s); sum1 += s;
+        if (hist.length > PLATEAU_WIN) { const m = hist[hist.length - 1 - PLATEAU_WIN]; sum1 -= m; sum2 += m; }
+        if (hist.length > 2 * PLATEAU_WIN) sum2 -= hist[hist.length - 1 - 2 * PLATEAU_WIN];
+        if (hist.length >= 2 * PLATEAU_WIN) {
+          const trend = Math.abs(sum1 - sum2) / PLATEAU_WIN / Math.max(want, 1e-3);
+          /* HELD, NOT HIT. One quiet window is a coincidence; a
+             wall-scrape that happens to sit flat does not survive six
+             consecutive ones. */
+          held = trend < PLATEAU_EPS_REL ? held + 1 : 0;
+          if (held >= PLATEAU_HOLD) { reachedPlateau = true; break; }
+        }
+      }
+      warmSpeed = controller.planarSpeed;
+      const p0 = controller.simPosition.clone();
+      let prevRot = wheel ? wheel.rotation.x : 0;
+      const prevP = controller.simPosition.clone();
+      for (let i = 0; i < T_FRAMES; i++) {
+        controller.step(T_DT);
+        controller.position.copy(controller.simPosition);
+        update(T_DT, i * T_DT);
+        lateUpdate(T_DT);
+        if (wheel) {
+          const raw = wheel.rotation.x - prevRot;
+          if (Math.abs(raw) > Math.abs(maxStepRad)) maxStepRad = raw;
+          const st = unwrapStep(raw);
+          if (st < backStepRad) backStepRad = st;
+          wheelRad += st;
+          prevRot = wheel.rotation.x;
+        }
+        dist += Math.hypot(controller.simPosition.x - prevP.x, controller.simPosition.z - prevP.z);
+        prevP.copy(controller.simPosition);
+        plateau += controller.planarSpeed;
+        sampleSeries.push(controller.planarSpeed);
+        if (i === 0) sampleS0 = controller.planarSpeed;
+        sampleS1 = controller.planarSpeed;
+      }
+      plateau /= T_FRAMES;
+      const fwd = new THREE.Vector3(Math.sin(yaw0), 0, Math.cos(yaw0));
+      travel = controller.simPosition.clone().sub(p0).dot(fwd);
+      controller.setInputFn(savedFn);
+      controller.teleport(savedPos);
+      controller.velocity.copy(savedVel);
+    }
+    /* Did the SAMPLE — not the warm-up — happen at a steady speed? The
+       rate figures below are only a rate measurement if it did.
+
+       TWO QUESTIONS, REPORTED SEPARATELY, because they fail for
+       different reasons and lumping them cost this flag its credibility.
+       `sampleDriftPct` is the first frame of the window against the last
+       — the old test, kept because it is cheap to check by hand, but it
+       is a two-point difference and terrain undulation moves it on a
+       sample that is otherwise perfect. `sampleTrendPct` is the second
+       half's mean against the first half's: undulation cancels in it and
+       acceleration does not, which is the only distinction that matters
+       here. `sampleSpreadPct` is the window's full range, published so
+       an undulating sample can be SEEN to be undulating rather than
+       inferred to be. */
+    const sampleDrift = Math.abs(sampleS1 - sampleS0) / Math.max(plateau, 1e-4);
+    let sampleTrend = 0, sampleSpread = 0;
+    if (sampleSeries.length >= 4) {
+      const h = sampleSeries.length >> 1;
+      let a = 0, b = 0, lo = Infinity, hi = -Infinity;
+      for (let i = 0; i < sampleSeries.length; i++) {
+        const v = sampleSeries[i];
+        if (i < h) a += v; else b += v;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      const den = Math.max(plateau, 1e-4);
+      sampleTrend = Math.abs(b / (sampleSeries.length - h) - a / h) / den;
+      sampleSpread = (hi - lo) / den;
+    }
+    /* 0.5% of the rung across the window. The bike's undulation trend at
+       cruise measures 0.03-0.06%; the motorcycle still accelerating
+       through its window measured 34.6%. Nothing lives in between.
+
+       AND IT IS GATED ON travelBlocked, WHICH IS THE HALF THIS FLAG WAS
+       BLIND TO. A steady speed was the whole test, and a controller
+       pinned dead against a wall is perfectly steady: measured from the
+       spawn mark at 24 headings, the motorcycle's 26.4 rung came back
+       travelBlocked at 20 of them and `sampledAtCruise` TRUE at 11 of
+       those — plateau reached, trend 0.000%, at 0.7% of the rung it was
+       asked for. The scooter's 13.2 did it at 3 of 6. The flag's own
+       header says READ IT FIRST, and read first it waved every one of
+       them through. It is not enough to pair it with travelBlocked in
+       prose: a reader who takes the instruction literally never gets to
+       the pairing. So the two are joined here, and `notCruiseBecause`
+       carries WHICH of the three it was, because an accelerating sample,
+       an undulating one and a blocked one are three different
+       complaints and lumping them is what cost this flag its
+       credibility the last time. (The rate figures — revolutions per
+       metre — can still be sound on a blocked sample; they are computed
+       from path length, not from forward travel. `notCruiseBecause` is
+       how you tell that case from a genuinely unusable one.) */
+    const expectedTravel = rungTarget * T_FRAMES * T_DT;
+    const blocked = expectedTravel > 0.05 && travel < expectedTravel * 0.5;
+    const steady = reachedPlateau && sampleTrend < 0.005;
+    const sampledAtCruise = steady && !blocked;
+    /* BLOCKED IS TESTED FIRST, and the order is the whole point. A pinned
+       machine also fails to plateau and also reads a wild trend, so an
+       accelerating-or-undulating test in front of it reports a SYMPTOM and
+       buries the cause: measured over 26 blocked runs, the old order named
+       the wrong one of the three on 12 of them (46%), worst case a
+       motorcycle that travelled 0.0023 m against 17.6 m expected and was
+       reported 'undulating'. Being pinned is the diagnosis that changes what
+       the reader does next; the other two labels are what it looks like. */
+    const notCruiseBecause = sampledAtCruise ? null
+      : (travelBlocked ? 'blocked' : (!reachedPlateau ? 'accelerating' : 'undulating'));
+    let crankRadPerCycle = 0;
+    for (let i = 1; i < rows.length; i++) {
+      crankRadPerCycle += unwrapStep(rows[i].crankRot - rows[i - 1].crankRot);
+    }
+    /* THE EXPECTATION IS THE RUNG THAT WAS ASKED FOR, not the average of
+       the sample being judged. See the note above. One name, computed
+       once, above, because sampledAtCruise is now gated on it. */
+    const expected = expectedTravel;
+    const revsRolled = wheelRad / TAU2;
+    const demandRevPerM = dist > 1e-4 ? 1 / (TAU2 * wr) : null;
+    const deliverRevPerM = dist > 1e-4 ? revsRolled / dist : null;
+
+    anim.setPhaseLock(wasLock);
+    bikeForced = wasForced;
+    if (wasManual) api.setLocomotion(wasS, wasT); else api.setLocomotion(null);
+
+    return {
+      ride: key, samples: n,
+      /* --- WHICH RUNG, asked for and actually reached ---
+         `rungRequested` is the argument; `rungMeasured` is the speed the
+         sample was taken at. They are both here so the answer can never
+         be attributed to a rung the machine never got to — the failure
+         that made this tool blind to the sprint. */
+      rungRequested: speed,
+      /* what the CONTROLLER was asked for: `speed` clamped to the gear
+         ladder the mounted machine actually has. travelBlocked is about
+         this number. */
+      rungTarget: +rungTarget.toFixed(3),
+      rungMeasured: +plateau.toFixed(3),
+      warmFrames,
+      warmSpeed: +warmSpeed.toFixed(3),
+      /* FALSE MEANS THE SAMPLE IS NOT A MEASUREMENT OF THE RUNG THAT WAS
+         ASKED FOR. Three ways: the warm-up ran out of frames before the
+         speed stopped trending; the speed was still trending across the
+         sample window itself; or the machine held a steady speed it
+         reached by being stopped by something. Read it first — it is
+         safe to read first now, which it was not while a machine pinned
+         against a wall at 0.7% of its rung satisfied it. */
+      sampledAtCruise,
+      /* 'accelerating' | 'undulating' | 'blocked' | null — WHICH of the
+         three, so the flag can be read first without losing what a
+         second look would have told you. On 'blocked' the revs-per-metre
+         figures may still be sound; on the other two they are not. */
+      notCruiseBecause,
+      /* the two halves of the flag, still published on their own */
+      steadyInWindow: steady,
+      /* the warm-up's own verdict, on its own */
+      plateauReached: reachedPlateau,
+      /* the sample window: trend is the one the flag is gated on, spread
+         and drift are published so undulation is visible rather than
+         inferred */
+      sampleTrendPct: +(sampleTrend * 100).toFixed(3),
+      sampleSpreadPct: +(sampleSpread * 100).toFixed(3),
+      sampleSpeedDriftPct: +(sampleDrift * 100).toFixed(3),
+      /* --- the direction-of-travel half --- */
+      travelAlongOwnForward: +travel.toFixed(4),
+      /* what the REQUESTED rung would have covered in the sample window */
+      travelExpected: +expected.toFixed(4),
+      cruiseSpeed: +plateau.toFixed(3),
+      /* TRUE MEANS MOVE HIM AND RUN IT AGAIN. Measured against the rung
+         that was asked for, so a machine that stalled at two thirds of
+         it trips this — which the old expectation, derived from the
+         stalled average itself, could never do. sampledAtCruise is gated
+         on this, so the two can no longer disagree. */
+      travelBlocked: blocked,
+      /* --- the RATE half: what the ground demands vs what it gets ---
+         Both figures are revolutions per metre. They are the whole
+         point of the tool: a drivetrain can point the right way and
+         still be 41% slow, which is what the crank-driven wheel was at
+         the sprint rung. --- */
+      metresTravelled: +dist.toFixed(4),
+      wheelRevs: +revsRolled.toFixed(4),
+      wheelRadius: +wr.toFixed(4),
+      revPerMetreDemanded: demandRevPerM == null ? null : +demandRevPerM.toFixed(4),
+      revPerMetreDelivered: deliverRevPerM == null ? null : +deliverRevPerM.toFixed(4),
+      wheelRateErrPct: (demandRevPerM && deliverRevPerM)
+        ? +(((deliverRevPerM / demandRevPerM) - 1) * 100).toFixed(2) : null,
+      /* THE SNAP DETECTOR. maxWheelStepRad is the largest step in the
+         RAW angle, so a legitimate wrap shows up here as about -2*pi
+         and that is fine — a rotation of exactly one turn is identity.
+         maxBackwardStepRad is the same series with exact 2*pi taken
+         out, so it is the largest step the EYE would see going the
+         wrong way. It read -5.27 rad (-302 deg) on the crank-driven
+         wheel, about 1.5 times a second; it must read ~0 now, and
+         anything below about -0.05 at a walking pace is a real snap. */
+      maxWheelStepRad: +maxStepRad.toFixed(4),
+      maxBackwardStepRad: +backStepRad.toFixed(4),
+      dzAtTop: { ankle: dzAt('ankle', 'top'), pedal: dzAt('pedal', 'top'), wheelMark: dzAt('mark', 'top') },
+      dzAtBottom: { ankle: dzAt('ankle', 'bottom'), pedal: dzAt('pedal', 'bottom'), wheelMark: dzAt('mark', 'bottom') },
+      /* THE VERDICT, WITH THE NOISE FLOOR APPLIED. See the header: a
+         pedal-less machine's ankle reads 0.16 mm and a bare sign test
+         calls that a reversed drivetrain. */
+      dzNoiseFloorM: DZ_NOISE_M,
+      driveDirection: {
+        ankle: dirOf(dzAt('ankle', 'top')),
+        pedal: dirOf(dzAt('pedal', 'top')),
+        wheelMark: dirOf(dzAt('mark', 'top')),
+      },
+      /* THE FREE CROSS-CHECK, and it costs nothing because both halves
+         are already in this object. `driveDirection.wheelMark` reads the
+         valve stem at the top of ONE circle during the phase sweep;
+         `wheelRollVsTravel` reads the whole travel probe — the sign of
+         the revolutions the wheel actually turned against the sign of
+         the distance the controller actually covered. They answer the
+         same question from two independent halves of the tool, so a
+         disagreement is a defect in the RULER and not in the drivetrain.
+         'idle' when there is not enough of either to have a sign. */
+      wheelRollVsTravel: (Math.abs(revsRolled) < 0.02 || Math.abs(travel) < 0.02)
+        ? 'idle' : ((revsRolled > 0) === (travel > 0) ? 'agree' : 'disagree'),
+      /* UNWRAPPED, and that is the whole repair: both of these used to
+         difference a wrapped angle at phase 0 against the same wrapped
+         angle at phase 1 and report 0. The crank should read one full
+         turn per locomotion cycle.
+
+         AND IT IS REPORTED IN TURNS. The key used to say Turn and the
+         value used to be 6.2832 — radians, one turn — so the next
+         reader saw "6.28 turns per pedal cycle" and either filed a bug
+         or believed it. Both units are published now, under names that
+         say which is which. */
+      crankTurnsPerCycle: prop && prop.crank ? +(crankRadPerCycle / TAU2).toFixed(4) : null,
+      crankRadPerCycle: prop && prop.crank ? +crankRadPerCycle.toFixed(4) : null,
+      /* fitMax is the WORST GAP between ankle and pedal plate over the
+         stroke; fitDrift is how far the offset VECTOR wanders from its
+         own mean. Different questions — see the header.
+
+         NULL ON A MACHINE WITH NO PEDALS, rather than the seed values.
+         A motorcycle used to report fitMin 1000000000000 (the 1e9 m
+         sentinel in millimetres) and fitMax 0.0, and a zero-millimetre
+         fit reads as a perfect one. There is no fit to report; say so. */
+      fitMaxMM: offs.length ? +(fitMax * 1000).toFixed(1) : null,
+      fitMinMM: offs.length ? +(fitMin * 1000).toFixed(1) : null,
+      fitDriftMM: offs.length ? +(fitDrift * 1000).toFixed(1) : null,
+      meanOffsetMM: offs.length
+        ? [+(mean[0] * 1000).toFixed(1), +(mean[1] * 1000).toFixed(1)] : null,
+      quarters: [0, 0.25, 0.5, 0.75].map((q) => {
+        const r = rows[Math.round(q * n)];
+        return {
+          ph: q,
+          ankle: r.ankle.map((v) => +v.toFixed(3)),
+          pedal: r.pedal ? r.pedal.map((v) => +v.toFixed(3)) : null,
+          spineRollDeg: r.spineRollDeg, ankRy: r.ankRy, elbowLx: r.elbowLx,
+        };
+      }),
     };
   };
 
@@ -2540,6 +3755,171 @@ export async function init(ctx) {
     shadowOn = !!on;
     if (shadowMesh) shadowMesh.visible = shadowOn;
   }
+
+  /* ================================================================
+     WALLY.debug.parkProbe(x, z, yaw, ride)
+
+     Stand a machine at a chosen spot and heading through the REAL
+     parkProp() path, then measure both wheel contacts against
+     ctx.world.heightAt at their own world positions. Returns the
+     gradient the machine was pitched to and each contact's error in
+     millimetres, positive for hovering.
+
+     `gradientDeg` IS THE MACHINE'S GRADIENT, NOT THE RIDER'S, and it
+     used to be the rider's. This probe computed its own chord under
+     (x, z) — where WALLY is standing — while parkProp offsets the
+     machine to his -x side and samples the chord THERE. On sloped
+     ground those are different hills, and the disagreement was not
+     small: measured pairs of machine gradient against what this probe
+     printed were -42.01 / 54.97 (it called that clamped; it is not),
+     -51.45 / 37.03 (it called that unclamped; it is clamped) and
+     47.01 / -47.53 — the sign as well.
+
+     That is the same defect as driveTrace's old travelBlocked, which
+     derived its expectation from the sample it was judging, and as the
+     silhouette tool that sampled background as subject and cost three
+     rounds of wrong work. A probe that measures one thing and names
+     another is worse than no probe. So the number now comes back OUT of
+     parkProp — the raw pitch it computed, from its own two samples, at
+     its own position — and `clamped` is derived from that raw value
+     rather than re-decided here.
+
+     The contacts are taken as the point directly under each axle in the
+     PROP's frame and then transformed by the group's world matrix —
+     never as wheel-local (0, -R, 0), which is a material point on the
+     rim and carries the rolling angle with it. A wheel that has turned
+     half a revolution would put that point on top.
+
+     IT MEASURES THE STAND TOO, AND IT MEASURES THE PAINTED SURFACE.
+     Two wheels on the ground says nothing about the third leg: the roll
+     was a constant for two rounds while the stand sat 0.23 to 0.34 m
+     out to the side, so a probe that reported 0.0/0.0 at both wheels
+     was reporting a machine whose foot hung 391 mm in the air.
+
+     `standFootMM` IS A CLEARANCE, NOT A LOWEST VERTEX, and that is this
+     round's correction to this probe. It used to be the lowest painted
+     vertex of the mesh named 'kickstand' measured against heightAt
+     under that vertex's own x/z — which is a fine number on flat ground
+     and a meaningless one on a hillside, where the lowest vertex is
+     simply whichever one hangs furthest out over the downhill and the
+     figure reports the gradient rather than the pose. It is now the
+     CLOSEST APPROACH: the minimum over every painted vertex of
+     (vertex y - heightAt at that vertex), which is the same number on
+     the flat, is the depth of the deepest penetration when the stand is
+     in the ground, and means the same thing at any angle. Negative is
+     into the ground, positive is hovering, and `standDesignMM` beside
+     it is the tube's axis endpoint — the DESIGN contact point, the one
+     solveParkPose actually stands on the ground. The painted surface
+     sits 4.71 mm below that point on the bicycle, 5.18 on the scooter
+     and 5.22 on the motorcycle (measured in the prop's own frame at its
+     own lean; see solveParkPose's header for why those are not the
+     4.4/5.6/5.1 this note used to give).
+     ================================================================ */
+  const _pfv = new THREE.Vector3();
+  function standProbe(group) {
+    let m = null;
+    group.traverse((o) => { if (o.name === 'kickstand') m = o; });
+    if (!m) return null;
+    const pos = m.geometry?.attributes?.position;
+    if (!pos) return null;
+    m.updateMatrixWorld(true);
+    let lo = Infinity, bx = 0, bz = 0, clear = Infinity;
+    for (let i = 0; i < pos.count; i++) {
+      _pfv.fromBufferAttribute(pos, i).applyMatrix4(m.matrixWorld);
+      if (_pfv.y < lo) { lo = _pfv.y; bx = _pfv.x; bz = _pfv.z; }
+      const h = ctx.world?.heightAt?.(_pfv.x, _pfv.z);
+      if (Number.isFinite(h)) clear = Math.min(clear, _pfv.y - h);
+    }
+    return { y: lo, x: bx, z: bz, clear: Number.isFinite(clear) ? clear : null, visible: m.visible };
+  }
+  /* `leave` stands the machine there and walks away instead of tidying
+     up — the probe prints millimetres, and millimetres are not a
+     substitute for looking at the thing. Without it every screenshot
+     rig had to re-implement the park path to get a machine that was
+     still on screen when the shutter opened, which is the same "a model
+     of the code under test" trap the gradient number fell into. */
+  dbg.parkProbe = (x, z, yaw = 0, rideName = 'bike', leave = false) => {
+    const key = rideKey(rideName) || 'bike';
+    const H = (px, pz) => { try { const h = ctx.world?.heightAt?.(px, pz); return Number.isFinite(h) ? h : null; } catch (e) { return null; } };
+    const gy0 = H(x, z);
+    if (gy0 == null) return { error: 'no terrain at ' + x + ',' + z };
+    const wasForced = bikeForced;
+    bikeForced = true;
+    api.setPosition(x, gy0, z);
+    api.setYaw(yaw);
+    setBike(true, { ride: key, instant: true });
+    root.updateMatrixWorld(true);
+    parkProp();
+    const p = props[key];
+    p.group.updateMatrixWorld(true);
+    const ws = p.wheels || [];
+    const rows = ws.map((w, i) => {
+      /* under the axle, in the prop's own frame */
+      const v = new THREE.Vector3(w.position.x, 0, contactZ(w, p.group));
+      let n = w.parent;
+      for (; n && n !== p.group; n = n.parent) { v.x += n.position.x; }
+      v.applyMatrix4(p.group.matrixWorld);
+      const h = H(v.x, v.z);
+      /* FOUR DECIMALS, AND THAT IS NOT FUSSINESS. This used to publish
+         toFixed(1) — a tenth of a millimetre — while the threshold every
+         census applies to it is "over 0.1 mm". Everything from 0.100 to
+         0.149 rounded down and fell out of the bucket, and the published
+         before-census undercounted by 156 contacts of 1 085 for exactly
+         that reason. A probe must not round at the resolution its
+         readers threshold on. */
+      return { wheel: i, errMM: h == null ? null : +((v.y - h) * 1000).toFixed(4) };
+    });
+    const L = _parkLast || {};
+    const out = { ride: key,
+      /* where the RIDER was told to stand, and where the MACHINE went */
+      standingAt: [+x.toFixed(2), +z.toFixed(2)],
+      machineAt: L.at || null, offsetX: L.offsetX ?? null,
+      yaw: +yaw.toFixed(3),
+      /* parkProp's own raw pitch, at parkProp's own position, from
+         parkProp's own pair of contact samples */
+      gradientDeg: L.gradientDeg ?? null,
+      wheelbase: L.base ?? null,
+      pitchDeg: +(p.group.rotation.x * 180 / Math.PI).toFixed(2),
+      clampDeg: +(PARK_PITCH_MAX * 180 / Math.PI).toFixed(1),
+      clamped: !!L.clamped,
+      /* the lateral half: what the roll solve did and what the stand
+         foot ended up doing about it */
+      rollDeg: +(p.group.rotation.z * 180 / Math.PI).toFixed(2),
+      /* what the ground ASKED for before the band and the floor got at
+         it — the number that says whether the clamp is doing anything */
+      rollRawDeg: L.rollRawDeg ?? null,
+      leanDeg: L.leanDeg ?? null,
+      rollClamped: !!L.rollClamped,
+      /* how hard the pitch solve had to work, so a site that needed the
+         bisection can be found again */
+      pitchIters: L.pitchIters ?? null, bisected: !!L.bisected,
+      solveResidualMM: L.solveMM || null, liftMM: L.liftMM ?? null,
+      wheels: rows,
+      ...(() => {
+        const s = standProbe(p.group);
+        if (!s) return { standFootMM: null, standDesignMM: null, standLowestVertexMM: null };
+        const h = H(s.x, s.z);
+        const F = p.standFoot;
+        let dmm = null;
+        if (F) {
+          const v = new THREE.Vector3(F.x, F.y, F.z).applyMatrix4(p.group.matrixWorld);
+          const dh = H(v.x, v.z);
+          if (dh != null) dmm = +((v.y - dh) * 1000).toFixed(3);
+        }
+        return {
+          /* the painted stand's closest approach to the ground */
+          standFootMM: s.clear == null ? null : +(s.clear * 1000).toFixed(3),
+          /* the point the solve puts on the ground */
+          standDesignMM: dmm,
+          /* the old metric, kept only so an old reading can be
+             recognised for what it was — see standProbe */
+          standLowestVertexMM: h == null ? null : +((s.y - h) * 1000).toFixed(3),
+        };
+      })() };
+    if (!leave) setBike(false, { instant: true });
+    bikeForced = wasForced;
+    return out;
+  };
 
   dbg.wallyCam = (preset) => {
     const p = CAMS[preset] || CAMS.full;

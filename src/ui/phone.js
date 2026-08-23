@@ -19,9 +19,13 @@ import { BRAND, CATEGORY, SEA, LAND, BUILD, css } from '../core/palette.js';
 import { clamp } from '../core/contracts.js';
 import {
   h, clear, icon, money, money2, pad2, portrait, glyphAvatar, hueFor,
-  wallyMark, rgba, mix, C, meterColour, tickerTag,
+  wallyMark, wallyAvatar, rgba, mix, C, meterColour, tickerTag,
 } from './style.js';
 import { cityMap } from './map.js';
+/* The 'B' chip on the buy card is a KEYBOARD shortcut, and a phone
+   has no B. touch.js owns the one answer to "what is this player
+   holding" and the one table of what each action is called. */
+import { touchUI, actionLabel } from './touch.js';
 
 export function createPhone(ctx, ui) {
   const g = () => ctx.game;
@@ -209,10 +213,22 @@ export function createPhone(ctx, ui) {
     });
   }
 
+  /* THE HERO GETS A FACE. Every named correspondent resolved to their
+     own drawn portrait and Wally alone fell through to a coloured
+     circle with a W in it — the one character the game is named after
+     was a letter in his own phone while the retired teacher he owes
+     money to had eyes, a hat and a mood. He is now the mark, in the
+     same disc every other correspondent gets, at whatever size the
+     caller asked for (26 in WallyNet, 30 in Messages). The name test
+     comes FIRST: if a client record is ever added under his name, the
+     mark still wins, because the mark is his likeness and a generated
+     face would not be.
+     dialogue.js draws the same thing by hand at 62 px — style.js now
+     exports wallyAvatar() so that copy can go. */
   function avatarFor(name, size) {
+    if (/^wally$/i.test(name)) return wallyAvatar(size);
     const c = Object.values(g().data.clientById).find((x) => x.n === name);
     if (c) return portrait(c, size);
-    if (/^wally$/i.test(name)) return glyphAvatar('W', BRAND.token, size);
     return glyphAvatar((name[0] || '?').toUpperCase(), hueFor(name), size);
   }
   const timeStr = (mins) => pad2(Math.floor((mins / 60) % 24)) + ':' + pad2(Math.floor(mins % 60));
@@ -241,10 +257,45 @@ export function createPhone(ctx, ui) {
     const known = game.data.locations.filter((l) => game.known(l.id));
     if (!placeSel || !game.known(placeSel)) placeSel = st.loc;
 
+    /* ============================================================
+       A PHONE ON ITS SIDE IS A DIFFERENT SCREEN, NOT A SHORTER ONE.
+
+       Measured at 844x390: the scroller is 280 px tall, the chart took
+       218 of them, and everything the screen is actually FOR — the
+       selected place's name, whether it is open, how far it is, and
+       every fare to it — began at y=366 in a 390 px viewport. 504 px
+       of overflow under a map. The player had to scroll a map off the
+       top of the screen to find out what they had just tapped.
+
+       Holding the chart back would have worked and would have cost the
+       island: a plate at the height that fits is 345 px of a 844 px
+       screen with 400 px of empty stock either side of it. The screen
+       is WIDE. So in landscape the column becomes two — chart and its
+       two buttons on the left, the place and its fares on the right,
+       each taking the full height of the scroller and the right one
+       scrolling on its own. Nothing is below any fold; the map keeps
+       its height; the 400 px that were empty are now the answer.
+
+       THE TRIGGER IS THE PANEL, NOT THE VIEWPORT. style.js turns the
+       phone into a wide slab at max-height:540 and leaves it a narrow
+       portrait one above that, so "the viewport is landscape" and "this
+       screen is wide" are different facts: at 844x600 a viewport test
+       put a two-column layout inside a 356 px panel and cut the chart
+       to 189x189 with thirteen colliding captions in it. The app body
+       is already in the document when an app renders, so it can simply
+       be asked how wide and how tall it is.
+       ============================================================ */
+    const bw = b.clientWidth || 0, bh = b.clientHeight || 0;
+    const land = bw >= 520 && bh > 0 && bh <= 340;
+
+    /* AND THE CHART IS TOLD ITS CAP, rather than left to infer one from
+       the window. Two columns: hold back the button row only. One
+       column: the fare board and the place card are under it too. */
     const detail = h('div');
     const map = cityMap(ctx, {
       compact: true,
       selected: placeSel,
+      hMax: bh ? Math.round(land ? bh - 62 : bh * 0.60) : 0,
       /* Picking a pin SHOWS that place and its fares — it does not
          aim the HUD arrow at it. Travelling is what the fare board
          below does; "Point me" is what aims the arrow. Doing both
@@ -256,9 +307,18 @@ export function createPhone(ctx, ui) {
         drawDetail();
       },
     });
-    b.append(map.el);
+    /* THE CHART BLEEDS TO THE SCREEN EDGES. The app body carries 13 px
+       of side padding, which on a 390 px phone is 26 px of the 341 the
+       chart has to draw an island in — 8 % of the one dimension the
+       island is actually short of, and the island is what the screen is
+       for. A plate that runs off both edges also reads like a sheet
+       folded into a pocket rather than a picture hung in a frame, which
+       is the thing map.js is drawing. */
+    const plate = h('div', {
+      style: { marginInline: land ? '0' : 'calc(-13px * var(--w-ts))' },
+    }, map.el);
 
-    b.append(h('div', {
+    const buttons = h('div', {
       style: { display: 'flex', gap: 'calc(7px * var(--w-ts))', margin: '0 0 calc(8px * var(--w-ts))' },
     },
       h('button.w-btn.sm.ghost.w-pe', {
@@ -274,9 +334,37 @@ export function createPhone(ctx, ui) {
           const l = game.data.locationById[placeSel];
           ui.toast('Pointing you at ' + (l ? l.n : 'it'), 'token');
         },
-      }, icon('nav', 13, { fill: 'currentColor', w: 1 }), 'Point me')));
+      }, icon('nav', 13, { fill: 'currentColor', w: 1 }), 'Point me'));
 
-    b.append(detail);
+    if (land) {
+      /* The left column does NOT scroll — it is the map and its two
+         buttons and it is cut to fit. The right one does, so a long
+         fare board is a scroll inside a panel rather than a map pushed
+         off the top of the world. `min-height:0` on both is what stops
+         a flex child refusing to shrink below its content. */
+      b.append(h('div', {
+        style: {
+          display: 'flex', gap: 'calc(11px * var(--w-ts))',
+          height: '100%', alignItems: 'stretch',
+          marginInline: 'calc(-5px * var(--w-ts))',
+        },
+      },
+        h('div', {
+          style: {
+            flex: '0 0 53%', minWidth: '0', minHeight: '0',
+            display: 'flex', flexDirection: 'column', justifyContent: 'flex-start',
+          },
+        }, plate, buttons),
+        h('div', {
+          style: {
+            flex: '1', minWidth: '0', minHeight: '0',
+            overflowY: 'auto', overflowX: 'hidden',
+            paddingRight: 'calc(3px * var(--w-ts))',
+          },
+        }, detail)));
+    } else {
+      b.append(plate, buttons, detail);
+    }
     drawDetail();
 
     function drawDetail() {
@@ -528,7 +616,9 @@ export function createPhone(ctx, ui) {
       h('div.w-grow', null,
         h('div.t', { text: 'Buy an asset by ticker' }),
         h('div.d', { text: 'GOLD · WHEAT · B5Y · TEAM — price, venue and total before you confirm' })),
-      h('div.m', { text: 'B', style: { color: C(BRAND.token2) } })));
+      /* the shortcut chip, and only where there is a key to press */
+      touchUI() ? null
+        : h('div.m', { text: actionLabel('buy'), style: { color: C(BRAND.token2) } })));
 
     put(b,
       kv('Net worth', money(E.netWorth())),

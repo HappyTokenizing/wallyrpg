@@ -480,10 +480,32 @@ float wLinearDepth( float d, vec2 nf ) {
 
    Verify with WALLY.debug.nanSelfTest() on any new driver before
    trusting a clean result — see postfx.js section 7.
+
+   W_FINITE_OFF — THE CONTROL, AND WHY IT IS SHIPPED.
+
+   The producer of the NaN has NOT been removed. It is still in the
+   frame: WALLY.debug.nanWatch(1) finds one non-finite texel in the
+   SCENE buffer every few hundred frames, and the on-hit raycast lands
+   on sky.dome every time. All this firewall does is stop that texel
+   reaching the pyramid. A guard whose worth rests on that claim has to
+   be falsifiable, so it can be compiled out at runtime:
+
+     WALLY.debug.finiteGuard(false)   // the pre-fix frame, exactly
+     WALLY.debug.finiteGuard(true)    // back
+
+   With it off, `node tools/blacksquares.mjs --noguard` reproduces the
+   user's report — a solid black block a few hundred pixels on a side,
+   in the intro and in play. That is the evidence this file is
+   load-bearing rather than decoration, and it is why the detector in
+   tools/ has something to be tested against. Never ship with it off.
    ------------------------------------------------------------------ */
 export const GLSL_FINITE = /* glsl */`
 bool wIsBad( float v ) {
+#ifdef W_FINITE_OFF
+  return false;
+#else
   return !( v <= 1e30 && v >= -1e30 ) || ( v != v ) || !( ( v * 0.0 ) == 0.0 );
+#endif
 }
 float wFinite1( float v, float fb ) { return wIsBad( v ) ? fb : v; }
 vec3 wFinite( vec3 c, float fb ) {

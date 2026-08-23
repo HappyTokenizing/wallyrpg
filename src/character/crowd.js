@@ -528,6 +528,17 @@ export function createCrowd(ctx, host) {
          alone; parking is what must never happen.
 
      `doorStats()` reports both distributions and both longest-singles.
+
+     WHAT THE SPLIT ACTUALLY FOUND. Over a clean 60 s window with the
+     fix switched OFF: 78 dwells, longest 8.27 s — and ZERO of them
+     parked. Every long one was a pedestrian walking the full length of
+     an approach corridor at 1.3-1.5 m/s, because a road that leads to a
+     door runs down the middle of that door's lane. The 6-9 s figure the
+     complaint was written from is real, and it is traffic. The parking
+     defect is real too, it is just rarer than a one-minute sample: see
+     the probe below, which produces it on demand instead of waiting for
+     it. Both numbers are reported; neither is allowed to stand in for
+     the other.
      ================================================================== */
   const DWELL_IN = 0.02;          // k above this counts as "inside"
   /* The round-3 anti-parking behaviour, switchable — and unlike the
@@ -567,6 +578,21 @@ export function createCrowd(ctx, host) {
       if (a.parkDwell > 0) record(stats.park, a.parkDwell);
       a.parkDwell = 0;
     }
+  }
+
+  /** k for ONE door — what the probe needs: "has he left the doorway
+      he was planted in", which is not the same question as "is he clear
+      of every doorway in a row of shopfronts". */
+  function doorK(x, z, d) {
+    const dx = x - d.x, dz = z - d.z;
+    const along = dx * d.ax + dz * d.az, side = dx * d.az - dz * d.ax;
+    let k = 0;
+    if (along > -0.8 && along < DOOR_LEN && Math.abs(side) < DOOR_HALF) {
+      k = 1 - Math.abs(side) / DOOR_HALF;
+    }
+    const r = Math.hypot(dx, dz);
+    if (r < DOOR_R) k = Math.max(k, 1 - r / DOOR_R);
+    return k;
   }
 
   /* THE PROBE. The natural crowd hardly ever parks in a doorway — road
@@ -670,17 +696,37 @@ export function createCrowd(ctx, host) {
 
          1. a FLOOR under the drift (never below ~0.28 m/s however
             shallow he is in the volume), so leaving actually completes;
-         2. an EVICTION at 1.2 s of continuous dwell — the loiter is cut
-            short and he walks off under a raised door weight for the
-            next 2.5 s, with a cooldown so he does not re-park at the
-            same forecourt. He walks out on his own legs rather than
+         2. an EVICTION at 0.8 s of continuous PARKED time — the loiter
+            is cut short and he walks off under a raised door weight for
+            the next 3.5 s, with a cooldown so he does not re-park at
+            the same forecourt. He walks out on his own legs rather than
             sliding out in an idle pose, which is the difference between
-            somebody moving aside and a body on a conveyor. */
+            somebody moving aside and a body on a conveyor.
+
+         MEASURED, eight agents planted half a metre from eight
+         different thresholds and told to loiter 25 s there
+         (WALLY.debug.doorProbe, both branches on one run):
+
+           before  stood 25 s (never took a step inside the window),
+                   fully clear of the volume at 10.92 s — the same
+                   10.92 s at all eight doors, because the drift was a
+                   pure function of k and the geometry of a threshold
+                   is the same everywhere. That identical figure is
+                   what an asymptote looks like from the outside.
+           after   stood 0.95-0.99 s, then walked; clear at
+                   2.90-3.41 s at seven doors. The eighth (infra) reads
+                   5.88 s, and it is not loitering: traced, he is out to
+                   k=0.54 by 2.4 s and the road he is following then
+                   carries him back across the same threshold at
+                   1.55 m/s. Walking past a door is the design.
+
+         In the wild, over a 40 s window on a 13:00 street, one agent
+         parked at all and he was moving again in 0.91 s. */
       const k = a.dk;
       if (k > DWELL_IN) {
-        if (EV.on && a.parkDwell > 1.2) {
+        if (EV.on && a.parkDwell > 0.8) {
           a.pause = 0; a.mode = 'walk';
-          a.evict = 2.5; a.noPause = 8;
+          a.evict = 3.5; a.noPause = 8;
           stats.evictions++;
           return;
         }
@@ -767,12 +813,24 @@ export function createCrowd(ctx, host) {
        separation term: it must be enough to bend a path around a
        threshold and never enough to stop somebody walking past one. */
     const dk = a.dk;
+    /* A WALKING AGENT CAN PARK TOO. He is not paused, he is jammed —
+       three people in a shop doorway and the separation term cancels
+       his heading — so the park clock is read here as well and raises
+       the same exit force. No pause to cut short; just a push. */
+    if (dk > 0 && EV.on && a.parkDwell > 0.8 && a.evict <= 0) {
+      a.evict = 3.5; stats.evictions++;
+    }
     if (dk > 0) {
-      /* the weight triples for a couple of seconds after an eviction:
-         enough to beat the road he is following back through the
-         threshold, and it decays, so the path bends rather than snaps */
-      const w = a.evict > 0 ? 0.85 + 1.75 * Math.min(1, a.evict / 2.5) : 0.85;
-      ux += a.dkx * dk * w; uz += a.dkz * dk * w;
+      /* The weight triples for a few seconds after an eviction: enough
+         to beat the road he is following back through the threshold,
+         and it decays, so the path bends rather than snaps. The k floor
+         is the same asymptote fix as the drift — without it the term
+         fades out exactly where he still has two metres of corridor to
+         clear, and he leaves the volume at a crawl. */
+      const ev = a.evict > 0 ? Math.min(1, a.evict / 3.5) : 0;
+      const w = 0.85 + 1.75 * ev;
+      const kk = ev > 0 ? Math.max(dk, 0.35 * ev) : dk;
+      ux += a.dkx * kk * w; uz += a.dkz * kk * w;
     }
     const ul = Math.hypot(ux, uz) || 1;
     ux /= ul; uz /= ul;
@@ -840,7 +898,7 @@ export function createCrowd(ctx, host) {
         a.pause = opts.pause ?? 12; a.mode = 'idle';
         a.doorDwell = 0; a.parkDwell = 0; a.doorAt = null;
         a.evict = 0; a.noPause = 0;
-        a.probe = { door: d.id, t: 0, clear: -1, k0: -1 };
+        a.probe = { door: d.id, d, t: 0, clear: -1, clearAll: -1, stood: -1, k0: -1, ko: 0 };
         probes.push(a);
       }
       return { probes: probes.length, evict: EV.on };
@@ -852,8 +910,11 @@ export function createCrowd(ctx, host) {
         evict: EV.on,
         rows: probes.map((a) => ({
           door: a.probe.door, k0: +Math.max(0, a.probe.k0).toFixed(2),
-          k: +a.dk.toFixed(2), t: +a.probe.t.toFixed(2),
+          k: +a.probe.ko.toFixed(2), kAny: +a.dk.toFixed(2),
+          t: +a.probe.t.toFixed(2),
+          stood: a.probe.stood < 0 ? -1 : +a.probe.stood.toFixed(2),
           clear: a.probe.clear < 0 ? -1 : +a.probe.clear.toFixed(2),
+          clearAll: a.probe.clearAll < 0 ? -1 : +a.probe.clearAll.toFixed(2),
         })),
       };
     },
@@ -953,8 +1014,17 @@ export function createCrowd(ctx, host) {
         tallyDwell(a, a.dk, dt, a.dkd);
         if (a.probe && a.probe.clear < 0) {
           a.probe.t += dt;
-          if (a.probe.k0 < 0) a.probe.k0 = a.dk;
-          if (a.dk <= DWELL_IN) a.probe.clear = a.probe.t;
+          const ko = doorK(a.pos.x, a.pos.z, a.probe.d);
+          if (a.probe.k0 < 0) a.probe.k0 = ko;
+          a.probe.ko = ko;
+          if (ko <= DWELL_IN) a.probe.clear = a.probe.t;
+          /* THE NUMBER THAT IS THE COMPLAINT: how long he was a
+             stationary body in the doorway. `clear` is a fair
+             companion but it counts a man walking briskly back across
+             a threshold on the road he was following, which is
+             traffic; `stood` counts only standing. */
+          if (a.probe.stood < 0 && a.speed > PARK_SPEED) a.probe.stood = a.probe.t;
+          if (a.dk <= DWELL_IN && a.probe.clearAll < 0) a.probe.clearAll = a.probe.t;
         }
         if (a.evict > 0) a.evict = Math.max(0, a.evict - dt);
         if (a.noPause > 0) a.noPause = Math.max(0, a.noPause - dt);

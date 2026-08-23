@@ -51,10 +51,18 @@ export const DEFAULT_SETTINGS = Object.freeze({
   music: 0.16, sfx: 0.35, speed: 1, relaxed: false,
   contrast: false, reduced: false, textSize: 1, touch: false,
   landscape: false,
-  /* HIDE UI. Fades out the two top clusters only — the stat pills,
-     the objective card and the money row. The thumbstick, the
-     bottom-right pad, every toast, banner, prompt and notification
-     stay: this is a clean view of the city, not a mute switch. */
+  /* HIDE UI. Fades out the two top clusters — the stat pills, the
+     objective card and the money row. Every toast, banner, prompt and
+     notification stays: this is a clean view of the city, not a mute
+     switch.
+
+     ON TOUCH IT HAS A SECOND STAGE, and deliberately NO SECOND KEY.
+     After ~5 s with no character movement the thumbstick and the
+     bottom-right pad fade out too, and a double tap anywhere brings
+     them back; adjusting the camera does neither. It was asked for as
+     part of Hide UI, so it rides Hide UI — a comfort mode you have to
+     configure is not a comfort mode, and a second saved flag would be
+     a second thing to end up in the wrong state. src/ui/touch.js. */
   hideUI: false,
 });
 
@@ -227,6 +235,26 @@ export function createState(env) {
     },
 
     /* --- vitals --- */
+
+    /* THE FLOOR AT 0 IS A MERCY RULE AND IT IS DELIBERATE. Read with
+       game.stride(), this clamp is the reason an empty elephant can
+       still cross the island: stride() charges by the metre through
+       addEnergy(-owed), the clamp swallows the overdraft, and once
+       the bar is at 0 the next metre is free. Measured: at energy 0
+       he walks 500 m for 0.00 e, and starting at 3 e he walks the
+       same 500 m and ends at 0 rather than being stopped at 74 m.
+       IT IS NOT AN OVERSIGHT AND IT MUST NOT BE "FIXED" INTO A DEBT.
+       data.js TRAVEL says walking is the floor that stops a broke,
+       exhausted player being hard-locked, and the floor is only real
+       if the road stays walkable at zero — the alternative is a save
+       with no money, no ride and no energy that cannot reach a bed,
+       which is a dead run, not a hard choice. The cost of running
+       empty is already charged elsewhere and charged properly: the
+       clock keeps running while he trudges, hunger keeps climbing,
+       and CONFIG.forceSleepMin collapses him at 25:00 for a rep
+       point. He pays in the day he loses, not in a bar that traps
+       him. Anything that wants to make exhaustion bite harder should
+       slow him down or take more rep — never refuse the metre. */
     addEnergy(n) {
       const S = env.state;
       S.energy = clamp(S.energy + n, 0, 100);

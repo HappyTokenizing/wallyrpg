@@ -21,6 +21,9 @@ import {
   tickerTag, ticketLine,
 } from './style.js';
 import { cityMap } from './map.js';
+/* Same reason as phone.js: the market's 'B' chip is a keyboard
+   shortcut and must not be shown to a player who has no keyboard. */
+import { touchUI, actionLabel } from './touch.js';
 
 export function createMenus(ctx, ui) {
   const g = () => ctx.game;
@@ -662,18 +665,117 @@ export function createMenus(ctx, ui) {
       title: 'Bull Bear City', sub: 'One island, ten districts, 28 places',
       glyph: '🗺️', tint: BRAND.info,
     }, (body, el) => {
+      /* ============================================================
+         A SHEET ON ITS SIDE IS A DIFFERENT SHEET.
+
+         Measured at 844x390: the sheet body is 558x308, the plate takes
+         246 of those 308, and the card naming the place you just tapped
+         printed at 357-413 in a 390 px viewport — 23 px of it below the
+         bottom of the screen, with 469 px of content scrolling inside
+         308. The chart answers "where is that"; the card under it
+         answers "what is it, is it open, how far, what does the fare
+         cost", and on a phone held sideways the second half of that
+         sentence was off the world.
+
+         The phone's Places app already solved this exact shape and the
+         solution measured clean — at 844x390 its card sits at 112-168,
+         fully above the fold — so the argument is lifted rather than
+         re-invented: WIDE AND SHORT IS TWO COLUMNS. The chart takes the
+         left column at the full height of the body, the place and its
+         fares take the right one and scroll on their own, and nothing
+         is under a fold because there is no fold.
+
+         Two things had to change to lift it, and both are why this is
+         not a copy-paste. (1) The trigger is the SHEET BODY, not the
+         viewport — same lesson phone.js learned at 844x600, where the
+         viewport says landscape and the panel is 356 px wide. (2) A
+         phone app is measured at build time because the app body is
+         already in the document; a sheet is built BEFORE it is
+         inserted, so the body reads 0x0 here. So the layout is applied
+         on the first frame after connection and re-applied on rotate,
+         and the chart is handed its cap as a FUNCTION it can re-ask
+         (see map.js) rather than a number fixed at construction.
+
+         The full-map sheet also gets NO button row under its chart —
+         it is already the full map — so its left column is the plate
+         and nothing else, and it keeps the whole height.
+         ============================================================ */
       const detail = h('div');
+      const plate = h('div');
+      const rail = h('div', null, detail);
+      const cols = h('div', null, plate, rail);
+      let wide = false;
       const map = cityMap(ctx, {
         selected: sel,
+        hMax: () => (wide ? Math.max(150, cols.clientHeight || 0) : 0),
         /* PICKING A PLACE IS NOT A JOURNEY, and it is not a waypoint
            either: it opens that place's fare board below the map, and
-           the fare board travels. Aiming the HUD arrow is the "Point
-           me" button's job and nothing else's — this is what used to
-           make walk and bicycle feel like they "only moved the
-           arrow". */
+           the board is where the decision is made. Which half of the
+           board he then taps decides whether he is carried there or
+           merely aimed at it — see travelModes(). Picking a pin does
+           neither, so it may not touch the arrow. */
         onPick: (id) => { sel = id; ui.sfx('ui.tab'); draw(); },
       });
-      body.append(map.el, detail);
+      plate.append(map.el);
+      body.append(cols);
+
+      const setStyle = (n, o) => { for (const k in o) n.style[k] = o[k]; };
+      function apply(w) {
+        wide = w;
+        const gap = 'calc(11px * var(--w-ts))';
+        setStyle(cols, w
+          ? { display: 'flex', flexDirection: 'row', gap, height: '100%', alignItems: 'stretch' }
+          : { display: 'block', gap: '', height: '', alignItems: '' });
+        setStyle(plate, w
+          ? { flex: '0 0 54%', minWidth: '0', minHeight: '0', display: 'flex', flexDirection: 'column', justifyContent: 'center' }
+          : { flex: '', minWidth: '', minHeight: '', display: '', flexDirection: '', justifyContent: '' });
+        setStyle(rail, w
+          ? { flex: '1', minWidth: '0', minHeight: '0', overflowY: 'auto', overflowX: 'hidden', paddingRight: 'calc(3px * var(--w-ts))' }
+          : { flex: '', minWidth: '', minHeight: '', overflowY: '', overflowX: '', paddingRight: '' });
+        /* the body stops being the scroller in two columns — the right
+           column is, and a scroller inside a scroller is how you get a
+           map that slides out from under a fare board */
+        body.style.overflowY = w ? 'hidden' : '';
+        /* AND THE SHEET TAKES THE WIDTH IT NOW HAS A USE FOR. style.js
+           caps every sheet at 560 px, which is right for a fare board
+           or a settings list and wrong for the one panel whose whole
+           job is a drawing: cut into two columns at 560 the plate was
+           286 px wide and the place card beside it broke "Your
+           Apartment" over two lines. A phone on its side has 844 px and
+           this sheet is the only one that can spend them. Portrait is
+           untouched — the rule below is cleared the moment the layout
+           goes back to one column. */
+        el.style.width = w ? 'min(94vw, 900px)' : '';
+        map.refresh();
+      }
+
+      let applied = null, tries = 0;
+      function fit() {
+        if (!cols.isConnected) { if (++tries < 90) requestAnimationFrame(fit); return; }
+        const bw = body.clientWidth || 0, bh = body.clientHeight || 0;
+        /* phone.js's two numbers, with the height opened out. 340 is
+           the app body's constant and the sheet body is a different box
+           inside the same screen: measured at one column, a 926x428
+           phone on its side gives this sheet a 343 px body and printed
+           the place card 21 px under the bottom of the screen, and a
+           1400x500 desktop window gives it 411 and cut the card by 19.
+           Both are the same failure — a wide box too short to stack a
+           chart and a card in — so the test is the box, and 420 is the
+           first number that catches both. 844x600 stays one column at
+           434, which is where it belongs: that screen is not short, it
+           is merely wide, and its card measures clean above the fold. */
+        const want = bw >= 520 && bh > 0 && bh <= 420;
+        if (want === applied) return;
+        applied = want;
+        apply(want);
+      }
+      requestAnimationFrame(fit);
+      const onRot = () => {
+        if (!cols.isConnected) { window.removeEventListener('resize', onRot); return; }
+        fit();
+      };
+      window.addEventListener('resize', onRot, { passive: true });
+
       function draw() {
         clear(detail);
         const loc = game.data.locationById[sel];
@@ -776,16 +878,76 @@ export function createMenus(ctx, ui) {
     }, ['S', 'M', 'L', 'XL']));
     body.append(toggle('Reduced motion', !!S.reduced, (on) => { S.reduced = on; ui.setReducedMotion(on); }));
     body.append(toggle('High contrast', !!S.contrast, (on) => { S.contrast = on; ui.setHighContrast(on); }));
+    /* ------------------------------------------------------------
+       THE ONE CONFIGURATION WITH NO WAY BACK, and the rule that
+       closes it.
+
+       On a phone, turn Touch controls OFF and Hide UI ON. .w-acts
+       and .w-stickzone both measure 0×0 (touch.js never built them),
+       the two top clusters are hidden, and what is left on screen is
+       .w-hints — "P Phone · M Places · O Desk · Esc Menu" — on a
+       device with no P, no M, no O and no Esc. Every chip in that row
+       IS a real button (hud.js builds them as button.w-hint.w-pe, and
+       style.js only hides the row under .w-touch-on), so a route home
+       does technically survive. It just reads as a keyboard legend,
+       which on a touchscreen is the same as not being there. And with
+       the pad off he cannot move either, so the game is a photograph.
+
+       THE FIX: THE TWO SWITCHES MAY NOT BOTH BE IN THE TRAP STATE,
+       on a device whose primary pointer is coarse. One rule, applied
+       from whichever side the player approaches it:
+
+         Hide UI on, pad off   → REFUSED. The switch snaps back and
+                                 says which switch to throw first.
+         pad off, Hide UI on   → the HUD comes back with it.
+
+       WHY REFUSE RATHER THAN EXPLAIN. A toast is gone in four
+       seconds and both of these settings PERSIST (state.settings,
+       replayed by ui.js on boot) — so an explanation fixes the
+       session that reads it and hands the trap to every session
+       after. Refusing means the pair can never be written in the
+       first place. It costs a phone player nothing they can use:
+       with no thumbstick there is no game to look at uncluttered.
+       And it leaves the legitimate configuration alone — a tablet
+       with a keyboard has a fine-pointer or real keys, so the
+       coarse-pointer test never fires and Hide UI works as before.
+       ------------------------------------------------------------ */
+    const coarseOnly = () => typeof matchMedia === 'function'
+      && matchMedia('(pointer: coarse)').matches
+      && ((navigator.maxTouchPoints | 0) > 0 || 'ontouchstart' in window);
+    const padOff = () => !ui.touch?.enabled;
+
     /* HIDE UI — the clean view of the city. Fades out the two top
-       clusters (stat pills, objective card, money row) and nothing
-       else: on a phone the thumbstick and the bottom-right pad stay,
-       and every toast, banner, prompt and notification keeps coming.
-       The toast names the way back, because with the top gone this
-       switch is the only route out and it is two taps deep. */
-    body.append(toggle('Hide UI', !!S.hideUI, (on) => {
+       clusters (stat pills, objective card, money row): every toast,
+       banner, prompt and notification keeps coming.
+
+       ON TOUCH IT HAS A SECOND STAGE (src/ui/touch.js): stand still for
+       a few seconds and the thumbstick and the pad fade out too, and a
+       double tap anywhere brings them back — adjusting the camera does
+       not. THE TOAST IS THE ONLY PLACE THAT IS EVER SAID. With the pad
+       away, the gear that opens this sheet is away with it, so the
+       double tap is the route home and a player who has not been told
+       it once has a screen with nothing on it. Saying it here, at the
+       moment the mode is chosen, costs no pixels in the mode itself —
+       which is the whole point of the mode. (The hairline seam at the
+       bottom of the screen is the other half: a reminder, not a
+       sentence.) The keyboard wording is the old one, because on a
+       desktop nothing fades but the top bars. */
+    const hideRow = toggle('Hide UI', !!S.hideUI, (on) => {
+      if (on && coarseOnly() && padOff()) {
+        ui.sfx('ui.error');
+        ui.toast('Turn Touch controls on first — with the pad off there is nothing left to tap', 'bad');
+        return false;                         // the switch snaps back
+      }
       ui.setHideUI(on);
-      ui.toast(on ? 'Top HUD hidden · Settings brings it back' : 'HUD back', 'info');
-    }));
+      const thumb = !!ui.touch?.enabled;
+      ui.toast(on
+        ? (thumb
+          ? 'HUD hidden · controls fade when you stand still — double-tap to bring them back'
+          : 'Top HUD hidden · Settings brings it back')
+        : 'HUD back', 'info');
+    });
+    body.append(hideRow);
     body.append(toggle('Relaxed pace', !!S.relaxed, (on) => {
       S.relaxed = on;
       ui.toast(on ? 'Everything takes 30% less time' : 'Normal pace', 'info');
@@ -794,6 +956,18 @@ export function createMenus(ctx, ui) {
        would rather thumb it than type, can have them on demand. */
     body.append(toggle('Touch controls', !!ui.touch?.enabled, (on) => {
       ui.setTouch(on);
+      /* The other half of the rule above: taking the pad away on a
+         touchscreen brings the HUD back with it, so the player is
+         never left holding a keyboard legend and no keyboard. The
+         Hide UI switch above is flipped in place rather than the
+         panel rebuilt — a settings sheet that redraws under the
+         thumb that is still on it is its own small horror. */
+      if (!on && coarseOnly() && S.hideUI) {
+        ui.setHideUI(false);
+        hideRow.querySelector('.w-switch')?.classList.remove('on');
+        ui.toast('Thumbstick off · HUD brought back, or there would be nothing to tap', 'info');
+        return;
+      }
       ui.toast(on ? 'Thumbstick on' : 'Thumbstick off', 'info');
     }));
     /* LANDSCAPE PLAY. A phone row, under Comfort with the other
@@ -881,13 +1055,17 @@ export function createMenus(ctx, ui) {
     return h('div', { style: { marginBottom: '12px' } },
       h('div.w-kv', { style: { borderBottom: '0', paddingBottom: '4px' } }, h('span', { text: name }), val), inp);
   }
+  /* A switch. `onChange` returning FALSE means "I refused that" and
+     the switch snaps back, so a setting that must not be entered can
+     say no and still look like a switch rather than a dead control.
+     Every other handler returns undefined and is unaffected. */
   function toggle(name, on, onChange) {
     const sw = h('button.w-switch.w-pe' + (on ? '.on' : ''), { type: 'button', role: 'switch' });
     sw.addEventListener('click', () => {
       const next = !sw.classList.contains('on');
       sw.classList.toggle('on', next);
       ui.click();
-      onChange(next);
+      if (onChange(next) === false) sw.classList.toggle('on', !next);
     });
     return h('div.w-kv', null, h('span', { text: name }), sw);
   }
@@ -989,7 +1167,8 @@ export function createMenus(ctx, ui) {
   }
 
   /* ============================================================
-     TRAVEL — the mode board.
+     TRAVEL — the mode board, in TWO HALVES, and the split is the
+     whole point of this screen.
 
      Shared by the travel sheet, the expanded map and the phone's
      Places app, so a fare is quoted the same way wherever it is
@@ -997,22 +1176,42 @@ export function createMenus(ctx, ui) {
      of its currencies — dollars, minutes and energy — and a mode
      that cannot be taken says why instead of vanishing.
 
-     THE MAP IS A TRAVEL SCREEN. Every row on this board TRAVELS,
-     and that is the whole contract: tap a mode, pay that mode's
-     time, money and energy, arrive. Nothing here plants a waypoint
-     and calls it a journey — the "Point me" button in the Places app
-     is the one control that aims the HUD arrow, and it says so.
+     WHAT THIS BOARD USED TO GET WRONG. Every row looked identical
+     and every row teleported, so tapping "Bicycle" put Wally across
+     the island — and the player reported it as a bug, in exactly
+     those terms: "I was able to fast travel somewhere via bike which
+     should not be possible." Two of these six rows are a ticket
+     somebody else drives you on. The other four are a decision to go
+     and do it yourself. A board that renders both as the same grey
+     card with a price on it is lying about which is which BEFORE the
+     player commits, which is the worst possible moment.
+
+     So the board is split under two headings that say what the tap
+     will do, in verbs:
+
+       TAKE ME THERE      Metro, Yoober. You pay, the clock jumps,
+                          you are standing at the door. game.travel()
+                          returns moved:true and the sheet closes
+                          onto that place.
+       POINT ME THERE     On foot, and whichever ride is in the shed.
+                          It aims the yellow HUD arrow, puts the ride
+                          under him, and gets out of the way. The
+                          minutes and the metres on these rows are a
+                          FORECAST of the journey he is about to
+                          make, so they are prefixed with a ~ and the
+                          right-hand column says "you ride it" rather
+                          than a price. The sheet closes onto the
+                          CITY, not onto the destination.
 
      THE RIDE ROW IS WHATEVER IS IN THE SHED. game.fares() prices the
      'bike' row at the equipped ride, or failing that at the best one
      owned, so a scooter's row says Scooter and quotes scooter
-     minutes. Owned but left at home used to be a dead row with an
-     Equip button beside it — two taps, and the first of them did not
-     travel. It now takes the ride WITH him and goes, in one tap,
-     because "get the bike and ride there" is one intention.
-     Unowned, the row is replaced by the garage offer below, which
-     lists everything sold at all: a price to save for, not a grey
-     line saying no.
+     minutes. Owned but left at home is not a refusal — game.travel()
+     mounts it as part of choosing the row, which is the "and equips
+     the bike" half of the report — and the row says so before it is
+     tapped. Unowned, the row is replaced by the garage offer below,
+     which lists everything sold at all: a price to save for, not a
+     grey line saying no.
      ============================================================ */
   const MODE_ICON = { walk: 'foot', bike: 'bike', train: 'train', trunk: 'car' };
 
@@ -1032,55 +1231,93 @@ export function createMenus(ctx, ui) {
     }
 
     const bike = game.actions.bike();
-    body.append(label('How do you want to get there'));
 
-    /* ONE PATH OUT OF THIS BOARD, so no mode can behave differently
-       from any other. Every row ends here. */
-    const go = (mode) => {
-      const r = game.travel(locId, mode);
+    /* ONE PATH OUT OF THIS BOARD. Both halves come through here, and
+       the branch is on what game.travel() DID, not on what this file
+       assumed it would do — `moved` is the engine's own answer. */
+    const go = (f) => {
+      const r = game.travel(locId, f.mode);
       if (!r.ok) { res(r); return; }
-      ui.sfx(mode === 'walk' ? 'step.dirt' : mode === 'train' ? 'train.horn' : 'ui.select');
-      ui.setDestination(null);
       ui.refresh();
       ui.rebuildTop();
-      ui.toast('Arrived at ' + loc.n, 'token');
+
+      if (r.moved) {                                   // Metro, Yoober
+        ui.sfx(f.mode === 'train' ? 'train.horn' : 'ui.select');
+        ui.setDestination(null);
+        ui.toast('Arrived at ' + loc.n, 'token');
+        onDone ? onDone() : ui.closeSheet(body);
+        ui.openPlace(locId);
+        return;
+      }
+
+      /* ROUTED. The arrow is the whole outcome, so say so and get
+         the interface out of the way — closing onto the place he has
+         not been to yet is the teleport in a different costume. */
+      ui.sfx(f.mode === 'walk' ? 'step.dirt' : 'ui.select');
+      ui.setDestination(locId);
+      const how = f.mode === 'walk' ? 'on foot'
+        : 'on the ' + String(r.ride ? (game.data.rides[r.ride] || {}).short || f.n : f.n).toLowerCase();
+      ui.toast('Head for ' + loc.n + ' ' + how + ' · follow the arrow', 'token');
       onDone ? onDone() : ui.closeSheet(body);
-      ui.openPlace(locId);
     };
 
-    for (const f of game.fares(locId)) {
-      if (f.mode === 'bike' && !bike.owned) continue;      // the garage, below
-      const bits = [f.mins + ' min'];
+    /* One row, built the same way in both halves so the two are
+       visibly the same KIND of object — only the verbs differ. */
+    const row = (f) => {
+      /* Left at home is not a refusal, it is a step this row takes
+         for you — game.travel() mounts the ride. */
+      const fetch = f.mode === 'bike' && bike.owned && !bike.equipped;
+      const bits = [(f.fast ? '' : '~') + f.mins + ' min'];
       if (f.energy) bits.push(f.energy + ' energy');
       if (f.metres) bits.push(f.metres + ' m');
-      /* Left at home is not a refusal, it is a step this row will
-         take for you — say so rather than quoting the engine's why. */
-      const fetch = f.mode === 'bike' && bike.owned && !bike.equipped;
-      const detail = fetch ? bits.join(' · ') + ' · takes the ' + bike.short.toLowerCase() + ' with you'
-        : f.ok ? bits.join(' · ') + (f.warn ? ' · ' + f.warn : '') : f.why;
-      body.append(card({
+      if (fetch) bits.push('takes the ' + bike.short.toLowerCase() + ' with you');
+      const live = f.ok || fetch;
+      return card({
         ic: MODE_ICON[f.mode] || 'foot',
         t: f.n,
-        d: detail,
-        m: f.cost ? money(f.cost) : 'Free',
-        mColor: !f.ok && !fetch ? BRAND.bad : f.trudge ? BRAND.warn : f.cost ? BRAND.ink : BRAND.good,
+        d: live ? bits.join(' · ') + (f.warn ? ' · ' + f.warn : '') : f.why,
+        /* THE RIGHT-HAND COLUMN IS THE VERB, not just a price. A
+           Yoober says $89 and a bicycle says "You go", in the same
+           slot, at the same size — which is the fastest way to read
+           the difference between the two halves of this board. The
+           hop count stays under both so the columns still line up. */
+        m: f.cost ? money(f.cost) : f.fast ? 'Free' : 'You go',
+        mColor: !live ? BRAND.bad : f.trudge ? BRAND.warn : f.cost ? BRAND.ink : BRAND.good,
         ms: f.hops ? f.hops + (f.hops === 1 ? ' hop' : ' hops') : null,
-        disabled: !f.ok && !fetch,
-        onclick: (!f.ok && !fetch) ? null : () => {
-          if (fetch) {
-            const e = game.actions.equipRide(bike.id);
-            if (!e.ok) { res(e); return; }
-          }
-          go(f.mode);
-        },
-      }));
+        disabled: !live,
+        onclick: !live ? null : () => go(f),
+      });
+    };
+
+    const board = game.fares(locId).filter((f) => !(f.mode === 'bike' && !bike.owned));
+    const fast = board.filter((f) => f.fast);
+    const own = board.filter((f) => !f.fast);
+
+    /* SELF-POWERED FIRST, and deliberately. game.fares() already puts
+       walking at the head of its list because it is the one row that
+       is always there; the same logic makes it the head of this
+       screen. It also means the first words on the board are "you
+       make the journey", which is the sentence the old board never
+       said and the player had to discover by being teleported. */
+    if (own.length) {
+      body.append(label('Point me there · you make the journey'));
+      for (const f of own) body.append(row(f));
+    }
+    if (fast.length) {
+      /* Short enough to hold one line at 390 px, where "pay, and the
+         journey is over" wrapped and left the heading looking like a
+         paragraph next to its one-line neighbour. */
+      body.append(label('Take me there · somebody else drives'));
+      for (const f of fast) body.append(row(f));
     }
 
     if (!bike.owned) for (const el of rideOffers()) body.append(el);
 
     body.append(h('div', {
       style: { fontSize: '11px', opacity: '.55', marginTop: '10px', lineHeight: '1.5' },
-      text: 'Or close this and walk there yourself — the island is one continuous place, and the door will prompt you when you reach it.',
+      text: 'Only the Metro and a Yoober carry you. On foot or on wheels you go under your own power, '
+        + 'in real time, through the actual streets — the arrow points the way and the door will prompt '
+        + 'you when you reach it.',
     }));
   }
 
@@ -1603,7 +1840,7 @@ export function createMenus(ctx, ui) {
          quantity, a total or a second thought goes through the ticket */
       body.append(card({
         ic: 'search', t: 'Search by ticker', d: 'Quantity, spread and the total before you confirm.',
-        m: 'B', mColor: BRAND.token2,
+        m: touchUI() ? null : actionLabel('buy'), mColor: BRAND.token2,
         onclick: () => ui.openQuickBuy(),
       }));
       const list = game.data.assets.filter((a) => a.ven === venue);

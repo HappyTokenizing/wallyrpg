@@ -344,13 +344,48 @@ export function createPaths(ctx, terrain) {
            photographed on a bench and a bin.
 
            The heightfield's own resolution is CELL = 2 m and the
-           collision tiles are built from it vertex for vertex, so a
-           ribbon sampled every 1.5 m cannot disagree with the collider
-           by more than the raster disagrees with itself. It costs about
-           four times the road vertices, which across the whole island
-           is a few thousand — under a tenth of one building. */
-        const pts = densify(e.points, 1.5);
+           collision tiles are built from it vertex for vertex, so the
+           chord that matters is the one between ribbon vertices — and
+           1.5 m was NOT short enough. It is not the raster that a
+           bridge spans, it is the KINK: rasterised at 0.5 m over every
+           road mesh, a 1.5 m ring still stood 0.276 m over the ground
+           at (-24, -200), where the Green Edge lane crosses a bank that
+           falls 0.6 m per metre and then flattens inside one metre.
+
+           Halved again to 0.75 m — the same chord the ring now uses
+           across — the tail collapses: 17 of 68910 sample points past
+           surfacetest's 0.12 m, from 273 before either change, p99.9
+           0.089 m. It costs 47.8k road vertices and 82.8k triangles
+           across the whole island, in a 5.4 M triangle scene.
+
+           WHAT IS LEFT IS NOT CHORD LENGTH. The worst point is still
+           (-24, -200) at 0.254 m, and halving the chord moved it by
+           two centimetres, because TWO ribbons are drawn there: the
+           district buckets each build their own mesh and the Green
+           Edge and Iron Hills lanes overlap across the boundary
+           (0.132 m and 0.041 m over the ground at the same point). A
+           downward ray takes the higher of the two, so at a junction
+           the tail belongs to whichever lane crosses the bank
+           sideways. Cutting the ribbon at the boundary, or letting one
+           lane win a junction, is the fix; it is not this one. */
+        const pts = densify(e.points, 0.75);
         const half = e.width * 0.38;   // the ribbon rides INSIDE the carve
+        /* ...AND ACROSS IT, FOR THE SAME REASON.
+
+           The paragraph above densified the ribbon ALONG the centreline
+           and then left it three vertices wide, so every quad was still
+           a flat plank up to `half` metres ACROSS — 3.0 m on a main
+           road, laid over the same 2 m heightfield. Rasterised at 0.5 m
+           over every road mesh, that bridge stood up to 0.404 m over the
+           ground it is drawn on at (-23, -200) on the Green Edge lane,
+           with 273 of 68903 sample points past surfacetest's 0.12 m.
+           That is what the suite reads as a SINK: he stands on the
+           terrain collider, which is heightAt vertex for vertex, while
+           the tarmac is drawn above his feet — worst walk sample
+           -0.139 m at (-314.2, 166) on Rusty Row. Same cure as along:
+           no chord, either way, longer than 0.75 m. */
+        const NS = Math.max(1, Math.ceil(half / 0.75));   // columns per side
+        const COLS = NS * 2 + 1;
         const ring = [];
         for (let i = 0; i < pts.length; i++) {
           const p0 = pts[Math.max(0, i - 1)], p1 = pts[Math.min(pts.length - 1, i + 1)];
@@ -362,8 +397,9 @@ export function createPaths(ctx, terrain) {
         const wear = ctx.makeRng('road.' + key + '.' + base);
         for (let i = 0; i < ring.length; i++) {
           const r = ring[i];
-          for (let s = -1; s <= 1; s++) {
-            const w = half * s * (s === 0 ? 0 : 1);
+          for (let s = -NS; s <= NS; s++) {
+            const t = s / NS;                    // -1 verge .. 0 crown .. +1
+            const w = half * t;
             const x = r.x + r.px * w, z = r.z + r.pz * w;
             /* 0.09 m was a z-fighting guard from before the material
                carried a polygon offset. It is now belt AND braces, and
@@ -373,20 +409,29 @@ export function createPaths(ctx, terrain) {
             const n = terrain.normalAt(x, z);
             pos.push(x, y, z);
             nrm.push(n.x, n.y, n.z);
-            uv.push(i * 0.18, s * 0.5 + 0.5);
-            _cc.copy(s === 0 ? C_ROAD : C_WORN);
+            /* 0.12 uv per METRE, not per ring: the ring pitch halved
+               and an index-based u would have run the road texture
+               twice as fast for a change that is supposed to be
+               geometry only. */
+            uv.push(i * 0.75 * 0.12, t * 0.5 + 0.5);
+            /* SAMPLED, NOT INTERPOLATED. Three vertices across gave the
+               quad a linear crown-to-verge ramp between C_ROAD and
+               C_WORN; mixing on |t| is that same ramp evaluated at every
+               new column, so the extra geometry changes the surface and
+               not the paint. */
+            _cc.copy(C_ROAD).lerp(C_WORN, Math.abs(t));
             const k = 0.88 + 0.24 * wear();
             col.push(_cc.r * k, _cc.g * k, _cc.b * k);
           }
         }
         for (let i = 0; i < ring.length - 1; i++) {
-          const a0 = base + i * 3, b0 = a0 + 3;
-          for (let s = 0; s < 2; s++) {
+          const a0 = base + i * COLS, b0 = a0 + COLS;
+          for (let s = 0; s < COLS - 1; s++) {
             const a = a0 + s, b = a0 + s + 1, c = b0 + s + 1, d = b0 + s;
             idx.push(a, b, c, a, c, d);
           }
         }
-        base += ring.length * 3;
+        base += ring.length * COLS;
       }
       if (!idx.length) continue;
       const geo = new THREE.BufferGeometry();

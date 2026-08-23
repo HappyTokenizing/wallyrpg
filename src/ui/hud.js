@@ -28,18 +28,25 @@
 import { BRAND } from '../core/palette.js';
 import { clamp, damp } from '../core/contracts.js';
 import { h, icon, money, pad2, rgba, C, meterColour } from './style.js';
+/* NO KEY NAME IS WRITTEN IN THIS FILE. Every one comes from the action
+   table in touch.js, which knows whether the player is holding a
+   keyboard or a thumb — see the header there. */
+import { actionLabel, actionPhrase, paintChip, onInputMode, touchUI } from './touch.js';
 
-/* The bottom-right row is the reminder tier and stays at four: B for
-   the buy sheet lives on the TICKER pill instead, which is a better
+/* The bottom-right row is the reminder tier and stays at four: the buy
+   sheet's shortcut lives on the TICKER pill instead, which is a better
    home for it anyway — the affordance and its shortcut in one object,
    sitting against the money it spends. tools/touchtest.mjs counts
    these four, so adding a fifth here is a test change as well as a
-   design one. */
+   design one. (The whole row is display:none on a touch build, where
+   the action pad stands in for it, but the chips are mode-aware
+   regardless: "it happens to be hidden" is not a reason to print a key
+   name at somebody who has no keys.) */
 const KEY_HINTS = [
-  { k: 'P', name: 'Phone', app: null, id: 'phone', code: 'KeyP' },
-  { k: 'M', name: 'Places', app: 'places', id: 'phone', code: 'KeyM' },
-  { k: 'O', name: 'Desk', id: 'office', code: 'KeyO' },
-  { k: 'Esc', name: 'Menu', id: 'pause', code: 'Escape' },
+  { act: 'phone', name: 'Phone', app: null, id: 'phone', code: 'KeyP' },
+  { act: 'places', name: 'Places', app: 'places', id: 'phone', code: 'KeyM' },
+  { act: 'desk', name: 'Desk', id: 'office', code: 'KeyO' },
+  { act: 'menu', name: 'Menu', id: 'pause', code: 'Escape' },
 ];
 
 export function createHud(ctx, ui) {
@@ -94,11 +101,19 @@ export function createHud(ctx, ui) {
      it, so the one control that spends it belongs in the same
      glance. Before this there was no route to a purchase that did
      not start with knowing which of nine venues sold the thing. */
+  const buyKb = h('span.kb');
   const buyPill = h('button.w-pill.tap.w-pe', {
-    type: 'button', title: 'Search a ticker and buy it  ·  B',
+    type: 'button',
     onclick: () => { ui.click(); ui.openQuickBuy(); },
-  }, icon('search', 13, { w: 2 }), h('span.w-k', { text: 'TICKER' }),
-    h('span.kb', { text: 'B' }));
+  }, icon('search', 13, { w: 2 }), h('span.w-k', { text: 'TICKER' }), buyKb);
+  /* The shortcut chip is a KEYBOARD reminder riding a control that is
+     already tappable, so under a thumb it is not "translated" — it is
+     removed, along with the tooltip that named the key. */
+  function paintBuy() {
+    paintChip(buyKb, 'buy', { hideOnTouch: true });
+    buyPill.title = 'Search a ticker and buy it'
+      + (touchUI() ? '' : '  ·  ' + actionLabel('buy'));
+  }
   /* THE REPUTATION PILL — a number, the TITLE it has earned, and a
      door. Reputation is standing, and WallyNet is where the city
      talks about you, so pressing this opens that app instead of
@@ -185,9 +200,11 @@ export function createHud(ctx, ui) {
   let bannerEl = null;
 
   const hintByKey = {};
+  const hintChips = [];
   for (const hk of KEY_HINTS) {
+    const kb = h('span.kb');
     const b = h('button.w-hint.w-pe', {
-      type: 'button',
+      type: 'button', 'aria-label': hk.name,
       onclick: () => {
         ui.click();
         if (hk.id === 'phone') ui.openPhone(hk.app);
@@ -195,9 +212,10 @@ export function createHud(ctx, ui) {
         else if (hk.id === 'buy') ui.openQuickBuy();
         else ui.show('pause');
       },
-    }, h('span.kb', { text: hk.k }), hk.name);
+    }, kb, hk.name);
     if (hk.app === 'places' || hk.id === 'phone') b.dataset.phone = '1';
     hintByKey[hk.code] = b;
+    hintChips.push({ kb, b, act: hk.act, name: hk.name });
     hints.append(b);
   }
   const msgBadge = h('span.badge', { text: '0', style: { display: 'none' } });
@@ -410,15 +428,64 @@ export function createHud(ctx, ui) {
      pointer rather than a twitching one.
      ============================================================ */
   let destOverride = null;          // a place the player chose on the map
+  let destRoute = null;             // …and the route id it came from, if any
   let ptrAngle = 0;                 // damped, radians
   const ptrShown = { txt: '', sub: '', why: '', chosen: null };
+
+  /* ------------------------------------------------------------
+     THE ARROW AND THE ROUTE ARE ONE DECISION.
+
+     `destOverride` was a module-local `let` that nothing ever seeded,
+     and game.route lives on the save. So the two halves of one choice
+     persisted differently, and it was measured: route to the cafe on
+     foot (41 min, 12.6 e, 302 m), the arrow reads "The Bent Spoon",
+     save, reload — the ROUTE comes back intact and the arrow has
+     reverted to the quest. Two hundred metres of walking then charged
+     8.08 energy toward a destination the HUD no longer named.
+     game.js's own comment claims the opposite ("being pointed at the
+     Business Broker is the kind of thing that should still be true
+     tomorrow"). It survived. The pointing did not.
+
+     So the ROUTE IS THE AUTHORITY and this mirrors it, on every read:
+       · a live route seeds and holds the arrow — at boot, after a
+         load, and for any route set by code that never went through
+         ui.setDestination();
+       · a route that ends — arrived, abandoned, cancelled, slept on —
+         takes down the arrow it seeded;
+       · aiming the arrow somewhere else, or dropping it with the ✕,
+         clears a route pointing anywhere but there (setDestination).
+
+     A destination picked WITHOUT a route (the phone's "Point me", the
+     map, "Come back to …") is still only an arrow, and stays one —
+     `destRoute` is what tells the two apart, so clearing a route never
+     silently steals a heading the player set by hand.
+     ------------------------------------------------------------ */
+  const routeDest = (g) => (g ? (g.routeTo ?? (g.route ? g.route.to : null)) : null);
+
+  function syncDest() {
+    const g = game();
+    if (!g) return;
+    const to = routeDest(g);
+    if (to) {
+      if (destOverride !== to) {
+        destOverride = to;
+        ptrShown.txt = ptrShown.sub = ptrShown.why = '';
+        ptrShown.chosen = null;
+      }
+      destRoute = to;
+    } else if (destRoute) {
+      if (destOverride === destRoute) destOverride = null;
+      destRoute = null;
+    }
+  }
 
   function pointerTarget() {
     const g = game();
     if (!g) return null;
+    syncDest();
     if (destOverride && g.data.locationById[destOverride]) {
       /* arriving retires it — otherwise it would point at his feet */
-      if (destOverride === g.state.loc) destOverride = null;
+      if (destOverride === g.state.loc) { destOverride = null; destRoute = null; }
       else return { id: destOverride, why: 'your destination', chosen: true };
     }
     const q = objQuest;
@@ -431,7 +498,17 @@ export function createHud(ctx, ui) {
   /* Aim the one strip somewhere the player chose. Null hands it back
      to the quest. It never creates an element — it retargets this one. */
   function setDestination(locId) {
-    destOverride = locId && game()?.data?.locationById?.[locId] ? locId : null;
+    const g = game();
+    const id = locId && g?.data?.locationById?.[locId] ? locId : null;
+    /* THE ✕ DROPS BOTH HALVES, and so does re-aiming: a route still
+       metering him toward somewhere the arrow no longer names is the
+       exact bug this block exists to stop. The one case that must NOT
+       clear is ui.js hearing 'route' and aiming the arrow at the route
+       that was just set — same id, nothing to drop. */
+    const to = routeDest(g);
+    if (to && to !== id) g.clearRoute(id ? 'pointed somewhere else' : 'the arrow was cleared');
+    destOverride = id;
+    destRoute = id && to === id ? id : null;
     ptrShown.txt = ptrShown.sub = ptrShown.why = '';
     ptrShown.chosen = null;
     paintStrip();
@@ -553,7 +630,7 @@ export function createHud(ctx, ui) {
           : want > 0 ? 'to your right' : 'to your left';
     const loc = g.data.locationById[t.id];
     const place = !t.chosen && loc ? loc.n + ' · ' : '';
-    const sub = arrived ? (t.chosen ? place + 'arrived' : place + 'go inside — press E')
+    const sub = arrived ? (t.chosen ? place + 'arrived' : place + 'go inside — ' + actionPhrase('interact'))
       : place + Math.round(dist) + ' m · ' + bearing;
     if (ptrShown.sub !== sub) { ptrShown.sub = sub; objD.textContent = sub; }
   }
@@ -661,11 +738,27 @@ export function createHud(ctx, ui) {
   const prompts = new Map();          // id -> {el, pos, text, key, sub, action, ttl}
   let promptSeq = 0;
 
+  /* THE CHIP ON THE FRONT OF A PROMPT.
+     `spec.act` names an ACTION and gets whatever that action is called
+     on this input — 'E' with a keyboard, 'Enter' under a thumb, and
+     never a keycap in the second case. `spec.key` is the escape hatch
+     for chips that are NOT keyboard keys at all (the race prints the
+     checkpoint number and a chequered flag); those stay literal and
+     keep the cap treatment, because a numeral in a cap is a numeral,
+     not a promise about hardware the player does not have. */
+  function paintPromptKey(p) {
+    if (p.lit != null) {
+      if (p.key.textContent !== p.lit) p.key.textContent = p.lit;
+      return;
+    }
+    paintChip(p.key, p.act);
+  }
+
   function addPrompt(spec) {
     const id = spec.id || 'p' + (promptSeq++);
     let p = prompts.get(id);
     if (!p) {
-      const key = h('span.key', { text: spec.key || 'E' });
+      const key = h('span.key');
       const label = h('span', { text: spec.text || '' });
       const sub = h('span.sub', { text: spec.sub || '' });
       const el = h('div.w-prompt', { style: { opacity: 0 } }, key, label, sub);
@@ -681,7 +774,9 @@ export function createHud(ctx, ui) {
     p.pos = spec.pos;
     p.ttl = spec.ttl ?? Infinity;
     p.action = spec.action;
-    if (p.key.textContent !== (spec.key || 'E')) p.key.textContent = spec.key || 'E';
+    p.lit = spec.key != null ? String(spec.key) : null;
+    p.act = spec.act || 'interact';
+    paintPromptKey(p);
     if (p.label.textContent !== (spec.text || '')) p.label.textContent = spec.text || '';
     if (p.sub.textContent !== (spec.sub || '')) p.sub.textContent = spec.sub || '';
     p.sub.style.display = spec.sub ? '' : 'none';
@@ -760,7 +855,7 @@ export function createHud(ctx, ui) {
     DOOR.id = addPrompt({
       id: 'door',
       pos: doorPos,
-      key: 'E',
+      act: 'interact',
       text: inside ? best.n : (open ? best.n : best.n),
       sub: inside ? 'you are here' : open ? '' : `closed · ${pad2(best.hours[0])}:00–${pad2(best.hours[1])}:00`,
       action: () => enterDoor(),
@@ -769,18 +864,80 @@ export function createHud(ctx, ui) {
   function dropDoor() {
     if (DOOR.id) { removePrompt(DOOR.id); DOOR.id = null; DOOR.loc = null; }
   }
+  /* ============================================================
+     A REFUSAL HAS TO SAY WHY, AND UNTIL NOW THIS ONE DID NOT.
+
+     `interact()` returned a bare false and did nothing, which is
+     unfalsifiable from outside: a clean, proven activation — handler
+     entered, click detail 0, inside the pad — that opened no panel and
+     toasted nothing is indistinguishable from a BROKEN INPUT PATH, and
+     one was measured looking exactly like that, once, straight after a
+     stacked phone-plus-desk pair was closed. An input suite cannot
+     close that; only the refusal itself can.
+
+     The other half of the same shape is already known and is the
+     mirror image: game.enter() legitimately refuses a closed building
+     or a starving elephant and RETURNS TRUE with a toast, so `true`
+     never meant "something happened" either.
+
+     So both ends now record a reason. Every path through here leaves a
+     one-line string behind, read back as WALLY.debug.interact(). No
+     toast is added for "nothing in range": a stray Enter on open ground
+     is the commonest press in the game and nagging about it would be
+     worse than the silence. The refusals a player CAN act on — a closed
+     door, no money — already toast, and still do.
+     ============================================================ */
+  let interactWhy = 'interact() has not been called yet';
   function enterDoor() {
     const l = DOOR.loc;
-    if (!l) return;
+    if (!l) return (interactWhy = 'no door: the prompt went away first');
     const g = game();
-    if (g.state.loc !== l.id) {
+    /* read BEFORE the enter, or every fresh entry reports itself as
+       one he was already standing in */
+    const wasInside = g.state.loc === l.id;
+    if (!wasInside) {
       const r = g.enter(l.id);
-      if (!r.ok) { ui.toast(r.why, 'bad'); ui.sfx('ui.error'); return; }
+      if (!r.ok) {
+        ui.toast(r.why, 'bad'); ui.sfx('ui.error');
+        return (interactWhy = `refused by game.enter(${l.id}): ${r.why}`);
+      }
       ui.sfx('door.open');
     }
     ui.openPlace(l.id);
+    return (interactWhy = `opened ${l.id}${wasInside ? ' (was already inside)' : ''}`);
   }
-  const interact = () => { if (DOOR.loc) { enterDoor(); return true; } return false; };
+  const interact = () => {
+    if (DOOR.loc) { enterDoor(); return true; }
+    /* WHAT TOOK THE DOOR AWAY IS THE USEFUL HALF. updatePointer() drops
+       the door prompt outright while ui.modal is true, so a press in
+       the frame or two after a sheet closes can honestly find nothing
+       here — which is the shape of the one unexplained silence on
+       record. Say which it was. */
+    const up = [...prompts.keys()];
+    interactWhy = `no door in range (ui.modal ${!!ui.modal}, prompts ${JSON.stringify(up)})`;
+    return false;
+  };
+
+  /* ============================================================
+     EVERY LABEL IN THIS FILE THAT NAMES A CONTROL, IN ONE PLACE.
+
+     Not baked at boot: Settings › Touch controls flips the input mode
+     mid-session, touch.js publishes it, and this runs again. The
+     objective sub-line is repainted by CLEARING its cache rather than
+     rewriting it — updatePointer() owns that string and rebuilds it on
+     the next frame with the distance and bearing still correct.
+     ============================================================ */
+  const offInputMode = onInputMode(() => {
+    paintBuy();
+    for (const c of hintChips) {
+      paintChip(c.kb, c.act, { hideOnTouch: true });
+      /* a screen reader must not be told to press a key either */
+      c.b.setAttribute('aria-label',
+        touchUI() ? c.name : c.name + ' · ' + actionLabel(c.act));
+    }
+    for (const p of prompts.values()) paintPromptKey(p);
+    ptrShown.sub = '';
+  });
 
   /* ============================================================
      the repaint
@@ -842,6 +999,9 @@ export function createHud(ctx, ui) {
     root,
     toast, banner, refresh,
     addPrompt, removePrompt, interact,
+    /** Why the last interact() did what it did — see A REFUSAL HAS TO
+        SAY WHY. ui.js folds this into WALLY.debug.interact(). */
+    get interactWhy() { return interactWhy; },
     /** The Mayor's Dash readout. ui.js owns the race; this paints it. */
     setRace,
     /* poser for screenshots — shows the money chip without having to
@@ -853,7 +1013,9 @@ export function createHud(ctx, ui) {
        back to the current objective. It retargets — it never spawns
        a second widget. */
     setDestination,
-    get destination() { return destOverride; },
+    /* Mirrors the route before answering, so nobody outside can read a
+       heading that is one frame staler than the one being metered. */
+    get destination() { syncDest(); return destOverride; },
     update(dt) {
       acc += dt;
       if (acc >= 0.125) { acc = 0; refresh(false); }
@@ -863,6 +1025,7 @@ export function createHud(ctx, ui) {
     },
     setHintsVisible(on) { hints.style.display = on ? '' : 'none'; },
     dispose() {
+      offInputMode();
       removeEventListener('keydown', onHintKey);
       for (const t of litT.values()) clearTimeout(t);
       root.remove();

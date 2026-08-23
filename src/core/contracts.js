@@ -120,6 +120,18 @@ export function createBus() {
    itself on. Tier is chosen at boot from a GPU probe and may be
    forced with ?quality=low|med|high|ultra.
    ============================================================ */
+/* bloomMips IS A SAFETY NUMBER AS WELL AS A LOOKS NUMBER, AND 3 IS A
+   FLOOR. A non-finite texel that reaches the scene buffer is smeared
+   by the bloom pyramid into a solid black block roughly 2^(mips+1) px
+   on a side — MEASURED cold-boot per tier: 94x106 at 3, 206x218 at 4,
+   428x432 at 5. tools/blacksquares.mjs is what catches that block, and
+   its floor is a measured 36x36. At 2 mips the block MEASURES 38x42
+   (area 1554) — 1.1x that floor, and under both of its solid-pass side
+   floors, so one of its two detectors goes blind and the gate is down
+   to detector 1b alone. Do not lower any bloomMips below 3 to buy
+   frames: postfx.js clamps at 3 and blacksquares FAILS the gate on a
+   tier that asks for less. Drop `bloom: false` instead — a tier with
+   no pyramid cannot make the block at all. */
 export const QUALITY_TIERS = {
   /* Integrated graphics and phones. Measured 120 fps here, which is
      the point: this tier has to hold 60 on a machine three to four

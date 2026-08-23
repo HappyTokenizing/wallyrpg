@@ -128,6 +128,12 @@ async function boot() {
     label(text) { if (elStage) elStage.textContent = text; },
   };
 
+  /* Which stage a frame handle came from. A WeakMap rather than a property
+     on the handle: these are other agents' objects and we do not write to
+     them. It is what turns "something threw" into "wally.update threw". */
+  const hname = new WeakMap();
+  const nameOf = (h, i) => hname.get(h) || `handle#${i}`;
+
   for (const [name, init] of STAGES) {
     curW = STAGE_W[name] ?? MIN_W;
     ctx.boot.label(name);
@@ -138,6 +144,7 @@ async function boot() {
       const handle = await init(ctx);
       if (handle) {
         ctx[name] = handle;
+        hname.set(handle, name);
         ctx._handles.push(handle);
       }
     } catch (e) {
@@ -151,11 +158,203 @@ async function boot() {
   ctx.boot.label('ready');
   paint(1);
 
-  /* ---- frame loop ---- */
+  /* ================================================================
+     THE FRAME LOOP — and why it is wrapped the way it is.
+
+     This loop used to re-arm requestAnimationFrame on its LAST line,
+     with no try/catch anywhere in it. That made every module's update()
+     a single point of failure for the whole session: one throw, the rAF
+     was never re-armed, every subsystem stopped at once, and the last
+     painted frame sat on screen looking like a GPU hang rather than a
+     crash. MEASURED on this build before the change — inject one
+     handle whose update() throws and ctx.frame goes 34 -> 36 and then
+     never moves again; three seconds later it is still 36, with a
+     single pageerror in the console and nothing else. Not hypothetical
+     either: a ReferenceError out of another module's in-flight edit
+     took a whole boot stage down this week.
+
+     Three rules now:
+
+       1  rAF IS RE-ARMED FIRST, before a single line of work. Nothing
+          below can cost us the next frame.
+       2  EVERY HOOK RUNS IN ITS OWN try/catch. A throw costs that one
+          module that one frame — the handles after it in the list
+          still update, and the frame still renders. One try/catch
+          around the whole batch would still let handle #2 starve
+          handles #3..#16 forever, which is most of the game.
+       3  A THROW IS LOUD, ONCE, AND THEN BOUNDED. Swallowing quietly
+          is exactly how src/audio/music.js came to lose the score
+          behind three console.warns (see the note there). So: the
+          first FAULT_LOGS throws from a hook print a full stack at
+          console.ERROR level — the level tools/shot.mjs greps for, so
+          every screenshot tool in tools/ now exits non-zero on one —
+          then one line every FAULT_QUIET ms while it keeps failing,
+          and at FAULT_LIMIT the hook is switched off for the session
+          with a banner on screen and an entry in
+          window.__WALLY_HEALTH__. A module throwing sixty times a
+          second is not going to fix itself, and sixty stack traces a
+          second is as unreadable as none at all.
+     ================================================================ */
+  const FAULT_LIMIT = 12;      // throws from one hook before it is switched off
+  const FAULT_LOGS = 3;        // full stack traces before we rate-limit
+  const FAULT_QUIET = 30000;   // ms between "still throwing" lines
+
+  /* The place a developer looks after the fact — and what
+     tools/audiotest.mjs asserts against. */
+  const health = { frames: 0, errors: 0, disabled: [], sources: {}, last: null };
+  window.__WALLY_HEALTH__ = health;
+
+  const faults = new Map();
+  const injected = [];
+  let faultBanner = null;
+  let bannerPlaced = 0;
+
+  /* THE BANNER GOES UNDER THE HUD, NEVER OVER IT.
+     ----------------------------------------------------------------
+     It used to be top:0, full width, 27 px tall. MEASURED at 1600x900
+     with a hook disabled: the top pill row sits at y 12..40, so the
+     banner covered the day/clock/energy/hunger pills on the left and
+     the money, TICKER, reputation and city-percent badges on the
+     right — sliced through the middle with only their bottom third
+     showing. pointer-events:none, so nothing was ever blocked, and it
+     only exists in a fault state — but a fault report that hides the
+     four numbers a player is trying to read is a poor way to report a
+     fault, and the render-fallback screenshot is exactly where you
+     want to see both at once.
+
+     So the position is MEASURED rather than guessed. The top HUD
+     clusters are `.w-bar` (src/ui/hud.js builds .w-bar.left — pills,
+     objective card, lock strip — and .w-bar.right — the badge row);
+     we take the lowest edge of the ones that are actually visible and
+     sit BANNER_GAP under it. Three cases, all checked:
+
+       · HUD up        → under the deepest cluster
+       · Hide UI on    → style.js hides .w-bar with VISIBILITY, not
+                         display, so those boxes still have live rects
+                         (deliberately — touch.js measures one of them).
+                         The COMPUTED style is what is read here, so
+                         they are skipped and the banner rises to the
+                         top of an empty screen.
+       · no UI at all  → nothing matches, same top edge.
+
+     Re-measured on resize and, while a banner is up, twice a second:
+     orientation, Hide UI and a two-line objective all move that edge,
+     and a banner is not allowed to drift back over the numbers later
+     just because it was placed correctly once. Half the viewport is
+     the ceiling — a HUD deep enough to push it further than that is a
+     UI bug, and the fault still has to be readable through it. */
+  const BANNER_GAP = 8;
+
+  function placeBanner() {
+    if (!faultBanner) return;
+    bannerPlaced = performance.now();
+    let y = 0;
+    try {
+      const vh = innerHeight || 900;
+      for (const el of document.querySelectorAll('.w-bar')) {
+        const cs = getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none' || +cs.opacity === 0) continue;
+        const r = el.getBoundingClientRect();
+        if (r.height <= 0 || r.top > vh * 0.5) continue;
+        if (r.bottom > y) y = r.bottom;
+      }
+      y = Math.min(y, vh * 0.5);
+    } catch { y = 0; }
+    faultBanner.style.top = Math.round(Math.max(0, y) + BANNER_GAP) + 'px';
+  }
+
+  function banner(text) {
+    try {
+      if (!faultBanner) {
+        faultBanner = document.createElement('div');
+        faultBanner.id = 'wallyFault';
+        /* Inset and rounded rather than edge-to-edge: a floating strip
+           reads as something the GAME is telling you, where a
+           full-bleed bar welded to the top of the window reads as
+           browser chrome — and once it is not at y=0 it has no edge to
+           hang off anyway. */
+        faultBanner.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;z-index:99999;'
+          + 'font:600 12px/1.45 ui-monospace,Menlo,Consolas,monospace;'
+          + 'background:#3a0d12ee;color:#ffbcbc;border:1px solid #7c1d26;border-radius:6px;'
+          + 'padding:6px 10px;pointer-events:none;white-space:pre-wrap;'
+          + 'box-shadow:0 2px 10px rgba(0,0,0,.35);';
+        document.body.appendChild(faultBanner);
+      }
+      faultBanner.textContent = text;
+      placeBanner();
+    } catch { /* no DOM is not a reason to stop the game */ }
+  }
+
+  function onFault(key, e) {
+    let f = faults.get(key);
+    if (!f) { f = { n: 0, off: false, logged: 0, at: 0, message: null }; faults.set(key, f); }
+    f.n++;
+    f.message = String(e?.message || e);
+    health.errors++;
+    health.sources[key] = f.n;
+    health.last = { at: key, message: f.message, frame: ctx.frame, count: f.n };
+    try { ctx.bus?.emit?.('frame:error', { at: key, error: e, count: f.n }); } catch { /* the bus is not allowed to make this worse */ }
+
+    if (f.n >= FAULT_LIMIT && !f.off) {
+      f.off = true;
+      health.disabled.push(key);
+      console.error(`[frame] ${key} has thrown ${f.n} times — DISABLED for the rest of the session. `
+        + 'The rest of the game keeps running without it. Last error:', e);
+      banner(`${key} disabled after ${f.n} errors — ${f.message}`);
+      return f;
+    }
+    const now = performance.now();
+    if (f.logged < FAULT_LOGS) {
+      f.logged++; f.at = now;
+      console.error(`[frame] ${key} threw (${f.n}/${FAULT_LIMIT}) — this frame is lost, the session is not:`, e);
+    } else if (now - f.at > FAULT_QUIET) {
+      f.at = now;
+      console.error(`[frame] ${key} is still throwing — ${f.n} times so far: ${f.message}`);
+    }
+    return f;
+  }
+
+  function runHook(h, hook, name, dt, elapsed) {
+    const fn = h && h[hook];
+    if (typeof fn !== 'function') return;
+    const key = name + '.' + hook;
+    const f = faults.get(key);
+    if (f && f.off) return;
+    try { fn.call(h, dt, elapsed); }
+    catch (e) { onFault(key, e); }
+  }
+
+  /* The renderer is the one hook that may not simply be switched off: a
+     disabled render() is a black screen, which is worse than losing the
+     post stack. So it degrades instead — once render.render has thrown
+     its way to FAULT_LIMIT we fall through to the plain forward path,
+     which has no composer in it to go wrong. */
+  function draw() {
+    const post = ctx.render?.render;
+    if (typeof post === 'function' && !faults.get('render.render')?.off) {
+      try { post.call(ctx.render); return; }
+      catch (e) {
+        const f = onFault('render.render', e);
+        if (f.off) console.error('[frame] falling back to the plain forward render path.');
+      }
+    }
+    try { renderer.render(scene, camera); }
+    catch (e) { onFault('renderer.render', e); }
+  }
+
   const perf = { fps: 0, ms: 0, frames: 0, acc: 0, calls: 0, tris: 0 };
   let last = performance.now();
 
   function frame(now) {
+    /* RULE 1. The next frame is booked before anything can go wrong. */
+    requestAnimationFrame(frame);
+    /* RULE 2 lives inside step(); this is only the backstop for a throw
+       in the loop's own arithmetic. */
+    try { step(now); }
+    catch (e) { onFault('main.frame', e); }
+  }
+
+  function step(now) {
     const raw = (now - last) / 1000;
     last = now;
     // Clamp dt so an alt-tab or a slow first frame can't launch Wally
@@ -165,12 +364,22 @@ async function boot() {
     ctx.dt = dt;
     ctx.elapsed += dt;
     ctx.frame++;
+    health.frames = ctx.frame;
 
-    for (const h of ctx._handles) if (h.update) h.update(dt, ctx.elapsed);
-    for (const h of ctx._handles) if (h.lateUpdate) h.lateUpdate(dt, ctx.elapsed);
+    /* Indexed, and the length is re-read every iteration: a module may
+       add a handle mid-frame (streamed content does) and a cached
+       length would either miss it or run off the end. */
+    const hs = ctx._handles;
+    for (let i = 0; i < hs.length; i++) runHook(hs[i], 'update', nameOf(hs[i], i), dt, ctx.elapsed);
+    for (let i = 0; i < hs.length; i++) runHook(hs[i], 'lateUpdate', nameOf(hs[i], i), dt, ctx.elapsed);
 
-    if (ctx.render?.render) ctx.render.render();
-    else renderer.render(scene, camera);
+    draw();
+
+    /* Only while a fault banner is on screen, and only twice a second:
+       one forced layout read every 500 ms during a state that already
+       means something is broken is cheap, and it is what keeps the
+       banner under a HUD that has since changed height. */
+    if (faultBanner && now - bannerPlaced > 500) placeBanner();
 
     perf.acc += raw; perf.frames++;
     if (perf.acc >= 0.5) {
@@ -179,12 +388,51 @@ async function boot() {
       perf.calls = renderer.info.render.calls;
       perf.tris = renderer.info.render.triangles;
       perf.acc = 0; perf.frames = 0;
-      window.__WALLY_PERF__ = { ...perf };
+      /* The error counters ride along with the perf block because that
+         is the object every tool in tools/ already prints. */
+      window.__WALLY_PERF__ = { ...perf, errors: health.errors, disabled: health.disabled.length };
       ctx.bus.emit('perf', perf);
     }
-    requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
+
+  /* ---- fault injection ----
+     Throwing on purpose is the only way to prove the guards above are
+     load-bearing rather than assumed; tools/audiotest.mjs PASS F drives
+     these. The injected handle goes to the FRONT of the list by default,
+     because the interesting assertion is that the handles AFTER it still
+     get their frame. */
+  window.WALLY.debug.health = () => ({
+    ...health, disabled: health.disabled.slice(), sources: { ...health.sources },
+    frame: ctx.frame, fps: perf.fps,
+  });
+  window.WALLY.debug.injectFault = (opts = {}) => {
+    const {
+      name = 'faultinjector', hook = 'update', times = Infinity,
+      first = true, message = 'injected fault',
+    } = opts;
+    let left = times === true ? Infinity : Number(times);
+    const h = { [hook]() { if (left-- > 0) throw new Error(message); } };
+    hname.set(h, name);
+    if (first) ctx._handles.unshift(h); else ctx._handles.push(h);
+    injected.push(h);
+    /* `left` is reported as a string: JSON turns Infinity into null,
+       and a test that prints "times: null" reads like a bug. */
+    return { name, hook, times: String(left), at: first ? 0 : ctx._handles.length - 1 };
+  };
+  window.WALLY.debug.clearFaults = () => {
+    for (const h of injected) {
+      const i = ctx._handles.indexOf(h);
+      if (i >= 0) ctx._handles.splice(i, 1);
+    }
+    injected.length = 0;
+    faults.clear();
+    health.errors = 0; health.disabled.length = 0;
+    health.sources = {}; health.last = null;
+    try { faultBanner?.remove(); } catch {}
+    faultBanner = null;
+    return true;
+  };
 
   /* ---- resize ---- */
   const onResize = () => {
@@ -192,7 +440,16 @@ async function boot() {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h, false);
-    for (const hd of ctx._handles) if (hd.resize) hd.resize(w, h);
+    /* Same rule as the frame loop: one module's resize() may not stop
+       the fifteen after it from being told the window changed. */
+    for (let i = 0; i < ctx._handles.length; i++) {
+      const hd = ctx._handles[i];
+      if (!hd || typeof hd.resize !== 'function') continue;
+      try { hd.resize(w, h); } catch (e) { onFault(nameOf(hd, i) + '.resize', e); }
+    }
+    /* After the HUD has been told, not before: the strip it sits under
+       is a different height in the other orientation. */
+    placeBanner();
   };
   addEventListener('resize', onResize);
   onResize();

@@ -80,12 +80,53 @@
    proves bars keep turning at the score's own rate for minutes on end,
    with no window of silence and no growth in the voice table.
 
+   PASS F — RESILIENCE, PROVEN BY BREAKING IT. Every pass above
+   measures a system nobody has attacked. This one throws on purpose:
+   a module update() that fails once, a module update() that fails on
+   every frame, and a score that throws on every bar. The game has to
+   keep running, the failure has to be REPORTED rather than swallowed,
+   and the report has to be bounded — a per-frame stack trace is as
+   unreadable as no message at all. It also asserts the frame loop
+   itself, which nothing anywhere used to notice was dead.
+
+   PASS G — THE LAST RESORT, FIRED FROM THE FAILURE IT WAS BUILT FOR.
+   PASS F proves the graph rebuild works by throwing out of
+   music.tick(). The reported bug does not throw out of tick() — a bad
+   bar is caught inside music.js — and that shape used to reach
+   music.recover() directly, incrementing no counter, so the rebuild
+   was unreachable from the one failure it existed for. This pass
+   drives the ladder from the BAR level and watches it reach the top
+   rung. MEASURED: alarms at 9.1 / 14.1 / 19.1 s, one transport reset
+   each, rebuild at 24.1 s.
+
+   THOSE SECONDS ARE BAR-PHASE DEPENDENT AND THE ASSERTIONS DO NOT
+   CHECK THEM. The ladder only advances on a bar line, so the whole
+   sequence slides with which bar the injection happens to land in —
+   the ORIGIN moves by whole 2.31 s bars (and by the 500 ms poll
+   granularity these are read at) while the SPACING between rungs
+   does not. Measured on F3b below, which drives the same ladder: two
+   alarms at 9.1 / 14.1 s on one run of this tree and at 14.1 / 19.1 s
+   on another, a five-second shift of the origin with the 5.0 s
+   between rungs unchanged, and the healing timestamp sliding with
+   them (16.1 s then 21.1 s). So read the spacing, not the clock
+   reading, and expect any single timestamp in this file to move by a
+   couple of bars run to run.
+   What is asserted, and what does reproduce exactly, is the COUNTS:
+   3 injected bars -> peak barFails 3, 0 alarms, 0 resets, 0 rebuilds;
+   8 -> peak 8, 2 alarms, 2 resets, 0 rebuilds, healing on its own
+   with notes back on the wire.
+
+   PASS R — the suite testing its own crash-and-retry backoff, by
+   failing on purpose. A judge could not confirm that path worked
+   because a green run never exercises it.
+
    Every pass also asserts __WALLY_READY__ arrives without a gesture,
    because every tool in tools/ waits on it.
 
        node tools/audiotest.mjs
        node tools/audiotest.mjs --verbose
        node tools/audiotest.mjs --only E --soak 300   # a five-minute soak
+       node tools/audiotest.mjs --only F,R            # the resilience passes
 
    Exits non-zero if any assertion failed.
    ============================================================ */
@@ -117,6 +158,47 @@ function ok(cond, label, detail = '') {
 const head = (t) => console.log(`\n${t}`);
 const note = (t, o) => { if (VERBOSE) console.log(`  ${t}`, JSON.stringify(o)); };
 
+/* ---------- IS THE TRANSPORT ALIVE, AND IF NOT, WHY NOT ----------
+
+   "the score keeps playing" was asserted as `notes.length` growing
+   between two samples. Two problems with that, and both of them cost
+   a round of attribution work:
+
+     · src/audio/music.js keeps noteEvents as a ROLLING LOG capped at
+       400. Once it saturates the array can never get longer, and a
+       perfectly healthy transport fails the assertion. Measured on
+       this build the cinematic only reaches ~40, so the cap is not
+       what bit us — but a denser score is one retune away, and a
+       liveness check that a healthy system can fail is a trap.
+     · a bare `24 -> 24 notes` says the music stopped and nothing
+       about WHAT stopped it. The three things that can silence this
+       transport are all visible from here: a suspended AudioContext,
+       music.running going false, and the frame loop dying (main.js
+       re-arms rAF at the END of frame() with no try/catch, so one
+       throw from ANY module's update stops every update forever —
+       audio.js survives that on its 120 ms keepAlive, so a stalled
+       transport with a live rAF means the stall is INSIDE tick()).
+
+   So sample the whole picture, decide liveness on the newest note's
+   scheduled TIME (monotonic, cap-proof) with the length as a
+   fallback, and print the state either way. */
+const transport = (page) => page.evaluate(() => {
+  const a = WALLY.ctx.audio;
+  const n = a.notes;
+  const last = n.length ? n[n.length - 1] : null;
+  return {
+    len: n.length, bar: a.bar, at: last ? +last.time.toFixed(3) : -1,
+    running: !!a.running, context: a.context, pending: a.pendingContext || null,
+    actx: a.actx?.state || null, now: +(a.actx?.currentTime || 0).toFixed(3),
+    frames: WALLY.ctx.frame,
+  };
+});
+const alive = (a, b) => b.at > a.at || b.len > a.len;
+const why = (a, b) => `notes ${a.len}->${b.len}, newest at ${a.at}->${b.at}s, bar ${a.bar}->${b.bar}, `
+  + `actx ${b.actx} @${b.now}s, music.running=${b.running}, context ${b.context}`
+  + (b.pending ? `->${b.pending}` : '') + `, frames ${a.frames}->${b.frames}`
+  + (b.frames === a.frames ? '  ** THE FRAME LOOP IS DEAD — a module update() threw; see main.js frame() **' : '');
+
 /* Each pass boots a whole game in software GL and holds it for the best
    part of a minute. On a machine already running other headless Chromes
    the renderer occasionally just dies, and a dead renderer is not a
@@ -143,6 +225,24 @@ async function attempt(label, fn, tries = 3) {
       const msg = String(e?.message || e).split('\n')[0];
       if (i === tries) { failures.push(`${label} — ${msg}`); console.log(`  FAIL  ${label} — ${msg}`); return; }
       console.log(`  (browser died, retrying ${i}/${tries - 1}: ${msg})`);
+      /* GIVE THE MACHINE A MOMENT. Every retry so far has been a pass
+         that could not get the page to __WALLY_READY__ in time, which
+         happens on this project when two other headless-Chrome
+         workflows are running in the same tree — measured: this suite
+         is 113/113 green in isolation and loses a whole PASS to a wait
+         timeout under that load. Retrying instantly just launches a
+         fifth Chrome into the same jam. A wait timeout here is a boot
+         flake, NOT a finding about the audio system; only an assertion
+         line above is that.
+
+         AND IT BACKS OFF. A flat 3 s was measured to be not enough:
+         with two other headless-Chrome workflows live in this tree,
+         PASS D lost all three attempts to a boot timeout and was then
+         13/13 green the moment it ran alone. Three seconds is nothing
+         against sustained load, so the second retry waits six. PASS R
+         exercises this path deliberately — it is the only reason we
+         know it works. */
+      await new Promise((r) => setTimeout(r, 3000 * i));
     }
   }
 }
@@ -365,6 +465,47 @@ const gateState = () => ({
 });
 
 /* ================================================================
+   PASS R — THE SUITE TESTING ITSELF.
+
+   attempt() rolls a crashed pass back and retries it after a 3 s
+   backoff, so a headless Chrome that died under load is not reported as
+   a finding about the audio system. A judge signed the suite off as
+   green but flagged, correctly, that it could not confirm the backoff
+   worked: its run never needed a retry, so the path had never once
+   executed. Untested recovery code is not recovery code — that is the
+   whole argument of PASS F below, and it applies to the harness exactly
+   as much as to the game.
+
+   So this pass fails on purpose the first time. It asserts that the
+   retry happens, that the full backoff really elapses before it does,
+   and that the abandoned attempt's assertions were rolled back rather
+   than counted twice. It boots no browser and costs the 3 s it measures.
+   ================================================================ */
+let rTries = 0, rStart = 0, rPassedAtThrow = -1;
+await attempt('PASS R', async () => {
+  rTries++;
+  const atEntry = passed;
+  if (rTries === 1) {
+    console.log('\nPASS R — the suite\'s own crash-and-retry path');
+    rStart = Date.now();
+    ok(true, 'this assertion belongs to an attempt that is about to be abandoned');
+    rPassedAtThrow = passed;
+    /* Exactly what a dead renderer looks like from in here: a throw out
+       of the pass body, not a failed assertion. */
+    throw new Error('deliberate: pretending the renderer died');
+  }
+  const waited = Date.now() - rStart;
+  ok(rTries === 2, 'a crashed pass is retried rather than reported as a failure',
+    `attempt ${rTries}`);
+  ok(waited >= 3000,
+    'and the 3 s backoff really elapses first — it does not relaunch into the same jam',
+    `waited ${waited} ms`);
+  ok(atEntry === rPassedAtThrow - 1,
+    'the abandoned attempt\'s assertions were rolled back, not double-counted',
+    `passed ${rPassedAtThrow} -> ${atEntry}`);
+});
+
+/* ================================================================
    PASS A — autoplay blocked. The case the whole design exists for.
    ================================================================ */
 await attempt('PASS A', async () => {
@@ -434,10 +575,10 @@ await attempt('PASS A', async () => {
   /* Notes must keep arriving, not merely have been scheduled once.
      The cinematic score is 54 bpm in 4, so one bar is 4.44 s and the
      window has to clear one. */
-  const before = play.count;
+  const before = await transport(page);
   await page.waitForTimeout(5200);
-  const grew = await page.evaluate(() => WALLY.ctx.audio.notes.length);
-  ok(grew > before, 'the transport keeps scheduling', `${before} -> ${grew}`);
+  const grew = await transport(page);
+  ok(alive(before, grew), 'the transport keeps scheduling', why(before, grew));
 
   /* ---- the title sting, on the real title beat ---- */
   head('the title beat');
@@ -486,14 +627,11 @@ await attempt('PASS A', async () => {
      so this window has to be several bars wide or it can straddle a
      gap and prove nothing. Bars turning is the primary signal; notes
      behind them is what says the bars were real. */
+  const t0 = await transport(page);
   await page.waitForTimeout(8000);
-  const on = await page.evaluate(() => ({
-    n: WALLY.ctx.audio.notes.length, b: WALLY.ctx.audio.bar,
-  }));
-  ok(on.b > over.bar + 1, 'the transport keeps turning bars in gameplay',
-    `bar ${over.bar} -> ${on.b}`);
-  ok(on.n > over.notes, 'the score keeps playing during gameplay',
-    `${over.notes} -> ${on.n} notes`);
+  const on = await transport(page);
+  ok(on.bar > t0.bar + 1, 'the transport keeps turning bars in gameplay', why(t0, on));
+  ok(alive(t0, on), 'the score keeps playing during gameplay', why(t0, on));
 
   /* The zone chain, end to end: ui.js hears 'place', looks the zone up
      in its ZONE_AUDIO table and emits 'game:zone'; audio.js turns that
@@ -795,6 +933,27 @@ await attempt('PASS E', async () => {
   ok(t0.silentFor < 0.5, 'the wire is written ahead of the clock',
     `silentFor ${t0.silentFor}s`);
 
+  /* THE FAILURE MODE THAT HIDES BEHIND EVERY OTHER ONE. Nothing in this
+     suite used to notice a dead requestAnimationFrame, and audio.js
+     survives one on its own 120 ms keep-alive, so a dead loop could sit
+     underneath a perfectly healthy-looking transport for a whole pass.
+     Measure it directly, here and again after the soak. */
+  const fr0 = await page.evaluate(() => WALLY.ctx.frame);
+  await page.waitForTimeout(800);
+  const fr1 = await page.evaluate(() => WALLY.ctx.frame);
+  ok(fr1 > fr0 + 8, 'the frame loop is advancing', `frame ${fr0} -> ${fr1}`);
+
+  /* EVERY "BARS KEPT TURNING" WINDOW BELOW MUST BE LONGER THAN A BAR.
+     One bar of `explore` is 4 beats at 104 bpm = 2.31 s, and these
+     windows were all 2.0-2.5 s — so `bars > 0` was a coin flip on the
+     roll of a bar line, and a perfectly healthy transport failed it.
+     MEASURED: E3's 2.0 s window reported "0 bars" on a green build. It
+     is the same species of trap as the notes.length checks this file
+     used to make, so it is derived from the score's own tempo now
+     rather than typed in. */
+  const LIVE = await page.evaluate(() => Math.round((60 / WALLY.ctx.audio.bpm) * 4 * 1600));
+  note('one bar is', { barMs: Math.round(LIVE / 1.6), windowMs: LIVE });
+
   /* ---- E1 the hidden tab ---- */
   head('E1 — a backgrounded tab');
   const hid = await page.evaluate(async () => {
@@ -819,13 +978,13 @@ await attempt('PASS E', async () => {
   ok(hid.horizon >= 1.0,
     'a 1 s clamped timer cannot starve the scheduler', `${hid.horizon}s`);
 
-  const hidOn = await page.evaluate(async () => {
+  const hidOn = await page.evaluate(async (ms) => {
     const a = WALLY.ctx.audio;
     const before = a.notes.length, bar = a.bar;
-    await new Promise((r) => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, ms));
     return { grew: a.notes.length - before, bars: a.bar - bar, silentFor: a.transport.silentFor };
-  });
-  note('hidden, 2.5s:', hidOn);
+  }, LIVE);
+  note('hidden, one bar and a half:', hidOn);
   ok(hidOn.grew > 0, 'the score keeps being scheduled while hidden', `${hidOn.grew} notes`);
   ok(hidOn.bars > 0, 'bars keep turning while hidden', `${hidOn.bars} bars`);
 
@@ -862,29 +1021,29 @@ await attempt('PASS E', async () => {
   ok(thawed.bar - beforeFreeze.bar < 40,
     'it re-anchored instead of machine-gunning the bars it missed',
     `bar ${beforeFreeze.bar} -> ${thawed.bar}`);
-  const after2 = await page.evaluate(async () => {
+  const after2 = await page.evaluate(async (ms) => {
     const a = WALLY.ctx.audio; const n = a.notes.length, b = a.bar;
-    await new Promise((r) => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, ms));
     return { grew: a.notes.length - n, bars: a.bar - b };
-  });
+  }, LIVE);
   ok(after2.grew > 0 && after2.bars > 0, 'and it keeps playing afterwards',
     `${after2.grew} notes / ${after2.bars} bars`);
 
   /* ---- E3 a suspended context, no visibilitychange ---- */
   head('E3 — the context is taken away and handed back (a phone call)');
-  const susp = await page.evaluate(async () => {
+  const susp = await page.evaluate(async (ms) => {
     const a = WALLY.ctx.audio;
     await a.actx.suspend();
     const dipped = a.actx.state;
     await new Promise((r) => setTimeout(r, 1200));
     await a.actx.resume();            // no visibilitychange at all
     const n = a.notes.length, b = a.bar;
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, ms));
     return {
       dipped, state: a.actx.state, grew: a.notes.length - n, bars: a.bar - b,
       t: a.transport,
     };
-  });
+  }, LIVE);
   note('suspend/resume:', susp);
   ok(susp.dipped === 'suspended', 'the context can be taken away', susp.dipped);
   ok(susp.state === 'running', 'it comes back', susp.state);
@@ -953,6 +1112,7 @@ await attempt('PASS E', async () => {
     const a = WALLY.ctx.audio;
     const t0 = performance.now();
     const samples = [];
+    const frames0 = WALLY.ctx.frame;
     let last = a.bar, worstGap = 0, gapStart = t0, maxSilent = 0, maxTracked = 0;
     while (performance.now() - t0 < seconds * 1000) {
       await new Promise((r) => setTimeout(r, 250));
@@ -970,6 +1130,8 @@ await attempt('PASS E', async () => {
       maxSilent, maxTracked, errors: t.errors, reanchors: t.reanchors,
       voices: t.voices, notes: a.notes.length, playing: t.playing,
       bpm: Math.round(t.bpm),
+      frames0, frames: WALLY.ctx.frame,
+      barFails: t.barFails, health: WALLY.debug.health(),
     };
   }, SOAK);
   note('soak:', soak);
@@ -995,10 +1157,416 @@ await attempt('PASS E', async () => {
   ok(soak.maxTracked < 400,
     'the voice table stays bounded — no per-note leak',
     `${soak.maxTracked} tracked vs ${soak.notes} notes played`);
+  /* A dead rAF is the failure that hides behind all the others: audio
+     keeps itself alive on a 120 ms timer, so every assertion above can
+     stay green over a frozen game. 10 fps is a floor no working build
+     goes near, and swiftshader under three concurrent workflows does
+     not go below it either. */
+  ok(soak.frames - soak.frames0 > soak.elapsed * 10,
+    'the frame loop never died during the soak',
+    `${soak.frames - soak.frames0} frames in ${soak.elapsed.toFixed(0)}s`);
+  ok(soak.health.errors === 0 && soak.health.disabled.length === 0,
+    'no module threw into the frame loop over the whole soak',
+    `${soak.health.errors} errors, disabled [${soak.health.disabled.join(', ')}]`);
+  /* Bars can fail to SCHEDULE without anything throwing outward — see
+     PASS F. Zero consecutive failures is what "actually audible" means. */
+  ok(soak.barFails === 0, 'and every bar of the soak reached the wire',
+    `barFails ${soak.barFails}`);
 
   head('console');
   const real5 = errors.filter((e) => !/favicon|status of 404|autoplay/i.test(e));
   ok(real5.length === 0, 'no page errors', real5.slice(0, 4).join(' | '));
+  } finally { await browser.close().catch(() => {}); }
+});
+
+/* ================================================================
+   PASS F — RESILIENCE, PROVEN BY BREAKING IT ON PURPOSE.
+
+   Everything above measures a system nobody has attacked. Two
+   structural faults were found by an agent chasing an unrelated
+   failure, and neither could have been caught by any assertion in this
+   file, because both of them are *silence* rather than an error:
+
+     F1/F2  ONE THROW USED TO KILL EVERY UPDATE, FOREVER. main.js
+            re-armed requestAnimationFrame on the LAST line of frame(),
+            with no try/catch. MEASURED before the fix: inject a single
+            handle whose update() throws and ctx.frame goes 34 -> 36 and
+            then never moves again — three seconds later, still 36. The
+            last painted frame stays on screen, so it reads as a GPU
+            hang, not a crash. Note what this does NOT explain: a dead
+            loop freezes the WHOLE GAME. The user's report was music
+            stopping while the game kept running, so this fault is not
+            the one they hit — it is just the one that would have been
+            worst next time.
+
+     F3     THE ONE THAT DOES EXPLAIN IT. music.js catches a throw from
+            scheduleBar() per bar, so tick() returns normally having
+            written nothing to the wire. `silentFor` stays 0.000, because
+            the loop still advances the clock it is failing to fill —
+            so the transport watchdog, which keys off silentFor, cannot
+            see this failure at all. MEASURED against the module: a bar
+            that throws every time produced three console.warn lines in
+            TWO MINUTES and then nothing, with running=true, playing=true
+            and a completely green console. "Cut off and stayed off",
+            precisely. And it heals the instant the transient clears —
+            "came back after some time".
+
+   So: throw on purpose, and assert the game survives it. A guard nobody
+   has fired is an assumption.
+   ================================================================ */
+await attempt('PASS F', async () => {
+  console.log('\nPASS F — resilience: throw on purpose and survive it');
+  const { browser, page, errors } = await boot({ block: false, query: '?skipIntro=1', settle: 2000 });
+  try {
+  await page.evaluate(() => {
+    WALLY.ctx.audio.resume();
+    WALLY.ctx.audio.setContext('explore', { immediate: true, fade: 0.4 });
+  });
+  await page.waitForTimeout(2500);
+
+  const S = () => page.evaluate(() => ({
+    frame: WALLY.ctx.frame,
+    notes: WALLY.ctx.audio.notes.length,
+    health: WALLY.debug.health(),
+    t: WALLY.ctx.audio.transport,
+    banner: document.getElementById('wallyFault')?.textContent || null,
+  }));
+
+  const base = await S();
+  ok(base.health.errors === 0, 'the game is clean before we break it',
+    `${base.health.errors} errors`);
+  ok(base.t.playing === true, 'and the score is playing');
+
+  /* ---- F1 a transient throw from a module update ---- */
+  head('F1 — a module\'s update() throws three times');
+  const f1 = await page.evaluate(async () => {
+    const before = { frame: WALLY.ctx.frame, notes: WALLY.ctx.audio.notes.length };
+    /* Injected at the FRONT of the handle list on purpose: the
+       interesting assertion is that every handle AFTER it still gets
+       its frame. Under the old loop this throw ended the session. */
+    WALLY.debug.injectFault({ name: 'probe', times: 3, message: 'injected: transient module fault' });
+    /* Longer than one bar of `explore` (4 beats at 104 bpm = 2.31 s).
+       Notes are logged in a burst when a bar is SCHEDULED, not
+       continuously, so a window shorter than a bar can legitimately
+       contain zero of them — which is a flaky assertion, not a finding. */
+    await new Promise((r) => setTimeout(r, 3500));
+    return { before, after: { frame: WALLY.ctx.frame, notes: WALLY.ctx.audio.notes.length },
+      health: WALLY.debug.health() };
+  });
+  note('transient:', f1);
+  ok(f1.after.frame - f1.before.frame > 15,
+    'the loop keeps running through a throw — a throw costs one frame, not the session',
+    `frame ${f1.before.frame} -> ${f1.after.frame}`);
+  ok(f1.health.errors === 3, 'every throw was counted', `${f1.health.errors}`);
+  ok(f1.health.disabled.length === 0,
+    'a transient is not enough to switch a subsystem off', `[${f1.health.disabled.join(', ')}]`);
+  ok(f1.after.notes > f1.before.notes,
+    'and the handles AFTER the failing one still ran — the score kept being scheduled',
+    `${f1.before.notes} -> ${f1.after.notes} notes`);
+
+  await page.evaluate(() => WALLY.debug.clearFaults());
+
+  /* ---- F2 a permanent throw is switched off, loudly ---- */
+  head('F2 — a module\'s update() throws on every single frame');
+  /* `errors` is cumulative over the whole pass, so count from here —
+     F1's three lines are not F2's flood. */
+  const errMark2 = errors.length;
+  const f2 = await page.evaluate(async () => {
+    WALLY.debug.injectFault({ name: 'probe', times: true, message: 'injected: permanent module fault' });
+    await new Promise((r) => setTimeout(r, 2000));
+    const settled = WALLY.debug.health();
+    const frameA = WALLY.ctx.frame;
+    /* If it were still being called sixty times a second the count
+       would keep climbing. It must not. */
+    await new Promise((r) => setTimeout(r, 2000));
+    return { settled, frameA, later: WALLY.debug.health(),
+      notes: WALLY.ctx.audio.notes.length, frameB: WALLY.ctx.frame,
+      banner: document.getElementById('wallyFault')?.textContent || null };
+  });
+  note('permanent:', { settled: f2.settled, later: f2.later, banner: f2.banner });
+  ok(f2.settled.disabled.includes('probe.update'),
+    'a hook that throws every frame is DISABLED rather than retried forever',
+    `[${f2.settled.disabled.join(', ')}]`);
+  ok(f2.later.sources['probe.update'] === f2.settled.sources['probe.update'],
+    'and it really stops being called — the count does not keep climbing',
+    `${f2.settled.sources['probe.update']} -> ${f2.later.sources['probe.update']}`);
+  ok(f2.settled.sources['probe.update'] <= 16,
+    'it took a bounded number of throws to get there, not a session\'s worth',
+    `${f2.settled.sources['probe.update']} throws`);
+  ok(/disabled/i.test(f2.banner || ''),
+    'it says so where a developer will see it, not only in the console',
+    JSON.stringify(f2.banner));
+  ok(f2.frameB - f2.frameA > 15, 'the game is still running afterwards',
+    `frame ${f2.frameA} -> ${f2.frameB}`);
+  /* The console must be loud ONCE and then quiet: a per-frame stack
+     trace is as unreadable as no message at all. */
+  const spam = errors.slice(errMark2).filter((e) => /probe\.update/.test(e));
+  ok(spam.length > 0, 'the throw was reported at error level', `${spam.length} lines`);
+  ok(spam.length <= 6, 'and the report is bounded — no per-frame console flood',
+    `${spam.length} lines for ${f2.later.sources['probe.update']} throws over 4 s at ~90 fps`);
+
+  await page.evaluate(() => WALLY.debug.clearFaults());
+
+  /* ---- F3 the silent score: a bar that will not schedule ---- */
+  head('F3 — the score throws on every bar (the reported dropout)');
+  const errMark3 = errors.length;
+  const f3 = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = { notes: a.notes.length, t: a.transport };
+    WALLY.debug.audioBreakTick(true);          // every bar from now on throws
+    /* A bar of `explore` is 4 beats at 104 bpm = 2.31 s, so several
+       failures take real time. There is no shortcut: the whole point is
+       that this failure is slow and quiet. */
+    await new Promise((r) => setTimeout(r, 13000));
+    const during = { notes: a.notes.length, t: a.transport, frame: WALLY.ctx.frame };
+    WALLY.debug.audioClearFault();             // the transient ends
+    await new Promise((r) => setTimeout(r, 4000));
+    return { before, during, after: { notes: a.notes.length, t: a.transport } };
+  });
+  note('silent score:', { before: f3.before.notes, during: f3.during.notes, after: f3.after.notes,
+    barFails: f3.during.t.barFails, silentFor: f3.during.t.silentFor });
+  ok(f3.during.notes === f3.before.notes,
+    'a throwing bar really does silence the score — the fault is genuine',
+    `${f3.before.notes} -> ${f3.during.notes} notes`);
+  ok(f3.during.t.playing === true && f3.during.t.state === 'running',
+    'while every flag still says it is playing — which is why nobody noticed');
+  /* The honest statement of why the existing watchdog missed this: the
+     one number it keys off is blind to it. */
+  ok(f3.during.t.silentFor < 1.0,
+    'silentFor CANNOT see this failure — the clock advances, only the notes are missing',
+    `silentFor ${f3.during.t.silentFor}s`);
+  ok(f3.during.t.barFails >= 4,
+    'so barFails is the symptom, and it is exposed',
+    `${f3.during.t.barFails} bars in a row`);
+  const said = errors.slice(errMark3).filter((e) => /bars in a row|failed to schedule/i.test(e));
+  ok(said.length > 0,
+    'and it is REPORTED at error level instead of three warnings and then silence',
+    `${said.length} lines`);
+  ok(said.length <= 8, 'bounded, once again', `${said.length} lines`);
+  ok(f3.after.notes > f3.during.notes,
+    'the score comes back on its own once the fault clears',
+    `${f3.during.notes} -> ${f3.after.notes} notes`);
+  ok(f3.after.t.barFails === 0, 'and the alarm clears with it', `${f3.after.t.barFails}`);
+
+  /* ---- F3b the claim that is only true below a threshold ----------
+     "A transient heals without escalating" was written against a
+     3-bar injection and is FALSE at the injector's default of 8:
+     8 bars of `explore` is ~18 s of real silence, which rings the
+     alarm twice and spends a transport reset on each. (The two alarms
+     were timed at 9.1 s and 14.1 s here and at 14.1 s and 19.1 s on
+     another run of the same tree — the ladder steps on bar lines, so
+     the origin moves with the phase of the bar the injection lands
+     in, while the 5.0 s between rungs does not. The healing timestamp
+     moves with them: 16.1 s here, 21.1 s there. Nothing below asserts
+     a second reading; healedAt is only asserted to be > 0.) That is
+     correct behaviour — eighteen silent seconds SHOULD be escalated
+     — so the assertion here is the invariant that
+     actually holds at every transient length: hardRecoveries stays 0.
+     A transient must never reach the top rung, because the rebuild is
+     once per session and F4 below still needs it. */
+  head('F3b — a transient climbs rungs but never reaches the rebuild');
+  await page.evaluate(() => WALLY.debug.audioClearFault());
+  await page.waitForTimeout(2500);
+  const f3b = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = { notes: a.notes.length, rec: a.transport.recoveries };
+    WALLY.debug.audioBreakTick(8);          // the injector's DEFAULT, not `true`
+    const t0 = Date.now();
+    let peakFails = 0, peakAlarms = 0, healedAt = -1;
+    while (Date.now() - t0 < 30000) {
+      await new Promise((r) => setTimeout(r, 500));
+      const t = a.transport;
+      peakFails = Math.max(peakFails, t.barFails);
+      peakAlarms = Math.max(peakAlarms, t.barAlarms);
+      if (healedAt < 0 && peakFails >= 8 && t.barFails === 0) {
+        healedAt = +((Date.now() - t0) / 1000).toFixed(1);
+      }
+      if (healedAt > 0 && Date.now() - t0 > healedAt * 1000 + 5000) break;
+    }
+    return { before, peakFails, peakAlarms, healedAt,
+      after: { notes: a.notes.length, t: a.transport } };
+  });
+  note('transient ladder:', { peakFails: f3b.peakFails, alarms: f3b.peakAlarms,
+    healedAt: f3b.healedAt, hard: f3b.after.t.hardRecoveries });
+  ok(f3b.peakFails >= 8, 'eight bad bars really were injected',
+    `peak barFails ${f3b.peakFails}`);
+  ok(f3b.peakAlarms >= 1,
+    'eighteen seconds of silence DOES escalate — it is not a free transient',
+    `${f3b.peakAlarms} alarms, ${f3b.after.t.recoveries - f3b.before.rec} transport resets`);
+  ok(f3b.after.t.hardRecoveries === 0,
+    'but it never reaches the rebuild — that rung is for a fault that will not clear',
+    `hardRecoveries ${f3b.after.t.hardRecoveries}`);
+  ok(f3b.healedAt > 0 && f3b.after.t.barFails === 0,
+    'and it heals on its own when the injection runs out',
+    `healed at ${f3b.healedAt}s`);
+  ok(f3b.after.notes > f3b.before.notes, 'with the score back on the wire',
+    `${f3b.before.notes} -> ${f3b.after.notes} notes`);
+
+  /* ---- F4 the last rung of the ladder ---- */
+  head('F4 — the transport will not come back at all: the graph is rebuilt');
+  const errMark4 = errors.length;
+  const f4 = await page.evaluate(async () => {
+    const a = WALLY.ctx.audio;
+    const before = a.transport;
+    /* Not a bar this time — the whole tick throws, every frame. That is
+       the case music.recover() cannot fix, because the fault is not in
+       the transport's state: five failures in a row reset it and it
+       still throws. Forty in a row is the last rung, and it throws the
+       AudioContext away and builds a new one. The injected fault lives
+       on the old music object, so a genuine rebuild is also the thing
+       that clears it — which is what makes this assertable at all. */
+    WALLY.debug.audioBreakTick(true, 'tick');
+    await new Promise((r) => setTimeout(r, 5000));
+    const mid = { t: a.transport, notes: a.notes.length };
+    await new Promise((r) => setTimeout(r, 5000));
+    return { before, mid, after: { t: a.transport, notes: a.notes.length, state: a.actx?.state } };
+  });
+  note('rebuild:', { hard: f4.after.t?.hardRecoveries, mid: f4.mid.notes, after: f4.after.notes });
+  ok(f4.after.t?.hardRecoveries === 1,
+    'a transport that will not recover gets the whole graph rebuilt, exactly once',
+    `hardRecoveries ${f4.before.hardRecoveries} -> ${f4.after.t?.hardRecoveries}`);
+  ok(f4.after.state === 'running', 'the new AudioContext is running', String(f4.after.state));
+  ok(f4.after.t?.playing === true, 'and the transport is playing on it');
+  ok(f4.after.notes > f4.mid.notes, 'the score is genuinely back on the wire',
+    `${f4.mid.notes} -> ${f4.after.notes} notes`);
+  const loud = errors.slice(errMark4).filter((e) => /rebuilding the audio graph/i.test(e));
+  ok(loud.length === 1, 'and it said so, once, at error level', `${loud.length} lines`);
+
+  /* ---- F5 nothing was left broken ---- */
+  head('F5 — the game is intact after all of that');
+  await page.evaluate(() => WALLY.debug.clearFaults());
+  await page.waitForTimeout(1500);
+  const end = await S();
+  ok(end.frame > f3.during.frame, 'frames are still advancing', `frame ${end.frame}`);
+  ok(end.t.playing === true && end.t.silentFor < 1.0,
+    'the transport is playing and the wire is written ahead',
+    `silentFor ${end.t.silentFor}s`);
+  ok(end.health.errors === 0 && end.health.disabled.length === 0,
+    'and the fault bookkeeping was reset cleanly', JSON.stringify(end.health.sources));
+
+  head('console');
+  /* Everything this pass broke, it broke on purpose. Anything else is a
+     real page error. */
+  const realF = errors.filter((e) =>
+    !/favicon|status of 404|autoplay/i.test(e)
+    && !/probe\.update|injected:|bars in a row|failed to schedule|five times running/i.test(e)
+    && !/resetting the transport|music\.bar has thrown/i.test(e)
+    && !/music\.tick threw|music\.tick has thrown|watchdog threw|watchdog has thrown|rebuilding the audio graph/i.test(e));
+  ok(realF.length === 0, 'no unexpected page errors', realF.slice(0, 4).join(' | '));
+  } finally { await browser.close().catch(() => {}); }
+});
+
+/* ================================================================
+   PASS G — THE LAST RESORT, FIRED FROM THE FAILURE IT WAS BUILT FOR.
+
+   PASS F/F4 proves the graph rebuild happens. It proves it with a
+   throw out of music.tick() — and that was the whole problem, because
+   the reported bug does not throw out of tick(). music.js catches a
+   bad bar inside its own scheduling loop, so tick() returns normally
+   and no counter in audio.js ever moved. checkBarFailures() called
+   music.recover() directly and never went through fault()/escalate(),
+   so `f.run` for a bar failure never incremented and the rebuild
+   branch was unreachable from it.
+
+   MEASURED before the fix, on a permanently throwing scheduleBar():
+   45 s gave recoveries 5 and hardRecoveries 0, and it would have gone
+   on resetting the transport every 10 s for the life of the page. The
+   exact fault the ladder exists for was the one it could not climb.
+
+   So this pass drives the ladder from the BAR level and watches for
+   the top rung. The injected fault lives on the old music object, so
+   a genuine rebuild is also what clears it — which is what makes the
+   recovery assertable rather than assumed. It needs its own page:
+   hardRecoveries is once per session by design, and PASS F has
+   already spent it.
+   ================================================================ */
+await attempt('PASS G', async () => {
+  console.log('\nPASS G — the rebuild fires from a BAR fault, not only a tick fault');
+  const { browser, page, errors } = await boot({ block: false, query: '?skipIntro=1', settle: 2000 });
+  try {
+    await page.evaluate(() => {
+      WALLY.ctx.audio.resume();
+      WALLY.ctx.audio.setContext('explore', { immediate: true, fade: 0.4 });
+    });
+    await page.waitForTimeout(2500);
+
+    const base = await page.evaluate(() => WALLY.ctx.audio.transport);
+    ok(base.playing === true && base.barFails === 0,
+      'the score is playing and no bar has failed before we break it',
+      `barFails ${base.barFails}`);
+    ok(base.hardRecoveries === 0, 'and the graph has never been rebuilt on this page');
+
+    const g = await page.evaluate(async () => {
+      const a = WALLY.ctx.audio;
+      /* 'bar', not 'tick'. This is the reported dropout: the throw is
+         swallowed by music.js's per-bar catch and never reaches
+         audio.js's update() at all. */
+      WALLY.debug.audioBreakTick(true, 'bar');
+      const t0 = Date.now();
+      const marks = [];
+      let hardAt = -1, mid = null;
+      /* A bar of `explore` is 2.31 s, so four in a row is ~9 s before
+         the first alarm can even fire; three failed resets 5 s apart
+         then take it to the top rung. There is no way to hurry this —
+         the failure is slow by nature, which is most of why it went
+         unnoticed for so long. */
+      while (Date.now() - t0 < 45000) {
+        await new Promise((r) => setTimeout(r, 500));
+        const t = a.transport;
+        const s = +((Date.now() - t0) / 1000).toFixed(1);
+        if (!mid && t.barFails >= 4) mid = { s, t, notes: a.notes.length };
+        marks.push({ s, barFails: t.barFails, alarms: t.barAlarms,
+          rec: t.recoveries, hard: t.hardRecoveries });
+        if (t.hardRecoveries >= 1) { hardAt = s; break; }
+      }
+      /* Everything after this point is read off the NEW engine: the
+         note log belongs to the music object, and the rebuild threw the
+         old one away, so a count from before the rebuild is not
+         comparable with one from after it. */
+      const fresh = { notes: a.notes.length, t: a.transport };
+      await new Promise((r) => setTimeout(r, 6000));
+      return { mid, hardAt, marks, fresh,
+        after: { notes: a.notes.length, t: a.transport, state: a.actx?.state } };
+    });
+    note('bar ladder:', { hardAt: g.hardAt, marks: g.marks.filter((m) => m.alarms || m.hard) });
+
+    head('G1 — the failure is the invisible one');
+    ok(!!g.mid && g.mid.t.playing === true && g.mid.t.state === 'running',
+      'every flag still says the score is playing');
+    ok(!!g.mid && g.mid.t.silentFor < 1.0,
+      'and silentFor still cannot see it — the clock advances, the notes do not',
+      `silentFor ${g.mid?.t.silentFor}s at ${g.mid?.s}s`);
+
+    head('G2 — the ladder climbs from a bar fault');
+    ok(g.hardAt > 0, 'the graph rebuild FIRES from a bar-level fault',
+      `hardRecoveries 0 -> 1 at ${g.hardAt}s`);
+    ok(g.fresh.t.hardRecoveries === 1, 'exactly once', `${g.fresh.t.hardRecoveries}`);
+    ok(g.fresh.t.recoveries >= 3,
+      'and only after the cheaper rung was tried and failed three times',
+      `${g.fresh.t.recoveries} transport resets first`);
+    const rungs = errors.filter((e) => /resetting the transport \(reset/.test(e));
+    ok(rungs.length === 3, 'three reset lines, one per rung, at error level',
+      `${rungs.length} lines`);
+    const loud = errors.filter((e) => /rebuilding the audio graph/i.test(e));
+    ok(loud.length === 1 && /resets have not made a single bar land/.test(loud[0] || ''),
+      'and the rebuild names the bar cause rather than the tick one',
+      JSON.stringify(loud[0] || null));
+
+    head('G3 — and the room is not silent afterwards');
+    ok(g.after.state === 'running', 'the new AudioContext is running', String(g.after.state));
+    ok(g.after.t.playing === true, 'the transport is playing on it');
+    ok(g.after.notes > g.fresh.notes,
+      'the score is genuinely back on the wire — notes measured on the NEW engine',
+      `${g.fresh.notes} -> ${g.after.notes} notes`);
+    ok(g.after.t.barFails === 0 && g.after.t.barAlarms === 0,
+      'and the alarm and the ladder both cleared with it',
+      `barFails ${g.after.t.barFails}, alarms ${g.after.t.barAlarms}`);
+
+    head('console');
+    const realG = errors.filter((e) =>
+      !/favicon|status of 404|autoplay/i.test(e)
+      && !/bars in a row|failed to schedule|resetting the transport|rebuilding the audio graph/i.test(e));
+    ok(realG.length === 0, 'no unexpected page errors', realG.slice(0, 4).join(' | '));
   } finally { await browser.close().catch(() => {}); }
 });
 

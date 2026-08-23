@@ -739,8 +739,19 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
   let tickGap = 0;          // measured seconds between tick() calls
   let lastTick = -1;
   let reanchors = 0;        // times we gave up catching up and re-clocked
-  let tickErrors = 0;
+  let tickErrors = 0;       // bars that failed to schedule, ever
+  /* ...AND HOW MANY IN A ROW, which is the number that means "the room
+     is silent right now". Zeroed the moment a bar actually lands. The
+     watchdog in audio.js reads it every frame: a bar that throws every
+     time produces NO growth in silentFor (the loop still advances the
+     clock, it just writes nothing to it) so this counter is the only
+     evidence that exists. */
+  let barFails = 0;
+  let recoveries = 0;       // full transport resets (recover(), below)
+  let barLogs = 0, lastBarLog = 0;
   let lastError = null;
+  /* Test hook, driven by WALLY.debug.audioBreakTick(). See injectFault(). */
+  let faultBars = 0, faultWhere = 'bar';
   let crossfadeUntil = 0;   // a commit is gliding the layers; heal() waits
   let silentUntil = 0;      // stop()'s fade owns the bus until this time
 
@@ -839,6 +850,13 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
   function beatDur() { return 60 / bpm; }
 
   function scheduleBar(when) {
+    /* Fault injection. A real browser throws exactly here — every Web
+       Audio param setter rejects a non-finite value with a TypeError —
+       so this is the honest shape of the failure, not a stand-in. */
+    if (faultBars > 0 && faultWhere === 'bar') {
+      faultBars--;
+      throw new TypeError('injected: the provided float value is non-finite');
+    }
     scheduled = true;
     advanceChord();
     progBarsLeft--;
@@ -1032,7 +1050,28 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
      Returns the number of bars it put on the wire. */
   function tick() {
     if (!running) return 0;
+    if (faultBars > 0 && faultWhere === 'tick') {
+      faultBars--;
+      throw new TypeError('injected: tick failed');
+    }
     const now = actx.currentTime;
+
+    /* A NON-FINITE CLOCK IS A PERMANENT, SILENT DEATH, so it is checked
+       rather than assumed. Every comparison below against a NaN nextTime
+       is false: the re-anchor branches do not fire, the while loop never
+       runs, nothing is ever scheduled again — and `silentFor` would be
+       currentTime - NaN, i.e. NaN, so the watchdog in audio.js cannot
+       see it either, because `NaN > SILENT_LIMIT` is also false. One bad
+       tempo anywhere upstream would wedge the score for the session with
+       every flag still reading "playing". Three comparisons is a cheap
+       price for closing that off. */
+    if (!Number.isFinite(nextTime) || !Number.isFinite(bpm) || bpm <= 0
+      || !Number.isFinite(meter) || meter < 1) {
+      console.error(`[music] the transport clock went non-finite `
+        + `(nextTime=${nextTime}, bpm=${bpm}, meter=${meter}) — resetting it.`);
+      recover();
+      return 0;
+    }
 
     /* How far apart our ticks are actually arriving. Rises instantly (we
        must cover the worst gap we have just seen) and decays slowly. */
@@ -1066,10 +1105,29 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
           if (Math.abs(bpm - bpmTarget) < 0.4) bpm = bpmTarget;
           scheduleBar(nextTime);
           bars++;
+          barFails = 0;              // a bar landed: we are audible again
         } catch (e) {
           tickErrors++;
+          barFails++;
           lastError = String(e?.message || e);
-          if (tickErrors <= 3) console.warn('[music] bar failed:', lastError);
+          /* LOUD, BOUNDED, COUNTED — and at error level.
+
+             This used to be three console.warns and then nothing at all,
+             ever. MEASURED against this module: a bar that throws every
+             time produces exactly 3 warning lines in TWO MINUTES of
+             play, `silentFor` stays 0.000 the whole way (the loop still
+             advances the clock, it just writes nothing to it), `running`
+             stays true, and the game plays on in silence with a green
+             console. That is the reported dropout, precisely. warn was
+             also the wrong level: tools/shot.mjs only greps for errors,
+             so no screenshot tool in tools/ would ever have failed on
+             it. audio.js now reads barFails and escalates. */
+          const t = Date.now();
+          if (barLogs < 3 || t - lastBarLog > 10000) {
+            barLogs++; lastBarLog = t;
+            console.error(`[music] bar ${bar} failed to schedule `
+              + `(${barFails} in a row, ${tickErrors} total) — the room is going quiet:`, e);
+          }
         }
       }
       nextTime += beatDur();
@@ -1085,11 +1143,51 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
      is playing but the wire has been empty long enough to hear. */
   function reanchor() {
     if (!running) return 0;
-    nextTime = actx.currentTime + MIN_STEP;
+    resetClock();
+    return tick();
+  }
+
+  function resetClock() {
+    const now = actx.currentTime;
+    nextTime = (Number.isFinite(now) ? now : 0) + MIN_STEP;
     beat = 0; bar++;
     lastTick = -1; tickGap = 0;
+    horizon = Math.max(LOOKAHEAD, horizonFloor);
     reanchors++;
-    return tick();
+  }
+
+  /* THE HEAVIER HAMMER, for when the score is failing every bar rather
+     than merely running late. reanchor() only moves the clock; when
+     scheduleBar() itself is throwing, the cause is upstream of the clock
+     — a tempo, a meter, a voicing, a half-committed context change — so
+     everything that could be carrying a bad value is thrown away and
+     rebuilt from the score data. Deliberately cause-agnostic: the same
+     argument as the watchdog's last branch in audio.js. It does NOT call
+     tick() (the non-finite guard above calls this, and re-entering tick
+     from inside tick is a recursion waiting for a bad day) — the next
+     tick, milliseconds away, does the scheduling. */
+  function recover() {
+    pending = null;
+    const s = SCORES[scoreName] || SCORES.explore;
+    score = s;
+    bpm = Number.isFinite(s.bpm) && s.bpm > 0 ? s.bpm : 80;
+    bpmTarget = bpm;
+    meter = Number.isFinite(s.meter) && s.meter >= 1 ? s.meter : 4;
+    progIdx = 0; progBarsLeft = 0;
+    voicing = null; chordPcs = []; barNotes = [];
+    mrng = mulberry(seed ^ hashName(scoreName || 'explore'));
+    newMotif(); phraseIdx = 0; leadDeg = 4;
+    silentUntil = 0; crossfadeUntil = 0;
+    scheduled = false;
+    /* barFails is deliberately NOT cleared here. It means "consecutive
+       bars that failed to reach the wire", and a reset does not make a
+       bar land — only scheduleBar() succeeding does. Clearing it here
+       would hide the symptom from the watchdog the moment the watchdog
+       reacted to it, which is the same trick that lost this failure in
+       the first place. */
+    resetClock();
+    recoveries++;
+    return true;
   }
 
   /* The other way this goes silent: the score plays perfectly into a bus
@@ -1220,6 +1318,7 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
     tick,
     update() { tick(); },
     reanchor,
+    recover,
     heal,
 
     /* --- scheduler health, for the watchdog and for audiotest.mjs ---
@@ -1227,7 +1326,16 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
        have passed the far edge of what the scheduler has actually
        written. Zero while the score is playing, and growing means the
        room is quiet no matter what `running` says. */
-    get silentFor() { return running ? Math.max(0, actx.currentTime - nextTime) : 0; },
+    get silentFor() {
+      if (!running) return 0;
+      /* A wedged clock IS silence, and it must not read as health.
+         Returning NaN here (which currentTime - NaN does) made every
+         comparison in the watchdog false, so the one number that exists
+         to say "the room is quiet" reported the quietest possible room
+         as fine. Infinity is the truth and it compares correctly. */
+      if (!Number.isFinite(nextTime)) return Infinity;
+      return Math.max(0, actx.currentTime - nextTime);
+    },
     get scheduledThrough() { return nextTime; },
     get horizon() { return horizon; },
     get tickGap() { return tickGap; },
@@ -1236,6 +1344,12 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
         session: it must track what is sounding, not what has ever sounded. */
     get tracked() { return live.length; },
     get errors() { return tickErrors; },
+    /** Bars that have failed IN A ROW. Non-zero means the room is silent
+        right now, whatever `running` and `silentFor` say — this is the
+        only symptom a throwing scheduleBar() produces. audio.js watches
+        it every frame. */
+    get barFails() { return barFails; },
+    get recoveries() { return recoveries; },
     get lastError() { return lastError; },
 
     /** Raise the floor under the look-ahead (audio.js does this while the
@@ -1255,6 +1369,19 @@ export function createMusic({ actx, dest, reverb = null, rng = null, seed = 0x7a
       lastTick = -1;
       return { silentFor: engine.silentFor, bar };
     },
+
+    /** TEST HOOK. Make the next `n` bars (or ticks, with where='tick')
+        throw. A real browser throws in exactly this place — every Web
+        Audio param setter rejects a non-finite value with a TypeError —
+        so this reproduces the failure rather than standing in for it.
+        tools/audiotest.mjs PASS F uses it to prove the module reports
+        and recovers instead of going quiet. `true` means forever. */
+    injectFault(n = 8, where = 'bar') {
+      faultBars = n === true ? Infinity : Math.max(0, Number(n) || 0);
+      faultWhere = where === 'tick' ? 'tick' : 'bar';
+      return { bars: faultBars, where: faultWhere };
+    },
+    clearFault() { faultBars = 0; barFails = 0; barLogs = 0; return engine; },
 
     /** 0..1 voice budget. `low` quality gets a thinner arrangement of the
         same piece, never a different one. */

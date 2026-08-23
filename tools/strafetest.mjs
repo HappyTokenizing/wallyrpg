@@ -27,7 +27,13 @@ const browser = await chromium.launch({ channel: 'chrome', args: ['--enable-unsa
 const page = await browser.newPage({ viewport: { width: 1400, height: 800 } });
 page.on('pageerror', e => console.log('PAGEERROR', e.message.split('\n')[0]));
 await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 60000 });
-await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 60000 });
+/* THE THIRD ARGUMENT. waitForFunction's signature is (fn, ARG, options)
+   — the two-argument form passed this options object as the page
+   ARGUMENT and silently kept the 30 s default, so with boot at ~35 s
+   under swiftshader this file died here before one assertion ran
+   (TimeoutError at line 30, no output). Same trap tools/touchtest.mjs
+   and tools/_vjpad-judge.mjs both document at their own boots. */
+await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 180000 });
 await page.waitForTimeout(3500);
 
 const state = () => page.evaluate(() => {

@@ -66,8 +66,8 @@ const page = await browser.newPage({ viewport: { width: 960, height: 540 } });
 let pageErr = null;
 page.on('pageerror', (e) => { pageErr = e.message.split('\n')[0]; console.log('PAGEERROR', pageErr); });
 
-await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 60000 });
-await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 60000 });
+await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 180000 });
+await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 180000 });
 await page.waitForTimeout(4000);
 
 /* ------------------------------------------------------------------
@@ -205,18 +205,51 @@ await page.evaluate(() => {
 
   window.__bodies = bodies;
 
-  /** Is there a clear 0.34 m capsule at (x,z)? Used for door approaches. */
+  /**
+   * Is there a clear 0.34 m capsule at (x,z)? Used for door approaches.
+   *
+   * TWO THINGS THIS USED TO GET WRONG, AND BOTH OF THEM MADE IT PASS.
+   *
+   * WHERE THE CAPSULE RESTS. It was dropped r + 0.02 above the reported
+   * ground, which is only where a capsule sits on the FLAT: on a plane
+   * of normal n the bottom sphere rests r/n.y above it, so on anything
+   * over about 7 degrees the capsule was placed inside the floor and
+   * the floor came back as an obstruction. Every founded building in
+   * the city now banks its ground into a berm, and a berm is a slope,
+   * so this fired on three doorways that are in fact wide open.
+   *
+   * WHAT COUNTS AS AN OBSTRUCTION. The ground he is standing on is not
+   * one, and neither is a lip inside the controller's 0.35 m step
+   * offset — he walks over both. A doorway is blocked by something that
+   * presents a WALL: a lamp post, a bench, a container, a nameboard
+   * hung too low. So a contact only counts if it is not floor-like, or
+   * if it is deep enough that he would have to climb it.
+   */
   window.__clearAt = function clearAt(x, z, r = 0.34, h = 1.62) {
     const g = phys.groundAt(x, z);
-    const a = new T.Vector3(x, g.y + r + 0.02, z);
+    const rest = g.y + r / Math.max(g.normal.y, 0.5) + 0.02;
+    const a = new T.Vector3(x, rest, z);
     const b = new T.Vector3(x, g.y + h - r, z);
     const hits = phys.capsuleCast(a, b, r);
     const who = new Set();
+    let n = 0;
     for (const c2 of hits) {
+      if (c2.normal.y > 0.6 && c2.depth < 0.35) continue;      // floor, or a kerb he steps over
+      n++;
       const rec = world.bodies.get(c2.body);
       who.add(rec?.opts?.name || `body${c2.body}`);
     }
-    return { n: hits.length, who: [...who], y: +g.y.toFixed(2) };
+    return { n, who: [...who], y: +g.y.toFixed(2), on: world.bodies.get(g.body)?.opts?.name || 'plane', hit: g.hit };
+  };
+
+  /** Park him near (x,z) so the streamed terrain window covers it. */
+  window.__park = async function park(x, z) {
+    const p = c.phys.player;
+    p.teleport(new T.Vector3(x, phys.groundAt(x, z).y + 0.2, z));
+    await frames(36);
+    p.teleport(new T.Vector3(x, phys.groundAt(x, z).y + 0.2, z));
+    await frames(36);
+    return true;
   };
 });
 
@@ -248,18 +281,25 @@ const pick = (name, nth = 0) => page.evaluate(([n, k]) => {
   return b ? { id: b.id, name: b.name, c: b.c, s: b.s, d: +b.d.toFixed(1) } : null;
 }, [name, nth]);
 
+/* A SUITE THAT CANNOT SEE THE OBJECT IT WAS WRITTEN TO COVER passes for
+   the wrong reason. The header above names signs.js as one of the four
+   modules that registered nothing with ctx.phys — and then this list
+   asked for a bin, a bench, a lamp, a barrel and a trunk and never for
+   a sign, so the run came back all green over twenty-eight nameboards
+   whose painted faces you could walk straight through. */
 const TARGETS = [
   ['bin', 'prop.bin'],
   ['bench', 'prop.bench'],
   ['lamp post', 'prop.lamp'],
   ['barrel', 'prop.barrel'],
   ['tree trunk', 'tree.'],
+  ['sign board', 'sign.board', { overhead: true }],
 ];
 
 const results = [];
 const ANGLES = [0, Math.PI / 2, Math.PI, -Math.PI / 2];
 
-for (const [label, prefix] of TARGETS) {
+for (const [label, prefix, opt = {}] of TARGETS) {
   const t = await pick(prefix);
   if (!t) {
     console.log(`--- ${label}: NOT FOUND in the collision world ---`);
@@ -287,10 +327,88 @@ for (const [label, prefix] of TARGETS) {
   results.push([`${label}: never passes through`, clipped === 0, `${clipped}/${tried} angles clipped`]);
   /* CLOSE. His axis must come within a radius plus a hand's breadth of
      the surface, or the collider is an invisible wall standing off the
-     object — which is how a well-meant fix feels worse than the bug. */
-  results.push([`${label}: gets close enough to touch`, closest < 0.34 + 0.14,
-    `closest axis-to-surface ${closest === Infinity ? 'n/a' : closest.toFixed(3)} m (radius 0.34)`]);
+     object — which is how a well-meant fix feels worse than the bug.
+
+     OVERHEAD bodies are exempt and must be: a nameboard that hangs at
+     2.2 m is doing its job precisely by being out of reach, and
+     demanding he touch it would be demanding it hang at head height.
+     They are covered by the dedicated section below instead. */
+  if (opt.overhead) {
+    console.log(`   (overhead body — clearance is asserted in the nameboard section, not by touch)`);
+  } else {
+    results.push([`${label}: gets close enough to touch`, closest < 0.34 + 0.14,
+      `closest axis-to-surface ${closest === Infinity ? 'n/a' : closest.toFixed(3)} m (radius 0.34)`]);
+  }
 }
+
+/* ------------------------------------------------------------------
+   1c. THE NAMEBOARDS.
+
+   The bug this section exists for: signs.js registered NOTHING, and
+   every board hung from a bracket that stood it a metre and three
+   quarters into the street with its bottom edge under Wally's 1.58 m
+   head. Driving at the Culture Bazaar board at 135 degrees put the
+   capsule 1.045 m INSIDE the painted face, on all three axes.
+
+   Two things have to be true of every one of the twenty-eight, and
+   they are alternatives, not both:
+
+     it hangs CLEAR — its lowest point is above the headroom line, so
+     he cannot reach it walking or jumping, and nothing about it can be
+     in his way; or
+
+     it is SOLID — a board on a frontage too short to give the room
+     stops him instead of letting him through.
+
+   A board that is neither is the original bug.
+   ------------------------------------------------------------------ */
+console.log('--- nameboards ---');
+const boards = await page.evaluate(() => {
+  const c = window.WALLY.ctx;
+  const T = window.WALLY.THREE;
+  const world = c.phys.world;
+  const solid = new Set();
+  for (const [id, rec] of world.bodies) if (rec.opts?.name === 'sign.board') solid.add(id);
+  const box = new T.Box3();
+  const out = [];
+  for (const [id, rec] of c.city.locations) {
+    if (!rec.sign) continue;
+    rec.sign.group.updateMatrixWorld(true);
+    box.setFromObject(rec.sign.board);
+    const cx = (box.min.x + box.max.x) / 2, cz = (box.min.z + box.max.z) / 2;
+    /* the ground a reader stands on under the board: the terrain
+       raster, or the building's own floor where that is higher */
+    const gy = Math.max(c.world.heightAt(cx, cz), rec.groundY + (rec.meta?.ground ?? 0));
+    out.push({
+      id,
+      kit: rec.kit,
+      clear: +(box.min.y - gy).toFixed(3),
+      hasBody: rec.sign.colliderId != null,
+      x: +cx.toFixed(1), z: +cz.toFixed(1),
+      w: +(rec.sign.width ?? 0).toFixed(2), h: +(rec.sign.height ?? 0).toFixed(2),
+    });
+  }
+  out.sort((a, b) => a.clear - b.clear);
+  return { boards: out, bodies: solid.size, head: c.phys.player.height };
+});
+/* Head height plus a running jump. Below this he can put his skull
+   through the board; above it he cannot reach it at all. */
+const HEADROOM = 2.15;
+for (const b of boards.boards.slice(0, 6)) {
+  const ok = b.clear >= HEADROOM || b.hasBody;
+  console.log(`   ${ok ? '      ' : '\x1b[31mWALK-THRU\x1b[0m'} ${b.id.padEnd(16)} ${b.kit.padEnd(9)} ` +
+    `board bottom ${b.clear.toFixed(2)} m above ground, ${b.w}x${b.h} m, ` +
+    `${b.hasBody ? 'solid' : '\x1b[31mno collider\x1b[0m'}`);
+}
+console.log(`   ${boards.boards.length} boards, ${boards.bodies} registered with phys, ` +
+  `lowest hangs ${boards.boards[0]?.clear.toFixed(2)} m over the ground (head at ${boards.head})`);
+const unreachable = boards.boards.filter((b) => b.clear < HEADROOM && !b.hasBody);
+results.push(['every nameboard is a body in the collision world',
+  boards.bodies === boards.boards.length, `${boards.bodies}/${boards.boards.length}`]);
+results.push(['no nameboard can be walked through',
+  unreachable.length === 0,
+  unreachable.length ? unreachable.map((b) => `${b.id} @${b.clear}m`).join(', ')
+    : `all ${boards.boards.length} either clear ${HEADROOM} m or are solid`]);
 
 /* ------------------------------------------------------------------
    1b. A building wall. The whole city is ONE merged collision body, so
@@ -336,31 +454,47 @@ if (wall) {
 /* ------------------------------------------------------------------
    2. Every door must still be reachable.
    ------------------------------------------------------------------ */
+/* ONE DOOR AT A TIME, WITH HIM STANDING THERE.
+
+   The whole sweep used to run from wherever the previous test had left
+   him. Terrain collision is a 3 x 3 window of 64 m tiles that follows
+   the PLAYER — 192 m of a 970 m island — so for most of the twenty-
+   eight doors there was no terrain under the probe at all, groundAt()
+   answered with whatever permanent body happened to be nearest, and the
+   capsule was placed at a height that had nothing to do with the
+   doorstep. Those doors passed because the test was sampling empty air.
+   Parking him beside each one first costs about a second a door and is
+   the difference between an assertion and a formality. */
 console.log('--- doorway approaches ---');
-const doors = await page.evaluate(() => {
-  const c = window.WALLY.ctx;
-  const T = window.WALLY.THREE;
-  const out = [];
-  for (const [id, rec] of c.city.locations) {
+const doorIds = await page.evaluate(() => [...window.WALLY.ctx.city.locations.keys()]);
+const doors = [];
+for (const id of doorIds) {
+  const r = await page.evaluate(async (lid) => {
+    const c = window.WALLY.ctx;
+    const rec = c.city.locations.get(lid);
     const d = rec.door;
-    if (!d) continue;
+    if (!d) return null;
     const ax = Math.sin(rec.loc.yaw), az = Math.cos(rec.loc.yaw);
+    await window.__park(d.x + ax * 3.0, d.z + az * 3.0);
     let worst = 0;
     const who = new Set();
+    let ground = '';
     /* walk the corridor the player has to use to reach the handle.
        The wall itself is at t = 0, so start clear of it. */
     for (const t of [1.0, 1.6, 2.2, 2.8]) {
-      const r = window.__clearAt(d.x + ax * t, d.z + az * t);
-      worst = Math.max(worst, r.n);
-      for (const w of r.who) who.add(w);
+      const q = window.__clearAt(d.x + ax * t, d.z + az * t);
+      worst = Math.max(worst, q.n);
+      for (const w of q.who) who.add(w);
+      ground = q.on;
     }
-    out.push({ id, blocked: worst, who: [...who] });
-  }
-  return out;
-});
+    return { id: lid, blocked: worst, who: [...who], ground };
+  }, id);
+  if (r) doors.push(r);
+}
 const blockedDoors = doors.filter((d) => d.blocked > 0);
 for (const d of blockedDoors) console.log(`   \x1b[31mBLOCKED\x1b[0m ${d.id} (${d.blocked} contacts: ${d.who.join(', ')})`);
-console.log(`   ${doors.length - blockedDoors.length}/${doors.length} doors have a clear approach corridor`);
+console.log(`   ${doors.length - blockedDoors.length}/${doors.length} doors have a clear approach corridor` +
+  ` (standing on: ${[...new Set(doors.map((d) => d.ground))].join(', ')})`);
 results.push(['every door approach is clear', blockedDoors.length === 0,
   blockedDoors.length ? blockedDoors.map((d) => d.id).join(', ') : 'all clear']);
 

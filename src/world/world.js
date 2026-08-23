@@ -82,11 +82,10 @@ export async function init(ctx) {
 
   groundGroup.add(terrain.group);
   groundGroup.add(paths.group);
-  /* Rock and the grass lip register themselves inside terrain.js —
-     they want outlines and shadow casting, which the two register()
-     calls below deliberately switch off for the heightfield. */
+  /* Rock registers itself inside terrain.js — it wants outlines and
+     shadow casting, which the two register() calls below deliberately
+     switch off for the heightfield. */
   groundGroup.add(terrain.rockGroup);
-  groundGroup.add(terrain.lipGroup);
   ctx.mat.register(terrain.group, { outline: false, castShadow: false, receiveShadow: true });
   ctx.mat.register(paths.group, { outline: false, castShadow: false, receiveShadow: true });
 
@@ -372,6 +371,28 @@ export async function init(ctx) {
     );
   };
 
+  /* A CAMERA OUT OVER A DROP, BELOW THE TURF LINE, AIMED BACK AT A
+     BRINK YOU NAME. This is the framing every argument about the
+     island's edges needs and almost never gets: from on top of a
+     brink looking down, a cliff and a shelf are the same picture.
+     (It used to have a sibling, lipCam, that ranked the sod tongues
+     for you. The tongues are gone — see terrain.js — and this is the
+     half that was about the terrain rather than about them.) */
+  dbg.spotCam = (x, z, opts = {}) => {
+    const e = 6;
+    const gx = (heightAt(x + e, z) - heightAt(x - e, z)) / (2 * e);
+    const gz = (heightAt(x, z + e) - heightAt(x, z - e)) / (2 * e);
+    const m = Math.hypot(gx, gz) || 1;
+    const ux = gx / m, uz = gz / m;                 // uphill
+    const d = opts.dist ?? 16;
+    const y = heightAt(x, z);
+    return takeCamera(
+      x - ux * d, y - (opts.drop ?? 5), z - uz * d,
+      x + ux * 1.5, y + 0.3, z + uz * 1.5,
+      opts.fov ?? 42, 0.4, 4000, 0,
+    );
+  };
+
   /* A height transect straight into the face — the only honest way to
      tell a sculpted shelf from a shaded one. */
   dbg.cliffProbe = (idx = 0, n = 44) => {
@@ -487,6 +508,9 @@ export async function init(ctx) {
 
       const f = currentFocus();
       terrain.updateCollision(f.x, f.z, 2);
+      /* Rock is the geometry the heightfield cannot hold, so it streams
+         beside it: the talus and boulders he can walk into. */
+      terrain.updateRockCollision(f.x, f.z, 4);
 
       terrain.updateLOD(ctx.camera);
       terrain.processPending(ctx.quality.name === 'low' ? 1 : 3);

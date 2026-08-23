@@ -624,6 +624,49 @@ export const BIKE_SEAT = {
 function bikeBody(ph, w, eff = 1, k = 1) {
   if (k <= 0) return;
   const a = ph * TAU;
+  /* ---- THE CRANK RUNS THE OTHER WAY ROUND FROM THE BODY ----
+
+     `cr` is the phase the LEG SOLVE runs on, and it is the negative of
+     `a`. This is the whole of the "he pedals backwards" fix and it is
+     worth saying why the minus sign lives here and nowhere else.
+
+     FORWARD IS +Z (bike.js line 37). A positive rotation.x carries a
+     point at +y toward +z, so a forward-rolling wheel and a
+     forward-turning crank BOTH have a positive rotation.x: the top of
+     the circle goes forward, the bottom goes back. Read the crank the
+     other way and you get the four stations in the order
+     bottom -> back -> top -> front.
+
+     The solved table this function is fitted to runs the other order.
+     Measured on the shipped rig with WALLY.debug.driveTrace, the leg
+     solve put the left ankle at root-local z:
+
+         ph 0     +0.012   bottom
+         ph 0.25  +0.108   FRONT
+         ph 0.5   +0.008   top
+         ph 0.75  -0.064   BACK
+
+     bottom -> front -> top -> back, which is a rider back-pedalling.
+     Somebody met this before and negated the two CONSUMERS instead —
+     bike.setCrankPhase(-phase) and a negated wheel spin in wally.js —
+     which glued the pedal mesh under the backwards foot and dragged
+     the wheels backwards with it, so the whole drivetrain agreed with
+     itself and disagreed with the direction of travel. Those two
+     negations are gone; the sign is here, once, at the source.
+
+     ONLY THE PEDAL SOLVE TAKES `cr`. Everything below the legs — the
+     rock, the shoulder counter-rotation, the head sway, the arm term —
+     stays on `a`, and that is not an oversight. The rock exists to
+     shift his mass onto whichever foot is PUSHING, and reversing the
+     crank does not change which foot that is: the ankle's HEIGHT curve
+     is very nearly even in phase, so the left foot descends over
+     ph 0.5..1.0 either way (measured: 0.369 -> 0.209 before, 0.369 ->
+     0.209 after). Flipping the rock with the crank would therefore
+     have moved his weight onto the foot that is coming UP. What DOES
+     change is where in the circle that push happens — it moves from
+     the back of the stroke to the FRONT, which is where a bicycle
+     makes its torque, and that is the point of the fix. */
+  const cr = -a;
   /* effort reshapes the torso, never the legs: the legs are on a crank
      and a crank does not care how hard you are trying */
   /* THE LEAN IS SMALL BECAUSE THE HEAD IS BIG. 25 degrees at the hip is
@@ -665,7 +708,7 @@ function bikeBody(ph, w, eff = 1, k = 1) {
      (knee to ankle 0.128) — and the ankle held 0.10 m above the pedal
      because that is where the sole is:
 
-       crank phase      0        PI/2      PI       3PI/2
+       solve phase p    0        PI/2      PI       3PI/2
        reach            0.345    0.315     0.206    0.249     (max 0.396)
        thigh forward    45.4     70.3      81.4     51.5      degrees
        knee flexion     59.5     75.6     119.4    103.6
@@ -673,6 +716,12 @@ function bikeBody(ph, w, eff = 1, k = 1) {
      Neither curve is a cosine — the circle is offset from the hip, so
      both are phase-shifted and the fit needs the shift. Two terms each,
      residual under 2.5 degrees, which is 4 mm at the ankle.
+
+     `p` IS NOT THE CRANK ANGLE — it is its negative (`cr` above). The
+     four stations are unchanged; p = PI/2 is still the FRONT of the
+     circle. Running them in descending order is what turns the crank
+     forward, and it is why bike.setCrankPhase() is now handed the
+     animator's phase unsigned.
 
      WHY THE HIP ONLY RISES 36 mm. §1.1 gives Wally a 0.30 H leg on a
      1.00 H body, so hip-to-ankle is 0.396 m on a 1.60 m character —
@@ -684,7 +733,10 @@ function bikeBody(ph, w, eff = 1, k = 1) {
      city-bike scale. That is not a stylisation either; it is what
      happens when you build a bicycle for these legs. */
   const pedal = (side, off) => {
-    const p = a + off;
+    /* `cr`, not `a` — see the note at the top. The four solved stations
+       below are unchanged; they are simply visited in the other order,
+       which is what makes it a forward stroke. */
+    const p = cr + off;
     const thigh = 63.4 - 20.3 * cos(p + 0.481);        // forward of vertical
     const knee = 89.5 - 33.1 * cos(p - 0.437);         // flexion
     w.r(`leg${side}0`, (-thigh + hipTilt) * k, 0, 0);

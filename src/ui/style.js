@@ -251,10 +251,104 @@ export function icon(name, size = 16, opts = {}) {
 export const iconNames = Object.keys(P);
 
 /* ============================================================
-   THE WALLY MARK — head-ball, dominant ears, black wayfarers and
-   THE GLINT (a flattened lazy-Z, ART_DIRECTION §1.4). Readable at
-   28 px. Used for the phone icon, the boot chip and his portrait.
+   THE WALLY MARK — ART_DIRECTION §1, held to the render.
+
+   MEASURED, NOT DRAWN BY EYE. The previous mark was authored by hand
+   and had never been checked against the character. A front-on studio
+   render (WALLY.debug.studio('cool','ears') on a black field) was cut
+   to a silhouette by border-connected flood fill — never a luma
+   threshold, which punches straight through the #0A0A0A lenses — and
+   every number below is that silhouette's, mapped into the 64 box.
+   The head block is "top of the ears down to the bottom of the ears":
+
+     ear span / block height     2.00   (mark 1.96)
+     crown drop below ear tips   0.175 block heights
+
+   THE ONE THAT MATTERED. §1.1: "Ears never droop below the jawline
+   hinge — a downward-hanging ear is the single worst likeness error."
+   The old ears were two ellipses at cy 30 with their tops SIX units
+   below the crown and tilted OUTWARD: flat sideways lugs on a dome.
+   The render puts the ear TIPS 0.175 of a block height ABOVE the
+   crown, leaning IN over the skull, with the fan swinging out and
+   down below — so the ellipses now sit at cy 24 rotated 20 degrees
+   the other way, and the crown is no longer the top of the mark.
+   That is the whole silhouette job; everything else is detail.
+
+   Also corrected against §1.1/§1.4/§1.5:
+     - THREE incised trunk lines, not two (§1.5 is explicit).
+     - Tusks are cream CONES hanging down-forward-out beside the
+       trunk, matched left to right. They used to be two little
+       sideways strokes that read as a moustache.
+     - The glint was drawn UPSIDE DOWN: a falling line, where
+       ref/wally-glint-canon.png and the render both show a RISING
+       one — short horizontal low-left, rising diagonal, short
+       horizontal high-right, both lenses the same way, not mirrored.
+     - The brow bar overhung the head ball by 3 units a side (1.34x
+       the head). The render is 1.10x; the overhang now reads as the
+       temple hooks it actually is.
+
+   Flat vector, not a tiny painting: at 26 px the only things that can
+   survive are the ear/head/glasses SILHOUETTE and one bright dash per
+   lens, so nothing here is finer than that.
    ============================================================ */
+/* --- the pieces, once, so the mark and its keyline cannot drift --- */
+/* EARS. cy 24 (not 30), rotated +22/-22 (not -11/+11): the tip leans IN
+   over the skull and the fan opens out and DOWN — §1.1's back-and-up
+   sweep as a front view sees it. rx 12.6 / ry 15.4 puts the tips at
+   y 8.96 and the roots at y 39.04, which is the render's block, and
+   holds ear span / block height at 1.96 against the render's 2.00. */
+const WM_EAR_L = 'cx="15.6" cy="24" rx="12.6" ry="15.4" transform="rotate(22 15.6 24)"';
+const WM_EAR_R = 'cx="48.4" cy="24" rx="12.6" ry="15.4" transform="rotate(-22 48.4 24)"';
+const WM_EARS = (mid, inner) => `
+    <ellipse ${WM_EAR_L} fill="${mid}"/>
+    <ellipse ${WM_EAR_R} fill="${mid}"/>
+    <ellipse cx="17" cy="25.6" rx="8.4" ry="10.8" fill="${inner}" transform="rotate(22 17 25.6)"/>
+    <ellipse cx="47" cy="25.6" rx="8.4" ry="10.8" fill="${inner}" transform="rotate(-22 47 25.6)"/>`;
+/* HEAD. A ball, and 0.53 of the ear span wide — the width the render's
+   silhouette has at the ear roots. cy 29.4 puts the crown 0.174 of a
+   block height below the ear tips; the render's is 0.175. */
+const WM_HEAD = 'cx="32" cy="29.4" rx="15.8" ry="15.2"';
+/* TRUNK. Root under the bridge, thick, smooth, rounded nub tip — and
+   THREE incised lines on the top ridge, §1.5, at 60% of trunk width. */
+const WM_TRUNK_D = 'M27 35.6h10c.3 6.2-.4 11-1 15.1-.5 3.3-.7 6.9-4 6.9s-3.5-3.6-4-6.9c-.6-4.1-1.3-8.9-1-15.1z';
+const WM_TRUNK = (clay, ao) => `
+    <path d="${WM_TRUNK_D}" fill="${clay}"/>
+    <path d="M29.1 39.9h5.8M29.2 43.5h5.6M29.4 47.1h5.2" stroke="${ao}" stroke-width="1.05" stroke-linecap="round" opacity=".5"/>`;
+/* TUSKS. Matched cream cones, down-forward-out from under the cheek. */
+const WM_TUSKS = `
+    <path d="M26.4 37.4c-.3 4.8-1.1 8.9-2.2 11.4-.8 1.8-3.1 1.5-3.4-.5-.6-3.2-.5-7.5.3-11.2z" fill="${C(CLAY.tusk)}"/>
+    <path d="M37.6 37.4c.3 4.8 1.1 8.9 2.2 11.4.8 1.8 3.1 1.5 3.4-.5.6-3.2.5-7.5-.3-11.2z" fill="${C(CLAY.tusk)}"/>`;
+/* THE GLASSES SIT ON THE FACE, NOT OVER THE EDGE OF IT. The first pass
+   at this kept the old mark's straight-sided lenses, and their bottom
+   OUTER corners hung past the head ball at a height where the ear has
+   already swept away — a hairline of background showed through between
+   ear and cheek and the lens leaked out of the silhouette entirely.
+   Caught by the flood-fill mask, which came back with the whole
+   sunglasses cut out as background; it was not a tool artefact, it was
+   the drawing. The lenses are now the trapezoids §1.4 asks for, tucking
+   in 3.7 units a side as they fall, and every point of the frame is
+   inside the head-or-ear silhouette at its own height. */
+const WM_BROW = 'M17.1 24.6h29.8a2 2 0 012 2.1l-.45 2.8h-12.3l-1.15-2.3h-6.1l-1.15 2.3h-12.3l-.45-2.8a2 2 0 012-2.1z';
+const WM_LENS_L = 'M15.5 29.5h14.7l-1.4 5a2.8 2.8 0 01-2.7 2.1h-5.6a2.8 2.8 0 01-2.7-2.1z';
+const WM_LENS_R = 'M48.5 29.5h-14.7l1.4 5a2.8 2.8 0 002.7 2.1h5.6a2.8 2.8 0 002.7-2.1z';
+/* THE GLINT — the approved white RISING line, §1.4. Low-left horizontal,
+   rising diagonal, high-right horizontal; ~40% of lens width; both
+   lenses point the SAME way. Match ref/wally-glint-canon.png, not
+   memory: the old one fell instead of rose. */
+const WM_GLINT = 'M20.3 34.2h1.9l1.8-2.4h1.9M38.1 34.2h1.9l1.8-2.4h1.9';
+
+/* THE PRINT KEYLINE — the mark's own silhouette, for anyone who needs
+   to spread a dark outline behind it (ui/map.js's "you are here" pawn,
+   the favicon). Exported so the keyline cannot drift from the mark the
+   way a hand-copied duplicate does. */
+export function wallyKeyline(attrs = '') {
+  return `<g ${attrs}>
+      <ellipse ${WM_EAR_L}/><ellipse ${WM_EAR_R}/>
+      <ellipse ${WM_HEAD}/>
+      <path d="${WM_TRUNK_D}"/>
+    </g>`;
+}
+
 /* The mark's inner markup on its own, in a 0 0 64 64 box, so it can be
    dropped into someone else's SVG (the chart's "you are here" pawn) as
    well as stand alone. `uid` suffixes the gradient id — two copies of the
@@ -262,54 +356,70 @@ export const iconNames = Object.keys(P);
    repaints the first. */
 export function wallyMarkup(uid = '') {
   const clay = C(CLAY.body), lit = C(CLAY.bodyLit), ao = C(CLAY.bodyAO);
-  const inner = C(CLAY.earInner), frame = C(CLAY.frame), lens = C(CLAY.lens);
+  const mid = C(CLAY.bodyMid), inner = C(CLAY.earInner);
+  const frame = C(CLAY.frame), lens = C(CLAY.lens);
   const gid = 'wmH' + uid;
   return `<defs>
-      <radialGradient id="${gid}" cx="38%" cy="28%" r="76%">
+      <radialGradient id="${gid}" cx="38%" cy="26%" r="78%">
         <stop offset="0" stop-color="${lit}"/><stop offset="1" stop-color="${clay}"/>
       </radialGradient>
     </defs>
-    <ellipse cx="11.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(-11 11.5 30)"/>
-    <ellipse cx="52.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(11 52.5 30)"/>
-    <ellipse cx="12.4" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(-11 12.4 30.6)"/>
-    <ellipse cx="51.6" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(11 51.6 30.6)"/>
-    <ellipse cx="32" cy="28.5" rx="17.4" ry="17" fill="url(#${gid})"/>
-    <path d="M32 40c4.6 0 6.5 3 6.5 8.2 0 4.2-1.7 7.4-3.1 9.6-1 1.6-3.6 1.4-4.4-.2-1.2-2.4-2.6-5.2-2.6-9.4 0-5.2 1-8.2 3.6-8.2z" fill="${clay}"/>
-    <path d="M29.6 46.4h5.2M29.9 50.2h4.6" stroke="${ao}" stroke-width="1.1" stroke-linecap="round" opacity=".55"/>
-    <path d="M24.6 41.4c-1.9 1.1-3.6.6-4.6-.9M39.4 41.4c1.9 1.1 3.6.6 4.6-.9" stroke="${C(CLAY.tusk)}" stroke-width="3.1" stroke-linecap="round"/>
-    <path d="M13.6 25.6h36.8a2 2 0 012 2.1l-.5 3.2h-15l-1.1-2.5h-7.6l-1.1 2.5h-15l-.5-3.2a2 2 0 012-2.1z" fill="${frame}"/>
-    <path d="M15.9 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
-    <path d="M33.7 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
-    <path d="M18.4 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-    <path d="M36.2 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+    ${WM_EARS(mid, inner)}
+    <ellipse ${WM_HEAD} fill="url(#${gid})"/>
+    ${WM_TUSKS}
+    ${WM_TRUNK(clay, ao)}
+    <path d="${WM_BROW}" fill="${frame}"/>
+    <path d="${WM_LENS_L}" fill="${lens}"/>
+    <path d="${WM_LENS_R}" fill="${lens}"/>
+    <path d="${WM_GLINT}" stroke="${C(CLAY.glint)}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
 }
 
+let _wmN = 0;
 export function wallyMark(size = 48) {
-  const clay = C(CLAY.body), lit = C(CLAY.bodyLit), ao = C(CLAY.bodyAO);
-  const inner = C(CLAY.earInner), frame = C(CLAY.frame), lens = C(CLAY.lens);
-  const svg = `
-  <svg viewBox="0 0 64 64" width="${size}" height="${size}" class="w-mark" aria-hidden="true">
-    <defs>
-      <radialGradient id="wmH" cx="38%" cy="28%" r="76%">
-        <stop offset="0" stop-color="${lit}"/><stop offset="1" stop-color="${clay}"/>
-      </radialGradient>
-    </defs>
-    <ellipse cx="11.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(-11 11.5 30)"/>
-    <ellipse cx="52.5" cy="30" rx="9.6" ry="12.6" fill="${clay}" transform="rotate(11 52.5 30)"/>
-    <ellipse cx="12.4" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(-11 12.4 30.6)"/>
-    <ellipse cx="51.6" cy="30.6" rx="6.2" ry="8.6" fill="${inner}" transform="rotate(11 51.6 30.6)"/>
-    <ellipse cx="32" cy="28.5" rx="17.4" ry="17" fill="url(#wmH)"/>
-    <path d="M32 40c4.6 0 6.5 3 6.5 8.2 0 4.2-1.7 7.4-3.1 9.6-1 1.6-3.6 1.4-4.4-.2-1.2-2.4-2.6-5.2-2.6-9.4 0-5.2 1-8.2 3.6-8.2z" fill="${clay}"/>
-    <path d="M29.6 46.4h5.2M29.9 50.2h4.6" stroke="${ao}" stroke-width="1.1" stroke-linecap="round" opacity=".55"/>
-    <path d="M24.6 41.4c-1.9 1.1-3.6.6-4.6-.9M39.4 41.4c1.9 1.1 3.6.6 4.6-.9" stroke="${C(CLAY.tusk)}" stroke-width="3.1" stroke-linecap="round"/>
-    <path d="M13.6 25.6h36.8a2 2 0 012 2.1l-.5 3.2h-15l-1.1-2.5h-7.6l-1.1 2.5h-15l-.5-3.2a2 2 0 012-2.1z" fill="${frame}"/>
-    <path d="M15.9 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
-    <path d="M33.7 31.2h14.4l-1.1 5.1a3.4 3.4 0 01-3.3 2.6h-6a3.4 3.4 0 01-3.3-2.6z" fill="${lens}"/>
-    <path d="M18.4 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-    <path d="M36.2 33.1h3.6l-1.5 1.9h3.1" stroke="#fff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  </svg>`;
+  /* one gradient id per instance: the phone can hold two marks at once
+     (a message from him above the WallyNet foot), and a shared id makes
+     the second copy silently repaint the first */
   const t = document.createElement('div');
-  t.innerHTML = svg.trim();
+  t.innerHTML = `<svg viewBox="0 0 64 64" width="${size}" height="${size}" class="w-mark"
+    aria-hidden="true">${wallyMarkup('m' + (_wmN++))}</svg>`;
+  return t.firstChild;
+}
+
+/* ============================================================
+   WALLY'S AVATAR — the mark in a portrait disc.
+
+   portrait() and glyphAvatar() both draw a tinted disc with a white
+   keyline ring and let the subject run off the bottom edge. The mark
+   did none of that, so in a message list beside Otto and Mabel he was
+   a grey shape floating on the paper while everyone else was a badge.
+   Same disc, same ring, same overflow — so he reads as one of the
+   correspondents rather than as a logo that wandered in.
+
+   THE EAR SPAN SETS THE SCALE, not the height. His ears are 0.92 of
+   the mark's whole width, so the transform parks their widest row on
+   the disc's own widest row (y 32) and takes the scale that leaves
+   ~2 units of blue outboard of the tips. Centring him by height
+   instead — the obvious thing, and the first thing tried — put the
+   ears up where the circle has narrowed and sliced both tips flat,
+   which on a character whose silhouette IS his ears is the one crop
+   you cannot take. The trunk runs off the bottom, as a portrait's
+   neck does.
+   ============================================================ */
+export function wallyAvatar(size = 56) {
+  const uid = 'a' + (_wmN++);
+  const t = document.createElement('div');
+  /* .trim() is load-bearing: a leading newline makes firstChild a text
+     node, and every caller that styles the returned element then throws */
+  t.innerHTML = `
+  <svg viewBox="0 0 64 64" width="${size}" height="${size}" class="w-portrait" aria-hidden="true">
+    <defs><clipPath id="wac${uid}"><circle cx="32" cy="32" r="31"/></clipPath></defs>
+    <g clip-path="url(#wac${uid})">
+      <rect x="0" y="0" width="64" height="64" fill="${C(BRAND.info)}" opacity=".92"/>
+      <ellipse cx="32" cy="59" rx="24" ry="12" fill="#000" opacity=".13"/>
+      <g transform="translate(32 8.2) scale(.99) translate(-32 0)">${wallyMarkup(uid)}</g>
+    </g>
+    <circle cx="32" cy="32" r="30.4" fill="none" stroke="rgba(255,255,255,.34)" stroke-width="1.4"/>
+  </svg>`.trim();
   return t.firstChild;
 }
 
@@ -1062,6 +1172,84 @@ export function stylesheet() {
   display:grid;place-items:center;padding:0 3px;box-shadow:0 0 0 2px ${rgba(BRAND.ink, 0.75)};
 }
 
+/* ---------- HIDE UI, STAGE TWO — the bottom controls fade too ----------
+   Only on touch, only inside Hide UI, and only after touch.js has
+   counted a few seconds with no CHARACTER MOVEMENT. See the header
+   block in src/ui/touch.js for the timings and the gesture rules.
+
+   THE SAME IDIOM AS THE TOP BARS, deliberately: opacity for the fade,
+   visibility flipped after it on the way out and instantly on the way
+   in, and nothing torn down — measure() still needs a real box for the
+   stick geometry, and hud.js still wants the layer in the layout.
+
+   POINTER-EVENTS:NONE IS THE JUDGEMENT CALL, not an implementation
+   detail. The player asked to get the controls back by double tapping,
+   so an invisible-but-live thumbstick would be wrong twice over: a tap
+   meant to wake would lurch the elephant instead, and the bottom-left
+   corner would become a hole the camera cannot be dragged from. Inert
+   means the whole screen is camera while the controls are away, which
+   is exactly what somebody framing a shot wants. The children re-enable
+   pointer-events for themselves, so each one has to be said again. */
+.w-touch .w-stickzone,.w-touch .w-acts{
+  transition:opacity .42s var(--w-ease),visibility 0s;
+}
+.w-touch.w-idlehide .w-stickzone,.w-touch.w-idlehide .w-acts{
+  opacity:0;visibility:hidden;pointer-events:none;
+  transition:opacity .42s var(--w-ease),visibility 0s linear .42s;
+}
+.w-touch.w-idlehide .w-abtn,.w-touch.w-idlehide .w-stickzone *{pointer-events:none}
+/* A TRANSPARENT CONTROL IS NOT A CONTROL. Removing .w-idlehide returns
+   pointer-events the instant the class flips, while the opacity above
+   still has 0.42 s to run — so a third tap after a waking double tap
+   pressed a Jump button that was drawn at opacity 0.0. touch.js keeps
+   .w-idlewake on for exactly the fade it reads back out of the rule
+   above, which makes the rule symmetric: the cluster is pressable only
+   at full opacity, in both directions. It is VISIBLE throughout —
+   these are only the hit-testing lines, so the fade-in itself is
+   untouched and there is no flash. */
+.w-touch.w-idlewake .w-stickzone,.w-touch.w-idlewake .w-acts,
+.w-touch.w-idlewake .w-abtn,.w-touch.w-idlewake .w-stickzone *{pointer-events:none}
+/* REDUCED MOTION. The global '.w-rm *' rule at the bottom of this file
+   already forces every transition-duration to .001s !important, so the
+   fade is gone for free. What that rule does NOT touch is the DELAY —
+   and the visibility flip above is a pure delay, so without this line
+   the controls would be invisible for 0.42 s before the layout agreed
+   they were gone. Exactly the fix .w-bar needed for stage one; there is
+   deliberately no duration here, because it would only lose to the
+   !important above and read as if it were doing something. */
+.w-rm .w-touch.w-idlehide .w-stickzone,.w-rm .w-touch.w-idlehide .w-acts{
+  transition-delay:0s;
+}
+
+/* THE ONE MARK THAT SURVIVES. A home-indicator hairline, 34x3 px at
+   16 % — no chrome, no blur, no caption, no pointer events. It is the
+   difference between "the controls are hidden" and "this game is
+   broken", and at 102 px^2 of 16 %-white it does not spoil the clean
+   screenshot the mode exists to produce. */
+.w-idleseam{
+  position:absolute;left:50%;bottom:calc(max(6px,env(safe-area-inset-bottom)) + 5px);
+  width:34px;height:3px;margin-left:-17px;border-radius:99px;
+  background:${rgba(BRAND.paper, 0.9)};
+  opacity:0;pointer-events:none;
+  transition:opacity .42s var(--w-ease);
+}
+.w-touch.w-idlehide .w-idleseam{opacity:.16}
+/* the FIRST fade of a session lands brighter and decays — it teaches
+   once, then never says anything again */
+.w-touch.w-idlehide.w-idlefirst .w-idleseam{animation:wSeam 1.4s var(--w-ease) both}
+@keyframes wSeam{from{opacity:.5}to{opacity:.16}}
+.w-rm .w-idleseam{transition:none}
+.w-rm .w-touch.w-idlehide.w-idlefirst .w-idleseam{animation:none;opacity:.16}
+
+/* THE BROWSER DEFAULT WE ARE TAKING OVER. Double-tap-to-zoom would
+   otherwise fire on the wake gesture. 'manipulation' kills exactly that
+   (and the 300 ms click delay with it) while leaving pan and pinch
+   alone, so a phone sheet still scrolls; touch-action intersects down
+   the ancestor chain, so the canvas keeps its stricter 'none' and the
+   sheets keep their scrolling. Touch sessions only — .w-touch-on is
+   never on a desktop <body>. */
+body.w-touch-on{touch-action:manipulation}
+
 /* ---------- the HUD steps aside for two thumbs ---------- */
 .w-touch-on .w-hints{display:none}
 /* Toasts live bottom-left — under the thumb. On touch they move to
@@ -1355,6 +1543,23 @@ button.w-stat:active{transform:scale(.97)}
   animation:wDlgIn .38s var(--w-ease) both;
 }
 .w-dlg.out{animation:wDlgOut .26s var(--w-ease) both}
+/* WITH THE PAD UP, THE CARD LIFTS OFF THE FLOOR — IN PORTRAIT TOO.
+   Landscape has had this since the pad shipped (see the .w-touch-on
+   rule in the landscape block below). Portrait never got it, and
+   portrait is where the pad is TALLEST: on a 390x844 screen .w-acts
+   runs from 25 px to 164 px off the bottom edge — two rows, the
+   shortcuts above the interact/jump pair — and the dialogue card sat
+   at 28 px, 169 px tall, straight over all of it. Measured with
+   elementFromPoint on a live conversation: all four shortcuts, JUMP,
+   ENTER/TALK and the thumbstick centre returned the card, not the
+   control. The player was never trapped (tapping the card advances
+   it, and it carries its own continue chip) but the action button was
+   labelled and unpressable and the gear/pause route was blocked for
+   the length of every conversation.
+   156 + the 16 px floor clears 164 with 8 px of air. Fixed pixels on
+   purpose: the things it has to clear are fixed-pixel buttons
+   (46/57/66), so a vh here would stop clearing on a short screen. */
+.w-touch-on .w-dlg{bottom:calc(max(16px,env(safe-area-inset-bottom)) + 156px)}
 @keyframes wDlgIn{from{opacity:0;transform:translateX(-50%) translateY(26px) scale(.97)}to{opacity:1;transform:translateX(-50%)}}
 @keyframes wDlgOut{to{opacity:0;transform:translateX(-50%) translateY(14px) scale(.985)}}
 .w-dlg-in{display:flex;gap:calc(15px * var(--w-ts));padding:calc(16px * var(--w-ts)) calc(19px * var(--w-ts)) calc(15px * var(--w-ts))}

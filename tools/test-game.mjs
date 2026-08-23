@@ -46,7 +46,7 @@ import DATA, {
   REP_TITLES, RACE, PRODUCERS, SLATE_MEAL, NPC_POSTS, ORDER_FAIL, HAPPY_ENDING, EMPLOYEE_BY_ID,
   DISCOVER, FIRST_ORDER, ruleLabel,
   repProgress, orderFailRep,
-  hops, fare, rideFare, worldDistance,
+  hops, fare, rideFare, worldDistance, strideCost, isFastTravel,
 } from '../src/game/data.js';
 import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -100,7 +100,15 @@ eq(EMPLOYEE_POOL.length, 10, '10 employees');
 eq(IPOS.length, 4, '4 IPOs');
 eq(STADIUM_STEPS.length, 10, '10-step stadium questline');
 eq(CONFIG.totalAssets, ASSETS.length, 'CONFIG.totalAssets agrees with the catalogue');
-ok(Object.keys(TRAVEL).length >= 3, 'at least 3 fast-travel modes');
+/* THIS USED TO READ "at least 3 fast-travel modes" and it passed by
+   counting MODES rather than FAST ones — there are four modes and only
+   two of them are fast travel, which is the whole rule of this round,
+   and the assertion meant to guard it was blind to it. */
+eq(Object.keys(TRAVEL).length, 4, 'four travel modes');
+eq(Object.keys(TRAVEL).filter((m) => TRAVEL[m].fast).join(','), 'train,trunk',
+  'exactly TWO of them are fast travel: the Metro and the Yoober');
+eq(Object.keys(TRAVEL).filter((m) => !TRAVEL[m].fast).join(','), 'walk,bike',
+  'and the other two are self-powered — he covers that ground himself');
 ok(NEWS_POOL.length >= 12, 'a news pool worth rolling', NEWS_POOL.length);
 ok(MILESTONES.length === 11, 'milestones every 10% plus the 5%', MILESTONES.length);
 
@@ -422,6 +430,29 @@ ok(typeof globalThis.window === 'undefined', 'no window exists in this process')
 
 const game = createGame({ seed: 0x5eed1e, autosave: false });
 ok(!!game, 'createGame() returned a handle');
+
+/* ------------------------------------------------------------
+   NAME THE BRANCH BEFORE ASSERTING ANYTHING ABOUT TRAVEL.
+
+   travel() has two shapes for a self-powered leg and which one you
+   get is `hasWalker`. In the browser init(ctx) sets it true from the
+   position feed and a walk becomes a ROUTE. Here there is no world,
+   no controller and no elephant, so nothing will ever cover a metre
+   and travel() resolves the leg itself as a lump.
+
+   Every travel assertion in this file below this line is therefore
+   the NO-WALKER branch, and it says so. It was not saying so, and
+   that is how 3386 green assertions ran the lump-sum path while the
+   round they were meant to be covering was about the other one.
+   tools/traveltest.mjs asserts table.walker before anything else and
+   owns the routed branch in a real browser; the WALKER section at the
+   end of this file drives the routed branch here too, by hand.
+   ------------------------------------------------------------ */
+eq(game.hasWalker, false,
+  '[no-walker] nothing in this process walks him, so travel() resolves a self-powered leg itself');
+eq(typeof game.setWalker, 'function', '[no-walker] …and the switch that says so is public');
+eq(game.route, null, '[no-walker] a fresh game has no route');
+
 eq(game.state.day, 1, 'a new game starts on day 1');
 eq(game.state.money, CONFIG.startMoney, 'a new game starts with $250');
 eq(game.state.loc, 'apartment', 'you wake up in your apartment');
@@ -3342,6 +3373,166 @@ T('the first client order is always CRUMB at the Business Broker');
     };
     eq(mk(), mk(), 'two runs of the same seed produce the identical first order');
   }
+}
+
+/* ============================================================
+   BOTH BRANCHES OF travel(), NAMED.
+
+   Everything above this point ran the NO-WALKER branch without ever
+   saying so. These two sections say so, and then drive the other one.
+
+   THE SPLIT, so neither section can be read as the general case:
+
+     [no-walker]  nothing covers a metre in this process, so a
+                  self-powered leg is RESOLVED — fare paid, minutes
+                  and energy in one lump, arrived, moved:true,
+                  resolved:'no-walker', no route left behind.
+     [walker]     setWalker(true) is the browser's shape, driven by
+                  hand here: travel() sets a ROUTE, charges nothing,
+                  and stride() bills every metre he covers.
+   ============================================================ */
+T('travel: the no-walker branch, named');
+{
+  const g = createGame({ seed: 0x0f007, autosave: false });
+  eq(g.hasWalker, false, '[no-walker] the branch this block is on');
+  g.state.known.stadium = true;
+  g.state.energy = 100;
+  g.state.time = 10 * 60;          // mid-morning: every door in this block is open
+  const before = { loc: g.state.loc, time: g.state.time, energy: g.state.energy };
+  const quote = g.fares('stadium').find((f) => f.mode === 'walk');
+  const r = g.travel('stadium', 'walk');
+  ok(r.ok && r.moved === true, '[no-walker] a walk MOVES him — there is nobody here to walk it', JSON.stringify(r));
+  eq(r.routed, false, '[no-walker] and it does not claim to be a route');
+  eq(r.resolved, 'no-walker', '[no-walker] it says which branch resolved it, in the result');
+  eq(r.fast, false, '[no-walker] but it never claims a walk was fast travel', String(r.fast));
+  eq(g.state.loc, 'stadium', '[no-walker] he is at the stadium');
+  eq(g.route, null, '[no-walker] and no route was left behind');
+  ok(g.state.time - before.time >= quote.mins - 0.01,
+    '[no-walker] the clock took the whole quoted lump of minutes', `${before.time} -> ${g.state.time}`);
+  ok(Math.abs((before.energy - g.state.energy) - quote.energy) < 0.5,
+    '[no-walker] and the energy came off in one lump too, on arrival',
+    `${(before.energy - g.state.energy).toFixed(2)} vs ${quote.energy}`);
+  eq(g.stride(0, 0), 0, '[no-walker] stride() has no baseline yet, so the first sample is free');
+  eq(g.stride(50, 0), 0, '[no-walker] and a 50 m jump is a warp, not a walk');
+  const e0 = g.state.energy;
+  g.resetStride(); g.stride(0, 0);
+  for (let i = 1; i <= 100; i++) g.stride(i, 0);
+  ok(Math.abs((e0 - g.state.energy) - strideCost('walk') * 100) < 0.02,
+    '[no-walker] stride() itself still charges by the metre if something DOES feed it',
+    `${(e0 - g.state.energy).toFixed(2)} for 100 m`);
+}
+
+T('travel: the walker branch, driven by hand');
+{
+  const g = createGame({ seed: 0x0f008, autosave: false });
+  g.setWalker(true);
+  eq(g.hasWalker, true, '[walker] the branch this block is on');
+  const walk = (n) => { g.resetStride(); g.stride(0, 0); for (let i = 1; i <= n; i++) g.stride(i, 0); };
+  const rate = strideCost('walk');
+  g.state.known.stadium = true;
+  g.state.known.bank = true;
+  g.state.energy = 100;
+  g.state.time = 10 * 60;          // mid-morning: every door in this block is open
+
+  /* --- it points, it does not carry --- */
+  const before = { loc: g.state.loc, time: g.state.time, money: g.state.money, energy: g.state.energy };
+  const r = g.travel('stadium', 'walk');
+  ok(r.ok && r.moved === false && r.routed === true,
+    '[walker] a walk is a ROUTE: moved:false, routed:true', JSON.stringify(r));
+  eq(g.state.loc, before.loc, '[walker] he has not gone anywhere yet');
+  eq(g.route.to, 'stadium', '[walker] but he is pointed at the stadium');
+  eq(g.routeTo, 'stadium', '[walker] and routeTo is the same answer, cheaply');
+  eq(g.state.time, before.time, '[walker] no lump of minutes — the live clock bills those');
+  eq(g.state.money, before.money, '[walker] and no money changed hands');
+  eq(g.state.energy, before.energy, '[walker] nothing is charged until he moves');
+
+  /* --- the road, charged by the metre, with no cap --- */
+  walk(200);
+  const spent200 = before.energy - g.state.energy;
+  ok(Math.abs(spent200 - rate * 200) < 0.02,
+    '[walker/routed] 200 m costs 200 x strideCost', `${spent200.toFixed(2)} vs ${(rate * 200).toFixed(2)}`);
+
+  /* --- re-tapping the same row keeps the ledger (P3) --- */
+  const again = g.travel('stadium', 'walk');
+  eq(again.resumed, true, '[walker/routed] re-tapping the same row resumes the same journey');
+  ok(Math.abs(g.route.spent - spent200) < 0.02,
+    '[walker/routed] …with its ledger intact, not reset to zero', String(g.route.spent));
+  eq(g.route.walked, 200, '[walker/routed] and the road already covered stays covered');
+  walk(200);
+  ok(Math.abs((before.energy - g.state.energy) - rate * 400) < 0.03,
+    '[walker/routed] 400 m of walking costs 400 m, not two full quotes',
+    `${(before.energy - g.state.energy).toFixed(2)} vs ${(rate * 400).toFixed(2)}`);
+
+  /* --- a different row is a change of mind, cleanly --- */
+  const cleared = [];
+  const off = g.bus.on('route', (e) => { if (e.kind === 'clear') cleared.push(e); });
+  g.travel('bank', 'walk');
+  off();
+  eq(cleared.length, 1, '[walker/routed] changing destination fires exactly one clear event');
+  eq(cleared[0].to, 'stadium', '[walker/routed] …naming the route it dropped');
+  ok(cleared[0].spent > 0, '[walker/routed] …and what that route had already spent', String(cleared[0].spent));
+  eq(g.route.spent, 0, '[walker/routed] the new route starts a fresh ledger');
+
+  /* --- THE ROAD WITH NO ROUTE AT ALL (P2) --- */
+  g.clearRoute('test');
+  eq(g.route, null, '[walker/no-route] nothing is routed');
+  g.state.energy = 100;
+  walk(300);
+  ok(Math.abs((100 - g.state.energy) - rate * 300) < 0.02,
+    '[walker/no-route] 300 m still costs 300 x strideCost — moving is never free',
+    `${(100 - g.state.energy).toFixed(2)} vs ${(rate * 300).toFixed(2)}`);
+
+  /* --- and the ride under him sets the rate --- */
+  g.state.rides = { owned: { bike: true, scooter: false, motorcycle: false }, equipped: 'bike' };
+  g.state.energy = 100;
+  walk(300);
+  const onBike = 100 - g.state.energy;
+  ok(Math.abs(onBike - strideCost('bike', 'bike') * 300) < 0.02,
+    '[walker/no-route] on the bicycle the same 300 m is charged at the bicycle rate',
+    `${onBike.toFixed(2)} vs ${(strideCost('bike', 'bike') * 300).toFixed(2)}`);
+  ok(onBike < rate * 300, '[walker/no-route] …which is cheaper than his feet');
+
+  /* --- standing still is still free, and creeping is not lost --- */
+  g.actions.equipRide(null);
+  g.state.energy = 100;
+  g.resetStride(); g.stride(0, 0);
+  for (let i = 0; i < 200; i++) g.stride(0, 0);          // he is not moving at all
+  eq(g.state.energy, 100, '[walker/no-route] standing still costs nothing, however often he is sampled');
+  /* A step under MIN_STEP_M is not billed, but it does not move the
+     baseline either, so a slow creep accumulates against the last
+     place he actually stood rather than being quietly forgiven. */
+  for (let i = 1; i <= 200; i++) g.stride(0.001 * i, 0);  // 0.2 m of creep, 1 mm at a time
+  const crept = 100 - g.state.energy;
+  ok(crept > rate * 0.2 * 0.8 && crept <= rate * 0.2 + 1e-9,
+    '[walker/no-route] …but a slow creep accumulates instead of being forgiven a millimetre at a time',
+    `${crept.toFixed(5)} for 0.2 m of creep vs ${(rate * 0.2).toFixed(5)} walked outright`);
+
+  /* --- A ROUTE DOES NOT SURVIVE THE NIGHT (P11) --- */
+  g.actions.equipRide(null);
+  g.enter('apartment');
+  g.travel('stadium', 'walk');
+  eq(g.route.to, 'stadium', '[walker/routed] a live route, at bedtime');
+  const day0 = g.state.day;
+  g.actions.sleep();
+  eq(g.state.day, day0 + 1, '[walker/routed] the day rolled');
+  eq(g.route, null, '[walker/routed] and the route did not survive the night');
+
+  /* --- arriving is what ends one, and it costs no second fare --- */
+  g.state.energy = 100;
+  g.state.time = 10 * 60;          // the new day starts at dawn; the stadium opens at 08:00
+  const m0 = g.state.money, t0 = g.state.time;
+  g.travel('stadium', 'walk');
+  walk(100);
+  const arrive = g.enter('stadium');
+  ok(arrive.ok && arrive.routed === true, '[walker/routed] enter() at the door closes the routed journey',
+    JSON.stringify(arrive));
+  eq(g.state.loc, 'stadium', '[walker/routed] and now he is there');
+  eq(g.state.money, m0, '[walker/routed] the whole journey cost no money');
+  eq(g.state.time, t0, '[walker/routed] and no lump of minutes');
+  eq(g.route, null, '[walker/routed] the route is closed');
+  ok(Math.abs((100 - g.state.energy) - rate * 100) < 0.02,
+    '[walker/routed] he paid for the 100 m he actually covered and not a metre more',
+    `${(100 - g.state.energy).toFixed(2)}`);
 }
 
 /* ============================================================

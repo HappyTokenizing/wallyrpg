@@ -52,7 +52,10 @@
      downstream of it.
    ============================================================ */
 
-import { SEA, LAND, BUILD, BRAND } from '../core/palette.js';
+import { SEA } from '../core/palette.js';
+/* ONE BICYCLE IN THE GAME, NOT TWO. See createBicycle at the foot of
+   this file for why the intro's private model is gone. */
+import { createBike } from '../character/bike.js';
 
 /* 54 bpm, 4/4 — one bar of SCORES.cinematic in src/audio/music.js. */
 export const BAR = 4 * 60 / 54;          // 4.4444 s
@@ -532,166 +535,115 @@ export function createGulls(ctx, opts = {}) {
 }
 
 /* ==================================================================
-   THE BICYCLE — $250, a bicycle and no reputation.
+   THE BICYCLE — and it is now the SAME bicycle the player rides.
 
-   Built here rather than borrowed from world/kits.js because that
-   file belongs to another agent and the intro must not depend on it
-   landing. Forward is +Z so `group.rotation.y = yaw` matches the
-   convention data.js uses for every building on the island.
+   THIS FILE USED TO BUILD ITS OWN. That second model is gone, and its
+   removal is the fix for three defects at once rather than a tidy-up:
+
+     * ITS CRANK RAN AT 2.3x ITS OWN RIDER. `crank.rotation.x = spin *
+       0.42` derived the pedals from the WHEEL — one crank revolution
+       per 5.017 m, measured — while intro.js drove the rider's legs at
+       one cycle per 2.198 m. Feet and cranks disagreed by 2.28x for
+       the whole of the shot the player sees first.
+     * ITS FEET WERE NOWHERE NEAR ITS PEDALS. Its bottom bracket sat at
+       y 0.300 with a saddle at 0.920 — 0.620 m of seat-to-crank on an
+       animal whose legs are 0.30 H. Measured across the ride shot, the
+       left ankle sat 376 mm above the pedal plate and wandered 268 mm.
+       It was a bicycle built for someone else.
+     * ITS MATERIALS BROKE §1.2. It passed `grain: 0.35` to ctx.mat.toon
+       — a normal perturbation of six radians, which scrambles the
+       normal outright. bike.js's own header calls that number out by
+       name and says do not copy it; this file was where it was copied
+       from.
+
+   character/bike.js's model has none of those: SADDLE, BARS and PEDAL
+   are MEASURED against this rider (see its header), its wheels roll
+   from distance through their own radii, and its crank takes the pedal
+   phase straight from the animator. bike.js has said since it was
+   written that `createBike` is exported "so the intro can adopt it
+   later if its owner wants one bicycle in the game rather than two".
+   This is that. Both files are now owned by the same agent, so the
+   rename risk that argued for a private copy is gone too.
+
+   WHAT THIS WRAPPER ADDS is the intro's own idiom and nothing else:
+   park() here takes a WORLD placement (the intro's bicycle is a scene
+   prop, not a child of Wally's root), where the prop's own park() only
+   knows about the stand and the lean.
+
+   Forward is +Z, on both models, so `group.rotation.y = yaw` still
+   matches the convention data.js uses for every building on the island.
    ================================================================== */
-export function createBicycle(ctx, opts = {}) {
-  const T = ctx.THREE;
-  const R = opts.wheel ?? 0.335;           // wheel radius
-  const base = opts.wheelbase ?? 1.08;     // axle to axle
-  const group = new T.Group();
-  group.name = 'intro.bicycle';
+export function createBicycle(ctx) {
+  const prop = createBike(ctx);
+  prop.group.name = 'intro.bicycle';
 
-  const toon = (o) => (ctx.mat?.toon
-    ? ctx.mat.toon({ grain: 0.35, outline: true, outlineWidth: 3.0, ...o })
-    : new T.MeshLambertMaterial({ color: o.color }));
-
-  const frameMat = toon({ color: BRAND.token2, spec: 0.16, specPow: 34, rim: 0.5 });
-  const metalMat = toon({ color: BUILD.metal, spec: 0.30, specPow: 44, specBanded: true, rim: 0.55 });
-  const tyreMat = toon({ color: LAND.rockShade, spec: 0.04, rim: 0.30, grain: 0.5 });
-  const seatMat = ctx.mat?.wood ? ctx.mat.wood({ color: BUILD.woodDark }) : toon({ color: BUILD.woodDark });
-  const basketMat = ctx.mat?.wood ? ctx.mat.wood({ color: LAND.dirt, woodScale: 1.6 }) : toon({ color: LAND.dirt });
-
-  const tyreGeo = new T.TorusGeometry(R, 0.046, 7, 26);
-  const rimGeo = new T.TorusGeometry(R - 0.055, 0.020, 6, 24);
-  const spokeGeo = new T.BoxGeometry(0.013, (R - 0.075) * 2, 0.013);
-  const hubGeo = new T.CylinderGeometry(0.035, 0.035, 0.10, 10);
-  const tubeGeo = new T.CylinderGeometry(1, 1, 1, 9);
-  const owned = [tyreGeo, rimGeo, spokeGeo, hubGeo, tubeGeo];
-
-  const _a = new T.Vector3(), _b = new T.Vector3(), _d = new T.Vector3();
-  const UP = new T.Vector3(0, 1, 0);
-  /* One unit cylinder, re-oriented per tube — nine tubes, one geometry. */
-  function tube(parent, ax, ay, az, bx, by, bz, r, mat) {
-    _a.set(ax, ay, az); _b.set(bx, by, bz);
-    _d.subVectors(_b, _a);
-    const len = _d.length();
-    const m = new T.Mesh(tubeGeo, mat);
-    m.scale.set(r, len, r);
-    m.position.copy(_a).addScaledVector(_d, 0.5);
-    m.quaternion.setFromUnitVectors(UP, _d.normalize());
-    parent.add(m);
-    return m;
-  }
-
-  const wheels = [];
-  for (const s of [1, -1]) {
-    const w = new T.Group();
-    w.position.set(0, R, s * base * 0.5);
-    const tyre = new T.Mesh(tyreGeo, tyreMat);
-    tyre.rotation.y = Math.PI / 2;
-    const rim = new T.Mesh(rimGeo, metalMat);
-    rim.rotation.y = Math.PI / 2;
-    const hub = new T.Mesh(hubGeo, metalMat);
-    hub.rotation.z = Math.PI / 2;
-    w.add(tyre, rim, hub);
-    for (let i = 0; i < 5; i++) {
-      const sp = new T.Mesh(spokeGeo, metalMat);
-      sp.rotation.x = (i / 5) * Math.PI;
-      w.add(sp);
-    }
-    group.add(w);
-    wheels.push(w);
-  }
-
-  const BB = [0, 0.30, -0.03];             // bottom bracket
-  const HEAD = [0, 0.93, 0.44];            // top of the head tube
-  const SEAT = [0, 0.88, -0.25];           // top of the seat tube
-  const RAX = [0, R, -base * 0.5];
-  const FAX = [0, R, base * 0.5];
-
-  tube(group, ...BB, ...HEAD, 0.030, frameMat);              // down tube
-  tube(group, ...SEAT, ...HEAD, 0.026, frameMat);            // top tube
-  tube(group, ...BB, ...SEAT, 0.028, frameMat);              // seat tube
-  for (const s of [-1, 1]) {
-    tube(group, HEAD[0], HEAD[1] + 0.05, HEAD[2] + 0.02,
-      FAX[0] + s * 0.048, FAX[1], FAX[2], 0.019, frameMat);  // fork blade
-  }
-  for (const s of [-1, 1]) {
-    tube(group, RAX[0] + s * 0.055, RAX[1], RAX[2], ...SEAT, 0.017, frameMat);   // seat stay
-    tube(group, RAX[0] + s * 0.055, RAX[1], RAX[2], ...BB, 0.017, frameMat);     // chain stay
-  }
-
-  /* handlebar + stem */
-  tube(group, HEAD[0], HEAD[1] + 0.06, HEAD[2] + 0.03, 0, 1.00, 0.50, 0.018, metalMat);
-  tube(group, -0.215, 1.00, 0.50, 0.215, 1.00, 0.50, 0.017, metalMat);
-
-  /* saddle */
-  const saddle = new T.Mesh(new T.SphereGeometry(0.5, 10, 7), seatMat);
-  saddle.geometry.scale(0.085, 0.045, 0.155);
-  saddle.position.set(0, SEAT[1] + 0.04, SEAT[2] - 0.02);
-  group.add(saddle);
-  owned.push(saddle.geometry);
-
-  /* crank + pedals — the arms are 180 deg apart, so the two feet in
-     the ride clip (which pedal in antiphase) land on them. */
-  const crank = new T.Group();
-  crank.position.set(0, BB[1], BB[2]);
-  tube(crank, -0.058, 0, 0, 0.058, 0, 0, 0.016, metalMat);
-  for (const s of [-1, 1]) {
-    const arm = new T.Group();
-    arm.position.set(s * 0.064, 0, 0);
-    arm.rotation.x = s > 0 ? 0 : Math.PI;
-    tube(arm, 0, 0, 0, 0, -0.155, 0, 0.014, metalMat);
-    const pedal = new T.Mesh(new T.BoxGeometry(0.055, 0.016, 0.095), seatMat);
-    pedal.position.set(0, -0.165, 0);
-    arm.add(pedal);
-    owned.push(pedal.geometry);
-    crank.add(arm);
-  }
-  group.add(crank);
-
-  /* front basket — the detail that makes it his bike and not a bike */
-  const basket = new T.Group();
-  basket.position.set(0, 0.86, 0.60);
-  const bw = 0.20, bh = 0.15, bd = 0.15;
-  const panel = new T.BoxGeometry(1, 1, 1);
-  owned.push(panel);
-  const wall = (px, py, pz, sx, sy, sz) => {
-    const m = new T.Mesh(panel, basketMat);
-    m.position.set(px, py, pz); m.scale.set(sx, sy, sz);
-    basket.add(m);
-  };
-  wall(0, -bh / 2, 0, bw, 0.016, bd);
-  wall(0, 0, bd / 2, bw, bh, 0.014);
-  wall(0, 0, -bd / 2, bw, bh, 0.014);
-  wall(-bw / 2, 0, 0, 0.014, bh, bd);
-  wall(bw / 2, 0, 0, 0.014, bh, bd);
-  group.add(basket);
-
-  /* Kickstand. A bike leaning at 8 degrees with nothing under it reads
-     as falling over; this is the one part that makes the parked shot
-     look parked. */
-  const stand = tube(group, -0.03, 0.30, -0.10, -0.20, 0.005, -0.20, 0.013, metalMat);
-  stand.visible = false;
-
-  if (ctx.mat?.register) ctx.mat.register(group, { castShadow: true, receiveShadow: true });
-
-  let spin = 0;
   const api = {
-    group,
-    /** Roll the wheels and turn the cranks for `speed` m/s. */
-    update(dt, speed) {
-      spin += (speed * dt) / R;
-      for (const w of wheels) w.rotation.x = spin;
-      crank.rotation.x = spin * 0.42;
+    group: prop.group,
+    /** Where the rider's pelvis has to land. The intro reads it rather
+        than keeping a second copy — that constant getting out of step
+        with the frame is exactly how the feet left the pedals. */
+    SADDLE: prop.SADDLE,
+    PEDAL: prop.PEDAL,
+    R: prop.R,
+
+    /** Axle to axle, read off the prop rather than typed in again. */
+    wheelbase: prop.wheels.length > 1
+      ? Math.abs(prop.wheels[0].position.z - prop.wheels[1].position.z) : 0,
+
+    /** Roll the wheels by `metres` of ground. See bike.js `roll`. */
+    roll(metres) { return prop.roll(metres); },
+
+    /** The parked lean and the stand's design contact point, read off
+        the prop. parkArrival() hands both to solveParkPose; keeping a
+        second copy of either here is how the intro's park solve came to
+        be a generation behind the gameplay one. */
+    get parkLean() { return prop.parkLean; },
+    get standFoot() { return prop.standFoot; },
+
+    /** Take it off the stand — it is being RIDDEN again.
+        Only the debug seek needs this: seeking to the hero mark parks
+        the machine, and seeking BACK to the ride mark handed it to
+        driveCharacter with the kickstand still out and the park lean
+        still on the group. A ridden bicycle standing on its stand is
+        the same defect as a parked one without. */
+    unpark() {
+      prop.park(false);
+      prop.group.rotation.order = 'XYZ';
+      prop.group.rotation.set(0, 0, 0);
     },
-    /** Lean it on its side stand at (x,y,z) facing `yaw`. */
-    park(x, y, z, yaw) {
-      group.position.set(x, y, z);
-      group.rotation.set(0, yaw, -0.13);
-      stand.visible = true;
-      crank.rotation.x = 1.15;          // cranks level-ish, as they park
+
+    /** Turn the cranks to a pedal phase in radians. The intro takes
+        this from the ride clip's own cycle, never from the wheel. */
+    setCrankPhase(ph) { prop.setCrankPhase(ph); },
+
+    /**
+     * Lean it on its stand at a world placement, pitched `pitch` about
+     * its own lateral axis so both wheels touch a sloping stage.
+     *
+     * ROTATION ORDER IS LOAD-BEARING. Default 'XYZ' composes Rx*Ry*Rz,
+     * which applies the pitch OUTSIDE the yaw — about the world x axis
+     * — so a bicycle parked facing east would tip sideways instead of
+     * nose-up. 'YXZ' gives Ry*Rx*Rz: yaw in the world, pitch about the
+     * machine's own lateral axis, and then prop.park()'s lean on z,
+     * innermost, about its own forward axis. wally.js's parkProp() sets
+     * the same order for the same reason; see the note there, and the
+     * measured before/after that made it necessary.
+     *
+     * @param {number} pitch radians, NEGATIVE for nose-up (three.js Rx
+     *        sends (0,0,L) to y = -L sin x, so +z falls on a positive x)
+     * @param {number} [roll] radians about its own forward axis. Omit
+     *        for the flat-ground lean; parkArrival passes the conformed
+     *        roll so the kickstand sits on the ground's cross-slope
+     *        rather than on the machine's own contact plane.
+     */
+    park(x, y, z, yaw, pitch = 0, roll) {
+      prop.group.position.set(x, y, z);
+      prop.group.rotation.order = 'YXZ';
+      prop.group.rotation.set(Number.isFinite(pitch) ? pitch : 0, yaw, 0);
+      prop.park(true, roll);
     },
-    dispose() {
-      group.parent?.remove(group);
-      for (const g of owned) g.dispose();
-      for (const m of [frameMat, metalMat, tyreMat, seatMat, basketMat]) m.dispose?.();
-    },
+
+    dispose() { prop.dispose(); },
   };
   return api;
 }

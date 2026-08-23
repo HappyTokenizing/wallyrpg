@@ -570,8 +570,19 @@ export function createScooter(ctx) {
     }
   }
 
+  /* SIDE STAND. See bike.js's kickstand block for the arithmetic: the
+     group rolls about the ground line through both wheel contacts, so a
+     foot at local (x, y) touches down when y = -x*tan(standLean). At
+     -0.16 rad and x 0.300 that is y 0.048. It has to be on +x because a
+     NEGATIVE roll tips the top toward +x, and a machine leaning away
+     from its own stand is the defect that made park() dead code. */
+  const SCOOT_FOOT = { x: 0.300, y: 0.048, z: -0.300 };
+  const stand = K.tube(group, [0.086, 0.196, -0.236], [SCOOT_FOOT.x, SCOOT_FOOT.y, SCOOT_FOOT.z], 0.018, metalMat);
+  stand.name = 'kickstand';
+  stand.visible = false;
+
   return finish(ctx, group, {
-    kind: 'scooter', R, wheels, steer,
+    kind: 'scooter', R, wheels, steer, stand, standFoot: SCOOT_FOOT,
     SADDLE: { x: 0, y: F.seatY, z: F.seatZ },
     BARS: SCOOT_BARS,
     REST: { y: F.deckY, z: F.deckZ },
@@ -776,8 +787,17 @@ export function createMotorcycle(ctx) {
     K.guard(group, R + 0.008, SEC + 0.014, R + 0.034, RZ, Math.PI * 0.52, Math.PI * 0.36, tankMat);
   }
 
+  /* SIDE STAND — same rule as the scooter's, and it is longer because
+     this one leans further: y = -x*tan(-0.20) puts the foot at 0.069 at
+     x 0.340. A cruiser's stand also hangs from further forward, ahead
+     of the peg rather than behind it. */
+  const MOTO_FOOT = { x: 0.340, y: 0.069, z: -0.372 };
+  const stand = K.tube(group, [0.112, 0.244, -0.286], [MOTO_FOOT.x, MOTO_FOOT.y, MOTO_FOOT.z], 0.022, metalMat);
+  stand.name = 'kickstand';
+  stand.visible = false;
+
   return finish(ctx, group, {
-    kind: 'motorcycle', R, wheels, steer,
+    kind: 'motorcycle', R, wheels, steer, stand, standFoot: MOTO_FOOT,
     SADDLE: { x: 0, y: F.seatY, z: F.seatZ },
     BARS: MOTO_BARS,
     REST: { y: F.pegY, z: F.pegZ },
@@ -792,12 +812,38 @@ export function createMotorcycle(ctx) {
    ================================================================== */
 function finish(ctx, group, spec, K) {
   if (ctx.mat.register) ctx.mat.register(group, { castShadow: true, receiveShadow: true });
-  /* Nothing here is frustum-culled on its own: the group rides Wally's
-     root and his bounding sphere already covers it, and a wheel that
-     pops out at the frame edge is a worse defect than a draw call. */
-  group.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });
+  /* FRUSTUM CULLING IS ON. It used to be switched off across the whole
+     prop, on the argument that "the group rides Wally's root and his
+     bounding sphere already covers it, and a wheel that pops out at the
+     frame edge is a worse defect than a draw call".
 
-  let spin = 0, steerAng = 0;
+     Neither half of that survived measurement. Three.js culls a mesh
+     only when its OWN bounding sphere is entirely outside the frustum,
+     so a wheel half in shot is never culled and cannot pop; and Wally's
+     bounding sphere covers nothing here, because the prop's meshes are
+     tested individually and are not inside it in any case. What the
+     flag actually bought was a machine that keeps drawing when it is
+     behind the lens: a bicycle PARKED 12 m behind the camera measured
+     199 draw calls and 30 751 rendered triangles a frame, and one 40 m
+     behind measured 163 and 25 541. With the flag on, all that is left
+     off screen is the shadow — 106 calls under 20 m, 53 out to 80 m,
+     0 past 100 — and parkedCull() in wally.js takes even that to 0
+     past 64 m. See the ladder in this file's header. */
+  group.traverse((o) => { if (o.isMesh) o.frustumCulled = true; });
+
+  /* ONE ACCUMULATOR PER WHEEL, AND EACH ONE ITS OWN RADIUS.
+     `spec.R` is the machine's nominal wheel, and on the motorcycle it
+     is a lie about one of the two: the rear is built at R + 0.008
+     because "a size fatter" is what reads as powerful. Rolling both off
+     spec.R therefore ran the rear 3.1% fast — measured, at 11 m/s, as
+     0.6078 rev/m delivered against 0.5895 demanded. The axle height IS
+     the rolling radius of a wheel standing on the ground, so read it
+     off the object instead of trusting a constant.
+     See bike.js's `roll` for why the angle is wrapped at exactly 2*pi. */
+  const TAU = Math.PI * 2;
+  const wheelR = spec.wheels.map((w) => Math.max(w.position.y, 0.02));
+  const wheelA = spec.wheels.map(() => 0);
+  let odo = 0, steerAng = 0;
 
   const api = {
     group,
@@ -811,18 +857,33 @@ function finish(ctx, group, spec, K) {
     PEDAL: { y: spec.REST.y, z: spec.REST.z, r: 0 },
     wheels: spec.wheels,
     steer: spec.steer,
+    stand: spec.stand || null,
     crank: null,
+    R: spec.R,
+    get wheelRadii() { return wheelR.slice(); },
+    get odometer() { return odo; },
 
-    /** Roll the wheels for `speed` metres/second. No crank: a motor's
-        wheels are geared to an engine the player never sees, so the
-        only honest drive is distance over radius. */
-    update(dt, speed) {
-      const v = Number.isFinite(speed) ? speed : 0;
-      spin += (v * dt) / spec.R;
-      if (!Number.isFinite(spin)) spin = 0;
-      for (const w of spec.wheels) w.rotation.x = spin;
-      return spin;
+    /** Roll the wheels forward by `metres` of ground. No crank: a
+        motor's wheels are geared to an engine the player never sees, so
+        the only honest drive is distance over radius. */
+    roll(metres) {
+      const d = Number.isFinite(metres) ? metres : 0;
+      odo += d;
+      if (!Number.isFinite(odo)) odo = 0;
+      for (let i = 0; i < spec.wheels.length; i++) {
+        let a = wheelA[i] + d / wheelR[i];
+        a -= Math.floor(a / TAU) * TAU;
+        if (!Number.isFinite(a)) a = 0;
+        wheelA[i] = a;
+        spec.wheels[i].rotation.x = a;
+      }
+      return odo;
     },
+
+    /* No update(dt, speed) here either — see bike.js, where the same
+       unused convenience wrapper was removed. The prop contract is
+       roll(metres) + setCrankPhase(radians), and each half has exactly
+       one caller (wally.js bikeUpdate, intro.js driveCharacter). */
 
     /** No-op: the bicycle's contract, kept so the caller has one path. */
     setCrankPhase() {},
@@ -838,10 +899,16 @@ function finish(ctx, group, spec, K) {
     get steerAngle() { return steerAng; },
 
     /** Parked: leaned over on its side stand. Both machines are heavy
-        enough that they lean further than the bicycle does. */
-    park(on = true) {
-      group.rotation.z = on ? spec.standLean : 0;
+        enough that they lean further than the bicycle does.
+        `roll` overrides the lean when the caller has conformed it to
+        the ground's cross-slope — see solveParkPose in bike.js. */
+    park(on = true, roll) {
+      if (spec.stand) spec.stand.visible = !!on;
+      group.rotation.z = on ? (Number.isFinite(roll) ? roll : spec.standLean) : 0;
     },
+    /** Same keys bike.js publishes, so the caller has one path. */
+    get parkLean() { return spec.standLean; },
+    get standFoot() { return spec.standFoot || null; },
 
     dispose() {
       group.parent?.remove(group);

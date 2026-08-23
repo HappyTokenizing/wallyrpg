@@ -1969,7 +1969,51 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
 
   let rockMat = null, ledgeMat = null;
   const rockGeos = [];
+  /* Every rock that stands proud of ground a player can walk on, with
+     the matrix it was drawn at. Registered with ctx.phys in a window
+     around the player — see rockCollision(). */
+  const rockCols = [];
+  /* One plain record per placed rock — kind, how proud it stands, the
+     ground normal under it, and which half of the gate (if either)
+     turned it away. Five hundred-odd tiny objects, no geometry held;
+     it is what `rockGateCensus()` reports, and the only way to answer
+     "why has that drawn boulder no body?" without a rebuild. */
+  const rockCensus = [];
+  const _rbb = new THREE.Box3();
+  const _rfn = new THREE.Vector3();
   const _UPV = new THREE.Vector3(0, 1, 0);
+
+  /* The two numbers the collider gate is made of: how proud a rock has
+     to stand before its own surface is a better answer than the
+     heightfield under it (surfacetest's SINK_TOL is 0.12, so anything
+     under 0.10 is already inside tolerance), and the slope beyond
+     which ground stops being ground he can stand on. */
+  const ROCK_RISE = 0.10;
+  const ROCK_WALK_NY = 0.45;
+
+  /**
+   * Is any of the ground this block covers ground he could stand on,
+   * with the block standing proud of it?
+   *
+   * A 5x5 grid over the transformed bounding box. The box is a
+   * superset of the hull, so a corner sample can vote for a block that
+   * does not actually reach there — that costs a few hundred triangles
+   * of collision and never costs correctness, which is the right way
+   * round for a gate whose failure mode is a drawn rock with no body.
+   */
+  function walkableUnder(bb, anchorNy) {
+    if (anchorNy > ROCK_WALK_NY) return true;
+    const dx = (bb.max.x - bb.min.x) / 4, dz = (bb.max.z - bb.min.z) / 4;
+    for (let i = 0; i <= 4; i++) {
+      for (let j = 0; j <= 4; j++) {
+        const x = bb.min.x + dx * i, z = bb.min.z + dz * j;
+        normalAt(x, z, _rfn);
+        if (_rfn.y <= ROCK_WALK_NY) continue;
+        if (bb.max.y - heightAt(x, z) > ROCK_RISE) return true;
+      }
+    }
+    return false;
+  }
 
   /* One boulder. Wind Waker rock is CARVED: a big confident rounded
      mass, then flat planes cut into it. So — lobes for the mass,
@@ -2364,6 +2408,74 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
         out.setRGB(out.r * k, out.g * k, out.b * k);
         groundChroma(out);
       }, (c.kind === 'slab' ? 'L' : 'R') + sectorKey(jx, jz));
+
+      /* ----------------------------------------------------------
+         THE ONES YOU CAN WALK INTO.
+
+         Rock is the only part of the island the heightfield cannot
+         express, so none of it was in the collision world — and
+         surfacetest found him a full 0.45 m inside the talus lying on
+         the beach, which is shin-deep in a boulder he is standing
+         beside. Two gates keep this from becoming a quarter of a
+         million triangles of cliff:
+
+           the ROCK has to stand proud enough to matter (below the
+           tolerance the heightfield under it is already the right
+           answer), and
+
+           the GROUND under it has to be walkable. A block bedded into
+           a 60-degree wall is backed by terrain he cannot reach in the
+           first place; giving it a body would only ever cost the
+           camera a clearance ray.
+
+         THE SECOND GATE USED TO ASK ABOUT A POINT AND THE ROCK IS NOT
+         A POINT. It read normalAt(jx, jz) — the ground under the
+         block's ANCHOR — and a talus block is up to 23 m across. The
+         east beach had one anchored at (479.3, 5.9) where the shore
+         face falls at 67 degrees (n.y 0.391), so the gate threw it
+         away; its flanks lie out across the flat sand four metres
+         away, and surfacetest found him 0.45 m inside a boulder that
+         was drawn and had no body. So the question is asked over the
+         block's whole PLAN FOOTPRINT: is there anywhere under this
+         thing where the ground is walkable AND the rock stands proud
+         of it? The anchor is still the fast path — only the blocks the
+         old gate would have rejected pay for the grid.
+
+         The survivors are handed their OWN geometry, not a proxy: a
+         box round a lobed boulder either floats over its flanks or
+         sinks under its crown, and 0.12 m is not enough room for
+         either. Cost is bounded by streaming them (rockCollision
+         below), not by approximating them.
+         ---------------------------------------------------------- */
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      _rbb.copy(geo.boundingBox).applyMatrix4(m4);
+      const rise = _rbb.max.y - gy;
+      /* ROCK_RISE is 0.10 because the surface test's tolerance is 0.12
+         and a rock under that is already inside it; ROCK_WALK_NY is
+         0.45 because ground steeper than that is not ground he can
+         stand on, and rock backed only by such ground would cost a
+         camera ray and buy nothing. What changed is WHERE the second
+         one is evaluated — see walkableUnder(). */
+      const okRise = rise > ROCK_RISE, okGround = walkableUnder(_rbb, nrm.y);
+      rockCensus.push({
+        x: +jx.toFixed(1), z: +jz.toFixed(1), kind: c.kind,
+        rise: +rise.toFixed(3), ny: +nrm.y.toFixed(3),
+        top: +_rbb.max.y.toFixed(2), gy: +gy.toFixed(2),
+        /* the plan box the footprint gate walked, so an outside judge
+           can re-run the same question on its own terms — see the rock
+           assertion in tools/surfacetest.mjs */
+        box: [+_rbb.min.x.toFixed(2), +_rbb.min.z.toFixed(2), +_rbb.max.x.toFixed(2), +_rbb.max.z.toFixed(2)],
+        r: +(Math.max(_rbb.max.x - _rbb.min.x, _rbb.max.z - _rbb.min.z) * 0.5).toFixed(2),
+        solid: okRise && okGround,
+        why: okRise && okGround ? '' : (!okRise && !okGround ? 'rise+ground' : (!okRise ? 'rise' : 'ground')),
+      });
+      if (okRise && okGround) {
+        rockCols.push({
+          x: jx, z: jz, geo, m: m4.clone(),
+          r: Math.max(_rbb.max.x - _rbb.min.x, _rbb.max.z - _rbb.min.z) * 0.5,
+          tris: geo.attributes.position.count / 3,
+        });
+      }
     }
 
     merger.build(ledgeMat, rockGroup, 'ledge', 'L');
@@ -2376,160 +2488,64 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
   }
 
   /* ============================================================
-     THE GRASS LIP.
+     THE GRASS LIP IS GONE. Read this before adding it back.
 
-     Turf does not stop at a cliff edge, it overhangs it: the root
-     mat holds a foot or two of sod out over the drop before it
-     breaks off. Without it the plateau meets the face along a hard
-     line — which is exactly what the shore shot showed — and no
-     amount of colour blending fixes a hard line, because the line is
-     a silhouette.
+     The feature drew sod tongues overhanging the island's brinks, to
+     break the hard silhouette line where the plateau meets the face.
+     It had three rounds of art fixes, each of which found something
+     real: a full random spin and a depth scaled off the width (12 m
+     sods pointing at any bearing, six metres thick); mats plastering
+     grey rock metres below the turf line, fixed with a daylight
+     requirement; and a lift term that always won on a real cliff, so
+     the top face sat a median 1.43 m below its own brink. After all
+     three it still read as "a large planar green wedge extruded
+     sideways into the sky ... a diving board, not torn sod".
 
-     Sod tongues, merged and static: the colour is sampled from the
-     ground's own palette at the root so they cannot read as
-     separate objects, and the tip is pulled toward the shade tone so
-     each tongue has an underside.
+     WHAT DECIDED IT was four A/B pairs shot from spots the physics
+     controller actually stands on, with main.js's dt frozen to zero so
+     the only difference between the two frames is the tongues (wind,
+     grass, cloud and water move enough to change 83k pixels of a 921k
+     frame otherwise, which is how a diff of this feature had been
+     lying). The frames are the argument, not this paragraph:
+     scratchpad wl7/ab, run6a/run11/run6b/lone-divingboard, -off
+     against -on. In every one the frame is better WITHOUT: the OFF
+     ridge is a clean grass headland whose edge is already broken all
+     along by the blade field, and the ON frame adds dark, hard-edged,
+     dead-straight flat polygons that read as torn card stuck to the
+     silhouette, or as holes punched in the world.
+
+     THE ONE PLACE IT WAS SAID TO WORK — "several tongues seen edge-on
+     along one brink" — WAS SHOT ON PURPOSE AND FAILED. It also barely
+     existed: measured over the 80 that stood, no tongue anywhere on
+     the island had three neighbours within 6 m, 24 of the 39 clusters
+     were a single tongue, and 15 tongues had nothing within 12 m. A
+     grid picker over a 0.13-0.38 steepness band produces isolated
+     picks, and AIR_MIN then deleted 184 of 264 and thinned what runs
+     there were into scattered singletons. A real fringe needs a traced
+     brink polyline and elements at tuft scale — and at tuft scale the
+     element IS a grass blade, which grass.js already draws at 68 per
+     m² with wind, baked AO, ground-sampled colour and a far-field
+     shader path. The endpoint of the surviving design is a worse
+     duplicate of a feature that already exists.
+
+     AND 38 % OF WHAT IT DREW WAS BURIED. AIR_MIN was a MAXIMUM over
+     the mat's 135 vertices, so a mat lying in a terrace passed on its
+     single most-lifted corner: of the 80 placed, 30 had a vertex under
+     0.10 m of clearance, 20 had a third or more of the mat under
+     0.10 m, 17 had a median vertex under 0.25 m and 11 had their
+     median vertex UNDERGROUND — the worst 123 of 135 vertices under
+     the raster, 91 % buried. Gating on a fraction instead of the
+     extremum was the fix while the feature lived; deleting it removes
+     the same waste, all 3,600 triangles of it.
+
+     What the island loses: nothing that showed up in a frame. The
+     ground shader still paints turf green over the brink (lipFactor,
+     above, which is a different thing and stays), and the blade field
+     still breaks the edge. If you bring this back, bring back a
+     silhouette A/B with the world frozen — not a screenshot from on
+     top of the brink looking down, which is the one angle at which a
+     curtain looks like a sheet.
      ============================================================ */
-  const lipGroup = new THREE.Group();
-  lipGroup.name = 'terrain.lip';
-  let lipMat = null;
-  const lipGeos = [];
-
-  function makeSodGeo(rng) {
-    /* Local +Y runs root -> tip; the instance rotates it to hang. */
-    const RINGS = [0, 0.34, 0.66, 0.88, 1.0];
-    const SEG = 5;
-    const curl = 0.16 + rng() * 0.26;
-    const pos = [], idx = [];
-    for (let r = 0; r < RINGS.length; r++) {
-      const t = RINGS[r];
-      /* Only a light taper. A tongue that comes to a point renders as
-         a blade of grass, and a thousand of them along a brink read
-         as green confetti — which is what the first pass did. Turf
-         tears off in blunt-ended slabs. */
-      const w = (0.5 - 0.13 * t * t) * (0.86 + rng() * 0.3);
-      const th = 0.30 * (1 - 0.62 * t);
-      for (let s = 0; s < SEG; s++) {
-        const a = (s / SEG) * Math.PI * 2;
-        pos.push(
-          Math.cos(a) * w,
-          t + Math.sin(a) * th * 0.35,
-          Math.sin(a) * th + curl * t * t,
-        );
-      }
-    }
-    const tipBase = pos.length / 3;
-    pos.push(0, 1.06, curl * 1.1);
-    for (let r = 0; r < RINGS.length - 1; r++) {
-      for (let s = 0; s < SEG; s++) {
-        const a = r * SEG + s, b = r * SEG + (s + 1) % SEG;
-        idx.push(a, b, a + SEG, b, b + SEG, a + SEG);
-      }
-    }
-    const last = (RINGS.length - 1) * SEG;
-    for (let s = 0; s < SEG; s++) idx.push(last + s, last + (s + 1) % SEG, tipBase);
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
-    g.setIndex(idx);
-    g.computeVertexNormals();
-    const out = g.toNonIndexed();
-    g.dispose();
-    out.computeVertexNormals();
-    return out;
-  }
-
-  function buildLip() {
-    const rng = ctx.makeRng('wally.lip.v1');
-    const scale = clamp(ctx.quality.grass ?? 1, 0.28, 1.4);
-    lipMat = ctx.mat.plaster({
-      name: 'terrain.lip',
-      color: 0xffffff, vertexColors: true,
-      variation: 0.0, edgeWear: 0.0, varScale: 0.5, relief: 0.34,
-      grain: 0.018, grainScale: 1.5, grainAlbedo: 0.15, grainFade: [90, 340],
-      macro: 0.30, macroScale: 0.20,
-      term: 0.16, bandSoft: 0.026, band2: 0.22, core: 0.56, coreSoft: 0.04,
-      spec: 0.035, specPow: 24, rim: 0.30, skyBounce: 0.12,
-      outline: false, noOutline: true,
-    });
-    for (let i = 0; i < 6; i++) lipGeos.push(makeSodGeo(rng));
-
-    const picks = [];
-    const STRIDE = 2;
-    for (let j = 2; j < NZ - 2; j += STRIDE) {
-      for (let i = 2; i < NX - 2; i += STRIDE) {
-        const o = IX(i, j);
-        const h = H[o];
-        if (h < 2.2) continue;
-        const x = wx(i), z = wz(j);
-        if (PATH[o] > 0.15 || nearLocation(x, z, 1.2)) continue;
-        const st = wideSteep(x, z, 6);
-        if (st < 0.13 || st > 0.62) continue;
-        const e = 6;
-        const gx = (heightAt(x + e, z) - heightAt(x - e, z)) / (2 * e);
-        const gz = (heightAt(x, z + e) - heightAt(x, z - e)) / (2 * e);
-        const m = Math.hypot(gx, gz);
-        if (m < 1e-4) continue;
-        const ux = gx / m, uz = gz / m;                  // uphill
-        if (wideSteep(x + ux * 8, z + uz * 8, 6) > 0.13) continue;   // still climbing
-        if (wideSteep(x - ux * 8, z - uz * 8, 6) < 0.28) continue;   // nothing below
-        picks.push({ x, z, ux, uz });
-      }
-    }
-
-    const budget = Math.round(1500 * scale);
-    let list = picks;
-    if (picks.length > budget) {
-      const step = picks.length / budget;
-      list = [];
-      for (let t = 0; t < budget; t++) list.push(picks[Math.floor(t * step)]);
-    }
-
-    const merger = makeMerger();
-    const m4 = new THREE.Matrix4();
-    const n3 = new THREE.Matrix3();
-    const q = new THREE.Quaternion(), q2 = new THREE.Quaternion();
-    const p = new THREE.Vector3(), sc = new THREE.Vector3(), ax = new THREE.Vector3();
-    const root = new THREE.Color(), tipc = new THREE.Color();
-
-    for (const c of list) {
-      const geo = lipGeos[Math.floor(rng() * lipGeos.length)];
-      /* WIDE and short. Long and thin reads as a blade of grass and
-         the first pass at this rendered as green confetti along the
-         brink; a sod overhang is a MAT of turf with its root layer
-         showing, so it has to be wider than it is deep. */
-      const len = 1.5 + rng() * 2.4;
-      const wide = len * (1.5 + rng() * 1.2);
-      /* Out over the brink and down. */
-      const jx = c.x - c.ux * (0.4 + rng() * 1.5);
-      const jz = c.z - c.uz * (0.4 + rng() * 1.5);
-      const gy = heightAt(jx, jz);
-      /* Mostly straight down, with a little of the fall line in it —
-         turf tears off vertically, it does not lie on the slope. */
-      ax.set(-c.ux * (0.28 + rng() * 0.34), -1, -c.uz * (0.28 + rng() * 0.34)).normalize();
-      q.setFromUnitVectors(_UPV, ax);
-      q2.setFromAxisAngle(_UPV, rng() * Math.PI * 2);
-      q.multiply(q2);
-      sc.set(wide, len, wide * (0.6 + rng() * 0.35));
-      p.set(jx, gy + 0.34 + rng() * 0.26, jz);
-      m4.compose(p, q, sc);
-      n3.getNormalMatrix(m4);
-
-      groundColor(c.x + c.ux * 3, c.z + c.uz * 3, heightAt(c.x + c.ux * 3, c.z + c.uz * 3), 1, root);
-      tipc.copy(root).lerp(C_GRASS_D, 0.55);
-      merger.add(geo, m4, n3, (wv, wn, out) => {
-        /* Down the tongue toward the tip, and darker underneath —
-           the sod's own thickness reading as a shadowed edge. */
-        const t = clamp((gy + 0.4 - wv.y) / Math.max(0.6, len), 0, 1);
-        out.copy(root).lerp(tipc, t * 0.9);
-        const k = 0.72 + 0.34 * (wn.y * 0.5 + 0.5);
-        out.setRGB(out.r * k, out.g * k, out.b * k);
-      }, sectorKey(jx, jz));
-    }
-
-    merger.build(lipMat, lipGroup, 'lip');
-    ctx.mat.register(lipGroup, { outline: false, castShadow: true, receiveShadow: true });
-    return list.length;
-  }
 
   /* ============================================================
      Collision — a 3x3 window of 64 m tiles that follows the player.
@@ -2611,6 +2627,43 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
   const pendingColKeys = new Set();
 
   /* ------------------------------------------------------------
+     ROCK COLLISION — the same window trick, one rock at a time.
+
+     The candidates were chosen at build time (see buildRocks); this
+     only decides which of them are live. Radius is deliberately a
+     little wider than the terrain window's inner tile so a boulder is
+     always solid well before he can reach it, and the drop radius is
+     wider still so walking a boundary cannot thrash it.
+     ------------------------------------------------------------ */
+  const ROCK_IN = 62, ROCK_OUT = 82;
+  const rockLive = new Map();          // index -> body id
+  let rockTris = 0;
+
+  function updateRockCollision(px, pz, budget = 2) {
+    if (!ctx.phys || !ctx.phys.addTriangles || !rockCols.length) return;
+    for (const [i, id] of [...rockLive]) {
+      const r = rockCols[i];
+      if (Math.hypot(r.x - px, r.z - pz) <= ROCK_OUT + r.r) continue;
+      ctx.phys.remove(id);
+      rockLive.delete(i);
+      rockTris -= r.tris;
+    }
+    let n = 0;
+    for (let i = 0; i < rockCols.length && n < budget; i++) {
+      if (rockLive.has(i)) continue;
+      const r = rockCols[i];
+      if (Math.hypot(r.x - px, r.z - pz) > ROCK_IN + r.r) continue;
+      rockLive.set(i, ctx.phys.addTriangles(
+        r.geo.attributes.position.array,
+        r.geo.index ? r.geo.index.array : null,
+        { matrix: r.m, name: 'terrain.rock', walkable: true },
+      ));
+      rockTris += r.tris;
+      n++;
+    }
+  }
+
+  /* ------------------------------------------------------------
      Build
      ------------------------------------------------------------ */
   const t0 = (typeof performance !== 'undefined' ? performance.now() : 0);
@@ -2645,7 +2698,7 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
   );
 
   return {
-    group, material, bounds, tiles, rockGroup, lipGroup,
+    group, material, bounds, tiles, rockGroup,
     NX, NZ, CELL, BX, BZ, gx0, gz0, H, PATH, SD,
     IX, wx, wz,
     zoneList, setTurf,
@@ -2658,22 +2711,26 @@ vec3 wTerrainTurf( vec3 base, vec3 wp, vec3 nrm ) {
       buildTiles();
       this.stats.tiles = tiles.length;
       this.stats.rocks = buildRocks();
-      this.stats.lip = buildLip();
     },
 
     heightAt, normalAt, slopeAt, pathAt, shoreDistAt, shoreDist,
     zoneAt, zoneIndexAt, groundColor,
     wideSteep, lipFactor, rockBase, cliffiness, patchStrata,
-    updateLOD, processPending, updateCollision,
+    updateLOD, processPending, updateCollision, updateRockCollision,
     colliderCount: () => colTiles.size,
+    rockColliderStats: () => ({ candidates: rockCols.length, live: rockLive.size, tris: rockTris }),
+    /** Every placed rock and why it did or did not get a body. */
+    rockGateCensus: (x, z, r = Infinity) => (r === Infinity ? rockCensus
+      : rockCensus.filter((e) => Math.hypot(e.x - x, e.z - z) <= r + e.r)),
 
     dispose() {
+      for (const id of rockLive.values()) ctx.phys?.remove(id);
+      rockLive.clear();
       for (const t of tiles) for (const g of t.geo) g?.dispose();
       material.dispose();
-      for (const m of [...rockGroup.children, ...lipGroup.children]) m.geometry?.dispose();
-      for (const g of [...rockGeos, ...lipGeos]) g.dispose();
+      for (const m of rockGroup.children) m.geometry?.dispose();
+      for (const g of rockGeos) g.dispose();
       rockMat?.dispose();
-      lipMat?.dispose();
       for (const id of colTiles.values()) ctx.phys?.remove(id);
       colTiles.clear();
     },

@@ -373,7 +373,34 @@ export function createPostFX(ctx, { composer }) {
      its halo, and blown specular catches. Those bloom generously;
      nothing else blooms at all.
      ================================================================ */
-  const MIPS = Math.max(2, q.bloomMips ?? 5);
+  /* THE FLOOR IS 3, NOT 2, AND IT IS A SAFETY FLOOR RATHER THAN A
+     LOOKS FLOOR. Read once, here, and never again: setQuality() does
+     not rebuild the pyramid, so this is the only line that decides how
+     big a bad texel gets smeared for the life of the page.
+
+     A non-finite sample that gets past the guards below arrives on
+     screen as a solid block roughly 2^(MIPS+1) px on a side —
+     MEASURED, cold boot per tier: 94x106 at 3 mips, 206x218 at 4,
+     428x432 at 5. tools/blacksquares.mjs is what catches that block in
+     a frame, and its detection floor is a measured 36x36 (a 32x32
+     plant arrives as 978 px against its MIN_PX of 1024, because FXAA
+     and the grain erode the edge). At 2 mips the block is 38x42, area
+     1554 — MEASURED on a tree built with this clamp and the low tier
+     both at 2, not extrapolated from the halving, which predicted
+     47x53 and was 20 % optimistic because the last mip's edge erodes
+     too. 1.1x the detector's floor instead of 2.6x, only 1.5x its
+     MIN_PX, and under both of its solid-pass side floors (SOLID_SIDE
+     48, SQUARE_SIDE 72) — so at 2 mips one of the two detectors that
+     watch for this block goes blind and the gate is down to detector
+     1b alone.
+
+     No shipped tier asks for fewer than 3 (contracts.js: 3/4/4/5) and
+     blacksquares now FAILS if one does; this clamp is the same floor
+     for a hand-built tier that never goes through QUALITY_TIERS. The
+     cost of raising it from 2 is exactly zero on every shipped tier,
+     and one extra quarter-res target on a tier that asked for less
+     bloom than the detector can survive. */
+  const MIPS = Math.max(3, q.bloomMips ?? 5);
 
   const bloomPreMat = composer.makeMaterial(/* glsl */`
     uniform sampler2D tSrc;
@@ -392,7 +419,17 @@ export function createPostFX(ctx, { composer }) {
          catch, an emissive with a bad exponent) is capped rather than
          zeroed, so a genuinely bright highlight still blooms. */
       vec3 c = wFinite( texture2D( tSrc, vUv ).rgb, 0.0 );
+      /* The ceiling is a SECOND, independent guard, and it has to come
+         out with the first one or W_FINITE_OFF does not restore the
+         pre-fix frame: clamp( +Inf, 0.0, 64.0 ) is a well-defined
+         64.0, so the ceiling alone stops an Inf from ever reaching the
+         pyramid. Measured — with only wFinite compiled out, an
+         injected +Inf texel left bloom mip 0 completely clean and no
+         square appeared. Both off is the frame the bug was reported
+         in; both on is what ships. */
+      #ifndef W_FINITE_OFF
       c = clamp( c, vec3( 0.0 ), vec3( uCeil ) );
+      #endif
       float br = max( c.r, max( c.g, c.b ) );
       float knee = uThreshold * uKnee + 1e-5;
       float soft = clamp( br - uThreshold + knee, 0.0, 2.0 * knee );
@@ -1129,6 +1166,26 @@ export function createPostFX(ctx, { composer }) {
 
     /* Put an intermediate buffer on screen. null restores the frame. */
     setDebug(name) { params.debug = name || null; },
+
+    /* ---- the firewall, as an A/B switch ----
+       Compiles wIsBad() out of the two materials that guard the frame
+       (see GLSL_FINITE in shaders.js). OFF is the pre-fix build: the
+       sky's stray NaN texel reaches bloomPreMat, the pyramid smears it
+       over a few hundred pixels, and the composite writes it to the
+       byte target as a black block. That is the whole reported bug, on
+       demand, which is what makes it testable — tools/blacksquares.mjs
+       --noguard asserts the block APPEARS, the plain gate asserts it
+       does not. Two material recompiles; debug only. */
+    setFiniteGuard(on) {
+      const off = on === false;
+      for (const m of [bloomPreMat, compositeMat]) {
+        m.defines = m.defines || {};
+        if (off) m.defines.W_FINITE_OFF = 1; else delete m.defines.W_FINITE_OFF;
+        m.needsUpdate = true;
+      }
+      params.finiteGuard = !off;
+      return !off;
+    },
 
     /* ---- the non-finite probe (see section 7) ----
        Every buffer in the chain, in the order the frame builds them,

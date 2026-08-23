@@ -457,6 +457,242 @@ export async function init(ctx) {
   let recoveries = 0;
   let lastStallLog = 0;
 
+  /* ============================================================
+     FAULT REPORTING — the other half of the watchdog.
+
+     Everything above this line handles a transport that has gone quiet
+     WITHOUT throwing. This handles the one that throws, which used to
+     be the module's blind spot: update() wrapped the whole frame in one
+     try/catch behind one console.warn, gated on a `loggedUpdateError`
+     flag that was set once and never cleared. So a music.tick() that
+     began throwing produced exactly one warning for the life of the
+     page, took the ambience beds and the 3D listener down with it (they
+     are after tick() inside the same try), and reported a green
+     console for the rest of the session. "Cut off and stayed off" with
+     nothing in the log is the precise shape of that.
+
+     The replacement:
+       · every sub-call gets its OWN guard, so a failing tick cannot
+         starve the beds;
+       · the first three throws print a full stack at ERROR level —
+         tools/shot.mjs greps for errors, not warnings, so a screenshot
+         run now fails on this;
+       · after that, one line every FAULT_QUIET ms, so a per-frame
+         failure cannot turn into a per-frame console flood;
+       · and it ESCALATES rather than just narrating: five in a row
+         resets the transport, forty rebuilds the whole graph once —
+         and the bar-level failure below climbs the SAME ladder, three
+         failed resets to the same rebuild, because a ladder the
+         reported bug cannot climb is a ladder with two rungs.
+     ============================================================ */
+  const FAULT_LOGS = 3;
+  const FAULT_QUIET = 10000;
+  const faults = new Map();
+  let hardRecoveries = 0;
+
+  /* `silent` is for a fault that has ALREADY been reported by whoever
+     detected it — checkBarFailures() below prints a line naming the bar
+     count and the rung, which is strictly more useful than this generic
+     one. It still has to be counted here, because the counter is what
+     the ladder climbs. */
+  function fault(where, e, { silent = false } = {}) {
+    let f = faults.get(where);
+    if (!f) { f = { where, n: 0, run: 0, logged: 0, at: 0, message: null }; faults.set(where, f); }
+    f.n++; f.run++;
+    f.message = String(e?.message || e);
+    const now = Date.now();
+    if (silent) return f;
+    if (f.logged < FAULT_LOGS) {
+      f.logged++; f.at = now;
+      console.error(`[audio] ${where} threw (${f.n}) — the score does not get to fail quietly:`, e);
+    } else if (now - f.at > FAULT_QUIET) {
+      f.at = now;
+      console.error(`[audio] ${where} has thrown ${f.n} times and is still failing: ${f.message}`);
+    }
+    return f;
+  }
+
+  /** Run one piece of the frame with its own guard, and escalate on it. */
+  function safe(where, fn) {
+    try {
+      const v = fn();
+      const f = faults.get(where);
+      if (f) f.run = 0;
+      return v;
+    } catch (e) {
+      escalate(fault(where, e));
+      return undefined;
+    }
+  }
+
+  /* THE LADDER — reset, then rebuild — and it has to be climbable from
+     BOTH shapes of failure, which it was not.
+
+     Counted on CONSECUTIVE failures, so a transient never reaches the
+     REBUILD — and say it that way, because a long enough transient
+     does climb the lower rungs, and it should. MEASURED on this build
+     with WALLY.debug.audioBreakTick(n), explore score, 2.31 s bars:
+
+       n = 3   ~7 s silent   0 alarms, 0 resets, hardRecoveries 0.
+                             peak barFails 3, back to 0 one bar after
+                             the fault clears, notes 14 -> 32. Nothing
+                             escalates at all: 3 is under BAR_ALARM_RUN.
+       n = 8   ~18 s silent  peak barFails 8, TWO alarms 5.0 s apart,
+                             one transport reset each, then it heals on
+                             its own with notes back on the wire and
+                             hardRecoveries still 0.
+
+     THE COUNTS ARE THE MEASUREMENT; THE WALL CLOCK IS NOT. Those two
+     rows reproduce exactly, run to run, and they are what
+     tools/audiotest.mjs F3/F3b actually assert. The seconds do not:
+     the ladder only advances on a BAR LINE, so the whole sequence
+     slides with the phase of the bar the injection happens to land
+     in. The ORIGIN moves by whole 2.31 s bars (and by the 500 ms poll
+     the timings are read at); the ~5.0 s SPACING between rungs does
+     not. The n = 8 row read its two alarms at 9.1 s and 14.1 s with
+     healing at 16.1 s on the run this comment was written from, and
+     14.1 s / 19.1 s with healing at 21.1 s on another run of the same
+     tree — a five-second shift of the origin, the spacing unchanged.
+     Read the spacing, not the clock, and expect any single timestamp
+     in this file to move by a bar or two.
+
+     Eighteen seconds of a room the player can hear is empty SHOULD
+     ring the alarm and reset the transport — that is what BAR_ALARM_RUN
+     is for. What must never happen on a transient is the TOP rung: the
+     rebuild is once per session and would throw away a context that
+     was about to come back by itself. So the invariant is "a transient
+     never reaches the rebuild", not "a transient never escalates".
+     PASS G is the permanent case, where the ladder does reach it.
+
+     WHAT WAS BROKEN. checkBarFailures() used to call music.recover()
+     directly and never came through here, so a bar-level fault
+     incremented no counter and could not reach the rebuild.
+     MEASURED on this build: 45 s of a permanently throwing
+     scheduleBar() gave recoveries 5, hardRecoveries 0 — and it would
+     have gone on resetting the transport every 10 s for the life of
+     the page without ever trying the one thing left. Only a throw out
+     of music.tick() ITSELF could reach the rebuild, and the bar-level
+     throw — the one that produced the reported dropout — is precisely
+     the one that cannot throw out of tick(), because music.js catches
+     it per bar. The exact fault the ladder exists for was the one it
+     could not escalate. Both shapes now count into the same map and
+     end at the same rung.
+
+     MEASURED after the fix, same permanently throwing scheduleBar():
+     THREE alarms — one transport reset each — and then the graph
+     rebuilt on the next rung, hardRecoveries 0 -> 1, with the score
+     audible again on the new context about six seconds later. The
+     run this was written from read those four events at 9.1 s,
+     14.1 s, 19.1 s and 24.1 s; like every timestamp above they are
+     bar-phase dependent and the whole sequence slides by whole 2.31 s
+     bars with the bar the injection lands in, while the ~5.0 s
+     spacing between rungs holds. tools/audiotest.mjs PASS G is that
+     run, and what it asserts is the counts and the ordering. */
+  function escalate(f) {
+    if (f.where === 'music.bar') {
+      /* The bar ladder ticks on ALARMS, not on frames: one bar failure
+         is one symptom every BAR_ALARM_QUIET, not sixty a second. Three
+         resets that fail to make a bar land, then the graph. */
+      if (f.run > BAR_RESETS) {
+        rebuildGraph(`${BAR_RESETS} transport resets have not made a single bar land`);
+        return;
+      }
+      console.error(`[audio] resetting the transport (reset ${f.run} of ${BAR_RESETS}) — `
+        + 'a bar that will not schedule is silence, whatever the flags say.');
+      recoveries++;
+      try { music.recover(); } catch (e) { fault('music.recover', e); }
+      return;
+    }
+    if (f.where !== 'music.tick' && f.where !== 'watchdog') return;
+    if (f.run === 5) {
+      console.error('[audio] the transport has failed five times running — '
+        + 'resetting it rather than playing to an empty room.');
+      recoveries++;
+      try { music.recover(); } catch (e) { fault('music.recover', e); }
+    } else if (f.run === 40) {
+      rebuildGraph('40 consecutive failures out of the transport itself');
+    }
+  }
+
+  /* Last resort, once per session. If the transport will not come back
+     after a reset then the fault is in the graph or the context itself
+     — a device change, a context the OS has quietly killed — and the
+     only thing left is to build a new one. The page has sticky
+     activation by this point, so the fresh context may resume without
+     another gesture.
+
+     ONCE, and shared between the two ladders on purpose: a rebuild that
+     did not fix it will not fix it the second time either, and a
+     rebuild loop would be a worse failure than the silence. */
+  function rebuildGraph(why) {
+    if (hardRecoveries >= 1) return false;
+    hardRecoveries++;
+    console.error(`[audio] the transport will not come back (${why}) — rebuilding the audio graph.`);
+    try {
+      teardownGraph();
+      if (build() && wantPlaying) { music.start(); music.tick(); }
+    } catch (e) { console.error('[audio] rebuild failed:', e); }
+    return true;
+  }
+
+  /* THE FAILURE THIS MODULE WAS ACTUALLY LOSING, and it never threw
+     anywhere update() could see it. music.js catches a bad bar inside
+     its own scheduling loop, so tick() returns normally having written
+     nothing to the wire — and `silentFor` stays 0.000, because the loop
+     still advances the clock it is failing to fill. MEASURED against the
+     real module: a bar that throws every time is three log lines in two
+     minutes, silentFor 0.000 throughout, running true, and a silent
+     game. The consecutive-failure count is the only symptom that
+     exists, so it is read every frame rather than waited for.
+
+     BAR_ALARM_RUN is 4 because a bar of `explore` is 4 beats at 104 bpm
+     = 2.31 s, so four in a row is already nine seconds of a room the
+     player can hear is empty. BAR_ALARM_QUIET spaces the rungs: it is
+     the ladder's clock as well as the log's, and 5 s is two bars — long
+     enough for a reset to have been given a fair chance to land one,
+     short enough that the whole ladder is spent inside half a minute
+     rather than after the player has already quit. */
+  const BAR_ALARM_RUN = 4;        // consecutive failed bars before the alarm
+  const BAR_ALARM_QUIET = 5000;   // ms between rungs (and between log lines)
+  const BAR_RESETS = 3;           // resets that must fail before the rebuild
+  let barAlarmAt = 0;
+  let barLogs = 0;
+  let barLogAt = 0;
+
+  function checkBarFailures() {
+    const run = music.barFails;
+    if (run < BAR_ALARM_RUN) {
+      /* A bar reached the wire. The ladder counts CONSECUTIVE alarms, so
+         this is where it is torn down — and it is torn down on the
+         SYMPTOM clearing, never on us having reacted to it. */
+      if (run === 0) {
+        const f0 = faults.get('music.bar');
+        if (f0 && f0.run) { f0.run = 0; barLogs = 0; }
+      }
+      return;
+    }
+    const now = Date.now();
+    if (now - barAlarmAt < BAR_ALARM_QUIET) return;
+    barAlarmAt = now;
+
+    /* Counted into the SAME map every other audio fault uses. This is a
+       real throw — it happened inside music.js's own per-bar try/catch,
+       which is exactly why it never reached safe() — so it gets a real
+       fault record, and the rungs above become reachable from here. It
+       is logged by hand rather than by fault(), because the bar count
+       and the rung are worth more than a generic line. */
+    const f = fault('music.bar', new Error(music.lastError || 'scheduleBar failed'),
+      { silent: true });
+    if (barLogs <= BAR_RESETS || now - barLogAt > FAULT_QUIET * 3) {
+      barLogs++; barLogAt = now;
+      console.error(`[audio] the score has failed to schedule ${run} bars in a row — `
+        + `the room is silent while every flag still says "playing" `
+        + `(alarm ${f.run}; the graph is rebuilt at ${BAR_RESETS + 1}). `
+        + `Last error: ${music.lastError}`);
+    }
+    escalate(f);
+  }
+
   function pump(reason = 'frame') {
     if (!built || !actx) return;
     if (actx.state !== 'running') { nudge(); return; }
@@ -482,8 +718,18 @@ export async function init(ctx) {
       }
       music.heal();
       music.tick();
+      /* A clean pass clears the run. The ladder in escalate() counts
+         CONSECUTIVE failures on purpose — a transient that heals itself
+         must never reach the rebuild. (It may well ring the alarm and
+         cost a transport reset first; see the ladder comment above for
+         the measured 3-bar and 8-bar runs.) */
+      const f = faults.get('watchdog');
+      if (f) f.run = 0;
     } catch (e) {
-      console.warn('[audio] watchdog:', e?.message || e);
+      /* This used to console.warn on every pass. The keep-alive timer
+         runs at 120 ms, so a persistent fault here was eight warnings a
+         second, forever — which is its own kind of invisible. */
+      escalate(fault('watchdog', e));
     }
   }
 
@@ -529,7 +775,6 @@ export async function init(ctx) {
   const lpos = [0, 0, 0], lfwd = [0, 0, -1], lup = [0, 1, 0];
   let listenerAcc = 0;
   let wdAcc = 0;
-  let loggedUpdateError = false;
 
   function updateListener(dt) {
     const cam = ctx?.camera;
@@ -614,8 +859,17 @@ export async function init(ctx) {
         tickGap: +music.tickGap.toFixed(3),
         reanchors: music.reanchors,
         errors: music.errors,
+        /* Bars that have failed IN A ROW. The one number that is
+           non-zero while a throwing scheduler plays to an empty room —
+           `silentFor` cannot see that case at all. */
+        barFails: music.barFails,
         lastError: music.lastError,
         recoveries,
+        hardRecoveries,
+        /* Which rung of the bar ladder we are on: consecutive ALARMS,
+           not consecutive bars. `> BAR_RESETS` is the rebuild. */
+        barAlarms: faults.get('music.bar')?.run || 0,
+        faults: Object.fromEntries([...faults.values()].map((f) => [f.where, f.n])),
         voices: music.voices,
         tracked: music.tracked,
         busGain: +music.out.gain.value.toFixed(3),
@@ -757,27 +1011,40 @@ export async function init(ctx) {
     },
 
     /* --- frame ---
-       Nothing in here may throw into main.js's frame loop: that loop has
-       no try/catch of its own, so one bad note would stop the whole game,
-       not just the music. */
+       Nothing in here may throw into main.js's frame loop. main.js now
+       guards every hook itself — a throw from here costs audio one frame
+       rather than the session — but this module still contains its own
+       failures, because it is the one that knows how to recover from
+       them and main.js only knows how to switch a subsystem off.
+
+       ONE GUARD PER SUB-CALL, not one around the frame. The old shape
+       was a single try/catch behind a single console.warn gated on a
+       flag that was set once and never cleared: a throwing tick() also
+       stopped the ambience beds and the 3D listener (they sit after it
+       in the same block) and said so exactly once for the life of the
+       page. See the FAULT REPORTING note above. */
     update(dt) {
       if (!built || !actx) return;
-      try {
-        if (actx.state !== 'running') { nudge(); return; }
-        music.tick();
-        /* The full watchdog four times a second — cheap, but no reason to
-           run the gain reads on every frame. */
-        wdAcc += dt;
-        if (wdAcc >= 0.25) { wdAcc = 0; pump('frame'); }
-        const w = ctx?.wind?.strength;
-        sfx.update(dt, { wind: typeof w === 'number' ? w : 0.4 });
-        listenerAcc += dt;
-        if (listenerAcc >= 1 / 30) { updateListener(listenerAcc); listenerAcc = 0; }
-      } catch (e) {
-        if (!loggedUpdateError) {
-          loggedUpdateError = true;
-          console.warn('[audio] update:', e?.message || e);
-        }
+      if (actx.state !== 'running') { safe('nudge', nudge); return; }
+
+      safe('music.tick', () => music.tick());
+
+      /* The full watchdog four times a second — cheap, but no reason to
+         run the gain reads on every frame. pump() carries its own guard. */
+      wdAcc += dt;
+      if (wdAcc >= 0.25) { wdAcc = 0; pump('frame'); }
+
+      /* The score can stop dead without a single exception reaching this
+         function; music.js catches its own bad bars. So ask it. */
+      safe('barcheck', checkBarFailures);
+
+      const w = ctx?.wind?.strength;
+      safe('sfx.update', () => sfx.update(dt, { wind: typeof w === 'number' ? w : 0.4 }));
+
+      listenerAcc += dt;
+      if (listenerAcc >= 1 / 30) {
+        safe('listener', () => updateListener(listenerAcc));
+        listenerAcc = 0;
       }
     },
 
@@ -880,6 +1147,41 @@ export async function init(ctx) {
       return music.running === false;
     };
     dbg.audioTransport = () => api.transport;
+    /* Simulate the cause the module used to lose entirely: a bar that
+       throws. Web Audio throws in exactly this place when it is handed a
+       value it does not like, and music.js catches it per bar — so the
+       tick returns normally, the wire stays empty, silentFor reads 0.000
+       and the console is green. `n = true` means forever.
+         audioBreakTick(3)           three bad bars: ~7 s of silence,
+                                     peak barFails 3, 0 alarms, 0 resets,
+                                     heals a bar after the fault clears
+         audioBreakTick(8)           THE DEFAULT. Eight bad bars is ~18 s
+                                     of silence: peak barFails 8, TWO
+                                     alarms ~5.0 s apart, one transport
+                                     reset each, then it heals on its own.
+                                     hardRecoveries stays 0 — a transient
+                                     never reaches the rebuild, which is
+                                     the invariant. Both runs MEASURED on
+                                     this build, and it is the COUNTS that
+                                     reproduce: the ladder steps on bar
+                                     lines, so every timestamp slides by
+                                     whole 2.31 s bars with the bar the
+                                     injection lands in. This build read
+                                     the two alarms at 9.1 / 14.1 s and
+                                     healing at 16.1 s; another run of the
+                                     same tree read 14.1 / 19.1 s and
+                                     21.1 s. See tools/audiotest.mjs F3b.
+         audioBreakTick(true)        permanent, until cleared
+         audioBreakTick(3, 'tick')   the whole tick throws, not just a bar
+       Used by tools/audiotest.mjs PASS F. */
+    dbg.audioBreakTick = (n = 8, where = 'bar') => (built ? music.injectFault(n, where) : null);
+    dbg.audioClearFault = () => {
+      if (!built) return null;
+      music.clearFault();
+      faults.clear();
+      barAlarmAt = 0; barLogs = 0; barLogAt = 0;
+      return true;
+    };
     /* Simulate the failure this all exists for: freeze the transport as
        if the tab had been backgrounded for `seconds` and every clock had
        been throttled away. The watchdog should pick it up within a tick

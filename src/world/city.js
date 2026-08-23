@@ -90,6 +90,11 @@ function registerCityMesh(ctx, m, S) {
    ================================================================== */
 
 const _wp = { x: 0, z: 0 };
+const _rv = new THREE.Vector3();
+/* How proud a berm stone has to stand before its own surface is a
+   better answer than the earth under it. terrain.js's ROCK_RISE, for
+   the same reason: surfacetest's SINK_TOL is 0.12. */
+const RUBBLE_RISE = 0.10;
 
 /* A handful of forms sprawl well past their nominal footprint — a
    temple's podium and colonnade, a pier's deck, the stadium bowl, a
@@ -188,15 +193,48 @@ function footing(K, world, loc, S, groundY, o) {
       K.add('stone', boxRound(segW + 0.10, top - g, 0.30 + proud, 0.07, 1),
         faceTRS(face, w, d, u, (top + g) / 2, proud * 0.5 - 0.15),
         i % 2 ? stone : stoneAlt);
+      /* THE PLINTH IS A LEDGE AND IT WAS NOT IN THE COLLISION WORLD.
+         Its top stands a third of a metre proud of the terrain all the
+         way round every founded building — measured -0.34 m at the
+         Trunk Depot and Apartment thresholds, which is the second worst
+         surface disagreement in the game after the berm. It also does
+         the load-bearing job of keeping the capsule off the berm's own
+         inner edge: nothing can get closer than a radius to this box,
+         and a radius out is already on the drawn bank. */
+      if (o.collide) {
+        const cx = face === 0 ? u : face === 1 ? -u : (face === 2 ? w / 2 + proud * 0.5 - 0.15 : -w / 2 - proud * 0.5 + 0.15);
+        const cz = face === 0 ? d / 2 + proud * 0.5 - 0.15 : face === 1 ? -d / 2 - proud * 0.5 + 0.15 : (face === 2 ? -u : u);
+        o.collide.push({
+          w: face < 2 ? segW + 0.10 : 0.30 + proud,
+          h: top - g,
+          d: face < 2 ? 0.30 + proud : segW + 0.10,
+          x: cx, z: cz, y: (top + g) / 2,
+        });
+      }
     }
   }
-  /* corner quoins tying the four courses together */
+  /* corner quoins tying the four courses together.
+
+     THE QUOIN IS A LEDGE TOO. The four courses got a collision box each
+     when the plinth went into the world; the four blocks that tie them
+     together at the corners did not, and a quoin stands 0.65 m square
+     and 0.60 m proud of the earth at the corner of every founded
+     building on the island. Measured at the Trunk Depot threshold, that
+     is a drawn stone the collision world answers 0.276 m below — the
+     last surface disagreement at a door once the berms agree, and the
+     one every diagonal approach to a shopfront walks over. */
   for (const sx of [-1, 1]) {
     for (const sz of [-1, 1]) {
       const cx = sx * (w / 2 + proud * 0.4), cz = sz * (d / 2 + proud * 0.4);
       const g = reachOf([[cx + sx * 1.3, cz + sz * 1.3], [cx + sx * 2.6, cz + sz * 2.6]]);
       K.add('stone', boxRound(0.48 + proud, top - g, 0.48 + proud, 0.09, 1),
         TRS(cx, (top + g) / 2, cz), stone);
+      if (o.collide) {
+        o.collide.push({
+          w: 0.48 + proud, h: top - g, d: 0.48 + proud,
+          x: cx, z: cz, y: (top + g) / 2,
+        });
+      }
     }
   }
 }
@@ -284,19 +322,65 @@ function bermBand(world, loc, groundY, pts, a, b, wob, hn) {
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
   g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  /* THE STRIP IS GENERATED, SO PROVE IT FACES THE SKY — and prove it
+     with the face normal, not with a 2D cross product whose sign
+     convention was wrong. It was wrong. Every founding berm on the
+     island has been wound face-DOWN since this was written, and under
+     FrontSide culling that means the bank of earth the whole system
+     exists to draw was never rasterised: a downward raycast onto the
+     Main Street berm MISSES it front-side and HITS it double-sided, at
+     14.40 m, exactly where the geometry says it is. That is why the
+     buildings still met the grass on a hard line after two passes at
+     it — and why a collision surface built from the same rings reads as
+     0.43 m of "float" over ground the renderer is not drawing. */
+  if (faceNormalY(pos, idx) < 0) flipWinding(idx);
+  /* AND THEN STOP GUESSING. The test above agrees the strip is wound
+     face-up, and the merged mesh it ends up in is nevertheless
+     back-facing: a downward raycast onto the Main Street berm misses it
+     front-side and hits it double-sided at 14.40 m, exactly where the
+     geometry puts it. Somewhere between here and the merged buffer the
+     winding turns over. A berm is a bank of earth with two sides — the
+     top you walk on and the underside where it is cut into the hill —
+     so it is emitted with both, and no downstream stage can make it
+     invisible again. 464 triangles a building; the city draws 4.2 M.
+
+     ATTRIBUTION — THIS IS WHAT FIXED MAIN STREET, and it was written as
+     a rendering fix. Against HEAD the Main Street leg reads mean +0.252
+     m of float over 395 samples, worst +0.412; here the same leg reads
+     mean +0.008, worst +0.023. The WORST point is the free inner edge
+     of the collision strip and groundBerm() below claims it. The MEAN
+     is this line: a whole district floating a quarter of a metre is not
+     an edge case, it is every sample on the street, and it is the drawn
+     berm not being rasterised at all — the ray passed through the bank
+     of earth the buildings stand on and answered with the terrain
+     underneath. A back-facing berm is an invisible one, and an
+     invisible one reads to any downward ray as ground that is not
+     there. */
   g.setIndex(idx);
-  /* the strip is generated, so prove it faces the sky rather than
-     assuming a winding: a back-facing berm is an invisible one */
-  const ax = pos[idx[0] * 3], az = pos[idx[0] * 3 + 2];
-  const bx = pos[idx[1] * 3], bz = pos[idx[1] * 3 + 2];
-  const cx2 = pos[idx[2] * 3], cz2 = pos[idx[2] * 3 + 2];
-  if ((bx - ax) * (cz2 - az) - (bz - az) * (cx2 - ax) > 0) {
-    for (let i = 0; i < idx.length; i += 3) { const t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t; }
-    g.setIndex(idx);
-  }
-  /* it is a slope now, not a sheet: shade it as one */
+  /* it is a slope now, not a sheet: shade it as one — and derive the
+     normals from the FRONT winding alone, before the back faces are
+     appended. computeVertexNormals() on a double-wound buffer sums each
+     face normal with its own negation and hands every vertex a zero
+     vector, which is a black berm. */
   g.computeVertexNormals();
+  const back = idx.slice();
+  flipWinding(back);
+  g.setIndex(idx.concat(back));
   return g;
+}
+
+/** Y component of the first triangle's face normal. Unambiguous. */
+function faceNormalY(pos, idx) {
+  const a = idx[0] * 3, b = idx[1] * 3, c = idx[2] * 3;
+  const abx = pos[b] - pos[a], abz = pos[b + 2] - pos[a + 2];
+  const acx = pos[c] - pos[a], acz = pos[c + 2] - pos[a + 2];
+  /* (ab x ac).y = ab.z*ac.x - ab.x*ac.z */
+  return abz * acx - abx * acz;
+}
+
+function flipWinding(idx) {
+  for (let i = 0; i < idx.length; i += 3) { const t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t; }
+  return idx;
 }
 
 /** The berm's TOP SURFACE as one continuous strip, for ctx.phys.
@@ -321,12 +405,21 @@ function bermBand(world, loc, groundY, pts, a, b, wob, hn) {
 const BERM_COL_RINGS = 4;
 
 function bermCollision(world, loc, groundY, pts, rings, wob, hn) {
-  const P = pts.length, R = Math.min(BERM_COL_RINGS, rings.length);
+  /* EXACTLY THE DRAWN BAND, NOT A METRE MORE.
+
+     Carrying the strip inward past ring 0 was tried and measured: the
+     annulus between the plinth and the bank is drawn as raw terrain, so
+     a collision plateau there put him 0.44 m over the ground he could
+     see (Main Street, +0.444 m). The strip stops where the drawn band
+     stops; what keeps him off its free inner edge is the plinth having
+     a body of its own now — see footing(). */
+  const inner = rings.slice(0, BERM_COL_RINGS);
+  const P = pts.length, R = inner.length;
   const pos = new Float32Array(P * R * 3);
   const idx = new Uint32Array((P - 1) * (R - 1) * 6);
   let v = 0;
   for (let r = 0; r < R; r++) {
-    const ring = rings[r];
+    const ring = inner[r];
     for (let i = 0; i < P; i++) {
       const p = pts[i];
       const k = ring.e * (1 + wob[i % wob.length] * 0.5);
@@ -348,12 +441,7 @@ function bermCollision(world, loc, groundY, pts, rings, wob, hn) {
   /* same winding proof the drawn band makes: phys derives its contact
      direction radially, but groundAt() and the slope test both read the
      stored face normal, and a berm wound face-down reports a ceiling. */
-  const ax = pos[idx[0] * 3], az = pos[idx[0] * 3 + 2];
-  const bx = pos[idx[1] * 3], bz = pos[idx[1] * 3 + 2];
-  const cx = pos[idx[2] * 3], cz = pos[idx[2] * 3 + 2];
-  if ((bx - ax) * (cz - az) - (bz - az) * (cx - ax) > 0) {
-    for (let i = 0; i < idx.length; i += 3) { const t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t; }
-  }
+  if (faceNormalY(pos, idx) < 0) flipWinding(idx);
   return { positions: pos, indices: idx };
 }
 
@@ -398,8 +486,21 @@ function groundBerm(K, world, loc, groundY, o) {
      contact line. That is the whole trick — the drawn ground can be a
      quarter of a metre off heightAt() (it routinely is, see bermBand)
      and all that changes is how wide the earth reads. */
+  /* THE BANK HAS TO REACH THE PLINTH IT IS BANKED AGAINST.
+
+     The inner ring is nominally "driven up INTO the plinth", and on a
+     form whose sprawl is wider than the plinth's 0.17 m projection it
+     was not: it stopped a quarter of a metre short, leaving a ring of
+     raw terrain between the stone and the earth. That is invisible —
+     the eye reads the two as one bank — and it is exactly where the
+     player's capsule ends up. Stopped by the plinth, his axis sits a
+     radius out from it, which landed him ON THE FREE EDGE of the strip,
+     perched 0.44 m over ground drawn at terrain level: +0.412 m of
+     float, the worst number in the surface test after the fix for the
+     sink. Closing the gap costs nothing and removes the edge. */
+  const inner = Math.max(o.inner ?? 0, -Math.min(hw, hd) * 0.5);
   const rings = [
-    { e: 0.00,      dy:  0.44, n: 0.00 },
+    { e: inner,     dy:  0.44, n: 0.00 },
     { e: R * 0.20,  dy:  0.24, n: 0.05 },
     { e: R * 0.46,  dy:  0.00, n: 0.09 },
     { e: R * 0.76,  dy: -0.34, n: 0.11 },
@@ -433,6 +534,17 @@ function groundBerm(K, world, loc, groundY, o) {
      and a couple of earth heaps break it in silhouette, which no amount
      of shading can do. */
   const nR = 7 + Math.floor(rng() * 6);
+  /* NOT ACROSS THE DOOR. props.js has refused a doorway approach since
+     the corridors went in ("4 props refused a doorway approach"); the
+     berm's own rubble was never asked. Three boulders 0.3 m proud lay
+     straddling the Trunk Depot entrance — the front door of the second
+     building in the game, with a delivery corridor drawn through them —
+     and the surface test read the middle one as him standing 0.276 m
+     inside the ground he can see. A stone lying in the dirt beside a
+     wall is the point of them; a stone lying in the threshold is
+     debris. Same reach the props are held to. */
+  const DOOR_CLEAR = 2.2;
+  const dx0 = o.door ? o.door.x : NaN, dz0 = o.door ? o.door.z : NaN;
   for (let i = 0; i < nR; i++) {
     const side = Math.floor(rng() * 4);
     const along = (rng() - 0.5) * 0.9;
@@ -440,12 +552,42 @@ function groundBerm(K, world, loc, groundY, o) {
     const t = (side < 2 ? d : w) / 2 + 0.34 + rng() * 0.8;
     const lx = side === 0 ? u : side === 1 ? -u : side === 2 ? t : -t;
     const lz = side === 0 ? t : side === 1 ? -t : side === 2 ? -u : u;
+    const s = 0.26 + rng() * 0.42;
+    /* the rng draws happen either way, so vetoing a stone never
+       reshuffles the ones after it */
+    const yj = s * (0.10 + rng() * 0.28), rot = rng() * PI;
+    const ys = 0.52 + rng() * 0.3, zs = 0.78 + rng() * 0.4;
+    const col = mixHex(LAND.rock, LAND.dirt, 0.25 + rng() * 0.5);
+    if (o.door && Math.hypot(lx - dx0, lz - dz0) < DOOR_CLEAR + s) continue;
     toWorldXZ(loc, lx, lz, _wp);
     const gy = world.heightAt(_wp.x, _wp.z) - groundY;
-    const s = 0.26 + rng() * 0.42;
-    K.add('stone', sphereG(s, 7),
-      TRS(lx, gy + s * (0.10 + rng() * 0.28), lz, rng() * PI, 1, 0.52 + rng() * 0.3, 0.78 + rng() * 0.4),
-      mixHex(LAND.rock, LAND.dirt, 0.25 + rng() * 0.5), { ao: () => 0.62 });
+    const geo = sphereG(s, 7);
+    const m = TRS(lx, gy + yj, lz, rot, 1, ys, zs);
+    /* AND A STONE IS SOLID. Both threshold defects left over after the
+       porch pads are these: a drawn boulder standing 0.15 to 0.20 m
+       proud of the berm with nothing under it, at (-279.06, 146.26) on
+       the Trunk Depot and (-367.28, 196.53) at the player's own front
+       door. Same class as the talus the terrain gate was rebuilt for
+       last round, one scale down and in the city — and held to the same
+       number: terrain.js beds rock under ROCK_RISE 0.10 on the grounds
+       that SINK_TOL is 0.12 and the ground under it is already the
+       right answer, so a stone that clears 0.10 gets a body here too.
+
+       ITS OWN TRIANGLES, NOT A BOX. Seventy of them; a box round a
+       squashed sphere either floats over its flanks or sinks under its
+       crown, and the whole point is that what he stands on and what he
+       sees are the same surface. Read before K.add() because the kit
+       merges and lets go of the geometry it is handed. */
+    if (o.collide && s * ys + yj > RUBBLE_RISE) {
+      const P = geo.attributes.position, I = geo.index;
+      const pos = new Float32Array(P.count * 3);
+      for (let k = 0; k < P.count; k++) {
+        _rv.fromBufferAttribute(P, k).applyMatrix4(m);
+        pos[k * 3] = _rv.x; pos[k * 3 + 1] = _rv.y; pos[k * 3 + 2] = _rv.z;
+      }
+      o.collide.push({ positions: pos, indices: new Uint32Array(I.array), name: 'city.rubble' });
+    }
+    K.add('stone', geo, m, col, { ao: () => 0.62 });
   }
 }
 
@@ -528,9 +670,12 @@ export async function init(ctx) {
       groundBerm(K, world, loc, groundY, {
         w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
         reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
-        collide: bermSurfaces,
+        /* reach back to the plinth face: the ring is nominally at
+           w/2 + spr - 0.15 and the stone stands at w/2 + 0.17 */
+        inner: Math.min(0, 0.32 - spr),
+        collide: bermSurfaces, door: meta.door,
       });
-      footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d });
+      footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d, collide: meta.collide });
     }
     const group = new THREE.Group();
     group.name = `city.${loc.id}`;
@@ -562,7 +707,7 @@ export async function init(ctx) {
     /* --- the nameboard --- */
     let sign = null;
     try {
-      sign = createSign(ctx, loc, S, meta, rng, lib);
+      sign = createSign(ctx, loc, S, meta, rng, lib, { groundY, world, yaw: loc.yaw });
       ctx.mat.register(sign.group);
       full.add(sign.group);
       const wp = new THREE.Vector3();
@@ -602,6 +747,12 @@ export async function init(ctx) {
 
     /* --- collision --- */
     for (const b of meta.collide) {
+      /* The apartment's shell is thrown away and rebuilt per home tier
+         (4b), and a doorstep is the one collider whose position is a
+         property of the DOOR rather than of the plot — leaving the
+         generic one baked into the merged body would stand a phantom
+         kerb wherever this building's door used to be. */
+      if (b.step && loc.id === 'apartment') continue;
       collideQueue.push({ box: b, matrix: group.matrixWorld.clone() });
     }
     for (const s of bermSurfaces) {
@@ -800,8 +951,8 @@ export async function init(ctx) {
          and the hard wall/grass line were. They get the full footing
          and apron treatment instead. */
       const gy = settleY(world, fake, w, dd);
-      groundBerm(out.K, world, fake, gy, { w, d: dd, reach: clamp(w * 0.20, 2.4, 4.2), rng: frng2 });
-      footing(out.K, world, fake, S, gy, { w, d: dd });
+      groundBerm(out.K, world, fake, gy, { w, d: dd, reach: clamp(w * 0.20, 2.4, 4.2), rng: frng2, door: out.meta.door });
+      footing(out.K, world, fake, S, gy, { w, d: dd, collide: out.meta.collide });
 
       const m = new THREE.Matrix4().compose(
         new THREE.Vector3(x, gy, zz),
@@ -1140,10 +1291,16 @@ export async function init(ctx) {
     let bermTris = 0;
     for (const b of bermQueue) {
       try {
-        ctx.phys.addTriangles(b.positions, b.indices, { matrix: b.matrix, name: 'city.berm', walkable: true });
+        const id = ctx.phys.addTriangles(b.positions, b.indices, {
+          matrix: b.matrix, name: b.name || 'city.berm', walkable: true,
+        });
+        if (b.id === 'apartment') homeBermIds.push(id);
         bermTris += b.indices.length / 3;
       } catch (e) { console.warn('[city] berm collision failed', b.id, e); }
     }
+    /* ...and immediately throw the apartment's away again if a home
+       tier is already standing on the plot. See wireHomeBerm(). */
+    wireHomeBerm();
 
     /* --- the nameboards ---
        A board hung over a shopfront is a solid object and the collision
@@ -1283,11 +1440,33 @@ export async function init(ctx) {
     catch (e) { console.error('[city] home tier failed:', T.id, e); return null; }
     const { K, meta, loc, S } = built;
     const groundY = homeRec.groundY;
-    /* founded in the ground exactly as the other 28 are */
+    /* founded in the ground exactly as the other 28 are — AND COLLIDED
+       LIKE THEM, which for eleven rounds it was not.
+
+       The berm is trodden earth whose surface is generated from a
+       circular noise field; the strip ctx.phys walks on is the same
+       rings run through the same noise. The apartment is the one plot
+       in the game whose drawn shell is thrown away and rebuilt (there
+       are five tiers of it), and the rebuild drew a SECOND berm — same
+       plot, different rng seed, and without the `inner` that reaches
+       the ring back under the plinth. So the earth the renderer drew
+       and the strip the controller stood on were two different lobed
+       surfaces on one plot. Rasterised against each other at 0.25 m,
+       34 of the collision strip's 324 triangles covered ground with no
+       drawn berm under them at all and the rest disagreed by up to
+       0.55 m — which is the +0.41 m "float" and the -0.44 m "sink" the
+       surface test has reported at the player's own front door since
+       the tiers landed.
+
+       There is no reconciling two noise fields. The tier that is drawn
+       hands ITS strip to phys and the generic one is dropped. */
     const spr = SPRAWL[loc.kit] ?? 0.6;
+    const bermCol = [];
     groundBerm(K, world, loc, groundY, {
       w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
       reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
+      inner: Math.min(0, 0.32 - spr),
+      collide: bermCol, door: meta.door,
     });
     footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d });
 
@@ -1306,9 +1485,57 @@ export async function init(ctx) {
       }
     } catch (e) { console.warn('[city] home lod failed', T.id, e); }
 
-    const entry = { id: T.id, tier: T, full, lod, meta, S, loc, ms: performance.now() - t0 };
+    const entry = { id: T.id, tier: T, full, lod, meta, S, loc, berms: bermCol, ms: performance.now() - t0 };
     homeCache.set(T.id, entry);
     return entry;
+  }
+
+  /* The apartment plot's berm in the collision world: whatever the
+     tier standing on it is DRAWING, and nothing else. Called from
+     setHome (which can run before phys exists) and from wirePhysics
+     (which can run after the tier is already up), so either order
+     converges on the same single body. */
+  /* Plural since the berm's own rubble rides these rails too: one
+     strip for the bank, one small triangle body per stone standing
+     proud of it. Same argument as the strip — the tier that is DRAWN
+     hands its own to phys and the generic building's are dropped, or
+     the plot ends up with a phantom boulder where the building that
+     used to be here happened to put one. */
+  let homeBermIds = [];
+  let homeBermStrips = [];
+  let homeStepIds = [];
+  let homeEntry = null;
+  const _UPY = new THREE.Vector3(0, 1, 0);
+  const _sM = new THREE.Matrix4(), _sQ = new THREE.Quaternion();
+  const _sP = new THREE.Vector3(), _sOne = new THREE.Vector3(1, 1, 1);
+  function wireHomeBerm() {
+    if (!ctx.phys || !homeRec) return;
+    homeRec.group.updateMatrixWorld(true);
+    if (homeBermStrips.length) {
+      for (const id of homeBermIds) ctx.phys.remove(id);
+      homeBermIds = [];
+      for (const strip of homeBermStrips) {
+        try {
+          homeBermIds.push(ctx.phys.addTriangles(strip.positions, strip.indices, {
+            matrix: homeRec.group.matrixWorld.clone(), name: strip.name || 'city.berm', walkable: true,
+          }));
+        } catch (e) { console.warn('[city] home berm collision failed', e); }
+      }
+    }
+    /* ...and the tier's own doorstep. The generic apartment's step went
+       into the merged city body with the rest of the 28; this tier's
+       door is somewhere else, on a building that no longer exists, so
+       the step travels with it. See doorway() in buildings.js. */
+    for (const id of homeStepIds) ctx.phys.remove(id);
+    homeStepIds = [];
+    for (const b of homeEntry?.meta?.collide || []) {
+      if (!b.step) continue;
+      _sP.set(b.x || 0, b.y || 0, b.z || 0).applyMatrix4(homeRec.group.matrixWorld);
+      _sQ.setFromAxisAngle(_UPY, (b.ry || 0) + homeRec.loc.yaw);
+      _sM.compose(_sP, _sQ, _sOne);
+      try { homeStepIds.push(ctx.phys.addOBB(b.w, b.h, b.d, _sM, { name: 'city.step', walkable: true })); }
+      catch (e) { console.warn('[city] home step collision failed', e); }
+    }
   }
 
   function dropHomeCloths() {
@@ -1388,6 +1615,17 @@ export async function init(ctx) {
     e.full.visible = homeRec.visible;
     if (e.lod) e.lod.visible = !homeRec.visible;
     homeRec._casts = undefined;                 // re-decide the shadow pass
+    /* ...but WHERE it hangs is a property of the building, and each
+       tier is a different building: a different eaves line, a different
+       porch, a different floor height. Keeping the board and not
+       re-solving it left the one nameboard the player reads every day
+       hanging at the height a building that no longer exists wanted —
+       which is exactly why the Apartment board was the lowest on the
+       island, at 0.52 m, with its bottom half behind its own porch. */
+    if (homeRec.sign?.reposition) {
+      try { homeRec.sign.reposition(e.meta, { groundY: homeRec.groundY, world, yaw: homeRec.loc.yaw }); }
+      catch (err) { console.warn('[city] sign reposition failed', err); }
+    }
     homeRec.door.copy(e.meta.door).applyMatrix4(homeRec.group.matrixWorld);
     homeRec.interior.copy(e.meta.interior).applyMatrix4(homeRec.group.matrixWorld);
     homeRec.box = _hbox.setFromObject(e.full).clone();
@@ -1396,6 +1634,12 @@ export async function init(ctx) {
        flat, or it pops to a silhouette while it is still the tallest
        thing on the street. */
     homeRec.lodDist = Math.max(240, homeRec.loc.radius * 11, e.loc.size.h * 14);
+
+    /* the ground at his own front door is this tier's, not the
+       generic building's — see the note in buildHome() */
+    homeBermStrips = e.berms || [];
+    homeEntry = e;
+    wireHomeBerm();
 
     stringHomeCloths(e);
     releaseStale();

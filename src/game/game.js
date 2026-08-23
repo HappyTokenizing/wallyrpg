@@ -30,16 +30,47 @@
    isOpen(locId)            opening-hours check
    known(locId)             has the player heard of it
    fares(dest)              every mode, priced — see fares() below.
-                            [{mode, n, ico, cost, mins, energy, hops,
-                              ok, why, metres?, trudge?, warn?, ride?}]
+                            [{mode, n, ico, fast, cost, mins, energy,
+                              hops, ok, why, metres?, trudge?, warn?,
+                              ride?}]
                             'walk' is always ok. Order: walk, bike,
                             train (Metro), trunk (Yoober). The 'bike'
                             row is WHICHEVER RIDE IS EQUIPPED: `ride`
                             is its id and `n`/`ico` are its name and
                             glyph, so a scooter reads as a scooter.
-   travel(locId, mode)      pay the fare, spend the time, move.
+                            `fast` is the whole travel rule in one
+                            boolean — see travel() and data.js TRAVEL.
+   travel(locId, mode)      TWO THINGS, and which one you get is
+                            data.js's TRAVEL[mode].fast:
+                              fast (train, trunk)  pay, the clock
+                                jumps, he arrives. Emits 'travel'.
+                              self-powered (walk, bike/scooter/
+                                motorcycle) ROUTES him: aims the
+                                arrow, mounts the ride, charges
+                                nothing yet. Emits 'route'. Returns
+                                {ok:true, moved:false, routed:true}.
                             mode defaults to 'walk'.
-   enter(locId)             the 3D world walked Wally in — no fare
+   route                    the live self-powered journey, or null:
+                            {to, mode, ride, mins, energy, metres,
+                             spent, walked, from, day, left}
+                            `energy` is the QUOTE THE BOARD SHOWED,
+                            not a cap — see setRoute(). It is dropped
+                            at the day roll and at the door.
+   routeTo                  just the destination id, or null — the
+                            per-frame read hud.js's arrow makes
+   clearRoute(why)          drop it. He changed his mind.
+   stride(x, z, dt)         feed his world position — charges energy
+                            by the METRE for every metre he covers
+                            under his own power, ROUTE OR NO ROUTE,
+                            at the rate of whatever is under him.
+                            Called at 8 Hz from init(ctx). `dt` is that
+                            sample's own timestep and sizes the warp
+                            guard; omit it for the flat 40 m fallback.
+   setWalker(on)            "something in this build is actually
+                            walking him." Off (headless) means a
+                            self-powered travel() resolves itself.
+   enter(locId)             the 3D world walked Wally in — no fare;
+                            this is how a routed journey ENDS
    nearest(x, z)            nearest location to a world position
 
    economy.*                see economy.js. TICKERS ARE FIRST-CLASS:
@@ -143,7 +174,7 @@ import DATA, {
   HOME_BY_ID, HOMES, EMPLOYEE_BY_ID, EMPLOYEE_POOL, IPOS, IPO_STEPS, STADIUM_STEPS,
   ASSETS, ASSET_BY_ID, CLIENT_BY_ID, MORNING_NOTES, fare, worldDistance,
   RACE, PRODUCERS, SLATE_MEAL, repProgress, hops as hopsBetween,
-  DISCOVER, FIRST_ORDER,
+  DISCOVER, FIRST_ORDER, isFastTravel, strideCost,
 } from './data.js';
 import { newState, createState, mulberry32, hashStr, clamp, round2 } from './state.js';
 import { createEconomy } from './economy.js';
@@ -344,6 +375,15 @@ export function createGame(opts = {}) {
 
   function rollDay(collapsed) {
     const st = S();
+    /* A ROUTE DOES NOT SURVIVE THE NIGHT, and it is dropped BEFORE the
+       day number moves so its clear event still names the day it was
+       quoted on. Sleeping used to roll the day forward and leave
+       st.route holding yesterday's quote and its full unspent cap;
+       combined with an arrow that did not survive the reload, a player
+       could wake on day 2 pointed at nothing and still be metered
+       against a fare board he read yesterday. A heading is a thing you
+       hold in your head, and he slept. */
+    clearRoute(collapsed ? 'he fell asleep at the desk' : 'a new day');
     const income = econ.newDay();
     M.addHunger(collapsed ? 24 : 11);
     if (st.loan > 0) M.pay(-Math.max(4, Math.round(st.loan * 0.02)), 'loan interest');
@@ -740,6 +780,44 @@ export function createGame(opts = {}) {
   }
   env.grantRide = grantRide;
 
+  /* PUT ONE UNDER HIM, or take them all away with null. The whole
+     implementation of actions.equipRide, lifted out so setRoute()
+     can mount a ride without going through the public actions
+     object — picking the bicycle on the fare board now IS equipping
+     the bicycle, and the two must not be able to drift apart. */
+  function mountRide(id) {
+    const st = S();
+    const rs = syncRides(st);
+    if (id == null) {
+      const was = rs.equipped;
+      rs.equipped = null;
+      syncRides(st);
+      bus.emit('ride', { kind: 'unequip', ride: was, owned: { ...rs.owned }, equipped: null });
+      bus.emit('bike', { owned: anyRide(), equipped: false, bought: false, ride: null });
+      return { ok: true, ride: null, bike: { ...st.bike } };
+    }
+    if (!RIDES[id]) return { ok: false, why: 'No such ride' };
+    if (!rs.owned[id]) return { ok: false, why: 'You do not own the ' + RIDES[id].short.toLowerCase() };
+    rs.equipped = id;                    // ONE AT A TIME: a single slot
+    syncRides(st);
+    bus.emit('ride', { kind: 'equip', ride: id, name: RIDES[id].name, speed: RIDES[id].speed,
+      owned: { ...rs.owned }, equipped: id });
+    bus.emit('bike', { owned: true, equipped: true, bought: false, ride: id });
+    return { ok: true, ride: rideView(id), bike: { ...st.bike } };
+  }
+
+  /* ------------------------------------------------------------
+     IS ANYTHING ACTUALLY WALKING HIM?
+
+     The single fact that decides whether a self-powered travel() is
+     a route or a resolved journey. init(ctx) turns it on because
+     there is an elephant, a controller and a world under him there.
+     tools/test-game.mjs never calls init(), so it stays off and the
+     sim keeps travelling the way it always did — see travel().
+     ------------------------------------------------------------ */
+  let hasWalker = !!opts.walker;
+  function setWalker(on) { hasWalker = !!on; if (!hasWalker) resetStride(); return hasWalker; }
+
   /* ------------------------------------------------------------
      Every way of getting from here to `dest`, priced.
 
@@ -809,8 +887,11 @@ export function createGame(opts = {}) {
         row.n = mount.short;
         row.ico = mount.ico;
       }
+      /* REAL METRES ON EVERY SELF-POWERED ROW, not just walking. He
+         is going to cover them himself now, whichever of the four he
+         picks, so the distance is part of the quote for all of them. */
+      if (!t.fast) row.metres = Math.round(worldDistance(st.loc, dest));
       if (mode === 'walk') {
-        row.metres = Math.round(worldDistance(st.loc, dest));
         row.trudge = trudge;
         row.warn = warn;
       }
@@ -821,8 +902,49 @@ export function createGame(opts = {}) {
     return out;
   }
 
-  /* Fast travel: charge the fare, burn the clock, move.
-     Default mode is WALKING — you do not own a bicycle yet. */
+  /* ============================================================
+     TRAVEL — and only half of it is fast travel.
+
+     THE BUG THIS SHAPE EXISTS TO FIX, in the player's words: "I was
+     able to fast travel somewhere via bike which should not be
+     possible — it only updates the arrow and equips the bike. The
+     only true fast travel is metro or yoober."
+
+     They were describing what they EXPECTED and the code was doing
+     the other thing: every row on the fare board, bicycle included,
+     charged a fare and teleported him. So:
+
+       FAST (data.js TRAVEL[mode].fast — the Metro and the Yoober)
+         unchanged and deliberately so. Somebody else drives. Pay the
+         fare, spend the minutes and the energy in one lump, arrive.
+         Emits 'travel', which is what ui.js listens for in order to
+         move the character and fade the screen.
+
+       SELF-POWERED (on foot, and whichever RIDE is under him)
+         a ROUTE, not a journey. It aims the HUD arrow, it puts the
+         ride under him if he picked a ride, and then it gets out of
+         the way: he rides there himself, through the real streets,
+         on the real clock. No money changes hands, no minutes are
+         charged (the live clock is already charging them, one
+         in-game minute per two real seconds), and the energy is
+         charged by the metre in stride(). Emits 'route'. Returns
+         moved:false so no caller can mistake it for an arrival.
+
+     THE ONE PLACE THE TWO PATHS MEET is enter(): the door. A fast
+     journey ends the moment it is paid for; a routed one ends when
+     he walks up to the building and enter() closes it.
+
+     AND THE HEADLESS ESCAPE HATCH, which is honest rather than
+     hidden. A route needs somebody to walk it. In the browser that
+     is the elephant, and init(ctx) says so with setWalker(true).
+     tools/test-game.mjs imports this module with no world, no
+     renderer and no character; nothing there will ever cover a
+     metre, so a route would be a journey that can never end and the
+     sim would sit in its flat for thirty days. With no walker,
+     travel() resolves a self-powered leg itself — same minutes, same
+     energy, charged in the lump that is now the only honest way to
+     charge them, because there is no ride to spread them over.
+     ============================================================ */
   function travel(locId, mode = 'walk') {
     const st = S();
     if (!LOC_BY_ID[locId]) return { ok: false, why: 'No such place' };
@@ -832,25 +954,350 @@ export function createGame(opts = {}) {
        you arrived, and the closed sign meant nothing. */
     const door = canEnter(locId);
     if (!door.ok) return { ok: false, why: door.why, kind: door.kind, opens: door.opens, food: door.food };
-    const opt = fares(locId).find((f) => f.mode === mode);
-    if (!opt) return { ok: false, why: 'No such travel mode' };
-    if (!opt.ok) return { ok: false, why: opt.why };
 
+    /* PICKING THE RIDE ROW IS PICKING THE RIDE, and this is where
+       that stops being a UI convenience and becomes the rule.
+
+       fares() still REFUSES a ride that is owned and left in the
+       shed — "your bicycle is not with you" is a true sentence about
+       a board he is reading before he has decided anything, and
+       tools/test-game.mjs holds it to that. But choosing the row is
+       the decision, and the decision includes fetching the thing:
+       "it only updates the arrow and equips the bike" is the whole
+       report. So mount it, THEN price the board. If the row is
+       refused for some other reason — too tired to ride, the place
+       is shut — put the shed back exactly as it was, because a
+       refused journey must not leave the world rearranged. */
+    const wasEquipped = syncRides(st).equipped;
+    if (!isFastTravel(mode) && TRAVEL[mode] && TRAVEL[mode].needs === 'ride' && !equippedRide()) {
+      const best = bestRide();
+      if (best) mountRide(best.id);
+    }
+    const opt = fares(locId).find((f) => f.mode === mode);
+    const bad = !opt ? { ok: false, why: 'No such travel mode' } : !opt.ok ? { ok: false, why: opt.why } : null;
+    if (bad) {
+      if (syncRides(st).equipped !== wasEquipped) mountRide(wasEquipped);
+      return bad;
+    }
+
+    if (!isFastTravel(mode)) return setRoute(locId, mode, opt);
+    return jump(locId, mode, opt, true);
+  }
+
+  /* FAST TRAVEL, exactly as it always was. The two modes that are
+     allowed to skip the journey are the two you buy a ticket for.
+
+     `fast` is a parameter and not a constant because this is also the
+     no-walker resolution of a self-powered leg (see setRoute), and a
+     result that claimed a bicycle was fast travel would be the very
+     lie this whole change exists to stop telling. */
+  function jump(locId, mode, opt, fast) {
+    const st = S();
+    clearRoute('fast travel');
     if (opt.cost) M.pay(-opt.cost, 'fare');
     st.travel = mode;
     st.stats.trips++;
     if (opt.metres) st.stats.metres += opt.metres;
     advance(opt.mins, opt.energy);
     const first = M.setLoc(locId);
-    bus.emit('travel', { to: locId, mode, cost: opt.cost, mins: opt.mins, first });
+    bus.emit('travel', { to: locId, mode, cost: opt.cost, mins: opt.mins, first, fast: !!fast });
+    /* A TELEPORT SAYS SO RATHER THAN BEING GUESSED AT. ui.js moves him
+       to city.doorPosition() on that event, so by here he is already
+       across the island; dropping the stride baseline means the next
+       sample starts fresh from where he landed instead of billing the
+       jump. The warp guard in stride() still catches teleports nobody
+       announced (debug hooks, arrival fades) — this just stops the one
+       we DO know about from depending on a heuristic. */
+    resetStride();
     quests.check();
     storyBeats();
     if (first) M.note('token', 'Discovered ' + LOC_BY_ID[locId].n);
-    return { ok: true, first, cost: opt.cost, mins: opt.mins, trudge: !!opt.trudge };
+    return { ok: true, moved: true, fast: !!fast, first, cost: opt.cost, mins: opt.mins, trudge: !!opt.trudge };
   }
 
-  /* The 3D world walked Wally through a door. No fare, no clock jump —
-     the walking already cost him the time. */
+  /* ------------------------------------------------------------
+     THE ROUTE — "point me there", and put the bike under me.
+
+     Everything a self-powered leg needs to know, in one record on
+     the state so it survives a save:
+
+       to from      where he is headed and where he set off
+       mode ride    'walk', or 'bike' plus WHICH ride is under him
+       mins energy  THE QUOTE THE FARE BOARD DISPLAYED, and nothing
+                    more than that. It was a hard cap for exactly one
+                    round and the cap is gone — see below.
+       metres       the straight-line distance the board quoted
+       walked spent how much road he has actually covered, and how
+                    much energy that has cost so far
+       day set      the day and the minute he chose it
+
+     WHY `energy` IS A QUOTE AND NOT A CAP. The line it replaces read
+     "the journey still never costs more energy than the board said it
+     would", which is a lovely promise and it cannot survive a player
+     who wanders. Two ways it breaks, both measured:
+
+       · with the road now charged whether or not he routed (stride()),
+         a cap would make ROUTING CHEAPER THAN NOT ROUTING. The fare
+         board would become a discount coupon and the phone's "Point
+         me" the mug's option — the same two-controls-one-outcome hole
+         that was just closed, running the other way.
+       · the cap is per JOURNEY, so the cheapest quote on the board
+         buys unlimited road: 76 m to the pawnshop at 4.2 e, then 900 m
+         on the same 4.2. Measured at an 11.8x discount.
+
+     The quote is still HONEST, and by construction rather than by
+     promise: strideCost() is the table's own per-hop energy divided by
+     HOP_METRES, so walking the direct line costs what the board said
+     to within the hop-to-metre rounding. Go round by the harbour to
+     look at the gulls and you pay for the harbour. `left` on the view
+     is therefore "how much of the quote is still unspent" — a budget
+     bar, not a guarantee — and it floors at 0 rather than going
+     negative.
+     ------------------------------------------------------------ */
+  function syncRoute(st = S()) {
+    const r = st.route;
+    if (!r || typeof r !== 'object' || !LOC_BY_ID[r.to] || !TRAVEL[r.mode] || TRAVEL[r.mode].fast) {
+      if (st.route) st.route = null;
+      return null;
+    }
+    /* A ROUTE DOES NOT SURVIVE THE NIGHT. rollDay() drops a live one
+       with a proper clear event; this catches the other way in — a
+       save written before that rule existed, or one hand-edited — so
+       a route quoted on day 3 can never meter him on day 4. */
+    if (Number.isFinite(r.day) && r.day !== st.day) { st.route = null; return null; }
+    if (!Number.isFinite(r.walked)) r.walked = 0;
+    if (!Number.isFinite(r.spent)) r.spent = 0;
+    return r;
+  }
+
+  function routeView() {
+    const r = syncRoute();
+    return r ? { ...r, left: Math.max(0, round2(r.energy - r.spent)) } : null;
+  }
+
+  function clearRoute(why = 'cancelled') {
+    const st = S();
+    const r = syncRoute(st);
+    if (!r) return null;
+    st.route = null;
+    bus.emit('route', { kind: 'clear', to: r.to, mode: r.mode, ride: r.ride, why, spent: round2(r.spent) });
+    return r;
+  }
+
+  function setRoute(locId, mode, opt) {
+    const st = S();
+    /* CHOOSING A RIDE IS CHOOSING TO BE ON IT. "It only updates the
+       arrow and equips the bike" is the correct behaviour, so do
+       both — the fare board offered the row at that ride's speed and
+       he must actually be on that ride for the quote to be true. */
+    let ride = null;
+    if (mode === 'bike') {
+      ride = opt.ride || fareRide().id;
+      const cur = equippedRide();
+      if (!cur || cur.id !== ride) mountRide(ride);
+      ride = (equippedRide() || {}).id || ride;
+    }
+
+    /* RE-TAPPING THE SAME ROW IS NOT A SECOND JOURNEY.
+
+       This used to overwrite st.route wholesale, which reset `spent`
+       to 0 with no refund and no clear event. Measured: apartment to
+       the treasury on foot, quoted 33.6 e, walked for 31.53; re-tap
+       the SAME row and walk again, another 31.53; a third time,
+       another. 94.58 energy for one journey quoted at 33.6, and he
+       never arrived. Re-opening the board to re-aim an arrow you
+       dismissed with the ✕ is the obvious way a player does that.
+
+       Same destination, same mode, same thing under him: it is the
+       same decision, so the ledger carries on. Anything else is a
+       change of mind, and a change of mind CLEARS the old route
+       properly — its spend accounted, its 'clear' event fired — so
+       nobody downstream is left holding a route that silently
+       vanished. */
+    const live = syncRoute(st);
+    const same = !!live && live.to === locId && live.mode === mode
+      && (live.ride || null) === (ride || null);
+    if (live && !same) clearRoute('changed his mind');
+
+    if (same) {
+      live.from = st.loc;
+      live.mins = opt.mins;
+      live.energy = opt.energy;
+      live.metres = opt.metres ?? Math.round(worldDistance(st.loc, locId));
+      live.day = st.day;
+      live.set = st.time;
+    } else {
+      st.route = {
+        to: locId, from: st.loc, mode, ride,
+        mins: opt.mins, energy: opt.energy,
+        metres: opt.metres ?? Math.round(worldDistance(st.loc, locId)),
+        walked: 0, spent: 0, day: st.day, set: st.time,
+      };
+    }
+    /* state.travel is "the last mode he chose", and he has chosen
+       this one — he is on the bike from this moment, not from the
+       moment he arrives. */
+    st.travel = mode;
+    bus.emit('route', { kind: 'set', ...st.route, resumed: same });
+    quests.check();
+
+    /* No elephant in this build? Then nobody is going to walk it. */
+    if (!hasWalker) {
+      const done = jump(locId, mode, opt, false);
+      st.route = null;
+      return { ...done, routed: false, resolved: 'no-walker' };
+    }
+    return {
+      ok: true, moved: false, routed: true, fast: false, resumed: same,
+      to: locId, mode, ride,
+      mins: opt.mins, energy: opt.energy, metres: st.route.metres,
+      spent: round2(st.route.spent), walked: st.route.walked,
+      trudge: !!opt.trudge, warn: opt.warn || null,
+    };
+  }
+
+  /* ------------------------------------------------------------
+     STRIDE — the road tax, and THE ROAD DOES NOT CARE WHETHER YOU
+     ASKED FOR DIRECTIONS.
+
+     Fed his world position at 8 Hz by init(ctx). Charges data.js
+     strideCost() per metre of ground actually covered, at the rate of
+     whatever is under him. Standing still costs nothing, which is the
+     same rule ambient time already obeys — waiting is not tiring,
+     moving is.
+
+     THE BUG THIS SHAPE EXISTS TO FIX. Until now this returned 0 the
+     moment there was no live route, which made the whole cost of
+     moving OPT-IN: the fare board's rows billed him, and the identical
+     535 m apartment-to-mine walk with no route charged 0.00 energy and
+     still arrived. Two controls with one outcome — the board's "On
+     foot" row and the phone's "Point me" button both end with a yellow
+     arrow and an elephant walking — and only one of them was taxed. It
+     also made the quote a season ticket: route to the pawnshop (76 m,
+     4.2 e), then walk 900 m on that same 4.2, an 11.8x discount. And
+     with walking free, the Metro's bargain — "almost no money, a
+     quarter of your day's energy" — had nothing left to trade against.
+
+     So: HE PAYS FOR THE ROAD HE COVERS, route or no route. With a
+     route live the ledger on it records the journey (walked/spent, so
+     the HUD can show progress against the quote); with no route the
+     metre is charged at the rate of the ride he is on, or at foot rate
+     if he is on nothing. The fare board is now a QUOTE and a heading,
+     never a toll gate.
+
+     AND THE QUOTE IS NOT A CAP — see setRoute() and data.js's fare
+     table for the whole argument. A cap that survives a wanderer is a
+     discount on every metre after the quoted one, which is the same
+     hole the other way round.
+
+     A JUMP IS NOT A STRIDE. A position that moved further than a
+     motorcycle could possibly have in one sample was a teleport (fast
+     travel, a debug hook, an arrival fade), and a teleport is not road
+     covered.
+
+     THE GUARD IS A SPEED, NOT A DISTANCE, and it used to be a distance.
+     A flat 40 m ceiling is only "impossible" if you assume the sample
+     was the nominal 125 ms, and the feed does not promise that: it
+     hands stride() whatever senseAcc had accumulated, so ONE BAD FRAME
+     WIDENS THE HOLE. Measured on the old constant: 39 m in a sample
+     billed 1.5764 e and 41 m billed 0.0000, and 41 m is only 1.52 s of
+     stall at the motorcycle's flat-out 26.4 m/s (6.78 s on foot, which
+     is why nobody hit it walking). A hitch on a bike is not a teleport
+     and must not be a free ride across the island. So the ceiling is
+     now WARP_MPS · dt with the sample's own dt, and it is tighter in
+     the common case as well as looser in the rare one: at the nominal
+     125 ms it is 7.5 m, so that same 39 m jump is now correctly read
+     as the warp it is. WARP_MPS is 60 — 2.3x the fastest thing in
+     RIDES, which leaves room for a slope, a shove or a physics blip
+     without leaving room for a journey.
+
+     dt IS OPTIONAL. Callers that do not know their own timestep (the
+     tests, anything hand-feeding positions) get the old flat 40 m, so
+     a sample without a clock behaves exactly as it always did.
+     ------------------------------------------------------------ */
+  const WARP_MPS = 60;            // no ride on the island does half of this
+  const MAX_STEP_M = 40;          // the dt-less fallback: one nominal sample
+  /* …and less than that in one sample is not a step. Now that standing
+     about is the only free thing left, "standing about" has to include
+     the controller's own settle: a centimetre of jitter eight times a
+     second is not a journey and must not quietly drain the bar. A walk
+     covers 0.3 m per sample at cruise, so this is two orders of
+     magnitude clear of anything real. */
+  const MIN_STEP_M = 0.02;
+  let lastStride = { x: 0, z: 0, has: false };
+
+  function resetStride() { lastStride = { x: 0, z: 0, has: false }; }
+
+  /* WHAT IS UNDER HIM RIGHT NOW, priced. A live route names its own
+     mode and ride — it mounted that ride when it was set, and travel()
+     will not let the two drift. With no route, the shed is the truth:
+     the ride he has equipped is the ride he is on, and an empty slot
+     is a pair of feet. state.travel is deliberately NOT consulted —
+     it is "the last mode he chose", and stepping off the Metro does
+     not make the walk home cost metro energy. */
+  function strideRate() {
+    const r = syncRoute();
+    if (r) return { rate: strideCost(r.mode, r.ride), route: r };
+    const cur = equippedRide();
+    return { rate: strideCost(cur ? 'bike' : 'walk', cur ? cur.id : null), route: null };
+  }
+
+  /* How far he is allowed to have got in a sample of `dt` seconds
+     before it stops being a journey and starts being a teleport. */
+  function warpLimit(dt) {
+    return Number.isFinite(dt) && dt > 0 ? WARP_MPS * dt : MAX_STEP_M;
+  }
+
+  function stride(x, z, dt) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return 0;
+    const prev = lastStride;
+    if (!prev.has) { lastStride = { x, z, has: true }; return 0; }
+    const step = Math.hypot(x - prev.x, z - prev.z);
+    /* A step under the floor does NOT move the baseline — creeping is
+       still travelling, it just is not billable one sample at a time,
+       so it accumulates against the last place he actually stood. A
+       warp does move it, because the far side of a teleport is where
+       the next real step starts from. */
+    if (step > warpLimit(dt)) { lastStride = { x, z, has: true }; return 0; }
+    if (step < MIN_STEP_M) return 0;
+    lastStride = { x, z, has: true };
+
+    const { rate, route: r } = strideRate();
+    if (!(rate > 0)) return 0;
+    const owed = step * rate;
+    if (r) {
+      /* THE LEDGER CARRIES FULL PRECISION. Rounding each instalment and
+         then charging the unrounded one is how a 4.2-energy walk
+         quietly becomes a 4.24-energy walk over two hundred samples;
+         only routeView() rounds, and only for whoever is reading. */
+      r.walked = round2(r.walked + step);
+      r.spent += owed;
+    }
+    countMetres(step);
+    advance(0, owed);
+    return owed;
+  }
+
+  /* Every metre he covers himself, counted once, whether or not he was
+     following a route when he covered it. enter() used to be the only
+     thing that fed this and it only ever saw routed legs. */
+  function countMetres(step) {
+    const st = S();
+    if (st.stats) st.stats.metres = round2((st.stats.metres || 0) + step);
+  }
+
+  /* ------------------------------------------------------------
+     THE 3D WORLD WALKED WALLY THROUGH A DOOR.
+
+     No fare and no clock jump: on a routed leg the live clock has
+     already taken the minutes and stride() has already taken the
+     energy, one metre at a time, on the way here.
+
+     THIS IS ALSO HOW A ROUTE ENDS. Arriving at the place he was
+     pointed at closes it and counts the trip; walking into anywhere
+     else drops it, because a player who went somewhere else changed
+     his mind and the arrow should stop insisting.
+     ------------------------------------------------------------ */
   function enter(locId) {
     const st = S();
     if (!LOC_BY_ID[locId]) return { ok: false, why: 'No such place' };
@@ -860,13 +1307,30 @@ export function createGame(opts = {}) {
        whatever this returns, so the sign and the door now agree. */
     const door = canEnter(locId);
     if (!door.ok) return { ok: false, why: door.why, kind: door.kind, opens: door.opens, food: door.food };
-    st.travel = 'walk';
+
+    const r = syncRoute(st);
+    const arrived = !!r && r.to === locId;
+    const mode = arrived ? r.mode : 'walk';
+    if (r) {
+      st.route = null;
+      st.stats.trips++;
+      /* THE METRES ARE ALREADY IN. stride() counts every metre as he
+         covers it now — routed or not — so adding r.walked here again
+         would bill the odometer twice for the same road. The no-walker
+         branch is the one that still needs a lump, and jump() does it
+         there (see setRoute). */
+      bus.emit('route', {
+        kind: arrived ? 'arrive' : 'abandon', to: r.to, at: locId,
+        mode: r.mode, ride: r.ride, walked: r.walked, spent: round2(r.spent),
+      });
+    }
+    st.travel = mode;
     const first = M.setLoc(locId);
-    bus.emit('travel', { to: locId, mode: 'walk', cost: 0, mins: 0, first });
+    bus.emit('travel', { to: locId, mode, cost: 0, mins: 0, first, fast: false, onFoot: true });
     quests.check();
     storyBeats();
     if (first) M.note('token', 'Discovered ' + LOC_BY_ID[locId].n);
-    return { ok: true, first };
+    return { ok: true, moved: true, first, routed: arrived };
   }
 
   /* Nearest location to a 3D position — the world module uses this to
@@ -907,6 +1371,34 @@ export function createGame(opts = {}) {
      for two frames is not a discovery either. Seven tenths of a second
      inside the radius is. `hysteresis` gives the timer a few metres of
      slack so jitter at the boundary does not keep resetting it.
+
+     RE-READ AGAINST THE v8 TRAVEL RULE, AND IT STANDS — but only two
+     of the six ways of getting about are still "fast travel", so the
+     sentence above now means something different in each half:
+
+       train, trunk   still teleport, still feed nothing. The rule is
+                      unchanged and so is the code: jump() calls
+                      M.setLoc() and the next stride()/sense() sample
+                      trips the teleport guard below and clears the
+                      dwell timers, so a Metro ride past nine
+                      buildings discovers none of them. Correct: he
+                      was underground.
+       walk, bike,    now feed this constantly, because the player is
+       scooter, moto  really out there covering the ground. That is
+                      the FEATURE — routing him to the Business
+                      Broker means he walks past the noodle carts and
+                      the city notices — and the dwell is the whole
+                      reason it does not become a skeleton key. At
+                      the motorcycle's 26.4 m/s a 16 m radius is 1.2 s
+                      of contact against a 0.7 s dwell, so a flat-out
+                      pass CAN bank a discovery; at any lower speed it
+                      is not close. That is the intended edge: the
+                      radius is the building's front, and if you were
+                      in front of it for the better part of a second
+                      you went past its door.
+
+     Nothing here gates on the route. Discovery is a property of
+     where his feet are, not of where he told the arrow to point.
 
      PURE ENOUGH TO TEST. sense(x, z, dt) takes a position and a
      timestep and returns the locations it just found — no ctx, no
@@ -1732,29 +2224,11 @@ export function createGame(opts = {}) {
       return { ok: true, cost: r.price, price: r.price, ride: rideView(id), bike: { ...S().bike } };
     },
     grantRide,
-    /* Take one with you, or leave it all behind. Pass null to walk. */
-    equipRide(id) {
-      const st = S();
-      const rs = syncRides(st);
-      if (id == null) {
-        const was = rs.equipped;
-        rs.equipped = null;
-        syncRides(st);
-        bus.emit('ride', { kind: 'unequip', ride: was, owned: { ...rs.owned }, equipped: null });
-        bus.emit('bike', { owned: anyRide(), equipped: false, bought: false, ride: null });
-        return { ok: true, ride: null, bike: { ...st.bike } };
-      }
-      if (!RIDES[id]) return { ok: false, why: 'No such ride' };
-      if (!rs.owned[id]) return { ok: false, why: 'You do not own the ' + RIDES[id].short.toLowerCase() };
-      rs.equipped = id;                    // ONE AT A TIME: a single slot
-      syncRides(st);
-      /* state.travel stays honest: it is the last mode actually used,
-         not the one he intends to use next. */
-      bus.emit('ride', { kind: 'equip', ride: id, name: RIDES[id].name, speed: RIDES[id].speed,
-        owned: { ...rs.owned }, equipped: id });
-      bus.emit('bike', { owned: true, equipped: true, bought: false, ride: id });
-      return { ok: true, ride: rideView(id), bike: { ...st.bike } };
-    },
+    /* Take one with you, or leave it all behind. Pass null to walk.
+       state.travel is NOT written here: it is the mode he chose on
+       the fare board, and putting a bicycle in the shed is not
+       choosing a way to get anywhere. */
+    equipRide(id) { return mountRide(id); },
 
     /* ---- the bicycle, in the words the old API used ----
        ui/menus.js and anything written against v6 still call these.
@@ -2386,6 +2860,15 @@ export function createGame(opts = {}) {
     /* a loaded save is not mid-stride outside a building it was never
        standing at: drop the proximity dwell timers on every boot */
     resetSense();
+    /* …and the stride baseline with them, so the first position fed
+       after a boot or a load is a starting point and not a 400 m
+       "journey" from wherever the last session left him. The ROUTE
+       itself survives the save — being pointed at the Business
+       Broker is the kind of thing that should still be true tomorrow
+       — but syncRoute() throws out anything malformed or aimed at a
+       mode that is now fast travel. */
+    resetStride();
+    syncRoute();
     if (fresh) clients.seedArrivals();
     else if (!S().arrivals.length) clients.seedArrivals();
     lastHour = -1;
@@ -2431,6 +2914,29 @@ export function createGame(opts = {}) {
     /* place */
     here, officeLoc, isOpen, known, visibleLocations, fares, travel, enter,
     nearest, zoneAt,
+
+    /* THE SELF-POWERED HALF OF TRAVEL — see travel() above.
+         route            the live route, or null. `left` is how much
+                          of the QUOTE is still unspent — a budget
+                          bar, not a promise (see setRoute).
+         routeTo          the destination id alone, or null. hud.js
+                          reads this every frame to keep the yellow
+                          arrow and the route one decision, and a
+                          getter that allocates nothing is the right
+                          shape for a per-frame read.
+         clearRoute(why)  drop it
+         stride(x, z, dt) feed his position; charges every metre he
+                          covers himself, route or no route, and
+                          returns what it just charged. `dt` sizes the
+                          warp guard (WARP_MPS · dt); leave it out and
+                          the guard is a flat 40 m.
+         setWalker(on)    is anything in this build actually walking
+                          him? Off means travel() resolves a
+                          self-powered leg itself.                   */
+    get route() { return routeView(); },
+    get routeTo() { const r = syncRoute(); return r ? r.to : null; },
+    clearRoute, stride, resetStride, setWalker,
+    get hasWalker() { return hasWalker; },
     zoneOf: (locId) => (LOC_BY_ID[locId] ? ZONES[LOC_BY_ID[locId].z] : null),
 
     /* DISCOVERY BY WALKING — see sense() above.
@@ -2656,7 +3162,21 @@ export async function init(ctx) {
     senseAcc = 0;
     const p = ctx.wally && ctx.wally.position;
     if (!p) return;
+    /* THERE IS AN ELEPHANT AND HE IS MOVING. This one line is what
+       makes walking and riding real journeys rather than lump-sum
+       fares — see travel() and setWalker(). It is set from the feed
+       rather than once at boot so a build that never produces a
+       position never claims to have a walker. */
+    game.setWalker(true);
     game.sense(p.x, p.z, step);
+    /* …and the same sample pays the road tax. Both are fed from here
+       because this is the only place in the codebase that knows where
+       Wally actually is — and `step` goes with the position, because
+       the warp guard is a SPEED: on a stalled frame this sample is
+       worth more than 125 ms of road and the ceiling has to grow with
+       it, or a hitch on the motorcycle reads as a teleport and rides
+       free. See stride(). */
+    game.stride(p.x, p.z, step);
   };
 
   /* Continue an existing run when there is one, unless we are taking
@@ -2712,6 +3232,16 @@ export async function init(ctx) {
       return p ? game.nearbyPlaces(p.x, p.z).map((n) => ({ id: n.id, dist: n.dist, r: n.radius, known: n.known })) : [];
     };
     d.placeProgress = () => game.placeProgress();
+    /* ---- THE TRAVEL RULE, for anyone poking at it ----
+       route()        the live self-powered journey, or null
+       routeTo(id,m)  set one by hand (the fare board's one tap)
+       clearRoute()   drop it
+       fast(id)       which modes to `id` would actually carry him  */
+    d.route = () => game.route;
+    d.routeTo = (id, m) => game.travel(id, m || 'walk');
+    d.clearRoute = () => game.clearRoute('debug');
+    d.fast = (id) => game.fares(id || game.state.loc)
+      .map((f) => f.mode + (f.fast ? ' · carries you' : ' · points you') + (f.ok ? '' : ' · ' + f.why));
     /* THE MAYOR'S DASH, for anyone posing or testing it. */
     d.race = () => game.race.view();
     d.raceOffer = () => game.race.offer();

@@ -448,6 +448,33 @@ const TRUNK_SOLID = {
 /* below the ground line, so a trunk on a hillside never floats its box */
 const TRUNK_BASE = -0.9;
 
+/* ------------------------------------------------------------------
+   NOTHING GROWS IN THE CARRIAGEWAY.
+
+   plantable() gates on turf(), and turf() only FADES with road
+   coverage — it multiplies by 1 - smoothstep(0.10, 0.40, pathAt), so a
+   candidate standing on the worn shoulder still scores 0.4 and still
+   gets planted. That is right for a blade of grass and wrong for a
+   trunk. A full-scale broadleaf is a 1.2 m collider inside a 1.7 m
+   flare: measured on the island, four of the 782 trunk boxes reach
+   road coverage between 0.41 and 0.93 — one Golden Heights topiary
+   with its AXIS at 0.73, which is the middle of a street, and one
+   Rusty Row broadleaf a metre off the kerb of the fork outside the
+   player's own flat. Walking that district runs the capsule into it at
+   (-322.9, 168.4) and grinds there for a second and a half.
+
+   Trees were the one solid the city never asked this of: it vetoes a
+   PROP that lands in a doorway corridor, and nothing was vetoing a
+   trunk that landed in a road. So the trunk is measured against the
+   carriageway explicitly — the disc its box occupies, PLUS the capsule
+   that has to get past it, has to stay under ROAD_EDGE. A candidate
+   that fails is walked down the coverage gradient; one that cannot get
+   clear inside 3 m is not planted. Four trees move; 778 do not, and
+   the walk consumes no rng, so every other tree is bit-identical.
+   ------------------------------------------------------------------ */
+const ROAD_EDGE = 0.42;      // pathAt at the worn edge of the carriageway
+const WALK_R = 0.35;         // the controller capsule, ART_DIRECTION §4
+
 /* ------------------------------------------------------------ */
 export function createTrees(ctx, env) {
   const W = env.world;
@@ -567,11 +594,53 @@ export function createTrees(ctx, env) {
     return false;
   }
 
+  /** Worst road coverage anywhere on the disc of radius r about (x, z). */
+  function roadOver(x, z, r) {
+    let worst = W.pathAt(x, z);
+    for (let a = 0; a < 8; a++) {
+      const ang = (a / 8) * Math.PI * 2;
+      const v = W.pathAt(x + Math.cos(ang) * r, z + Math.sin(ang) * r);
+      if (v > worst) worst = v;
+    }
+    return worst;
+  }
+
+  /** Walk (x, z) off the carriageway, or null if it cannot get clear.
+      Steepest descent on pathAt in 0.5 m steps — six of them, so a tree
+      never travels more than 3 m from where the placer meant it. */
+  function offRoad(x, z, r) {
+    if (roadOver(x, z, r) <= ROAD_EDGE) return null;      // already clear
+    for (let k = 0; k < 6; k++) {
+      let bx = x, bz = z, best = Infinity;
+      for (let a = 0; a < 12; a++) {
+        const ang = (a / 12) * Math.PI * 2;
+        const nx = x + Math.cos(ang) * 0.5, nz = z + Math.sin(ang) * 0.5;
+        const v = roadOver(nx, nz, r);
+        if (v < best) { best = v; bx = nx; bz = nz; }
+      }
+      x = bx; z = bz;
+      if (best <= ROAD_EDGE) return { x, z };
+    }
+    return { x: NaN, z: NaN };                            // give up, drop it
+  }
+
   function addTree(kind, x, z, rng, opts = {}) {
-    const y = W.heightAt(x, z);
     const v = (opts.variant != null ? opts.variant : (rng() * VARIANTS) | 0) % VARIANTS;
     const sh = shapes.get(kind + v);
     const s = (opts.scale ?? 1) * (0.74 + rng() * 0.66);
+    /* Off the road BEFORE anything is sampled from the position — the
+       height, the normal and the collider all follow from it. The
+       clearance asked for is the box's own half-width at this instance's
+       scale plus the capsule that has to walk past it. */
+    const solid = sh.hi.solid;
+    if (solid) {
+      const moved = offRoad(x, z, solid.r * s * 1.14 + WALK_R);
+      if (moved) {
+        if (!Number.isFinite(moved.x)) return null;
+        x = moved.x; z = moved.z;
+      }
+    }
+    const y = W.heightAt(x, z);
     const t = {
       kind, v, x, y, z, s,
       yaw: opts.yaw ?? rng() * Math.PI * 2,
@@ -834,7 +903,8 @@ export function createTrees(ctx, env) {
     plant(kind, x, z) {
       if (!KINDS.includes(kind)) return false;
       if (env.clearance(x, z) < 0.5) return false;
-      addTree(kind, x, z, env.rngFor('plant.' + x + ',' + z));
+      /* addTree answers null when the trunk cannot be got off the road */
+      if (!addTree(kind, x, z, env.rngFor('plant.' + x + ',' + z))) return false;
       acc = 99;
       return true;
     },
