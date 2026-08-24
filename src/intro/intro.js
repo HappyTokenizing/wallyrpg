@@ -433,6 +433,24 @@ export async function init(ctx) {
       typeof ctx.sky?.grade === 'string' ? ctx.sky.grade : saved.grade, 1.0);
     if (ctx.wally) {
       ctx.wally.release?.(0.35);
+      /* TWO DIFFERENT RELEASES, AND release() IS ONLY ONE OF THEM.
+         release() drops the explicit CLIP override (manual/manualHold).
+         The locomotion blend is a separate latch: play() at the top of
+         this file drives it with setLocomotion(v, 0), which sets
+         locoManual = true, and wally.js then feeds the animator that
+         pinned number instead of controller.planarSpeed for the rest of
+         the session. Its own docstring says "pass (null) to hand it back
+         to the controller" and nothing ever did.
+         The symptom was reported as "he moves but no walk animation or
+         bike animation": the controller integrates normally and the
+         animator believes he is standing still, because the last value
+         the cinematic set was ~0. Measured before this line existed —
+         animSpeed 0.004 against a controller reading 2.447 m/s, leg-bone
+         travel 0.156 rad against 0.98 rad walking.
+         It is HERE rather than in finish() because restoreWorld() is the
+         one hand-over both paths reach; a skip taken mid-ride does not
+         run the watched path's cues. */
+      ctx.wally.setLocomotion?.(null);
       ctx.wally.setPosition(anchor.x, anchor.y, anchor.z);
       ctx.wally.setYaw(board.yaw);
       ctx.wally.setControlled?.(true);
