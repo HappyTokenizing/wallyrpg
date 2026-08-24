@@ -27,6 +27,7 @@ import { h, clear, icon, portrait, glyphAvatar, wallyAvatar, hueFor } from './st
    comes from the action table in touch.js, which knows what the
    player is holding; see the header there. */
 import { paintChip, onInputMode, touchUI } from './touch.js';
+import { kb } from './kbowner.js';
 
 /* jitter for the talk-blip cadence — seeded, so a screenshot run is
    byte-identical between builds (Math.random is banned) */
@@ -170,8 +171,22 @@ export function createDialogue(ctx, ui) {
         }, c.icon ? icon(c.icon, 15) : null, c.label);
         chBox.append(b);
       }
-      /* first choice takes focus so a keyboard player can just hit Enter */
-      chBox.firstChild?.focus?.({ preventScroll: true });
+      /* FIRST CHOICE TAKES FOCUS so a keyboard player can just hit
+         Enter — and it DECLARES that it is doing so.
+
+         This one line put defect 3 back, 3 of 3, for a player who has
+         never touched a keyboard. A dialogue opening inside a sheet
+         hand-back's six-frame retry window moved the keyboard, the
+         hand-back compared document.activeElement against its
+         baseline, saw a move, and could not tell this from the player
+         pressing Tab — so it withheld its signature, the pad read an
+         ordinary player focus on a pad button, and the next Space
+         opened the pause sheet instead of jumping.
+
+         It is also one of the FOUR focus() calls round 5 counted as
+         two, and it is optional-chained twice over, which is exactly
+         why the grep missed it. See kbowner.js. */
+      kb.focus('dialogue.choice', chBox.firstChild, { preventScroll: true });
     }
 
     function advance() {

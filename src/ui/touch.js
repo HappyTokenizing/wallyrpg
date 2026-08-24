@@ -46,6 +46,7 @@
 
 import { clamp } from '../core/contracts.js';
 import { h, icon } from './style.js';
+import { kb } from './kbowner.js';
 
 /* stick shape — see ART_DIRECTION §4 for the speeds these map onto */
 const DEAD = 0.12;          // ignore the first 12 % of the throw
@@ -722,8 +723,34 @@ export function createTouch(ctx, ui) {
       opposed to a mouse, which a keyboard player may well also be
       holding. */
   const direct = (e) => e.pointerType === 'touch' || e.pointerType === 'pen';
-  /** True while the player is demonstrably driving with their thumbs. */
-  let driving = false;
+  /* THE FLAG IS NOT KEPT HERE ANY MORE, AND THAT IS THE ROUND-SIX FIX.
+
+     `driving` used to be a local of this closure, written by five
+     sites in this file and cleared by an INFERENCE drawn from a
+     focusin: "a focus arrived on a pad button, therefore the player
+     put it there". That inference was right about Tab, right about a
+     screen reader's rotor, and wrong about every focus() the UI
+     performed itself -- and there turned out to be four of those in
+     src, two of them behind optional chaining where a grep for the
+     method name could not see them.
+
+     So the pad is a CALLER now, not a participant. src/ui/kbowner.js
+     owns the answer, every focus() in src declares its intent to it,
+     and a focus it did not authorise is by definition the player's.
+     This file:
+
+       · REGISTERS its root, so the owner knows which controls count
+       · says kb.playing() when a thumb lands, which is the same
+         statement `driving = true` was making
+       · READS kb.gameHasKeyboard where it used to read `driving`
+       · and asks for nothing else.
+
+     Nothing about the transitions has changed. What changed is that
+     the events that move them can no longer be forged by a focus()
+     call somebody adds next month. See THE INVARIANT at the top of
+     kbowner.js. */
+  const unown = kb.ownControls(root);
+  off.push(unown);
   /** Is the keyboard's focus parked on one of our own buttons? */
   const padFocused = () => {
     const a = typeof document !== 'undefined' && document.activeElement;
@@ -808,6 +835,37 @@ export function createTouch(ctx, ui) {
        · A 50 ms DEADLINE -- an announced focus that never lands (see
          below) cannot sit armed waiting to swallow a genuine Tab.
 
+     AND A FOURTH BOUND THAT CANNOT LIVE IN THIS FILE, WHICH IS THE
+     CORRECTION THIS PARAGRAPH NEEDED. The three bounds above police
+     WHAT a signature covers; none of them asks whether the caller was
+     entitled to offer one. It was not always. A Tab pressed on the
+     closing lift lands INSIDE THE ALREADY-CLOSING PANEL -- outside
+     this root, so the listener below never sees it -- and the signed
+     hand-back then overwrote that focus while its signature kept
+     `driving` alive across the overwrite. The player's keystroke was
+     lost twice: its focus move undone AND its meaning discarded.
+     Measured as an A/B on one page, one load, alternating arms,
+     sixteen gestures each, identical finger events, one Tab:
+
+       signature ON  (as PAD-41 shipped it)  ->  DEAF 9 of 16
+       signature OFF (before it)             ->  DEAF 0 of 16
+
+     Before the signature, the restore's own unsigned focusin cleared
+     the flag and ACCIDENTALLY RESCUED the Tab. PAD-41 removed the
+     accident without replacing it.
+
+     The missing bound is the second half of the sentence the signature
+     was saying: not just "I performed this focus" but "AND I am not
+     overwriting one the player performed six milliseconds ago". Only
+     ui.js can answer that -- it is the only party that knows which
+     focus the close set out to restore -- so handBack() now samples
+     that focus when the close begins and OFFERS NO SIGNATURE when the
+     focus it is about to replace is no longer that one. This file is
+     unchanged by it and deliberately so: an unsigned restore is just a
+     focus, and the listener below already does the right thing with a
+     focus. See AND THE SIGNATURE HAD A SECOND CLAUSE in ui.js, and
+     PANEL-8..PANEL-8g.
+
      AND IT SURVIVES THE RESTORE'S OWN RETRY, which is the part a flag
      set once around the CALL would have got wrong. The hand-back spans
      roughly six frames: the pad is still display:none at the instant
@@ -849,31 +907,45 @@ export function createTouch(ctx, ui) {
      outside the panel stack (the two other focus() calls in the layer
      target an <input> inside a sheet, which root.contains() rejects
      one line down). Asserted as PAD-41..PAD-41e and PANEL-7..PANEL-7d.
+
+     AND THE PARENTHESIS IS WHERE ROUND 6 CAME IN. "The two other
+     focus() calls in the layer" was a count taken with a grep for the
+     method name. THERE WERE FOUR — dialogue.js and main.js reach it
+     through optional chaining, which is exactly what the grep could
+     not see, and the dialogue one was live. Everything above this
+     line is kept because the REASONING is all still true; what is no
+     longer true is that a rule inferred from focus events can be
+     made safe by enumerating the things that fool it. See THE
+     INVARIANT in src/ui/kbowner.js, and KB-3, which does the
+     enumeration structurally and fails if a new one appears.
      ============================================================ */
-  /** The one restore ui.js has announced and the pad has not yet seen:
-      { el, at } -- element identity, single use, 50 ms. */
-  let uiFocus = null;
-  /** ui.js: "I am about to focus this myself." Called immediately
-      before each focus() attempt of the hand-back. */
-  function uiWillFocus(el) {
-    if (!el || !root.contains(el)) return false;   // not ours; nothing to sign
-    uiFocus = { el, at: performance.now() };
-    return true;
-  }
-  /** Is the focusin now arriving the restore ui.js just announced? */
-  function isUiRestore(target) {
-    if (!uiFocus) return false;
-    const mine = uiFocus.el === target && (performance.now() - uiFocus.at) < 50;
-    if (mine) uiFocus = null;                      // consumed
-    return mine;
-  }
-  bindCap(document, 'focusin', (e) => {
-    if (!root.contains(e.target)) return;
-    /* THE ONE LINE THE DEFECT LIVED ON. A focus the PLAYER performed
-       is the handback. A focus the UI RESTORED is the player's place
-       in the document being handed back to them, and it says nothing
-       at all about which way they are holding the phone. */
-    if (!isUiRestore(e.target)) driving = false;
+  /* THE SIGNATURE IS GONE, AND ITS THREE BOUNDS WITH IT.
+
+     `uiWillFocus(el)` / `isUiRestore(target)` were the pad's way of
+     hearing ui.js say "the next focusin on that element is mine".
+     They needed element identity, single use and a 50 ms deadline
+     because they were a GUESS that had to be stopped from outliving
+     the focus it described -- and they still needed a fourth bound,
+     "and I am not overwriting a focus the player performed six
+     milliseconds ago", which could not be expressed here at all.
+
+     The owner needs none of them. focusin is dispatched
+     SYNCHRONOUSLY inside focus() (measured on this project), so
+     kbowner's authorisation is the same call stack as the arrival it
+     covers. A call stack cannot cover the wrong element, cannot be
+     used twice, and cannot expire. See THE THREE INTENTS in
+     kbowner.js; the fourth bound became `adopt`, which lives at the
+     one call site that can answer it.
+
+     WHAT THIS FILE STILL DOES WITH A FOCUS: the idle clock, and
+     nothing else. The routing bit moved to the owner. */
+  const unfocus = kb.onFocus(({ target, player }) => {
+    if (!root.contains(target)) return;
+    /* kbowner has already decided whether this was the player and,
+       if so, taken the keyboard back off the game. There is nothing
+       for this file to infer and deliberately no second opinion --
+       reading `player` here would be a rule in two places again. */
+    void player;
     /* ...AND IT IS ACTIVITY, WHICH IS THE WHOLE OF THIS FILE'S ANSWER
        TO THE FADE. style.js gives the faded cluster visibility:hidden,
        which takes every button out of the tab order AND out of the
@@ -899,7 +971,8 @@ export function createTouch(ctx, ui) {
        'modal' while the sheet is up. Splitting this line would change
        nothing and would put a second rule in a file that has one. */
     idleT = 0;
-  }, true);
+  });
+  off.push(unfocus);
 
   /* setPointerCapture throws for a pointerId the browser has no active
      contact for. It used to sit ABOVE the preventDefault in all three
@@ -997,7 +1070,7 @@ export function createTouch(ctx, ui) {
     if (stick.id !== null) return;                 // one thumb owns it
     /* A THUMB ON THE STICK IS THE PLAINEST STATEMENT OF INTENT THIS PAD
        CAN RECEIVE -- see THE FOCUS OUTLIVES THE MODALITY. */
-    if (direct(e)) driving = true;
+    if (direct(e)) kb.playing();
     const r = zone.getBoundingClientRect();
     stick.id = e.pointerId;
     stick.cx = clamp(e.clientX - r.left, ringR * 0.55, r.width + ringR * 0.35);
@@ -1121,7 +1194,7 @@ export function createTouch(ctx, ui) {
     if (jumpId !== null) return;
     /* ...and so is a thumb on Jump -- see THE FOCUS OUTLIVES THE
        MODALITY, above the stick. */
-    if (direct(e)) driving = true;
+    if (direct(e)) kb.playing();
     jumpId = e.pointerId;
     jumpHeld = true;
     jumpBtn.classList.add('down');
@@ -1152,7 +1225,7 @@ export function createTouch(ctx, ui) {
        already did -- wally.js reads the key off window. Answering it
        here as well would double-fire the very verb they wanted.
        See THE FOCUS OUTLIVES THE MODALITY. */
-    if (driving) return;
+    if (kb.gameHasKeyboard) return;
     if (jumpId !== null) return;                   // a thumb owns it: do not cut its hold
     jumpHeld = true;
     clearTimeout(jumpKeyT);
@@ -1357,7 +1430,7 @@ export function createTouch(ctx, ui) {
          A press that has got this far is past the rect test, past
          controlsLive and carries a real finger, so it is a player
          playing. See THE FOCUS OUTLIVES THE MODALITY. */
-      if (direct(e)) driving = true;
+      if (direct(e)) kb.playing();
       run();
     };
     bind(btn, 'pointerup', end, true);
@@ -1385,7 +1458,7 @@ export function createTouch(ctx, ui) {
          to some time ago. Tab hands it straight back, and focus is left
          exactly where they put it. See THE FOCUS OUTLIVES THE
          MODALITY. */
-      if (driving) return;
+      if (kb.gameHasKeyboard) return;
       run();
     }, true);
   }
@@ -1945,7 +2018,7 @@ export function createTouch(ctx, ui) {
        the fix not working. */
     bindCap(cv, 'pointerdown', (e) => {
       if (!enabled || !direct(e)) return;
-      driving = true;
+      kb.playing();
       const a = document.activeElement;
       if (a && a !== document.body) e.preventDefault();
     }, false);
@@ -2128,22 +2201,29 @@ export function createTouch(ctx, ui) {
          its class list as "the focus" reads as a focused element. */
       const a = d && d.activeElement !== d.body ? d.activeElement : null;
       return {
-        driving,
+        /* `driving` is kept as the NAME the suite and five rounds of
+           notes use. It is read from src/ui/kbowner.js now; this file
+           no longer holds a copy of it, which is the whole point. */
+        driving: kb.gameHasKeyboard,
         padFocused: padFocused(),
         focus: a ? (a.getAttribute?.('aria-label') || a.className || a.tagName) : null,
         /* the sentence a player would say: would Space fire the button? */
-        padTakesSpace: padFocused() && !driving,
+        padTakesSpace: padFocused() && !kb.gameHasKeyboard,
+        /* WHO SAYS SO -- the owner's own reading, so a test can tell a
+           pad that agrees with the owner from a pad that has quietly
+           gone back to keeping its own copy. */
+        owner: kb.report().gameHasKeyboard,
       };
     },
-    /** ui.js ANNOUNCING ITS OWN focus() — see A FOCUS THE PLAYER
-        PERFORMED AND A FOCUS THE UI RESTORED. Call it immediately
-        before EACH focus() attempt of the sheet hand-back; the pad
-        then knows that focusin is not the player picking the button up
-        again and leaves `driving` alone. Element identity, single use,
-        50 ms — a signature that outlived its focus would be a pad deaf
-        to a real one. Returns false for anything outside the cluster,
-        which is every other focus this layer performs. */
-    uiWillFocus,
+    /** THE PAD'S ROOT, so a test can ask the owner the same question
+        this file asks it. There is no uiWillFocus() any more: ui.js
+        does not announce its focuses to the PAD, it declares them to
+        kbowner, and the pad only ever reads the answer. Removing it
+        is the point — an API the panel layer had to remember to call
+        correctly, per attempt, with a fourth bound it could not
+        express, is exactly the shape that reopened this five times.
+        Asserted as KB-2 (the pad keeps no copy) and KB-6. */
+    get controlsRoot() { return root; },
     /** THE DEBUG SWITCH BEHIND lostIsRelease. false restores the old
         "a capture loss is a release" behaviour so the dead-drag rate
         can be measured before and after on one page. */

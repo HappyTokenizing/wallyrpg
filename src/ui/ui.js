@@ -44,6 +44,7 @@
 
 import { clamp } from '../core/contracts.js';
 import { injectStyle, h } from './style.js';
+import { kb } from './kbowner.js';
 import { createHud } from './hud.js';
 import { createDialogue } from './dialogue.js';
 import { createPhone } from './phone.js';
@@ -256,14 +257,288 @@ export async function init(ctx) {
   /** Can this element actually take the keyboard right now? */
   function focusable(el) {
     return !!el && el.isConnected && !el.disabled
-      && typeof el.focus === 'function' && el.getClientRects().length > 0;
+      && kb.canFocus(el) && el.getClientRects().length > 0;
   }
   /** Whoever had the keyboard when the modal stack last left empty. */
   let focusReturn = null;
+
+  /* ============================================================
+     AND THE SIGNATURE HAD A SECOND CLAUSE IT NEVER SAID: A TAB
+     PRESSED INSIDE THE HAND-BACK'S OWN RETRY WINDOW WAS EATEN.
+
+     THE REGRESSION THE FIX ABOVE INTRODUCED, measured as an A/B on one
+     page, one load, alternating arms, sixteen gestures each, identical
+     finger events throughout — thumb Jump, thumb Menu, thumb Resume —
+     with one Tab on the closing lift (tools/_r9e.mjs; my run, load
+     4.84 at boot / 6.12 at end, 10 cpus):
+
+       signature ON  (shipping)  ->  DEAF 9 of 16
+       signature OFF (pre-fix)   ->  DEAF 0 of 16
+
+     DEAF means the player pressed Tab, the focus ring ends on Menu,
+     and the pad still refuses the key. The ledger shows a 7-10 ms race
+     between two focus moves:
+
+       DEAF  the panel's focusin, then TAB at +2 ms landing inside the
+             ALREADY-CLOSING panel, then the signed hand-back at +8 ms
+             overwriting it
+       OK    the panel's focusin, the signed hand-back at +7 ms, then
+             TAB at +8 ms moving Menu -> Jump INSIDE the pad, where the
+             pad's own focusin rule sees it and hands the keyboard back
+
+     When the Tab loses the race it lands inside a panel that has
+     already closed — outside the pad's root — so the pad's focusin
+     rule never sees it at all. The hand-back then overwrites that
+     focus, and its signature keeps `driving` alive across the
+     overwrite. The Tab is lost TWICE: its focus move is undone AND its
+     meaning is discarded. Before the fix, the restore's own unsigned
+     focusin cleared the flag and ACCIDENTALLY RESCUED the Tab; the fix
+     removed the accident without replacing it.
+
+     THE DIAGNOSIS NAMES THE FIX. The signature is honest about "I
+     performed this focus" and silent about "and I am overwriting one
+     the player performed 6 ms ago". So the hand-back must know whether
+     the focus it is about to replace is still the one the close left
+     behind. It is, in one line: remember the focus AT THE MOMENT THE
+     CLOSE BEGAN, and compare it at the attempt that lands.
+
+       still there  -> this is a faithful RESTORE. Sign it.
+       moved        -> this is an OVERWRITE of somebody else's focus,
+                       and on this path that somebody is the player.
+                       Restore the position, WITHHOLD THE SIGNATURE.
+
+     THE FOCUS IS STILL RESTORED, AND THAT IS THE WHOLE POINT OF
+     PICKING THIS ONE. The pad then sees an ordinary unsigned focusin
+     on a pad button and clears `driving` exactly as it does for any
+     player focus — so the Tab keeps its MEANING, and the player keeps
+     a real place in the document instead of one inside a node that is
+     about to be removed.
+
+     WHAT I REJECTED, AND I MEASURED BOTH RATHER THAN ARGUING THEM.
+     `WALLY.debug.padHandBackYield(mode)` runs all three arms on ONE
+     page at ONE load; the numbers are in tools/touchtest.mjs at
+     PANEL-8.
+
+       'all' — YIELD THE HAND-BACK ENTIRELY when the focus changed
+         after the close began. It does not even fix the symptom: the
+         Tab landed in the DYING panel, so abandoning the restore
+         leaves the keyboard in a node that is removed 300 ms later and
+         focus drops to <body>. No pad focusin ever happens, `driving`
+         stays true — still DEAF — and now the player has lost their
+         place in the document as well, which is the PANEL-1 defect the
+         hand-back exists to repair. It trades a lost keystroke for a
+         lost position and keeps the lost keystroke. Three arms, one
+         page, one load, twelve gestures each (my run, load 5.28 at
+         boot / 6.69 at end, 10 cpus):
+
+           'sign'  DEAF  0/12   keyboard left on <body>  0/12
+           'none'  DEAF  3/12   keyboard left on <body>  0/12
+           'all'   DEAF  8/12   keyboard left on <body>  8/12
+
+       'sign' — what ships. See above.
+
+       ADOPT THE FOCUS INSIDE THE CLOSING PANEL as a player action and
+         let it stand. Same end state as 'all' — the panel is going
+         away — plus it would have to widen the pad's focusin rule
+         beyond its own root so touch.js could see focuses landing in
+         panels, which puts panel knowledge in the pad and gives every
+         focus anywhere in the document a say in `driving`. A bigger
+         blast radius to reach a worse outcome.
+
+     IT CANNOT BE DEFEATED BY THE RETRY, which is the trap the first
+     fix fell into and the reason the shape here is deliberate. The
+     baseline is captured ONCE, at the moment the close began; the
+     COMPARISON runs on EVERY attempt, next to the signature it
+     governs. Recapturing the baseline per attempt would be the same
+     class of mistake in reverse — attempt N's baseline would already
+     contain the player's Tab, the focus would always look unmoved,
+     and the check would be decorative. Asserted as PANEL-8b, which
+     lands the Tab BETWEEN attempts of a real, multi-attempt close.
+
+     <body> IS NOT A PLAYER MOVE, and this is the one line that keeps
+     the cure off the disease. Focus reverting to <body> is focus being
+     DROPPED — the panel node went, or the pad is still display:none —
+     and that is the exact condition the hand-back was written for. If
+     a bare <body> counted as "somebody moved it", every hand-back
+     would go unsigned and PANEL-7 would be back within a week. Only a
+     real, different, live element counts. Asserted as PANEL-8c.
+
+     THE RESIDUAL, STATED PLAINLY — AND IT WAS WRONG, WHICH IS WHY
+     ROUND 6 EXISTS. It used to read: "any OTHER focus() in this layer
+     that landed inside a hand-back's six-frame window would also cost
+     the signature. There are exactly two, both aimed at an <input>
+     inside an open sheet (openQuickBuy here, the Clear button in
+     menus.js), and both are outside the pad."
+
+     THERE ARE FOUR, and the residual found two because it went
+     looking for `.focus(`:
+
+       src/ui/ui.js        openQuickBuy         el?.…?.('input')?.focus()
+       src/ui/menus.js     Clear button         input.focus()
+       src/ui/dialogue.js  showChoices          firstChild?.focus?.()
+       src/main.js         ask (the boot chip)  goEl?.focus?.()
+
+     The last two are optional-chained, and one of them is not in this
+     layer at all. The dialogue one was live: a dialogue with choices
+     opening inside a hand-back's window cost the signature 3 of 3 and
+     put defect 3 back for a thumb-only player.
+
+     "Both are outside the pad, so the competing focus really is the
+     player's" was the false step, and it is false in general and not
+     just by two call sites. A focus THIS CODEBASE PERFORMS is never
+     the player, wherever it lands.
+
+     So the residual is closed rather than restated. src/ui/kbowner.js
+     owns the answer, every one of the four declares its intent to it,
+     and the enumeration is asserted two ways — KB-3 reads every file
+     in src/ off disk and fails on a `focus` member anywhere but
+     kbowner.js, and KB-4 wraps the DISPATCH so an alias or a computed
+     access cannot hide either. PANEL-9 still holds the containment
+     line, which is now a second belt rather than the whole brace.
+     ============================================================ */
+  /** Debug switch only — 'sign' ships. 'none' is the pre-fix
+      behaviour (always sign), 'all' the rejected yield-entirely. */
+  let yieldMode = 'sign';
+  /* ============================================================
+     THE TWO REVERT SWITCHES, AND THEY ARE ONE PER NEW BEHAVIOUR.
+
+     Round 5 shipped a hand-back that was right about the race and
+     wrong about two things it had no way to see. Each is backed out
+     independently here, so "the new assertions fail when the change
+     is removed" is a measurement on ONE page at ONE load rather than
+     a git stash and a hope. Both ship at their first value.
+
+       whoMode  'owner'   who moved the focus is asked of
+                          src/ui/kbowner.js: an arrival it did not
+                          AUTHORISE is the player's.
+                'active'  round 5: compare document.activeElement
+                          against the baseline. Cannot tell a
+                          dialogue opening inside the window from a
+                          player pressing Tab, which is defect 6b.
+
+       keepMode 'survivor' when the player HAS moved and their
+                          destination is a live node that will
+                          outlive this close, the hand-back leaves
+                          them there. Their keystroke keeps its
+                          destination as well as its meaning.
+                'never'   round 5: always restore the position and
+                          only ever yield the SIGNATURE. Takes a
+                          Shift-Tab's destination away, which is
+                          defect 6a and which this file's own notes
+                          call a worse failure than the bug.
+
+     These are NOT the same axis as yieldMode. yieldMode is round 5's
+     three-arm A/B and its numbers are quoted above; it is kept
+     untouched so PANEL-8/8d still mean what they meant. */
+  let whoMode = 'owner';
+  let keepMode = 'survivor';
+  /** Debug switch only — extra no-op attempts before the hand-back is
+      allowed to land, so a test can put a real Tab INSIDE the retry
+      window instead of racing it. Ships at 0. See the note on
+      d.padHandBackStall. */
+  let stallFrames = 0;
+  /** Has somebody OTHER than this hand-back taken the keyboard since
+      the close began? A real, live, different element only — <body>
+      is focus dropped, not focus moved, and dropped focus is the
+      thing we are here to repair. */
+  function focusMovedSince(from) {
+    const a = document.activeElement;
+    if (!a || a === document.body) return false;
+    return a !== from;
+  }
+
+  /* ============================================================
+     THE TWO HOLES ROUND 5 LEFT, AND WHY THEY ARE THE SAME HOLE.
+
+     6a  A Shift-Tab pressed on the closing lift lands on a LIVE
+         element OUTSIDE the closing panel — the pad sits BEFORE the
+         panel layer in the DOM, and every assertion in the suite
+         pressed Tab FORWARD, which is why nobody had been there. The
+         hand-back saw "the focus moved", withheld its signature, and
+         then restored the position anyway — taking the destination
+         away. 5 of 5 at zero offset. The keystroke kept its MEANING
+         and lost its DESTINATION, which is the same class of failure
+         as blur() and is rejected in this file in about twenty lines.
+
+     6b  A dialogue with choices opening inside the retry window
+         focuses its first choice. focusMovedSince() cannot tell that
+         from a player pressing Tab, so the hand-back went unsigned,
+         the pad read an ordinary player focus on a pad button, and
+         defect 3 came back for a player who has never touched a
+         keyboard. 3 of 3.
+
+     BOTH ARE ONE QUESTION THE OLD CODE COULD NOT ASK: who moved it.
+     `document.activeElement` records WHERE the keyboard is and
+     nothing at all about WHO put it there, and the whole of round 5
+     is an attempt to recover the second from the first. It cannot be
+     done — a script focus()'s focusin is isTrusted TRUE, byte
+     identical to a real Tab (measured), and a screen reader's rotor
+     moves focus with no DOM input event whatsoever.
+
+     So the question is asked of the owner instead. kb.mark() takes a
+     token when the close begins; kb.movedSince(token) answers with
+     the element the PLAYER moved to, counting only arrivals kbowner
+     did not authorise. A dialogue's focus is authorised and does not
+     count. A Shift-Tab is not and does.
+
+     AND THEN THE SECOND HALF, WHICH IS WHAT TO DO ABOUT IT. Round 5
+     measured that yielding the hand-back ENTIRELY is worse than the
+     bug (8/12 DEAF, 8/12 left on <body>) and it was right — but it
+     measured a Tab that landed INSIDE THE DYING PANEL, where there
+     is nothing to yield TO. That is not the same case as a Shift-Tab
+     landing on a live pad button, and treating them the same is what
+     6a is:
+
+       destination will SURVIVE this close   -> LEAVE THEM THERE.
+         The player chose a real place and it is still going to be
+         there. Restoring over it is a hidden focus teleport, which
+         is the thing this design exists not to do.
+       destination is DYING (inside the closing panel, or already
+       detached, or focus dropped to <body>)  -> restore the position
+         and ADOPT it: the move was the player's, so the arrival is
+         declared to the owner as theirs and the keystroke keeps its
+         meaning. This is round 5's unsigned restore, stated as an
+         intent instead of as the absence of one.
+
+     Asserted as KB-10 (6a closed, both Tab directions), KB-11 (6b
+     closed), KB-12 (the dying destination is still restored, so
+     PANEL-8 is not being deleted), and KB-13, which drives the same
+     gestures with a Tab that CANNOT reach a survivor and asserts the
+     yield count is ZERO — a guard that a reader can use to tell a
+     real green from a blind probe.
+     ============================================================ */
+  /** Will `el` still be a place the player can stand once this close
+      has finished? */
+  function survives(el, doomed) {
+    if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+    if (el === document.body || el === document.documentElement) return false;
+    if (doomed) for (const d of doomed) { if (d && (d === el || d.contains(el))) return false; }
+    /* focusable() is the same test the hand-back applies to its own
+       target, so "somewhere the player can stand" means one thing in
+       this file and not two. */
+    return focusable(el);
+  }
+  /** Who moved the keyboard since the close began, and where to.
+      One question, two implementations, and the second one is only
+      here so backing the first one out is a switch and not a diff. */
+  function playerMovedSince(token, from) {
+    if (whoMode === 'active') {
+      const moved = focusMovedSince(from);
+      return { moved, to: moved ? document.activeElement : null };
+    }
+    return kb.movedSince(token);
+  }
   /** Give `el` the keyboard as soon as it can hold it. A few frames,
       then give up — see the note above. */
   let lastRestore = null;          // debug: how the last hand-back went
-  function handBack(el) {
+  /** @param kind    'take' -- a panel just opened and wants the
+      keyboard; 'restore' -- a panel just closed and is giving the
+      player their place back. Only a RESTORE can yield, because only
+      a restore can be racing the player.
+      @param doomed  the nodes this close is removing, so the yield
+      can tell a destination that will survive from one that will
+      not. */
+  function handBack(el, kind = 'restore', doomed = null) {
     if (!el) return;
     /* THE ATTEMPT COUNT IS NOT DECORATION. The retry below is the part
        of this that a signature applied in the wrong place would slip
@@ -271,15 +546,78 @@ export async function init(ctx) {
        really did take more than one frame — otherwise PANEL-7 would be
        green on a page where the pad happened to be visible already and
        the retry branch was never entered at all. */
+    /* SAMPLED HERE AND NOWHERE ELSE. This is the moment the close
+       began; every attempt compares against it. */
+    const from = (typeof document !== 'undefined') ? document.activeElement : null;
+    /* THE OWNER'S BASELINE, taken at the same instant and for the
+       same reason. `from` is kept beside it because whoMode:'active'
+       is the revert arm and has to be able to run. */
+    const token = kb.mark();
     const rec = lastRestore = {
+      kind,
       to: el.getAttribute?.('aria-label') || el.className || el.tagName,
-      attempts: 0, landed: false, signed: false,
+      from: from && from !== document.body
+        ? (from.getAttribute?.('aria-label') || from.className || from.tagName)
+        : null,
+      attempts: 0, landed: false, signed: false, moved: false, movedTo: null,
+      yielded: false, mode: yieldMode, who: whoMode, keep: keepMode,
+      site: null, kept: false, survivor: null,
     };
-    attemptHandBack(el, 6, rec);
+    rec.stall = stallFrames;
+    attemptHandBack(el, 6 + stallFrames, rec, from, token, doomed, kind, stallFrames);
   }
-  function attemptHandBack(el, tries, rec) {
+  function attemptHandBack(el, tries, rec, from, token, doomed, kind, stall) {
     rec.attempts++;
+    /* THE WINDOW, HELD OPEN ON PURPOSE — debug only, 0 in shipping.
+       It moves WHEN the landing attempt happens and touches none of
+       the logic below it, which is the whole reason it is a legitimate
+       way to test that logic: the baseline is still sampled once at
+       the close, the comparison still runs at the attempt that lands,
+       and a Tab pressed at frame three of nine is exactly the case
+       PANEL-8b has to be able to reach without racing the machine. */
+    if (stall > 0) {
+      requestAnimationFrame(() => attemptHandBack(el, tries - 1, rec, from, token, doomed, kind, stall - 1));
+      return;
+    }
     if (focusable(el)) {
+      /* THE SECOND CLAUSE, EVALUATED AT THE ATTEMPT THAT LANDS — see
+         AND THE SIGNATURE HAD A SECOND CLAUSE above. Read live, so a
+         Tab that arrives at attempt three is seen by attempt four. */
+      const who = (kind === 'restore' && yieldMode !== 'none')
+        ? playerMovedSince(token, from) : { moved: false, to: null };
+      const moved = who.moved;
+      if (moved) {
+        const a = who.to || document.activeElement;
+        rec.moved = true;
+        rec.movedTo = a?.getAttribute?.('aria-label') || a?.className || a?.tagName || null;
+      }
+      /* ============================================================
+         6a, CLOSED. The player moved the keyboard themselves and the
+         place they moved it to is going to be there after this close
+         finishes. Restoring over it would undo a move they made on
+         purpose — a hidden focus teleport, announced by a screen
+         reader as a context change, and the exact failure blur() was
+         rejected for. LEAVE IT.
+
+         This is NOT the 'all' arm round 5 measured and rejected.
+         That arm abandoned the restore whether or not there was
+         anywhere to abandon it TO, which on a Tab into the dying
+         panel left the player on <body> with the keystroke still
+         lost. The survivor test is the difference, and KB-13 drives
+         the same gestures with no survivor available and asserts
+         this branch is taken zero times. */
+      if (moved && keepMode === 'survivor' && survives(who.to, doomed)) {
+        rec.kept = true;
+        rec.survivor = rec.movedTo;
+        return;
+      }
+      if (moved && yieldMode === 'all') {
+        /* THE REJECTED ARM, kept only so the A/B can run on one page:
+           abandoning the restore leaves the keyboard in the dying
+           panel and the player with no place at all. */
+        rec.yielded = true;
+        return;
+      }
       /* SIGN IT, AND SIGN EVERY ATTEMPT — see A FOCUS THE PLAYER
          PERFORMED AND A FOCUS THE UI RESTORED in touch.js, and the
          correction three paragraphs up. This focus() is very often
@@ -296,14 +634,43 @@ export async function init(ctx) {
          display:none the instant a sheet closes and focus() on it is a
          silent no-op), and a signature applied once outside would
          cover the first attempt — the one that always fails — and
-         leave the attempt that lands unsigned. */
-      try { rec.signed = touch.uiWillFocus?.(el) === true; } catch (e) {}
-      try { el.focus({ preventScroll: true }); } catch (e) {}
+         leave the attempt that lands unsigned.
+
+         ...AND ONLY WHEN IT IS STILL A RESTORE. `moved` means the
+         focus this is about to replace is not the one the close left
+         behind — on this path, the player's Tab, 6 ms old, landed in
+         the closing panel where the pad could not see it. The position
+         is still handed back; the signature is withheld, so the pad
+         reads the landing as the ordinary player focus it now stands
+         for and the Tab keeps its meaning. */
+      /* THE INTENT, DECLARED — see THE THREE INTENTS in
+         src/ui/kbowner.js. Three sites, one call, and which one it is
+         is decided HERE, at the attempt that lands, for exactly the
+         reason the old signature had to be applied per attempt: this
+         function re-enters itself on rAF for up to six frames because
+         the pad is display:none the instant a sheet closes and
+         focus() on it is a silent no-op.
+
+           panel.take     a panel opened and is taking the keyboard.
+           panel.restore  a faithful hand-back. The player has not
+                          moved, so this says nothing about who they
+                          are talking to and the routing bit does not
+                          move. (Round 5's "signed".)
+           panel.adopt    the player DID move, and their destination
+                          is dying. The position is handed back and
+                          the arrival is declared as THEIRS, so the
+                          keystroke keeps its meaning. (Round 5's
+                          "unsigned", said out loud instead of by
+                          omission.) */
+      const site = kind === 'take' ? 'panel.take' : (moved ? 'panel.adopt' : 'panel.restore');
+      rec.site = site;
+      rec.signed = site === 'panel.restore';
+      kb.focus(site, el, { preventScroll: true });
       rec.landed = true;
       return;
     }
     if (tries <= 0) return;
-    requestAnimationFrame(() => attemptHandBack(el, tries - 1, rec));
+    requestAnimationFrame(() => attemptHandBack(el, tries - 1, rec, from, token, doomed, kind, 0));
   }
   /** The keyboard is somewhere inside this panel. */
   const holdsFocus = (el) => {
@@ -314,8 +681,14 @@ export async function init(ctx) {
       already spliced, so `stack` is what will be left behind. */
   function releaseFocus(el) {
     if (!holdsFocus(el)) return;                 // not ours to hand on
+    /* THE NODE THIS CLOSE IS TAKING AWAY. The hand-back needs it to
+       tell a destination the player chose that will SURVIVE from one
+       that will not — see THE TWO HOLES ROUND 5 LEFT. It is still in
+       the document here (retire() gives it a 300 ms fade), so
+       isConnected alone cannot answer. */
+    const doomed = [el];
     const under = stack.length ? stack[stack.length - 1].el : null;
-    if (under) { handBack(under); return; }
+    if (under) { handBack(under, 'restore', doomed); return; }
     const back = focusReturn;
     focusReturn = null;
     /* `back` is null whenever nothing held the keyboard at the moment
@@ -324,7 +697,7 @@ export async function init(ctx) {
        nothing, the node goes, and the browser drops focus to <body>:
        exactly where it went before any of this existed. No worse, and
        no teleport handed to a player who never asked for one. */
-    if (back) handBack(back);
+    if (back) handBack(back, 'restore', doomed);
   }
 
   function pushSheet(el, name = 'sheet') {
@@ -367,7 +740,14 @@ export async function init(ctx) {
        Every real control inside it keeps its own ring untouched. */
     el.style.outline = 'none';
     syncModal();
-    handBack(el);
+    /* A TAKE, NOT A RESTORE, and saying so is not bookkeeping. An
+       open cannot be racing the player's Tab against a closing
+       panel, so it must never yield and must never adopt: the panel
+       root gets the keyboard, full stop. Round 5 ran both through
+       one unlabelled path and the yield logic applied to opens as
+       well, which was harmless only because `from` was almost always
+       the same element. */
+    handBack(el, 'take', null);
     return el;
   }
 
@@ -434,10 +814,11 @@ export async function init(ctx) {
        one — the element that had the keyboard before any of this
        opened. Read before the nodes leave the document. */
     const inside = stack.some((s) => holdsFocus(s.el));
+    const doomed = stack.map((s) => s.el);
     while (stack.length) stack.pop().el.remove();
     const back = focusReturn;
     focusReturn = null;
-    if (inside && back) handBack(back);
+    if (inside && back) handBack(back, 'restore', doomed);
     syncModal();
   }
   const topName = () => (stack.length ? stack[stack.length - 1].name : null);
@@ -764,7 +1145,12 @@ export async function init(ctx) {
   function openQuickBuy(preset) {
     const el = pushSheet(menus.quickBuy(preset), 'buy');
     try { ctx.game?.quests?.tip?.('ticker'); } catch (e) {}
-    setTimeout(() => { try { el?.querySelector?.('input')?.focus(); } catch (e) {} }, 80);
+    /* DECLARED, like every other focus move in src. It used to be a
+       bare optional-chained focus() and it is one of the two that a
+       grep for the method name did not find — round 5's residual
+       counted the layer's other focus calls and said "exactly two"
+       when there were four. */
+    setTimeout(() => { kb.focus('sheet.input', el?.querySelector?.('input'), { preventScroll: true }); }, 80);
     return el;
   }
 
@@ -1520,15 +1906,77 @@ export async function init(ctx) {
         test cannot tell a retry that was signed from a page where the
         retry never happened. See PANEL-7 in tools/touchtest.mjs. */
     d.focusRestore = () => (lastRestore ? { ...lastRestore } : null);
-    /** THE SIGNATURE, REACHABLE ON ITS OWN. The end-to-end path
-        (PANEL-7) proves the fix as the player meets it, but it cannot
-        reach the three BOUNDS on the signature — element identity,
-        single use, and the 50 ms deadline — because a real close never
-        misses on all six frames. Those bounds are the difference
-        between a fix and a pad that has gone deaf to a genuine focus,
-        so PAD-41c..PAD-41e drive them directly through here. Debug
-        only; nothing ships through this. */
-    d.padSignFocus = (el) => touch.uiWillFocus(el);
+    /** THE YIELD RULE, AS AN A/B SWITCH — see AND THE SIGNATURE HAD A
+        SECOND CLAUSE above. 'sign' ships: the hand-back restores the
+        position but withholds its signature when the focus it is
+        replacing is not the one the close left behind. 'none' is the
+        pre-fix behaviour (sign unconditionally — the arm that eats a
+        Tab pressed on the closing lift). 'all' is the rejected
+        alternative: abandon the hand-back entirely, which loses the
+        keystroke AND the player's place. Three arms on ONE page at ONE
+        load is the only way this rate means anything; PANEL-8 drives
+        it. Debug only; nothing ships through this. */
+    d.padHandBackYield = (mode) => {
+      if (mode === 'none' || mode === 'all' || mode === 'sign') yieldMode = mode;
+      return yieldMode;
+    };
+    /** HOLD THE RETRY WINDOW OPEN — n extra no-op attempts before the
+        hand-back may land. Debug only, 0 in shipping. The defect it
+        exists to test is a 7-10 ms race, and a suite that has to WIN a
+        race to enter a branch is a suite that goes green on a quiet
+        box for no reason — the ninth instance of the same mistake on
+        this project, waiting to happen. This widens the window instead
+        of hoping for it, so a real dispatched Tab lands INSIDE it
+        every time and the branch is entered deterministically. It
+        changes only the timing of the landing attempt; the baseline is
+        still sampled once when the close began and the comparison
+        still runs at the attempt that lands, which is precisely the
+        retry-proofing PANEL-8b asserts. */
+    d.padHandBackStall = (n = 0) => { stallFrames = Math.max(0, Math.min(30, +n || 0)); return stallFrames; };
+    /* ============================================================
+       THE OWNER, REACHABLE FROM THE SUITE.
+
+       PAD-41c..PAD-41e used to drive touch.uiWillFocus() directly to
+       reach the signature's three bounds — element identity, single
+       use, and the 50 ms deadline — because a real close never misses
+       on all six frames. There is no signature any more and there are
+       no bounds to reach: an authorisation is a call stack, so it
+       cannot name the wrong element, be used twice, or expire. What
+       replaces those three assertions is one that is strictly
+       stronger and that they could not make: NOTHING IN src MOVES
+       FOCUS WITHOUT DECLARING IT, and the register is complete.
+       ============================================================ */
+    /** The owner's whole state, including the violation ledger the
+        registration assertion reads. `violations` empty, after the
+        suite has driven every UI path in the game, IS the assertion. */
+    d.kb = () => kb.report();
+    /** Drive a declared focus by site id, so KB-3..KB-5 can reach the
+        three intents without having to reproduce the gesture that
+        normally produces each one. Debug only. */
+    d.kbFocus = (site, sel) => {
+      const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+      return kb.focus(site, el, { preventScroll: true });
+    };
+    /** THE REGISTRATION ASSERTION, FROM THE INSIDE. Moves focus by a
+        route that never touches kb.focus() and that a grep for the
+        method name cannot see — computed member access through a
+        string built at runtime. The guard must catch it anyway,
+        because it wraps the DISPATCH. This is the revert check for
+        the assertion itself: if _smuggle stops being recorded, the
+        assertion has quietly become decorative. See KB-1b. */
+    d.kbSmuggle = (sel) => {
+      const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+      const before = kb.report().violations.length;
+      kb._smuggle(el);
+      return { before, after: kb.report().violations.length };
+    };
+    d.kbReset = () => { kb._reset(); return kb.report(); };
+    /** THE TWO REVERT SWITCHES — see the block above whoMode. Each
+        backs out exactly one of round 6's two behaviours on ONE page
+        at ONE load, so "the new assertions fail without the change"
+        is a number. Debug only; nothing ships through these. */
+    d.kbWho = (m) => { if (m === 'owner' || m === 'active') whoMode = m; return whoMode; };
+    d.kbKeep = (m) => { if (m === 'survivor' || m === 'never') keepMode = m; return keepMode; };
     /** Turn the lostpointercapture re-take off, restoring the old
         "a capture loss is a release" behaviour, so tools/touchtest.mjs
         can measure the dead-drag rate before and after on ONE page at

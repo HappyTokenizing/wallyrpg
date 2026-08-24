@@ -24,6 +24,7 @@ import { cityMap } from './map.js';
 /* Same reason as phone.js: the market's 'B' chip is a keyboard
    shortcut and must not be shown to a player who has no keyboard. */
 import { touchUI, actionLabel } from './touch.js';
+import { kb } from './kbowner.js';
 
 export function createMenus(ctx, ui) {
   const g = () => ctx.game;
@@ -643,7 +644,8 @@ export function createMenus(ctx, ui) {
         h('button.w-btn.sm.ghost.w-pe.clr', {
           type: 'button', 'aria-label': 'Clear',
           style: { minWidth: '30px', padding: '0 7px' },
-          onclick: () => { input.value = ''; query = ''; pickId = null; paint(); input.focus(); },
+          /* declared, like every focus move in src — see kbowner.js */
+          onclick: () => { input.value = ''; query = ''; pickId = null; paint(); kb.focus('menus.clear', input); },
         }, icon('close', 13))));
       body.append(h('div.w-kv', null,
         h('span', { text: 'Cash in hand' }),

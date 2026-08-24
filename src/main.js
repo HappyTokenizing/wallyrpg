@@ -36,6 +36,7 @@ import { init as initNpc }    from './character/npc.js';
 import { init as initCam }    from './core/camera.js';
 import { init as initGame }   from './game/game.js';
 import { init as initUI }     from './ui/ui.js';
+import { kb }                 from './ui/kbowner.js';
 import { init as initAudio }  from './audio/audio.js';
 import { init as initIntro }  from './intro/intro.js';
 
@@ -534,7 +535,12 @@ async function boot() {
        gesture, so ask() is the path that ALWAYS runs and its wording was the
        only one anyone ever saw. One test, one assignment, no second opinion. */
     bootEl?.classList.add('ask');
-    goEl?.focus?.({ preventScroll: true });
+    /* THE FOURTH CALL SITE, and the one that proves the point. It is
+       in main.js, not in the ui layer at all, and it is optional
+       chained twice — so every audit that grepped src/ui for
+       `.focus(` counted it as zero. Focus moves in src go through
+       kbowner now precisely so the count cannot be wrong again. */
+    kb.focus('boot.chip', goEl, { preventScroll: true });
 
     const go = (e) => {
       /* Leave the browser's own chords alone: reloading or opening

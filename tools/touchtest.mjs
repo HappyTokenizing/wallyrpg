@@ -3889,16 +3889,37 @@ const stale41 = async () => {
   await thumbJump(110);
   return t;
 };
-/* focus a pad button from script, optionally signing it first, having
-   first moved the keyboard OFF it — focusing what is already focused
-   fires no focusin at all and there would be no edge to measure. */
-const scriptFocus = (label, sign) => page.evaluate(([l, s]) => {
+/* THE SIGNATURE IS GONE AND THESE ASSERTIONS OUTLIVED IT — RESTATED
+   AGAINST THE OWNER, WHICH IS WHY THE IDS ARE KEPT.
+
+   PAD-41..PAD-41e used to drive touch.uiWillFocus() and test the three
+   BOUNDS the signature needed: element identity, single use, and a
+   50 ms deadline. Round 6 deleted the signature, so those three bounds
+   no longer exist to test — an authorisation in src/ui/kbowner.js is
+   the CALL STACK of kb.focus(), and a call stack cannot name the wrong
+   element, be used twice, or expire. The bounds have become
+   properties of the shape rather than rules the shape has to be
+   trusted with.
+
+   Deleting the assertions would be the wrong move: the BRANCHES are
+   still real and a future agent could easily reintroduce a signature
+   with a lifetime. Each one is therefore rewritten to assert the same
+   PLAYER-VISIBLE fact through the new mechanism, and each says which
+   round-5 bound it stands in for.
+
+   `focus a pad button as the UI` -> a declared kb.focus(site, el).
+   `focus a pad button as the PLAYER` -> an UNDECLARED focus, driven
+   through WALLY.debug.kbSmuggle, which reaches the element by a route
+   no grep for the method name can see. That is also the honest model
+   of a screen reader's rotor: script did not declare it, so it is the
+   player's — and the ledger records it, which is what KB-1b is about. */
+const scriptFocus = (label, site) => page.evaluate(([l, s]) => {
   const b = [...document.querySelectorAll('.w-abtn')].find((e) => e.getAttribute('aria-label') === l);
   document.activeElement?.blur?.();
-  if (s) WALLY.debug.padSignFocus(b);
-  b.focus({ preventScroll: true });
+  if (s) WALLY.debug.kbFocus(s, b);
+  else WALLY.debug.kbSmuggle(b);                 // undeclared == the player
   return document.activeElement === b;
-}, [label, !!sign]);
+}, [label, site || null]);
 
 const t41 = await stale41();
 const kb41a = await padKb();
@@ -3906,12 +3927,12 @@ ok(t41 !== null && kb41a.driving === true && kb41a.padFocused === true && kb41a.
   'PAD-41-pre [BRANCH: the stale-focus state really exists]: one Tab parks the keyboard on Menu, a real finger on Jump sets the intent flag, and the focus is STILL on Menu afterwards — the pad never releases focus, which is why a single Tab poisons the rest of the session and why the hand-back finds a pad button to aim at at all',
   JSON.stringify(kb41a));
 
-/* --- BRANCH isUiRestore() TRUE: signed, so the flag survives --- */
-const took41 = await scriptFocus('Menu', true);
+/* --- BRANCH a DECLARED restore: the routing bit is left alone --- */
+const took41 = await scriptFocus('Menu', 'panel.restore');
 await page.waitForTimeout(120);
 const kb41b = await padKb();
 ok(took41 === true && kb41b.driving === true && kb41b.focus === 'Menu' && kb41b.padTakesSpace === false,
-  'PAD-41 [BRANCH: a SIGNED focus does not speak for the player]: ui.js announcing its own focus() leaves the intent flag alone, so a restored bookmark lands on the button, is honoured as the player’s place in the document, and does NOT hand the next Space to it',
+  'PAD-41 [BRANCH: a DECLARED restore does not speak for the player]: ui.js declaring its own focus() as `panel.restore` leaves the intent flag alone, so a restored bookmark lands on the button, is honoured as the player’s place in the document, and does NOT hand the next Space to it. Round 5 said this with a signature and three bounds; round 6 says it with an intent',
   JSON.stringify(kb41b));
 
 /* --- BRANCH isUiRestore() FALSE with uiFocus null: the screen reader.
@@ -3921,11 +3942,11 @@ ok(took41 === true && kb41b.driving === true && kb41b.focus === 'Menu' && kb41b.
        which is why the caller has to declare, and why "require a real
        input event behind every focus" was rejected outright. PAD-7 is
        this case; this pins the mechanism underneath it. --- */
-await scriptFocus('Menu', false);
+await scriptFocus('Menu', null);
 await page.waitForTimeout(120);
 const kb41c = await padKb();
 ok(kb41c.driving === false && kb41c.padTakesSpace === true,
-  'PAD-41b [BRANCH: an UNSIGNED programmatic focus still clears it]: a bare focus() with no keystroke and no contact anywhere near it — a screen reader moving its own cursor — is a player focus and is obeyed. This is why the rule cannot demand that a focus be attributable to a real INPUT event: PAD-7 produces none',
+  'PAD-41b [BRANCH: an UNDECLARED programmatic focus still clears it]: a bare focus() with no keystroke and no contact anywhere near it — a screen reader moving its own cursor — is a player focus and is obeyed. This is why the rule cannot demand that a focus be attributable to a real INPUT event: PAD-7 produces none',
   JSON.stringify(kb41c));
 
 /* --- BRANCH the consumption line, `uiFocus = null`. One signature
@@ -3933,44 +3954,57 @@ ok(kb41c.driving === false && kb41c.padTakesSpace === true,
        deafen that button for the rest of the session — the defect
        again, wearing the fix's clothes. --- */
 await stale41();
-await scriptFocus('Menu', true);                 // signed: consumed here
+await scriptFocus('Menu', 'panel.restore');      // declared: the authorisation ends here
 await page.waitForTimeout(90);
 const kb41dA = await padKb();
-await scriptFocus('Menu', false);                // the player, right after
+await scriptFocus('Menu', null);                 // the player, right after
 await page.waitForTimeout(120);
 const kb41dB = await padKb();
 ok(kb41dA.driving === true && kb41dB.driving === false && kb41dB.padTakesSpace === true,
-  'PAD-41c [BRANCH: the signature is SINGLE USE]: the focus it describes consumes it, so the very next focus on the SAME button is the player’s again — a signature that covered the button rather than the event would leave it deaf for the session',
+  'PAD-41c [BRANCH: an authorisation does not outlive its own call — stands in for round 5’s SINGLE USE bound]: a declared restore covers the focusin dispatched inside it and nothing after, so the very next focus on the SAME button is the player’s again. Round 5 needed a consumption line to get this; round 6 gets it from the call stack, and the branch is asserted either way because a future signature with a lifetime would fail here',
   `${JSON.stringify(kb41dA)} -> ${JSON.stringify(kb41dB)}`);
 
-/* --- BRANCH the 50 ms deadline. An announced focus that never lands
-       happens on EVERY real close — the pad is display:none for the
-       first frames of one — and it must not sit armed waiting to
-       swallow a genuine Tab that arrives later. --- */
+/* --- BRANCH a declaration that never LANDS. This happens on every
+       real close — the pad is display:none for the first frames of
+       one, and focus() on a display:none element is a silent no-op
+       that fires no focusin at all. Round 5 needed a 50 ms deadline so
+       an announcement that never landed could not sit armed waiting to
+       swallow a genuine Tab. Round 6 has nothing to arm: there is no
+       announce-then-focus API, only kb.focus(). Asserted by declaring
+       a focus at a HIDDEN button — the no-op case — and then giving
+       the player the real one. --- */
 await stale41();
-const signed41 = await page.evaluate(() => {
+const noop41 = await page.evaluate(() => {
   const b = [...document.querySelectorAll('.w-abtn')].find((e) => e.getAttribute('aria-label') === 'Menu');
-  return WALLY.debug.padSignFocus(b) === true;   // armed, and deliberately NOT focused
+  const clone = b.cloneNode(true);
+  clone.style.display = 'none';
+  b.parentElement.append(clone);
+  const called = WALLY.debug.kbFocus('panel.restore', clone);
+  const landed = document.activeElement === clone;
+  clone.remove();
+  return { called, landed };
 });
-await page.waitForTimeout(200);                  // > 50 ms: the signature is stale
-await scriptFocus('Menu', false);
+await page.waitForTimeout(200);                  // as long as round 5’s deadline, and then some
+await scriptFocus('Menu', null);
 await page.waitForTimeout(120);
 const kb41e = await padKb();
-ok(signed41 === true && kb41e.driving === false && kb41e.padTakesSpace === true,
-  'PAD-41d [BRANCH: the signature EXPIRES]: a signed focus that never landed does not lie in wait — 50 ms later a genuine focus on that same button clears the flag as it always did. This is the flip side of signing every retry: an armed signature outliving its focus is a pad gone deaf',
-  `armed ${signed41}, ${JSON.stringify(kb41e)}`);
+ok(noop41.called === true && noop41.landed === false
+  && kb41e.driving === false && kb41e.padTakesSpace === true,
+  'PAD-41d [BRANCH: a declaration that never lands leaves NOTHING armed — stands in for round 5’s 50 ms DEADLINE]: kb.focus() on a display:none element is a silent no-op, and 200 ms later a genuine focus on a real button clears the flag exactly as it always did. There is no window to expire because there is no announcement to outlive its focus',
+  `${JSON.stringify(noop41)}, ${JSON.stringify(kb41e)}`);
 
-/* --- BRANCH the identity test, `uiFocus.el === target`. --- */
+/* --- BRANCH one declaration, one element — stands in for round 5's
+       identity test. The declaration IS the call, so it cannot name
+       Menu and cover Phone; asserted anyway, because a reintroduced
+       signature would be exactly the thing that could. --- */
 await stale41();
-await page.evaluate(() => {
-  const b = [...document.querySelectorAll('.w-abtn')].find((e) => e.getAttribute('aria-label') === 'Menu');
-  WALLY.debug.padSignFocus(b);                   // signing MENU
-});
-await scriptFocus('Phone', false);               // ...and focusing PHONE
+await scriptFocus('Menu', 'panel.restore');      // declared, on MENU
+await page.waitForTimeout(60);
+await scriptFocus('Phone', null);                // ...and the player, on PHONE
 await page.waitForTimeout(120);
 const kb41f = await padKb();
 ok(kb41f.driving === false && kb41f.focus === 'Phone',
-  'PAD-41e [BRANCH: it only covers the node it names]: a signature for Menu does not excuse a focus arriving on Phone — the announcement is about one element, not about the cluster',
+  'PAD-41e [BRANCH: it only covers the node it names — stands in for round 5’s IDENTITY bound]: a declaration for Menu does not excuse a focus arriving on Phone. It cannot, by construction; the assertion is kept because a future agent reaching for an announce-then-focus API would break it first',
   JSON.stringify(kb41f));
 await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
 await page.waitForTimeout(400);
@@ -4300,6 +4334,766 @@ ok(at7 === 'Menu' && pn7.length === 1 && pn7[0] === 'pause',
 
 await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
 await page.waitForTimeout(400);
+
+/* ============================================================
+   THE TAB PRESSED ON THE CLOSING LIFT (PANEL-8 .. PANEL-8g)
+
+   WHY THIS BLOCK EXISTS. PANEL-7 above is right and it shipped a
+   regression, which is the honest way to describe what the signature
+   did: it taught the hand-back to say "I performed this focus" and
+   left it silent about "and I am overwriting one the player performed
+   6 ms ago". A Tab pressed inside the hand-back's own retry window was
+   eaten. Measured as an A/B on one page, one load, alternating arms,
+   sixteen gestures each, identical finger events throughout — thumb
+   Jump, thumb Menu, thumb Resume — with one Tab on the closing lift:
+
+     signature ON  (as PANEL-7 shipped it)  ->  DEAF 9 of 16
+     signature OFF (pre-fix)                ->  DEAF 0 of 16
+
+   DEAF is the player's own sentence: I pressed Tab, the ring is on
+   Menu, and the pad still will not take my key. The ledger is a 7-10
+   ms race — the Tab lands inside the ALREADY-CLOSING panel, outside
+   the pad's root where the pad's focusin rule cannot see it, and the
+   signed hand-back then overwrites that focus while keeping `driving`
+   alive across the overwrite. The Tab is lost twice: its focus move is
+   undone AND its meaning is discarded. Before the signature, the
+   restore's own unsigned focusin cleared the flag and ACCIDENTALLY
+   RESCUED the Tab; PANEL-7 removed the accident without replacing it.
+
+   AND THE SUITE MUST NOT HAVE TO WIN A RACE TO ENTER THE BRANCH.
+   Eight times on this project an assertion has been green for the
+   wrong reason, and "the box was quiet, so the window never opened"
+   would be the ninth. WALLY.debug.padHandBackStall(n) holds the retry
+   window open for n extra frames. It moves WHEN the landing attempt
+   happens and touches none of the logic under test: the baseline is
+   still sampled once when the close began, the comparison still runs
+   at the attempt that lands. So the branch is entered every time, on
+   any box, and PANEL-8b can put the Tab at frame three of nine — which
+   is the retry-proofing itself, asserted rather than hoped for.
+
+   PANEL-8f then reports the UNSTALLED rate, because the stall proves
+   the rule and only the raw gesture proves the rate.
+   ============================================================ */
+const yieldMode = (m) => page.evaluate((v) => WALLY.debug.padHandBackYield(v), m);
+const stall = (n) => page.evaluate((v) => WALLY.debug.padHandBackStall(v), n);
+/* WHERE THE TAB LANDED, FROM A LEDGER AND NOT FROM A POLL. The first
+   cut of this block read document.activeElement 60 ms after the Tab
+   and got the wrong answer for an honest reason: with the window held
+   open the hand-back had already landed and OVERWRITTEN the Tab's
+   focus by the time the sample was taken — which is the defect itself,
+   erasing the evidence for the defect. A focusin listener sees the
+   landing at the instant it happens and cannot be overwritten. */
+await page.evaluate(() => {
+  window.__F8 = [];
+  const lbl = (e) => e?.getAttribute?.('aria-label') || e?.className || e?.tagName || null;
+  const zone = (e) => !e ? 'body'
+    : (e.closest?.('.w-touch') ? 'pad'
+      : (e.closest?.('.w-sheet,.w-pause,.w-phone') ? (e.closest('.out') ? 'DYING' : 'panel') : 'other'));
+  document.addEventListener('focusin', (e) => window.__F8.push(
+    { ev: 'focusin', where: zone(e.target), label: lbl(e.target), at: +performance.now().toFixed(1) }), false);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab') window.__F8.push({ ev: 'TAB', at: +performance.now().toFixed(1) });
+  }, true);
+});
+const resumeAt = () => page.evaluate(() => {
+  const b = [...document.querySelectorAll('.w-pause button, .w-sheet button')]
+    .find((e) => /resume/i.test(e.textContent || ''));
+  if (!b) return null;
+  const r = b.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+});
+/* the stale-focus state PANEL-7 is about: one Tab ever, then thumbs */
+const stale8 = async () => {
+  await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
+  await toOpenGround();
+  await page.waitForTimeout(500);
+  const t = await tabTo('Menu');
+  await thumbJump(110);
+  return t;
+};
+/* ONE gesture. Thumb Menu open, thumb Resume shut, then a real
+   dispatched Tab `at` ms after the closing lift. `mid` is where that
+   Tab actually landed, read before the hand-back can move it again. */
+const liftTab = async ({ at = 40, tab = true } = {}) => {
+  const pre = await stale8();
+  await press(menu7.x, menu7.y, 60);
+  await page.waitForTimeout(700);
+  const opened = await panelsNow();
+  const rb = await resumeAt();
+  await page.evaluate(() => { window.__F8 = []; });
+  if (rb) await press(rb.x, rb.y, 45);
+  if (tab) {
+    if (at) await page.waitForTimeout(at);
+    await page.keyboard.press('Tab');
+  }
+  await page.waitForTimeout(900);
+  /* the FIRST focusin after the Tab keystroke — where the player's own
+     keystroke put the keyboard, before anything could move it again */
+  const led = await page.evaluate(() => window.__F8.slice());
+  const ti = led.findIndex((e) => e.ev === 'TAB');
+  const mid = (ti >= 0 ? led.slice(ti + 1).find((e) => e.ev === 'focusin') : null)
+    || { where: 'none', label: null };
+  const kb = await padKb();
+  const f = await focusNow();
+  const rec = await page.evaluate(() => WALLY.debug.focusRestore());
+  const t0 = led.length ? led[0].at : 0;
+  const trace = led.map((e) => `${e.ev}${e.label ? '(' + e.where + ':' + e.label + ')' : ''}@+${(e.at - t0).toFixed(0)}`).join(' ');
+  return { pre, opened, mid, kb, f, rec, trace, deaf: kb.driving === true, ranTab: tab };
+};
+
+await stall(8);                       // ~130 ms of window on this box
+
+/* --- BRANCH the defect, held open: the arm PANEL-7 shipped --- */
+await yieldMode('none');
+const g8none = await liftTab({ at: 0 });
+ok(g8none.pre !== null && g8none.opened.length === 1
+  && g8none.mid.where === 'DYING' && g8none.deaf === true
+  && g8none.kb.padFocused === true && g8none.kb.padTakesSpace === false,
+  'PANEL-8-pre [BRANCH: the defect, and the setup really enters it]: with the signature unconditional, a Tab pressed on the closing lift lands inside the ALREADY-CLOSING panel — outside the pad, where the pad cannot see it — and the signed hand-back then overwrites it. The ring ends on a pad button and the pad still refuses the key. Asserted with the window held open so this is the branch and not the weather',
+  `tab landed ${g8none.mid.where}:${g8none.mid.label}, then ${JSON.stringify(g8none.kb)}\n        rec ${JSON.stringify(g8none.rec)}\n        ${g8none.trace}`);
+
+/* --- BRANCH the fix: the position is restored, the SIGNATURE is not --- */
+await yieldMode('sign');
+const g8sign = await liftTab({ at: 0 });
+ok(g8sign.mid.where === 'DYING' && g8sign.deaf === false && g8sign.kb.padTakesSpace === true,
+  'PANEL-8 [BRANCH: the hand-back yields its SIGNATURE, not its focus]: the same Tab, the same window, the same landing inside the dying panel — but the hand-back can see that the focus it is about to replace is no longer the one the close left behind, so it restores the position UNSIGNED. The pad reads an ordinary player focus, clears the intent flag, and the keystroke keeps its meaning',
+  `tab landed ${g8sign.mid.where}:${g8sign.mid.label}, then ${JSON.stringify(g8sign.kb)}\n        ${g8sign.trace}`);
+
+ok(g8sign.f.inPad === true && g8sign.kb.padFocused === true,
+  'PANEL-8a [and the player keeps a real place in the document]: yielding the SIGNATURE and not the FOCUS is the whole reason to prefer it — the ring ends on a live pad button, not inside a node that is removed 300 ms later',
+  `focus ${JSON.stringify(g8sign.f)}`);
+
+ok(g8sign.rec && g8sign.rec.attempts > 2 && g8sign.rec.landed === true
+  && g8sign.rec.moved === true && g8sign.rec.signed === false
+  && g8sign.rec.yielded === false,
+  'PANEL-8b [BRANCH: IT CANNOT BE DEFEATED BY THE RETRY, which is exactly how the first fix went wrong]: the Tab arrived at frame three of nine and the attempt that LANDED still saw it. The baseline is sampled ONCE when the close began and compared on EVERY attempt; recapturing it per attempt would put the player’s Tab into the baseline itself and make the check decorative',
+  JSON.stringify(g8sign.rec));
+
+/* --- BRANCH <body> is focus DROPPED, not focus MOVED. If a bare
+       <body> counted as somebody else taking the keyboard, every
+       hand-back would go unsigned and PANEL-7 would be back inside a
+       week. The blur here is the harness constructing the state, not a
+       player action: it is the state a removed panel node leaves. --- */
+const g8body = await (async () => {
+  const pre = await stale8();
+  await press(menu7.x, menu7.y, 60);
+  await page.waitForTimeout(700);
+  const rb = await resumeAt();
+  if (rb) await press(rb.x, rb.y, 45);
+  await page.waitForTimeout(40);
+  const dropped = await page.evaluate(() => {
+    document.activeElement?.blur?.();
+    return !document.activeElement || document.activeElement === document.body;
+  });
+  await page.waitForTimeout(900);
+  return { pre, dropped, kb: await padKb(), rec: await page.evaluate(() => WALLY.debug.focusRestore()) };
+})();
+ok(g8body.dropped === true && g8body.rec && g8body.rec.moved === false
+  && g8body.rec.signed === true && g8body.kb.driving === true
+  && g8body.kb.padTakesSpace === false,
+  'PANEL-8c [BRANCH: <body> is focus DROPPED, not focus MOVED]: focus reverting to <body> mid-window is the exact condition the hand-back exists to repair, so it does NOT count as the player taking the keyboard. The restore is still signed and the thumb player’s Space still belongs to the game — without this line the cure eats the disease',
+  `${JSON.stringify(g8body.rec)} -> ${JSON.stringify(g8body.kb)}`);
+
+/* --- BRANCH no race at all: the signature must still apply, or this
+       is just a slower way of deleting PANEL-7 --- */
+const g8quiet = await liftTab({ tab: false });
+ok(g8quiet.rec && g8quiet.rec.moved === false && g8quiet.rec.signed === true
+  && g8quiet.kb.driving === true && g8quiet.kb.padTakesSpace === false,
+  'PANEL-8e [BRANCH: nothing moved, so it is a faithful RESTORE and is signed]: with no Tab anywhere near the close the rule is inert and PANEL-7 stands unchanged — the thumb player’s restored bookmark still does not speak for him',
+  `${JSON.stringify(g8quiet.rec)} -> ${JSON.stringify(g8quiet.kb)}`);
+
+/* --- BRANCH the REJECTED alternative, measured rather than argued.
+       'all' abandons the hand-back whenever the focus moved. It does
+       not even fix the symptom — the Tab landed in the DYING panel, so
+       there is no pad focusin at all, the flag stays set, and now the
+       keyboard is left in a node that is removed 300 ms later. It
+       trades the player's place in the document for nothing. --- */
+await yieldMode('all');
+const g8all = await liftTab({ at: 0 });
+await yieldMode('sign');
+ok(g8all.rec && g8all.rec.yielded === true && g8all.rec.landed === false
+  && g8all.f.inPad === false && g8all.deaf === true,
+  'PANEL-8d [BRANCH: the alternative I rejected, as a measurement]: yielding the hand-back ENTIRELY leaves the keystroke lost AND the player on <body> — the PANEL-1 defect the hand-back was written to repair, bought at the price of the bug it was meant to fix. Kept in the suite so the rejection is a number and not a paragraph',
+  `${JSON.stringify(g8all.rec)} -> focus ${JSON.stringify(g8all.f)}, ${JSON.stringify(g8all.kb)}`);
+
+/* --- and the keystroke is LIVE, not merely accounted for. The Tab
+       lands on a pad button; a Space there must operate it. --- */
+await stall(0);
+let at8 = (await padKb()).focus, hops8 = 0;
+const g8live = await liftTab({ at: 0 });
+at8 = g8live.kb.focus; hops8 = 0;
+while (at8 !== 'Menu' && hops8 < 12) {
+  await page.keyboard.press('Tab');
+  at8 = (await padKb()).focus; hops8++;
+}
+await page.keyboard.press('Space');
+await page.waitForTimeout(700);
+const pnl8 = await panelsNow();
+ok(at8 === 'Menu' && pnl8.length === 1 && pnl8[0] === 'pause',
+  'PANEL-8g [and the hand-back is still LIVE after all of this]: walking on to Menu through the state the unsigned restore left behind — no blur to wash it out — and pressing Space opens the PAUSE sheet. Named and counted, because `length === 1` alone once passed with the wrong panel already open',
+  `landed on ${JSON.stringify(at8)} after ${hops8} more tabs, panels ${JSON.stringify(pnl8)}`);
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
+await page.waitForTimeout(400);
+
+/* --- THE RATE, UNSTALLED. The stall proves the RULE; only the raw
+       gesture proves the RATE, and the rate is what says whether this
+       was worth fixing. Alternating arms on ONE page at ONE load,
+       identical finger events, one Tab on the closing lift. The `none`
+       arm is reported and not asserted: it is a race, and a quiet box
+       may simply not lose it. The `sign` arm IS asserted, because a
+       rule that holds under the stall must hold here too. --- */
+const rate8 = { sign: 0, none: 0 };
+const N8 = 8;
+for (let i = 0; i < N8; i++) {
+  for (const m of (i % 2 ? ['none', 'sign'] : ['sign', 'none'])) {
+    await yieldMode(m);
+    const g = await liftTab({ at: 0 });
+    if (g.deaf) rate8[m]++;
+  }
+}
+await yieldMode('sign');
+ok(rate8.sign === 0,
+  'PANEL-8f [the rate, on the raw gesture]: with the window NOT held open, a Tab pressed on the closing lift is heard every time. The pre-fix arm is printed beside it rather than asserted — it has to LOSE a 7-10 ms race to fail, and a quiet box may not lose it, which is why PANEL-8-pre holds the window open instead of trusting this number to enter the branch',
+  `sign deaf ${rate8.sign}/${N8}, pre-fix arm deaf ${rate8.none}/${N8} (reported, not asserted)`);
+
+/* ============================================================
+   THE LAYER'S OTHER focus() CALLS LAND OUTSIDE THE PAD (PANEL-9)
+
+   FLAGGED BY THE LAST AGENT AND NOT DONE. handBack() is signed because
+   it aims at pad buttons. The two other focus() calls in this layer —
+   openQuickBuy's in ui.js and the Clear button's in menus.js — are
+   unsigned, and they are SAFE only because root.contains() rejects
+   their target one line into the pad's focusin listener. Nothing
+   asserted that. If a future sheet ever rendered a control inside the
+   touch cluster, that unsigned focus would clear `driving` and hand
+   the next Space to a pad button — PAD-35, back through a door nobody
+   was watching. This is that door, with a lock on it.
+   ============================================================ */
+const staleQ = await stale8();
+await page.evaluate(() => WALLY.ctx.ui.show('buy'));
+await page.waitForTimeout(700);
+const q9 = await page.evaluate(() => {
+  const sheet = document.querySelector('.w-sheet');
+  const input = sheet?.querySelector('input');
+  const clear = sheet?.querySelector('.clr');
+  const pad = document.querySelector('.w-touch');
+  const focusables = [...document.querySelectorAll('.w-sheet,.w-pause,.w-phone')]
+    .flatMap((p) => [...p.querySelectorAll('button,[href],input,select,textarea,[tabindex]')]);
+  return {
+    hasInput: !!input,
+    hasClear: !!clear,
+    focused: document.activeElement === input,
+    inPad: !!input?.closest?.('.w-touch'),
+    /* ROUND 6: there is no signature to refuse. What makes these two
+       calls safe is now DECLARED rather than accidental — both are
+       `take` sites in the register, and a `take` never moves the
+       routing bit wherever it lands. `declared` proves the register
+       knows about them; `inPad` proves the old containment still
+       holds, so a sheet rendering a control inside the pad would
+       still be caught here. */
+    declared: WALLY.debug.kb().sites.includes('sheet.input')
+      && WALLY.debug.kb().sites.includes('menus.clear'),
+    padHoldsAPanel: !!pad && [...document.querySelectorAll('.w-sheet,.w-pause,.w-phone')].some((p) => pad.contains(p)),
+    strays: focusables.filter((e) => e.closest('.w-touch')).length,
+    driving: WALLY.debug.padKeyboard().driving,
+  };
+});
+ok(staleQ !== null && q9.hasInput && q9.hasClear && q9.focused === true,
+  'PANEL-9-pre [the call really happens]: opening quick-buy focuses the search input menus.js also focuses from its Clear button — unsigned, both of them. Asserted first, so PANEL-9 cannot go green by the focus never occurring',
+  JSON.stringify(q9));
+ok(q9.inPad === false && q9.declared === true && q9.driving === true,
+  'PANEL-9 [BRANCH: the two other focus calls in the layer are DECLARED, which is why they are safe]: the input is not inside .w-touch, both calls are `take` sites in the register, and focusing it leaves `driving` untouched. Round 5 called these "exactly two" and there were FOUR — the other two, in dialogue.js and main.js, are optional-chained and a grep for the method name could not see them. KB-3 is the enumeration that cannot be wrong again',
+  JSON.stringify(q9));
+ok(q9.padHoldsAPanel === false && q9.strays === 0,
+  'PANEL-9b [and it is the whole layer, not one input]: no panel and no focusable control in the panel layer is a descendant of the pad root. The containment handBack()’s signature relies on is asserted rather than assumed',
+  `panels inside pad ${q9.padHoldsAPanel}, stray controls ${q9.strays}`);
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
+await page.waitForTimeout(400);
+
+/* ============================================================
+   ROUND SIX — THE KEYBOARD HAS AN OWNER (KB-1 .. KB-13)
+
+   WHY THIS BLOCK EXISTS, AND IT IS THE SIXTH TIME. One rule: WHEN THE
+   PLAYER PRESSES SPACE, DOES IT JUMP OR DOES IT FIRE THE FOCUSED PAD
+   BUTTON? It has been fixed five times. Every fix was correct, was
+   well measured, and reopened the rule somewhere else, because every
+   fix was a better INFERENCE drawn from focus events — and focus is a
+   global that the whole UI writes to from call sites nobody had
+   counted. Round 5's own residual is the tell: it said there were
+   "exactly two" other focus() call sites in the panel layer. THERE
+   ARE FOUR, and the two it missed are optional-chained, which is
+   exactly why a grep for the method name did not find them.
+
+   So round 6 stops inferring. src/ui/kbowner.js states the invariant
+   once — THE KEYBOARD BELONGS TO THE GAME UNLESS THE PLAYER PUT IT ON
+   A UI CONTROL THEMSELVES, and a focus arrival no call site DECLARED
+   is by definition the player's — and every focus() in src declares
+   its intent to it. The pad, the panels, the dialogue and the boot
+   chip are callers.
+
+   KB-1..KB-4 are the REGISTRATION ASSERTION and they are worth more
+   than any individual fix, because they are what stops a seventh
+   round. KB-10..KB-13 close the two holes round 5 left, each beside
+   the arm that puts it back.
+   ============================================================ */
+const kbReport = () => page.evaluate(() => WALLY.debug.kb());
+/* one real finger on a named pad button */
+const kbTap = async (label, hold = 70) => {
+  const c = await page.evaluate((l) => {
+    const b = [...document.querySelectorAll('.w-abtn')].find((e) => e.getAttribute('aria-label') === l);
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }, label);
+  if (!c) return false;
+  await touch('touchStart', c.x, c.y);
+  await page.waitForTimeout(hold);
+  await touch('touchEnd', c.x, c.y);
+  await page.waitForTimeout(300);
+  return true;
+};
+
+/* --- KB-1: the owner exists and the register is what it says --- */
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.kbReset(); });
+await page.waitForTimeout(350);
+const kbR1 = await kbReport();
+const KB_SITES = ['panel.take', 'panel.restore', 'panel.adopt', 'sheet.input',
+  'menus.clear', 'dialogue.choice', 'boot.chip'];
+ok(kbR1.guard === true && kbR1.regions === 1
+  && kbR1.sites.length === KB_SITES.length && KB_SITES.every((x) => kbR1.sites.includes(x)),
+  'KB-1 [the owner is installed and the register is complete]: the guard wraps the DISPATCH (HTMLElement/SVGElement focus and blur), the pad has registered its root as the one control region, and the register names all seven declared intents across the six physical kb.focus() call sites — five product paths plus one debug forwarder that carries no site of its own',
+  `${kbR1.sites.length} sites: ${kbR1.sites.join(', ')}`);
+
+/* --- KB-1b: THE REVERT CHECK FOR THE ASSERTION ITSELF.
+       An assertion that cannot fail is decoration. kbSmuggle moves
+       focus by a route that never touches kb.focus() and that a grep
+       for the method name cannot see — computed member access through
+       a string built at runtime, which is the exact shape that hid
+       two call sites from four rounds of auditing. The guard must
+       still catch it, because it intercepts the dispatch. --- */
+const smug = await page.evaluate(() => WALLY.debug.kbSmuggle('.w-abtn'));
+ok(smug.after === smug.before + 1,
+  'KB-1b [BRANCH: the registration assertion actually fires — this is its revert check]: a focus smuggled through computed member access, built from a string at runtime, with no kb.focus() anywhere near it, is recorded. If this ever goes green at zero, KB-4 below has become a blind probe and the enumeration is worthless',
+  `violations ${smug.before} -> ${smug.after}`);
+
+/* --- KB-1c: blur() was rejected in round 2 in about twenty lines,
+       because sending activeElement to <body> restarts sequential
+       navigation from the top of the document and destroys a screen
+       reader player's place. "We never blur" has been a promise for
+       four rounds. The guard records blur too, so it is now a
+       measurement — and this is the probe that proves the recorder
+       works before KB-4 asserts the count is zero. --- */
+const blurSeen = await page.evaluate(() => {
+  const before = WALLY.debug.kb().violations.filter((v) => v.kind === 'blur').length;
+  document.activeElement?.blur?.();
+  return { before, after: WALLY.debug.kb().violations.filter((v) => v.kind === 'blur').length };
+});
+ok(blurSeen.after === blurSeen.before + 1,
+  'KB-1c [BRANCH: blur() is recorded too, so "this design never blurs" is a measurement]: the guard wraps blur as well as focus. Round 2 rejected blur() in about twenty lines of reasoning and every round since has repeated the promise; KB-4 turns it into a count',
+  `blurs ${blurSeen.before} -> ${blurSeen.after}`);
+
+/* --- KB-2: the pad keeps NO COPY of the answer. `driving` used to be
+       a local of touch.js written by five sites in that file. If a
+       future agent reintroduces a local copy, the pad and the owner
+       drift and this is the assertion that says so — the owner is
+       reset underneath the pad and the pad has to follow. --- */
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); });
+await page.waitForTimeout(250);
+await thumbJump(110);                            // sets the routing bit
+const kb2A = await padKb();
+const kb2B = await page.evaluate(() => { WALLY.debug.kbReset(); return WALLY.debug.padKeyboard(); });
+ok(kb2A.driving === true && kb2A.owner === true && kb2B.driving === false && kb2B.owner === false,
+  'KB-2 [the pad READS the answer, it does not keep one]: a thumb on Jump sets the routing bit in the owner and the pad reports it; resetting the OWNER underneath the pad changes what the pad reports, on the same frame. A reintroduced local copy in touch.js fails here',
+  `${JSON.stringify(kb2A)} -> ${JSON.stringify(kb2B)}`);
+
+/* --- KB-4: THE RUNTIME HALF OF THE ENUMERATION. Drive every UI path
+       the game has and require the ledger to be EMPTY. Every focus in
+       here is a declared one; anything that is not gets recorded with
+       its stack. Note the reset first: the three probes above
+       deliberately dirtied the ledger, and a suite that asserted
+       "empty" without ever having proved the recorder fires would be
+       the blind probe KB-1b exists to rule out. --- */
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.kbReset(); });
+await page.waitForTimeout(300);
+await kbTap('Menu'); await page.waitForTimeout(400);
+await page.evaluate(() => WALLY.ctx.ui.closeAll()); await page.waitForTimeout(400);
+await page.evaluate(() => WALLY.ctx.ui.openPhone('places')); await page.waitForTimeout(600);
+await page.evaluate(() => WALLY.ctx.ui.closeAll()); await page.waitForTimeout(400);
+await page.evaluate(() => WALLY.ctx.ui.show('buy')); await page.waitForTimeout(600);
+await page.evaluate(() => { document.querySelector('.w-srch .clr')?.dispatchEvent(new MouseEvent('click', { bubbles: true })); });
+await page.waitForTimeout(300);
+await page.evaluate(() => WALLY.ctx.ui.closeAll()); await page.waitForTimeout(400);
+await page.evaluate(() => { WALLY.ctx.ui.dialogue({ speaker: 'Wally', text: 'x', choices: [{ label: 'Yes', value: 1 }, { label: 'No', value: 2 }] }); WALLY.ctx.ui.interact(); });
+await page.waitForTimeout(500);
+await page.evaluate(() => WALLY.ctx.ui.hide('dialogue')); await page.waitForTimeout(400);
+/* a real Tab traversal, NOT through tabTo() — that helper blurs
+   first, and a harness blur is a recorded violation by design */
+for (let i = 0; i < 12; i++) await page.keyboard.press('Tab');
+await page.keyboard.press('Shift+Tab');
+await page.waitForTimeout(200);
+const kbR4 = await kbReport();
+ok(kbR4.violations.length === 0,
+  'KB-4 [BRANCH: the RUNTIME half of the enumeration]: the pause sheet, the phone, quick-buy, the Clear button, a dialogue with choices and a Tab traversal all driven — and not one focus or blur reached the DOM without declaring itself. This cannot be defeated by optional chaining, computed access, an alias or a file this agent does not own, because it wraps the dispatch and not the syntax',
+  kbR4.violations.length ? JSON.stringify(kbR4.violations.slice(0, 3)) : '0 violations, 6 UI paths');
+
+/* --- KB-3: THE STATIC HALF. The runtime half only sees the paths the
+       suite happens to drive; a new call site on a path nobody
+       exercises would sail through it. So the files are read from
+       disk, comments and string literals are stripped (this codebase
+       has thousands of lines of prose containing the word focus()),
+       and the identifier `focus` in a member or computed position is
+       required to appear NOWHERE in src except kbowner.js itself.
+       THIS is the assertion that stops the seventh round: a new call
+       site fails the suite whether or not it ever runs. --- */
+function stripJs(src) {
+  let out = '', i = 0, prev = '';
+  const n = src.length;
+  const opnd = (c) => c === '' || '=(,:[!&|?{};+-*%<>~^'.includes(c);
+  while (i < n) {
+    const c = src[i], d = src[i + 1];
+    if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') { out += ' '; i++; } continue; }
+    if (c === '/' && d === '*') {
+      out += '  '; i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { out += src[i] === '\n' ? '\n' : ' '; i++; }
+      out += '  '; i += 2; prev = ';'; continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c; out += ' '; i++;
+      while (i < n) {
+        if (src[i] === '\\') { out += '  '; i += 2; continue; }
+        if (src[i] === q) { out += ' '; i++; break; }
+        if (q === '`' && src[i] === '$' && src[i + 1] === '{') {
+          out += '  '; i += 2; let depth = 1;
+          while (i < n && depth) {
+            if (src[i] === '{') depth++; else if (src[i] === '}') depth--;
+            out += depth ? src[i] : ' ';
+            i++;
+          }
+          continue;
+        }
+        out += src[i] === '\n' ? '\n' : ' '; i++;
+      }
+      prev = ';'; continue;
+    }
+    /* a slash where an OPERAND is expected is a regex, not a divide */
+    if (c === '/' && opnd(prev)) {
+      let j = i + 1, cls = false, closed = false;
+      while (j < n) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '\n') break;
+        if (src[j] === '[') cls = true;
+        else if (src[j] === ']') cls = false;
+        else if (src[j] === '/' && !cls) { closed = true; break; }
+        j++;
+      }
+      if (closed) {
+        for (let k = i; k <= j; k++) out += ' ';
+        i = j + 1;
+        while (i < n && /[a-z]/.test(src[i])) { out += ' '; i++; }
+        prev = ';'; continue;
+      }
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
+}
+/* COMMENTS OUT, STRINGS KEPT. The computed half has to read string
+   literals — `el['focus']` is invisible once strings are blanked —
+   but this codebase carries thousands of lines of prose about
+   focus(), including backticked `focus` inside block comments, and a
+   scan that could not tell those apart reported three of them as
+   call sites on its first run. */
+function stripComments(src) {
+  let out = '', i = 0, prev = '';
+  const n = src.length;
+  const opnd = (c) => c === '' || '=(,:[!&|?{};+-*%<>~^'.includes(c);
+  while (i < n) {
+    const c = src[i], d = src[i + 1];
+    if (c === '/' && d === '/') { while (i < n && src[i] !== '\n') { out += ' '; i++; } continue; }
+    if (c === '/' && d === '*') {
+      out += '  '; i += 2;
+      while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { out += src[i] === '\n' ? '\n' : ' '; i++; }
+      out += '  '; i += 2; prev = ';'; continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c; out += c; i++;
+      while (i < n) {
+        if (src[i] === '\\') { out += src[i] + (src[i + 1] || ''); i += 2; continue; }
+        out += src[i];
+        if (src[i] === q) { i++; break; }
+        i++;
+      }
+      prev = ';'; continue;
+    }
+    if (c === '/' && opnd(prev)) {
+      let j = i + 1, cls = false, closed = false;
+      while (j < n) {
+        if (src[j] === '\\') { j += 2; continue; }
+        if (src[j] === '\n') break;
+        if (src[j] === '[') cls = true; else if (src[j] === ']') cls = false;
+        else if (src[j] === '/' && !cls) { closed = true; break; }
+        j++;
+      }
+      if (closed) { for (let k = i; k <= j; k++) out += ' '; i = j + 1; while (i < n && /[a-z]/.test(src[i])) { out += ' '; i++; } prev = ';'; continue; }
+    }
+    out += c;
+    if (!/\s/.test(c)) prev = c;
+    i++;
+  }
+  return out;
+}
+/* ============================================================
+   `.focus` THAT IS NOT THE DOM METHOD, DECLARED RATHER THAN GUESSED.
+
+   Static analysis cannot type an expression, so `s.focus` on a camera
+   settings object — a depth-of-field DISTANCE, a number — is
+   indistinguishable from `el.focus` on an element. There are exactly
+   two in the tree and both are in a file this agent does not own.
+
+   They are allowlisted by REGEX rather than by line number, so
+   src/core/camera.js can be edited freely without failing a suite it
+   has nothing to do with; and every entry is asserted to still MATCH
+   something, so a stale exemption cannot quietly widen the hole. If
+   camera.js renames the field, this fails and somebody looks — which
+   is the correct outcome, because that is also what a new DOM call
+   site in that file would look like.
+
+   The event-name string 'focus' — addEventListener('focus', …) — is
+   not exempted here; it is simply not a member access, and the
+   computed scan below only matches `[ 'focus' ]` and Reflect. That
+   distinction cost the first run of this scanner two false positives.
+   ============================================================ */
+const NOT_THE_DOM_METHOD = [
+  { file: 'src/core/camera.js', re: /\bs\.dof\?\.focus\b/,
+    why: 'camera depth-of-field focus DISTANCE (a number), read for the debug dump' },
+  { file: 'src/core/camera.js', re: /\bplace\([^)]*\bs\.focus\s*\)/,
+    why: 'the same distance, passed to place()' },
+];
+const { readdir } = await import('node:fs/promises');
+async function walk(dir) {
+  const out = [];
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) out.push(...await walk(full));
+    else if (e.name.endsWith('.js')) out.push(full);
+  }
+  return out;
+}
+const lineOf = (src, idx) => src.slice(0, idx).split('\n').length;
+const srcFiles = (await walk(join(ROOT, 'src'))).sort();
+const kbFile = join(ROOT, 'src/ui/kbowner.js');
+const found = [];
+const exemptHit = new Set();
+for (const f of srcFiles) {
+  if (f === kbFile) continue;
+  const raw = await readFile(f, 'utf8');
+  const rel = f.slice(ROOT.length + 1);
+  const noComments = stripComments(raw);
+  const code = stripJs(raw).replace(/\bkb\.focus\b/g, 'kb.KBDECLARED');
+  /* computed / reflective access, which survives no comment and is
+     invisible once strings are blanked — so it is scanned on the
+     comment-stripped text with strings intact */
+  for (const m of noComments.matchAll(/\[\s*['"`]focus['"`]\s*\]|Reflect\s*\.\s*\w+\s*\([^)]*['"`]focus['"`]/g)) {
+    found.push({ rel, line: lineOf(raw, m.index), how: 'computed/reflective', src: m[0] });
+  }
+  /* `.focus` in ANY position — a call, an optional chain, or an alias
+     capture like `const f = el.focus` — minus the two declared
+     non-DOM properties */
+  for (const m of code.matchAll(/\.\s*focus\b/g)) {
+    const line = lineOf(raw, m.index);
+    const text = raw.split('\n')[line - 1] || '';
+    const ex = NOT_THE_DOM_METHOD.find((e) => e.file === rel && e.re.test(text));
+    if (ex) { exemptHit.add(ex); continue; }
+    found.push({ rel, line, how: 'member', src: text.trim().slice(0, 60) });
+  }
+}
+const staleExempt = NOT_THE_DOM_METHOD.filter((e) => !exemptHit.has(e));
+/* the scanner has to be shown to WORK before its zero means anything */
+const selfCheck = (() => {
+  const probe = "const a=1; /* el.focus() in a comment and a `focus` in backticks */ const s='el.focus()';"
+    + " x?.focus?.(); y['focus'](); const z = q.focus; addEventListener('focus', f);";
+  const st = stripJs(probe).replace(/\bkb\.focus\b/g, 'kb.KBDECLARED');
+  const nc = stripComments(probe);
+  return {
+    member: [...st.matchAll(/\.\s*focus\b/g)].length,
+    computed: [...nc.matchAll(/\[\s*['"`]focus['"`]\s*\]/g)].length,
+    eventName: [...nc.matchAll(/\[\s*['"`]focus['"`]\s*\]/g)].length,
+  };
+})();
+ok(selfCheck.member === 2 && selfCheck.computed === 1,
+  'KB-3-pre [the scanner is not blind, and it is not noisy either]: on one probe line it finds the optional-chained call and the alias capture, finds the computed access, and finds NONE of the three decoys — the same call spelled inside a comment, inside a string, and the event NAME in addEventListener(\'focus\'). src/ui/touch.js alone carries about ninety mentions of the word in prose and its first run reported three of them, so telling those apart is the whole difficulty',
+  `member ${selfCheck.member}/2, computed ${selfCheck.computed}/1, decoys 0`);
+ok(staleExempt.length === 0,
+  'KB-3b [and the two non-DOM exemptions are still real]: each entry in NOT_THE_DOM_METHOD matched something. A stale exemption is a hole that widens silently as the file it points at changes, so the allowlist is asserted from both ends',
+  staleExempt.length ? staleExempt.map((e) => e.file + ' ' + e.re).join(', ') : `${NOT_THE_DOM_METHOD.length}/${NOT_THE_DOM_METHOD.length} live (both are camera focus DISTANCE, a number)`);
+ok(found.length === 0,
+  'KB-3 [BRANCH: the STATIC half of the enumeration — the assertion that stops round seven]: across every .js file in src/, the identifier `focus` appears in a member, computed or reflective position NOWHERE except src/ui/kbowner.js and two declared camera distances. A new call site fails this whether or not the suite ever executes it, which is the half the runtime guard cannot cover',
+  found.length ? found.map((h) => `${h.rel}:${h.line} (${h.how}) ${h.src}`).join('  |  ')
+    : `${srcFiles.length} files scanned, 0 undeclared — and tools/_kb6-revert.mjs proves this goes RED for all five hiding shapes`);
+
+/* ============================================================
+   THE SHIFT-TAB THAT LANDED SOMEWHERE REAL (KB-10, KB-13)
+
+   Round 5's hand-back yields its SIGNATURE when the focus moved, and
+   restores the position regardless. That is right when the player's
+   Tab landed inside the ALREADY-CLOSING panel — there is nowhere to
+   leave them. It is wrong when the destination is going to SURVIVE:
+   the keystroke keeps its meaning and loses its destination, which
+   this project's own notes call a worse accessibility failure than
+   the bug it was fixing.
+
+   Nobody had been here because EVERY assertion in the suite pressed
+   Tab FORWARD, and the pad sits BEFORE the panel layer in the DOM —
+   so the two directions land in different places. Forward goes into
+   the panel's own buttons (dying). Shift-Tab goes back onto a live
+   pad button. Both directions are driven below.
+
+   THE WINDOW IS HELD OPEN with padHandBackStall rather than raced.
+   The branch is a 7-10 ms race and a suite that has to WIN one goes
+   green on a quiet box for no reason.
+   ============================================================ */
+const kbStall = 25;
+const armOneTab = async () => {
+  await page.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.padHandBackStall(0); });
+  await page.waitForTimeout(300);
+  const t = await tabTo('Menu');
+  /* AFTER the traversal, not before: tabTo() blurs to get a clean
+     start and a harness blur is a recorded violation by design. */
+  await page.evaluate(() => WALLY.debug.kbReset());
+  await thumbJump(110);
+  return t;
+};
+const kbRoundTrip = async (during) => {
+  await kbTap('Menu');
+  await page.waitForTimeout(320);
+  await page.evaluate((n) => WALLY.debug.padHandBackStall(n), kbStall);
+  const res = await page.evaluate(() => {
+    const b = [...document.querySelectorAll('.w-pause button')].find((e) => /resume/i.test(e.textContent || ''));
+    if (!b) return null;
+    const r = b.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  });
+  await touch('touchStart', res.x, res.y); await page.waitForTimeout(50); await touch('touchEnd', res.x, res.y);
+  await page.waitForTimeout(20);
+  if (during) await during();
+  await page.waitForTimeout(900);
+  await page.evaluate(() => WALLY.debug.padHandBackStall(0));
+  return {
+    restore: await page.evaluate(() => WALLY.debug.focusRestore()),
+    pad: await padKb(),
+    focus: await page.evaluate(() => {
+      const a = document.activeElement;
+      if (!a || a === document.body) return { label: null, where: 'body' };
+      return { label: a.getAttribute?.('aria-label') || a.className || a.tagName,
+        where: a.closest?.('.w-touch') ? 'pad' : (a.closest?.('.w-sheet,.w-pause,.w-phone') ? 'panel' : 'other') };
+    }),
+  };
+};
+
+/* --- KB-10, both arms, one page, one load --- */
+const kbArm = {};
+for (const keep of ['never', 'survivor']) {
+  await page.evaluate((m) => WALLY.debug.kbKeep(m), keep);
+  await armOneTab();
+  kbArm[keep] = await kbRoundTrip(async () => { await page.keyboard.press('Shift+Tab'); });
+}
+await page.evaluate(() => WALLY.debug.kbKeep('survivor'));
+ok(kbArm.never.focus.where === 'pad' && kbArm.never.restore.kept === false
+  && kbArm.never.focus.label !== kbArm.survivor.focus.label,
+  'KB-10-pre [BRANCH: the defect, and the setup really enters it]: with the survivor test backed out — round 5 exactly — a Shift-Tab pressed on the closing lift lands on a LIVE pad button outside the closing panel, and the hand-back overwrites it with the banked one. The player chose a place and had it taken away',
+  `round5 ends on "${kbArm.never.focus.label}", round6 ends on "${kbArm.survivor.focus.label}"`);
+ok(kbArm.survivor.restore.kept === true && kbArm.survivor.restore.landed === false
+  && kbArm.survivor.focus.where === 'pad' && kbArm.survivor.pad.padTakesSpace === true,
+  'KB-10 [BRANCH: the keystroke keeps its DESTINATION as well as its meaning]: the Shift-Tab landed on a live element that will outlive this close, so the hand-back leaves the player exactly where they put themselves — and the pad still answers their Space, which is the half round 5 already had. Restoring over a place the player chose is a hidden focus teleport, and this file rejected those for blur() four rounds ago',
+  `kept=${kbArm.survivor.restore.kept} survivor=${kbArm.survivor.restore.survivor} padTakesSpace=${kbArm.survivor.pad.padTakesSpace}`);
+
+/* --- KB-13: THE GUARD THAT ASSERTS NOTHING HAPPENED. Same gesture,
+       same window, same stall — but a FORWARD Tab, which cannot reach
+       a survivor because the closing panel's own buttons come next in
+       DOM order. The yield must fire ZERO times, and PANEL-8's
+       behaviour must be exactly what it was. Without this, KB-10 could
+       be green because the hand-back had quietly stopped restoring
+       anything at all. --- */
+await armOneTab();
+const kbFwd = await kbRoundTrip(async () => { await page.keyboard.press('Tab'); });
+ok(kbFwd.restore.kept === false && kbFwd.restore.landed === true
+  && kbFwd.restore.site === 'panel.adopt' && kbFwd.pad.padTakesSpace === true,
+  'KB-13 [BRANCH: the guard — a Tab with no survivor to reach, and the yield does NOT fire]: forward Tab lands inside the DYING panel, so the position is still handed back and the arrival is declared as the player’s (`panel.adopt` — round 5’s unsigned restore, said out loud). The yield count here is zero, which is how a reader tells KB-10 apart from a hand-back that has simply stopped working. This is also PANEL-8 unchanged',
+  `kept=${kbFwd.restore.kept} site=${kbFwd.restore.site} movedTo=${kbFwd.restore.movedTo}`);
+
+/* ============================================================
+   THE DIALOGUE THAT LOOKED LIKE A PLAYER (KB-11, KB-12)
+
+   Round 5 asked "did the focus move?" of document.activeElement,
+   which records WHERE the keyboard is and nothing about WHO put it
+   there. A dialogue with choices opening inside the retry window
+   focuses its first choice; that is indistinguishable from a Tab by
+   the evidence available, so the hand-back went unsigned, the pad read
+   an ordinary player focus on a pad button, and defect 3 came back —
+   for a player who has never touched a keyboard.
+
+   THE REVERT ARM IS ROUND FIVE WHOLE, both switches. Backing out only
+   whoMode leaves the survivor test in place and the dialogue's own
+   choice button IS a live survivor, so the yield swallows the defect
+   and the arm reads green for the wrong reason. Measured on this rig:
+   who=active with keep=survivor gave site=null, kept, and
+   padTakesSpace=false. One fix masking another is exactly how a suite
+   goes green over a live bug.
+   ============================================================ */
+const kbDlg = {};
+for (const [who, keep, arm] of [['active', 'never', 'round5'], ['owner', 'survivor', 'round6']]) {
+  await page.evaluate(([w, k]) => { WALLY.debug.kbWho(w); WALLY.debug.kbKeep(k); }, [who, keep]);
+  await armOneTab();
+  let landed = null;
+  kbDlg[arm] = await kbRoundTrip(async () => {
+    landed = await page.evaluate(() => {
+      const ui = WALLY.ctx.ui;
+      ui.dialogue({ speaker: 'Wally', text: 'x', choices: [{ label: 'Yes', value: 1 }, { label: 'No', value: 2 }] });
+      ui.interact();                             // complete the typewriter -> showChoices() -> its focus
+      const a = document.activeElement;
+      return a ? (a.textContent || '').trim().slice(0, 6) : 'body';
+    });
+  });
+  kbDlg[arm].landed = landed;
+  await page.evaluate(() => WALLY.ctx.ui.hide('dialogue'));
+  await page.waitForTimeout(300);
+}
+await page.evaluate(() => { WALLY.debug.kbWho('owner'); WALLY.debug.kbKeep('survivor'); });
+ok(kbDlg.round5.landed === 'Yes' && kbDlg.round5.restore.moved === true
+  && kbDlg.round5.pad.padTakesSpace === true,
+  'KB-11-pre [BRANCH: the defect, and the setup really enters it]: with round 5 restored whole, a dialogue opening inside the hand-back window focuses its first choice, the hand-back reads that as the player moving the keyboard, and the thumb-only player’s next Space opens the pause sheet instead of jumping. Defect 3, back through a door nobody was watching',
+  `dialogueFocused=${kbDlg.round5.landed} moved=${kbDlg.round5.restore.moved} padTakesSpace=${kbDlg.round5.pad.padTakesSpace}`);
+ok(kbDlg.round6.landed === 'Yes' && kbDlg.round6.restore.moved === false
+  && kbDlg.round6.restore.site === 'panel.restore' && kbDlg.round6.pad.padTakesSpace === false,
+  'KB-11 [BRANCH: a focus the UI performed is not the player moving]: the SAME dialogue opens in the SAME window and the hand-back is unmoved by it, because the owner authorised that focus and only an UNAUTHORISED arrival is the player’s. The restore stays faithful and the thumb player’s Space is still his',
+  `dialogueFocused=${kbDlg.round6.landed} moved=${kbDlg.round6.restore.moved} site=${kbDlg.round6.restore.site} padTakesSpace=${kbDlg.round6.pad.padTakesSpace}`);
+
+/* --- KB-12: THE SECOND GUARD THAT ASSERTS NOTHING. The same window
+       with NOTHING opening in it. Nothing moved, so both arms must
+       restore faithfully — which is PANEL-8e, and which proves KB-11
+       is measuring the dialogue and not the weather. --- */
+const kbEmpty = {};
+for (const [who, keep, arm] of [['active', 'never', 'round5'], ['owner', 'survivor', 'round6']]) {
+  await page.evaluate(([w, k]) => { WALLY.debug.kbWho(w); WALLY.debug.kbKeep(k); }, [who, keep]);
+  await armOneTab();
+  kbEmpty[arm] = await kbRoundTrip(null);
+}
+await page.evaluate(() => { WALLY.debug.kbWho('owner'); WALLY.debug.kbKeep('survivor'); });
+ok(kbEmpty.round5.restore.moved === false && kbEmpty.round6.restore.moved === false
+  && kbEmpty.round5.pad.padTakesSpace === false && kbEmpty.round6.pad.padTakesSpace === false
+  && kbEmpty.round6.restore.site === 'panel.restore',
+  'KB-12 [BRANCH: the guard — an EMPTY window, and both arms agree]: with nothing opening inside the hand-back the rule is inert, the restore is faithful in round 5 and round 6 alike, and the thumb player’s Space belongs to the game. KB-11’s difference is the dialogue and nothing else about the run',
+  `round5 ${JSON.stringify(kbEmpty.round5.pad.padTakesSpace)} / round6 ${JSON.stringify(kbEmpty.round6.pad.padTakesSpace)}`);
+
+/* --- and the ledger is STILL clean after all of that --- */
+await page.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.padHandBackStall(0); });
+await page.waitForTimeout(400);
+const kbEnd = await kbReport();
+ok(kbEnd.violations.length === 0,
+  'KB-5 [and the register held through every branch above]: six UI paths, both Tab directions, four revert arms and a dialogue opened mid-hand-back later, still not one undeclared focus or blur reached the DOM',
+  kbEnd.violations.length ? JSON.stringify(kbEnd.violations.slice(0, 3)) : '0 violations');
 
 await ctxMobile.close();
 
