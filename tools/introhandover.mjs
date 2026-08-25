@@ -75,16 +75,26 @@ async function run(label, mobile) {
 
   if (mobile) {
     await page.touchscreen.tap(90, 700).catch(() => {});
-    await page.evaluate(() => WALLY.ctx.wally.setInput?.(() => ({ x: 0, z: 1, run: false })));
+    await page.evaluate(() => { WALLY.ctx.wally.setInput?.(() => ({ x: 0, z: 1, run: false })); return true; });
   } else await page.keyboard.down('KeyW');
 
+  /* NEVER let this hang. A promise that only resolves from requestAnimationFrame
+     never resolves if rAF stops, and page.evaluate then waits forever — that wedged
+     the mobile run of this very file for four and three quarter hours with no output.
+     A wall-clock fallback resolves with whatever was sampled, and a stalled rAF then
+     reports as a FAILED assertion instead of a hung suite. */
   const legs = await page.evaluate(() => new Promise((res) => {
     const w = WALLY.ctx.wally; let bone = null;
     w.root.traverse((o) => { if (!bone && o.isBone && /leg|thigh|shin/i.test(o.name)) bone = o; });
-    if (!bone) return res({ bone: null, range: -1 });
-    const s = []; let n = 0;
-    const t = () => { s.push(bone.rotation.x); if (++n < 60) requestAnimationFrame(t); else res({ bone: bone.name, range: +(Math.max(...s) - Math.min(...s)).toFixed(4) }); };
+    if (!bone) return res({ bone: null, range: -1, why: 'no leg bone' });
+    const s = []; let n = 0, done = false;
+    const finish = (why) => { if (done) return; done = true;
+      res({ bone: bone.name, frames: s.length, why,
+            range: s.length ? +(Math.max(...s) - Math.min(...s)).toFixed(4) : -1 }); };
+    const t = () => { if (done) return; s.push(bone.rotation.x);
+      if (++n < 60) requestAnimationFrame(t); else finish('sampled'); };
     requestAnimationFrame(t);
+    setTimeout(() => finish('rAF stalled'), 4000);
   }));
   await page.waitForTimeout(900);
   const st = await page.evaluate(() => {
@@ -103,7 +113,7 @@ async function run(label, mobile) {
   ok(Math.abs(st.animSpeed - st.ctrlSpeed) < 0.25,
      `${label}: the animator tracks the controller — locomotion handed back`,
      `anim ${st.animSpeed} vs controller ${st.ctrlSpeed}`);
-  ok(legs.range > 0.5, `${label}: the legs actually swing`, `${legs.range} rad (idle sway is ~0.16)`);
+  ok(legs.range > 0.5, `${label}: the legs actually swing`, `${legs.range} rad over ${legs.frames ?? 0} frames (${legs.why}); idle sway is ~0.16`);
   ok(errs.length === 0, `${label}: no page errors`, errs.slice(0, 2).join(' | '));
   await ctx.close();
 }
