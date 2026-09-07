@@ -238,6 +238,47 @@ export function createTitleCard(ctx) {
     ? 'TAP THE SCREEN TO SKIP'
     : 'PRESS ANY KEY TO SKIP';
 
+  /* ------------------------------------------------------------------
+     THE TAGLINE IS THE SAVE, NOT A SLOGAN.
+
+     "TWO HUNDRED AND FIFTY DOLLARS · ONE BICYCLE · NO REPUTATION" is
+     the opening position of a NEW GAME, and it was hard-coded — so a
+     returning player who has just watched himself ride in on a
+     Thunderhead 900 read "one bicycle" under the logo, in the same
+     frame as the motorcycle standing behind his shoulder. Two things
+     on screen at once, contradicting each other, both of them ours.
+
+     So the three clauses are the three numbers they were always
+     describing: what he has, what he rides, and what he is worth.
+     Rounded and spelled the way the original line spells them, and
+     falling back to the original words exactly when there is no game
+     module to ask — which is every headless tool, and a first boot.
+     ------------------------------------------------------------------ */
+  const FRESH_TAG = 'TWO HUNDRED AND FIFTY DOLLARS &middot; ONE BICYCLE &middot; NO REPUTATION';
+  const grouped = (n) => Math.round(n).toLocaleString('en-US');
+  const TAG = (() => {
+    try {
+      const a = ctx.game?.actions;
+      if (!a?.rides) return FRESH_TAG;
+      const owned = a.rides().filter((r) => r.owned);   // rides() is fastest first
+      const rep = Math.round(ctx.game.state?.rep ?? 0);
+      const cash = ctx.game.state?.money;
+      /* A save with nothing in it IS the opening position — say it in
+         the words that were written for it rather than deriving
+         something clumsier that means the same thing. */
+      if (!owned.length && rep <= 0) return FRESH_TAG;
+      /* THE MACHINE'S NAME, NOT ITS CATEGORY. "ONE BICYCLE" was a
+         count because there was nothing to name; a player who owns
+         the Thunderhead 900 should read THUNDERHEAD 900 under the
+         logo, standing next to it. */
+      const ride = owned.length
+        ? owned[0].n.toUpperCase() + (owned.length > 1 ? ` &plus;${owned.length - 1} MORE` : '')
+        : 'NOTHING TO RIDE';
+      const money = cash > 0 ? `${grouped(cash)} DOLLARS` : 'NOT ONE DOLLAR';
+      return `${money} &middot; ${ride} &middot; ${rep > 0 ? `REPUTATION ${rep}` : 'NO REPUTATION'}`;
+    } catch (e) { return FRESH_TAG; }
+  })();
+
   /* --- DOM ------------------------------------------------------- */
   const root = document.createElement('div');
   root.id = 'introOverlay';
@@ -246,7 +287,7 @@ export function createTitleCard(ctx) {
     `<div class="ic-card">` +
       `<div class="ic-scrim"></div>` +
       svg +
-      `<div class="ic-tag">TWO HUNDRED AND FIFTY DOLLARS &middot; ONE BICYCLE &middot; NO REPUTATION</div>` +
+      `<div class="ic-tag">${TAG}</div>` +
     `</div>` +
     `<div class="ic-skip">${SKIP_HINT}</div>`;
 

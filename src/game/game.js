@@ -719,7 +719,55 @@ export function createGame(opts = {}) {
     }
     if (!RIDES[st.rides.equipped] || !st.rides.owned[st.rides.equipped]) st.rides.equipped = null;
     st.bike = { owned: !!st.rides.owned.bike, equipped: st.rides.equipped === 'bike' };
+    syncParked(st.rides);
     return st.rides;
+  }
+
+  /* ------------------------------------------------------------
+     WHERE HE LEFT IT.
+
+     character/wally.js has been able to leave a machine standing in
+     the street since the parked feature shipped, and none of it
+     survived a reload: `parkedIds` is a runtime Set and the save had
+     nowhere to put a position. You could leave the bicycle at the
+     cafe, quit, come back, and it was under you again — which is a
+     small lie about a small machine.
+
+     It is not a small lie about the balloon. The balloon IS a place:
+     it lies on the ground where you landed it, ten metres of it, and
+     "it is wherever you put it down" is most of what owning one
+     means. So the spot is state now.
+
+       state.rides.parked = { <rideId>: {x, y, z, yaw} }   world metres
+
+     THE SHAPE IS DELIBERATELY THE MINIMUM. Not the pitch, not the
+     roll, not the kickstand — every one of those is SOLVED from the
+     terrain by bike.js solveParkPose on the way back in, so storing
+     them would be storing an answer that the ground can contradict
+     after a world rebuild. Position and heading are the only two
+     facts the terrain does not already know.
+
+     save.js does not need to be taught anything: sanitize() rewrites
+     `rides.owned` and `rides.equipped` and leaves every other key on
+     the record alone, and the state object is serialised verbatim. It
+     is repaired here on every syncRides() for the same reason
+     migrateRides() runs on every load — a save written by a build
+     before this line existed has no `parked` key at all, and a
+     hand-edited one could have anything.
+     ------------------------------------------------------------ */
+  function syncParked(rs) {
+    if (!rs.parked || typeof rs.parked !== 'object' || Array.isArray(rs.parked)) rs.parked = {};
+    for (const id of Object.keys(rs.parked)) {
+      const p = rs.parked[id];
+      const bad = !RIDES[id] || !rs.owned[id] || !p || typeof p !== 'object'
+        || !Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z);
+      /* A machine you do not own cannot be standing anywhere, and a
+         non-finite spot is how you lose one under the map. */
+      if (bad) { delete rs.parked[id]; continue; }
+      p.x = round2(p.x); p.y = round2(p.y); p.z = round2(p.z);
+      p.yaw = Number.isFinite(p.yaw) ? round2(p.yaw) : 0;
+    }
+    return rs.parked;
   }
 
   const ownsRide = (id) => !!syncRides().owned[id];
@@ -741,12 +789,18 @@ export function createGame(opts = {}) {
     return {
       id: r.id, name: r.name, n: r.n, short: r.short, ico: r.ico,
       speed: r.speed, effort: r.effort,
-      desc: r.desc, line: r.line,
+      desc: r.desc, line: r.line, pitch: r.pitch || null,
       unlock: u.kind, price: r.price, questId: r.questId,
       rep: u.rep || 0, locs: u.locs || [],
+      /* the progress gate, and how far through it he is, so a locked
+         row can be a goal with a distance on it rather than a "no" */
+      assets: u.assets || 0,
+      assetsHave: Object.keys(S().tokenized || {}).length,
       buyable: u.kind === 'buy',
       owned: !!rs.owned[r.id],
       equipped: rs.equipped === r.id,
+      /* where he left it, or null if it is with him / never parked */
+      parked: rs.parked && rs.parked[r.id] ? { ...rs.parked[r.id] } : null,
     };
   }
 
@@ -2202,6 +2256,27 @@ export function createGame(opts = {}) {
         return { ok: false, price: r.price, rep: u.rep,
           why: 'They will not sell you one below reputation ' + u.rep };
       }
+      /* THE PROGRESS GATE — "much later in the game", said in the
+         game's own units rather than in money.
+
+         Reputation is a poor proxy for lateness on its own: it comes
+         off shifts and orders and a grinder can have 75 of it in the
+         first fortnight. `unlock.assets` counts TOKENIZED assets,
+         which is the one number that only goes up when the city
+         actually changes, and it is the same number the HUD is
+         already showing as "% CITY". Only RIDES.balloon carries it —
+         the Treasury will not sell its survey balloon to somebody who
+         has not surveyed anything — and every other row is unchanged
+         because an absent field is not a gate. */
+      const need = u.assets || 0;
+      if (need > 0) {
+        const have = Object.keys(st.tokenized || {}).length;
+        if (have < need) {
+          return { ok: false, price: r.price, assets: need, assetsHave: have,
+            why: 'Not until ' + need + ' of the city’s ' + CONFIG.totalAssets
+              + ' assets are tokenized — you are at ' + have };
+        }
+      }
       if (!u.locs.includes(st.loc)) {
         return { ok: false, price: r.price, locs: u.locs,
           why: r.short + 's are sold at ' + u.locs.map((l) => LOC_BY_ID[l].n).join(' and ') };
@@ -2229,6 +2304,36 @@ export function createGame(opts = {}) {
        the fare board, and putting a bicycle in the shed is not
        choosing a way to get anywhere. */
     equipRide(id) { return mountRide(id); },
+
+    /* ---- WHERE HE LEFT IT ----
+       The 3D layer owns the pose; this owns the fact. character/
+       wally.js calls setParkSpot() the moment parkProp() stands a
+       machine on the ground and clearParkSpot() when he picks it up
+       again, and reads parkSpots() once at boot to put back whatever
+       the last session left lying about. See syncParked().
+
+       NEITHER CALL IS EVER REQUIRED. A headless build (tools/
+       test-game.mjs) never calls either one and the record stays
+       empty, which is the correct description of a world with no
+       geometry in it. */
+    parkSpots() { return { ...syncRides().parked }; },
+    parkSpot(id) { const p = syncRides().parked[id]; return p ? { ...p } : null; },
+    setParkSpot(id, at) {
+      const rs = syncRides();
+      if (!RIDES[id] || !rs.owned[id] || !at) return { ok: false, why: 'No such ride' };
+      if (!Number.isFinite(at.x) || !Number.isFinite(at.y) || !Number.isFinite(at.z)) {
+        return { ok: false, why: 'Not a place' };
+      }
+      rs.parked[id] = { x: round2(at.x), y: round2(at.y), z: round2(at.z),
+        yaw: round2(Number.isFinite(at.yaw) ? at.yaw : 0) };
+      return { ok: true, at: { ...rs.parked[id] } };
+    },
+    clearParkSpot(id) {
+      const rs = syncRides();
+      const had = !!rs.parked[id];
+      delete rs.parked[id];
+      return { ok: true, had };
+    },
 
     /* ---- the bicycle, in the words the old API used ----
        ui/menus.js and anything written against v6 still call these.

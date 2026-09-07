@@ -31,7 +31,7 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { CLAY, SHADOW } from '../core/palette.js';
-import { clamp, damp } from '../core/contracts.js';
+import { clamp, damp, lerp } from '../core/contracts.js';
 
 import {
   H, PROP, BONES, BONE_INDEX, buildSkeleton, bindWorld,
@@ -46,6 +46,7 @@ import { Expression, EXPRESSION_NAMES } from './expression.js';
 import { Secondary } from './secondary.js';
 import { createBike, solveParkPose, PARK_PITCH_MAX } from './bike.js';
 import { createScooter, createMotorcycle, triangleCost } from './rides.js';
+import { createBalloon, FIT as BALLOON_FIT, FLIGHT, stepFlight, newFlight } from './balloon.js';
 
 const _e = new THREE.Euler(0, 0, 0, 'XYZ');
 const _v = new THREE.Vector3();
@@ -1132,15 +1133,44 @@ export async function init(ctx) {
       steer: 0.055,
       enter: { x: -0.78, y: 0.03, z: -0.14, yaw: 0.18, roll: -0.40 },
     },
+    /* THE BALLOON IS A ROW HERE AND NOTHING READS MOST OF IT, which
+       is on purpose rather than by neglect. It never touches the
+       character controller — flyUpdate() below disables it and
+       integrates the machine itself — so `speeds` is never patched in
+       and `lean` is never applied. The row exists because a dozen
+       lookups in this file are written `RIDE_TUNE[rideId] ||
+       RIDE_TUNE.bike`, and a missing row means every one of them
+       quietly answers "bicycle" about a balloon. The numbers are the
+       honest ones for the machine so that anything which DOES read
+       them reads the truth: `speeds` is the drift ceiling from
+       balloon.js FLIGHT, and the lean is zero because a balloon has
+       no bank at all. */
+    balloon: {
+      speeds: {
+        walkSpeed: 5.60, runSpeed: 9.00, turnRate: 0.9,
+        strideLength: 1e6, accel: 2.0, decel: 1.4,
+      },
+      lean: { gain: 0, max: 0, rate: 1 },
+      steer: 0,
+      enter: { x: 0, y: 0, z: 0, yaw: 0, roll: 0 },
+    },
   };
   const MOUNT_T = 0.62;   // must equal CLIPS['bike-mount'].duration
   const DISMOUNT_T = 0.54;
   const RIDE_BUILD = {
     bike: createBike, scooter: createScooter, motorcycle: createMotorcycle,
+    balloon: createBalloon,
   };
   /* 'moto' is what a human types into a debug console at midnight. */
-  const RIDE_ALIAS = { moto: 'motorcycle', motorbike: 'motorcycle', bicycle: 'bike', scoot: 'scooter' };
+  const RIDE_ALIAS = {
+    moto: 'motorcycle', motorbike: 'motorcycle', bicycle: 'bike', scoot: 'scooter',
+    air: 'balloon', hotair: 'balloon', assessor: 'balloon',
+  };
   const rideKey = (id) => (id == null ? null : (RIDE_ALIAS[id] || (RIDE_TUNE[id] ? id : null)));
+  /* Which machines fly. One entry today, asked as a question so the
+     twenty call sites below read as "is this one airborne" rather
+     than as a string comparison repeated twenty times. */
+  const isAir = (id) => rideKey(id) === 'balloon';
 
   const props = {};                // id -> prop, built on first equip
   let rideId = 'bike';             // which machine setBike(true) mounts
@@ -1164,6 +1194,10 @@ export async function init(ctx) {
     if (props[key]) return props[key];
     const p = RIDE_BUILD[key](ctx);
     p.group.visible = false;
+    /* Looked up ONCE. flyUpdate leans the envelope every frame and a
+       per-frame children.find() over a machine with forty parts is a
+       linear scan for a pointer that never changes. */
+    if (key === 'balloon') flyEnvGroup = p.group.children.find((o) => o.name === 'balloon.envGroup') || null;
     /* The shadow projector renders a private layer, and it was walked
        over `root` before this existed — so opt the prop in by hand or
        he casts a rider-shaped shadow with no machine in it. */
@@ -1512,17 +1546,27 @@ export async function init(ctx) {
   const PARK_SIDE_X = -0.62;
   const PARK_CLEAR_M = 1.0;       // measured: the props are 0.60-0.72 m wide
   const PARK_STEP_M = 1.1;        // > PARK_CLEAR_M, or a rung blocks its neighbour
+  /* THE CLEARANCE IS THE MACHINE'S, NOT A CONSTANT, and the balloon is
+     why. 1.0 m is the measured width of the widest thing on wheels; a
+     moored balloon is a basket with five metres of cold envelope laid
+     out in front of it (balloon.js `parkClear` = 4.2), and parking one
+     0.62 m from a motorcycle puts the motorcycle inside the fabric.
+     The pair is asked BOTH ways round — the widest of the two decides,
+     so it does not matter which was put down first. */
+  const clearOf = (p) => (p && Number.isFinite(p.parkClear) ? p.parkClear : PARK_CLEAR_M);
   function parkOffsetX(at, yaw) {
     const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const mine = clearOf(bike);
+    const step = Math.max(PARK_STEP_M, mine * 1.1);
     for (let i = 0; i < 4; i++) {
-      const ox = PARK_SIDE_X - i * PARK_STEP_M;
+      const ox = PARK_SIDE_X - i * step;
       const x = at.x + cy * ox, z = at.z - sy * ox;
       let clear = true;
       for (const id of parkedIds) {
         const p = props[id];
         if (!p || p === bike) continue;
         const q = p.group.position;
-        if (Math.hypot(q.x - x, q.z - z) < PARK_CLEAR_M) { clear = false; break; }
+        if (Math.hypot(q.x - x, q.z - z) < Math.max(mine, clearOf(p))) { clear = false; break; }
       }
       if (clear) return ox;
     }
@@ -1585,17 +1629,24 @@ export async function init(ctx) {
    * parkProbe what was actually measured. The arithmetic lives in one
    * place because it used to live in two and they drifted apart.
    */
-  function parkProp() {
+  /**
+   * @param {{x:number, z:number, yaw:number}} [at]  put it HERE instead
+   *   of beside him. The restore path passes the saved spot, because
+   *   "beside him" is a rule about a dismount and a machine coming back
+   *   across a reload was not dismounted just now. Everything else about
+   *   the pose — pitch, roll, height, mooring — is solved either way.
+   */
+  function parkProp(at) {
     if (!bike) return;
     const g = bike.group;
     root.updateMatrixWorld(true);
     root.getWorldPosition(_pv);
-    const yaw = root.rotation.y;
+    const yaw = at ? at.yaw : root.rotation.y;
     /* His -x side, stepped out if another machine is already standing
        there. Local +x maps to world (cos y, 0, -sin y). */
-    const ox = parkOffsetX(_pv, yaw);
-    const px = _pv.x + Math.cos(yaw) * ox;
-    const pz = _pv.z - Math.sin(yaw) * ox;
+    const ox = at ? 0 : parkOffsetX(_pv, yaw);
+    const px = at ? at.x : _pv.x + Math.cos(yaw) * ox;
+    const pz = at ? at.z : _pv.z - Math.sin(yaw) * ox;
 
     const ws = bike.wheels || [];
     const zf = ws.length > 1 ? contactZ(ws[0], g) : 0;
@@ -1614,7 +1665,7 @@ export async function init(ctx) {
          kickstand defect (it was on the side away from the lean)
          survived a whole round */
       foot: bike.standFoot || null,
-      fallbackY: _pv.y,
+      fallbackY: at ? at.y : _pv.y,
     });
     const gy = sol.y, pitch = sol.pitch;
     /* WHAT WAS ACTUALLY MEASURED, AND WHERE — for parkProbe, so the
@@ -1663,6 +1714,16 @@ export async function init(ctx) {
        rewritten mid-dismount. See propKey. */
     const id = propKey(bike);
     if (id) parkedIds.add(id);
+    /* AND IT SURVIVES A RELOAD NOW. game.js owns the fact (state.rides
+       .parked), this owns the pose — and only the two numbers the
+       terrain cannot re-derive are handed over, because pitch, roll
+       and height all come back out of solveParkPose on the way in and
+       a stored answer could contradict the ground it is standing on.
+       Wrapped because a headless build has no ctx.game at all. */
+    if (id) {
+      try { ctx.game?.actions?.setParkSpot?.(id, { x: px, y: gy, z: pz, yaw }); }
+      catch (e) { /* no game layer: the pose is still correct */ }
+    }
   }
 
   /** Take it off the stand and put it back under him. */
@@ -1670,6 +1731,9 @@ export async function init(ctx) {
     if (!bike) return;
     const id = propKey(bike);
     if (id) parkedIds.delete(id);
+    if (id) {
+      try { ctx.game?.actions?.clearParkSpot?.(id); } catch (e) { /* headless */ }
+    }
     const g = bike.group;
     bike.park(false);
     if (g.parent !== root) root.add(g);
@@ -1708,7 +1772,12 @@ export async function init(ctx) {
       if (d > PARK_FAR_M) { p.group.visible = false; continue; }
       _psph.center.copy(p.group.position);
       _psph.center.y += 0.55;                 // half its standing height
-      _psph.radius = 1.25 + PARK_SHADOW_PAD;
+      /* 1.25 is half a MOTORCYCLE's diagonal. A moored balloon is five
+         metres of envelope on the ground and a sphere sized for a
+         motorcycle would cull it while a corner of it was still in
+         shot — which is the pop §6 forbids, arriving through the
+         constant rather than through the rule. */
+      _psph.radius = Math.max(1.25, clearOf(p) * 0.75) + PARK_SHADOW_PAD;
       p.group.visible = _pfr.intersectsSphere(_psph);
     }
   }
@@ -1750,6 +1819,28 @@ export async function init(ctx) {
        changed — and the SCOOTER stayed on screen underneath him.
        Callers now say which machine they want and nothing else. */
     const wantRide = rideKey(o.ride) || rideId;
+    /* ---- THE AIR FORK ----
+       An air machine has no seated posture, no controller and no
+       kickstand, so it does not take one step down this function: it
+       goes to setFly() and the two state machines never overlap. The
+       fork is here rather than in the callers because setBike() is
+       the ONLY writer of `rideId` (see the note above) and the whole
+       point of that rule is that there is one door.
+
+       AND GETTING ON A BALLOON GETS YOU OFF A MOTORCYCLE, which is
+       the ride table's own one-at-a-time rule and has to be enforced
+       across the fork as well as inside each side of it. */
+    if (isAir(wantRide) && want) {
+      if (bikePhase !== 'off') setBike(false, { instant: true });
+      return setFly(true, o);
+    }
+    if (flyPhase !== 'off' && (!want || !isAir(wantRide))) {
+      /* he is in the air and something wants him out of it, or on a
+         different machine: ask her down, and let the landing hand him
+         back before anything else happens */
+      setFly(false, o);
+      if (!want || flyPhase !== 'off') return api;
+    }
     const already = bikePhase === 'on' || bikePhase === 'mounting';
     /* A SWAP IS NOT A NO-OP. Asking for the motorcycle while he is on
        the scooter passes want === already, and returning early there is
@@ -1968,16 +2059,1124 @@ export async function init(ctx) {
      in the same working tree, and two files disagreeing by name about a
      measured fact is how the next reader gets misled. */
 
+  /* ================================================================
+     6c. THE BALLOON — flight, and why it is not the bicycle path
+
+     Everything in 6b assumes the machine is UNDER a character
+     controller that owns the position. The balloon owns the position
+     itself, so this is a parallel state machine rather than a fourth
+     row in that one, and the seam between them is exactly two lines:
+     setBike() routes an air ride here, and update() calls flyUpdate()
+     before it copies the controller into `root`.
+
+     THE PHASES, and each one is a thing you can see:
+
+       off        on foot. The machine, if he owns one, is lying in a
+                  field somewhere with its envelope cold.
+       boarding   4.6 s. He is in the basket, the burner is lit, and
+                  the envelope is inflating off the ground. The basket
+                  stays on its runners until the lift genuinely beats
+                  the weight — the take-off is not timed, it is SOLVED.
+       aloft      flying. balloon.js stepFlight() owns the velocity.
+       landing    the basket is down and the envelope is collapsing
+                  forward onto the ground over 3.2 s. At the end of it
+                  parkProp() stands the machine where he left it.
+
+     THE CONTROLLER IS DISABLED, NOT DRIVEN, and its three positions
+     are written by hand. teleport() is the published way to move it
+     and it is the wrong one here: it calls snapToGround(4), so a
+     balloon four metres over a roof would be yanked down onto it on
+     the frame it crossed. Writing simPosition / position /
+     _prevPosition together is what teleport does minus that snap, and
+     all three have to move or phys._post() lerps him back across the
+     gap on the very next frame — see the long note at api.wallyWarp()
+     for the full account of what happens when they disagree.
+
+     WHAT THE VELOCITY IS FOR. It is written honestly rather than
+     zeroed, because three things downstream read it and all three are
+     wrong if it lies: world.js streams its collision window from
+     ctx.phys.player.position, the ear and trunk chains take their
+     inertia from the root's motion, and anything reading the subject
+     wants a real one. The locomotion blend is the one thing that must
+     NOT see it — a 9 m/s planarSpeed would have him sprinting on the
+     spot in a basket — so the blend is pinned at zero through
+     locoManual for the whole flight, and his idle, which is §1.6 pose
+     1 already, is the pose. Ears and trunk then do the acting.
+     ================================================================ */
+  const F_ANIM = { board: 4.6, land: 3.2 };
+  /* THE LIFT-OFF IS SOLVED, NOT TIMED. The basket leaves the ground
+     when the envelope is far enough inflated to carry it AND the
+     burner has put in enough heat to make the lift positive. Below
+     0.62 of inflation the fabric has not got the volume. */
+  const F_LIFT_INFLATE = 0.62;
+  const F_TOUCH_M = 0.06;
+  /* Inside this height the burner is nudged to bleed off the sink
+     rate — the last hundred feet, where every landing is made. */
+  const F_FLARE_M = 7.0;
+  /* She will not put you in the water and she will not put you on a
+     cliff. Inside this height over either the burner fires itself —
+     and 18 m rather than the 9 it started at, because a REFUSAL IS
+     NOT A BRAKE. She arrives at the line doing up to 3.6 m/s down,
+     the burner needs 0.7 s to put the heat back over trim and the
+     sink then takes another two seconds to wash out, so nine metres
+     of warning bought about six of overshoot: measured, she went from
+     9 m to 0.71 m over the sea before she came back. Eighteen leaves
+     the margin the physics actually needs.
+
+     AND A FLOOR UNDER IT, because "almost never" is not a rule. The
+     burner does all the work in every case measured (the floor is
+     reported by flightState.floored and was never touched in the
+     suite); it exists so that a gust, a stalled tab or a frame of
+     3.6 m/s cannot put an elephant in the sea in a game that has no
+     way to get him out of one. */
+  const F_REFUSE_M = 18.0;
+  const F_WATER_FLOOR = 1.6;
+  const F_BASKET_R = 0.95;
+  const F_ENV_PUSH = 7.5;        // m/s^2 the envelope shoulders with
+
+  let flyPhase = 'off';          // off | boarding | aloft | landing
+  let flyT = 0;
+  let flyBlend = 0;              // 0..1 — how much of him is the balloon
+  let flyState = newFlight(0);
+  let flyProp = null;
+  let flyIkSaved = true;
+  let flyGround = 0;             // solid height under the basket
+  let flyRefusing = false;       // the auto-burner is on
+  let flyLandWanted = false;     // he asked to get out while still up
+  let flyFogK = 0;
+  let flyAlt = 0;
+  /* A HELD BURNER, for the verifier. There is no keyboard in a
+     headless tab, so tools/test-balloon.mjs holds the burner through
+     this rather than through a synthetic key event — which would test
+     the event plumbing instead of the thing under test. */
+  let flyForceBurn = false;
+  /* has the water floor ever had to engage this flight? reported, so
+     "the burner does all the work" is a measurement rather than a
+     hope */
+  let flyFloored = false;
+  /* ...and a held stick, for the same reason. */
+  let flyStick = null;
+  /* the envelope group, looked up once when the prop is built rather
+     than searched for every frame */
+  let flyEnvGroup = null;
+  const _fv = new THREE.Vector3();
+  const _fv2 = new THREE.Vector3();
+  const _fup = new THREE.Vector3(0, 1, 0);
+  const _fin = { x: 0, z: 0, burn: false, vent: false };
+  const _fenv = { windX: 0, windZ: 0 };
+  const _fground = { y: 0, normal: _fup, hit: false };
+  const _fnormal = new THREE.Vector3(0, 1, 0);
+  const _fcamGround = { y: 0, normal: _fup, hit: false };
+
+  /** The solid the basket would land on: terrain, roofs, decks and
+      anything else phys calls static. groundAt takes the HIGHEST
+      surface under a point, which is why landing on a roof works
+      without a single line about roofs.
+   *
+   *  THE RESULT IS COPIED, NOT RETURNED BY REFERENCE. collision.js's
+   *  groundAt() hands back a SHARED scratch object when you pass no
+   *  `out` (`this._groundRes`), so two calls in one frame are the same
+   *  object and the second silently rewrites the first. Both callers
+   *  here are in one frame — the flight reads the ground under the
+   *  basket and the camera reads it under the lens — so this returns a
+   *  private record instead. Nothing is broken today because the
+   *  reads happen to precede the second call; that is not a property
+   *  anyone should have to re-verify after moving a line. */
+  /** The water surface here — phys owns a real water level (the
+      camera reads it for its own floor) and falls back to the world's
+      flat sea. Never the seabed: see flyUpdate. */
+  function waterAt(x, z) {
+    const p = ctx.phys;
+    if (p && p.waterLevelAt) {
+      try { const v = p.waterLevelAt(x, z); if (Number.isFinite(v)) return v; } catch (e) { /* fall through */ }
+    }
+    return ctx.world?.seaLevel ?? 0;
+  }
+
+  /** The surface she would come to rest on: the solid, or the water
+      if the solid is under it. THE DEBUG HOOKS USE THIS TOO — placing
+      the machine at "alt 14" over open sea against the SEABED put it
+      15.7 m below the waves, which is not an altitude anybody asked
+      for and is how the water refusal came to look broken when it was
+      the placement that was wrong. */
+  function flySurfaceUnder(x, z, fromY) {
+    const g = flySolidUnder(x, z, fromY, _fcamGround);
+    const wl = waterAt(x, z);
+    return (!g.hit || g.y <= wl + 0.35) ? wl : g.y;
+  }
+
+  function flySolidUnder(x, z, fromY, out) {
+    const r = out || _fground;
+    const p = ctx.phys;
+    if (p && p.groundAt) {
+      try {
+        const g = p.groundAt(x, z, null, (fromY ?? root.position.y) + 2, 900);
+        if (g && g.hit && Number.isFinite(g.y)) {
+          r.y = g.y; r.hit = true;
+          r.normal = r === _fground ? _fnormal.copy(g.normal) : g.normal.clone();
+          return r;
+        }
+      } catch (e) { /* fall through to the heightfield */ }
+    }
+    const h = ctx.world?.heightAt?.(x, z);
+    r.y = Number.isFinite(h) ? h : 0;
+    r.normal = r === _fground ? _fnormal.set(0, 1, 0) : _fup;
+    r.hit = Number.isFinite(h);
+    return r;
+  }
+
+  /* ----------------------------------------------------------------
+     WHAT THE BASKET IS ACTUALLY STANDING ON — the footprint, not a ray.
+
+     flySolidUnder() casts ONE ray, down the machine's centre line, and
+     for a balloon over open country that is the whole answer. Over a
+     roof it is not, and the roof is the case the feature was built to
+     make interesting: the basket is 1.34 m across and every parapet in
+     this city is a cliff.
+
+     MEASURED on the penthouse (roof 29.74 m over terrain, 8 of 8 flat
+     probes, edge 8.90 m from the centre), flown down on the stick with
+     station keeping, load 15.05-29.65:
+
+       centre 0.30 m INSIDE the edge   came to rest on the roof with
+                                       its four corner probes reading
+                                       71.67 / 71.67 / 86.74 / 86.74 —
+                                       a 15.07 m spread, i.e. half the
+                                       basket standing on nothing
+       centre 0.40 m OUTSIDE the edge  went straight down past the
+                                       building and landed on the
+                                       terrain 29 m below
+
+     Both are the same bug seen from either side of a line 1.34 m wide:
+     a rigid basket on two skids rests on the HIGHEST thing under its
+     footprint, and a single ray cannot know what that is.
+
+     So: the centre plus a ring at the skid radius, the highest wins,
+     and the direction of that highest support is published so the
+     approach can lean toward it (see the nudge in flyUpdate). The ring
+     is only paid for inside F_FOOT_M of the surface — four rays a
+     frame for the last few seconds of a landing, nothing for the rest
+     of a flight.
+     ---------------------------------------------------------------- */
+  const F_FOOT_M = 14.0;         // start probing the footprint this low
+  const F_FOOT_STEP = 0.8;       // corner disagreement that counts as an edge
+  const F_FOOT_PUSH = 3.4;       // m/s^2 toward the supported side
+  const _ffg = { y: 0, normal: _fup, hit: false };
+  const _ffoot = { y: 0, normal: _fup, hit: false, hiX: 0, hiZ: 0, spread: 0 };
+  function flyFootprint(x, z, fromY, centre) {
+    const r = _ffoot;
+    r.y = centre.y; r.normal = centre.normal; r.hit = centre.hit;
+    r.hiX = 0; r.hiZ = 0; r.spread = 0;
+    let lo = centre.y;
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * Math.PI * 2 + 0.7854;
+      const ox = Math.cos(a) * F_BASKET_R, oz = Math.sin(a) * F_BASKET_R;
+      const g = flySolidUnder(x + ox, z + oz, fromY, _ffg);
+      if (!g.hit) continue;
+      if (g.y < lo) lo = g.y;
+      /* A SKID DOES NOT REST ON A WALL. Beside a building the ring
+         probes land on its FACE, and letting one of those win puts the
+         machine's landing surface up at the height of the wall it is
+         passing and hands the refusal a normal pointing sideways — so
+         a balloon coming down a street would hover beside the brick
+         and decline to land in it. Only surfaces a basket could
+         actually stand on are candidates. */
+      if (g.normal && g.normal.y < 0.5) continue;
+      if (g.y > r.y + 1e-4) {
+        r.y = g.y; r.hit = true; r.normal = g.normal;
+        r.hiX = ox; r.hiZ = oz;
+      }
+    }
+    r.spread = r.y - lo;
+    return r;
+  }
+
+  /* ----------------------------------------------------------------
+     COLLISION — it must not fly through a building, and it must not be
+     TRAPPED by one either. Two probes, and they answer differently on
+     purpose:
+
+       THE BASKET is a hard capsule. It is 1.34 m across with an
+       elephant standing in it and it is not allowed inside a wall, so
+       a contact kills the inbound component of the velocity and keeps
+       the tangent. That is the whole of "it does not fly through
+       buildings".
+
+       THE ENVELOPE is a soft sphere six metres higher and seven
+       across. Between two three-storey terraces there is nowhere for
+       it to be, and a hard response there would pin the machine in a
+       street for ever — which is the "trapped" half of the brief, and
+       it is the one that ships by accident. So the envelope PUSHES
+       rather than stops: a lateral acceleration away from whatever it
+       is against, so a balloon that drifts into a terrace is eased
+       back over the middle of the street instead of stopping dead on
+       a chimney.
+
+     AND UP IS NEVER BLOCKED. Neither probe touches the vertical
+     velocity at all. Whatever else has gone wrong, the burner is the
+     way out — which is what makes trapped impossible rather than
+     merely unlikely.
+     ---------------------------------------------------------------- */
+  function flyCollide(dt) {
+    const p = ctx.phys;
+    if (!p || !p.raycast) return;
+    const sp = Math.hypot(flyState.vx, flyState.vz);
+    if (sp < 0.02) return;
+    const dx = flyState.vx / sp, dz = flyState.vz / sp;
+
+    /* --- the basket --- three rays, at the deck, at his chest and at
+       the rim, so a rail at one height cannot be walked through by a
+       probe that only looked at another. */
+    const reach = F_BASKET_R + sp * dt * 2 + 0.25;
+    let hitN = null, hitD = Infinity;
+    for (const h of [0.10, 0.70, BALLOON_FIT.WALL]) {
+      _fv.set(root.position.x, root.position.y + h, root.position.z);
+      _fv2.set(dx, 0, dz);
+      let r = null;
+      try { r = p.raycast(_fv, _fv2, reach); } catch (e) { r = null; }
+      if (r && r.distance < hitD) { hitD = r.distance; hitN = r.normal; }
+    }
+    if (hitN) {
+      const vn = flyState.vx * hitN.x + flyState.vz * hitN.z;
+      if (vn < 0) {
+        flyState.vx -= hitN.x * vn * 1.02;
+        flyState.vz -= hitN.z * vn * 1.02;
+        /* it is canvas and wicker, not glass: bleed a fifth of what is
+           left so a scrape along a wall costs you something */
+        flyState.vx *= 0.80; flyState.vz *= 0.80;
+      }
+      const gap = F_BASKET_R - hitD;
+      if (gap > 0) {
+        root.position.x += hitN.x * gap * 0.6;
+        root.position.z += hitN.z * gap * 0.6;
+      }
+    }
+
+    /* --- the envelope --- four probes on its own ring, answering with
+       a shove rather than a stop. */
+    const ec = flyProp ? flyProp.envelopeCentre : { y: 6, r: 3.6 };
+    const ey = root.position.y - BALLOON_FIT.DECK + ec.y;
+    let px = 0, pz = 0, n = 0;
+    const a0 = Math.atan2(dx, dz);
+    for (let i = 0; i < 4; i++) {
+      const a = a0 + (i / 4) * Math.PI * 2;
+      const ax = Math.sin(a), az = Math.cos(a);
+      _fv.set(root.position.x, ey, root.position.z);
+      _fv2.set(ax, 0, az);
+      let r = null;
+      try { r = p.raycast(_fv, _fv2, ec.r + 0.6); } catch (e) { r = null; }
+      if (r) {
+        const k = 1 - r.distance / (ec.r + 0.6);
+        px -= ax * k; pz -= az * k; n++;
+      }
+    }
+    if (n) {
+      const l = Math.hypot(px, pz) || 1;
+      flyState.vx += (px / l) * F_ENV_PUSH * dt;
+      flyState.vz += (pz / l) * F_ENV_PUSH * dt;
+    }
+  }
+
+  /* ----------------------------------------------------------------
+     THE HAZE AT ALTITUDE.
+
+     §2.4 pales everything toward #B8DEF0 past ~120 m and the fog is
+     how the game says so. MEASURED, live, on this build rather than
+     read off lighting.js's constructor: scene.fog sits at near 100 /
+     far 520 in clear weather at ground level — lighting.js builds it
+     at 60 / 420 and something in the update stages moves it, so the
+     multiplier below rides whatever is actually there rather than a
+     number from a source file. That range is exactly right at head
+     height and it is a WALL from 200 m up:
+     the island is 970 m across, so all of it sits past the far plane
+     and the one thing this feature exists to show is a flat turquoise
+     wash. Measured, from 200 m aimed down the island at 07:00: the
+     coast, the sea and the far half of the city are simply not there.
+     The same frame with the ramp opened out has all three of them, a
+     horizon and a shoreline (shots/balloon-alt200.png against
+     shots/balloon-alt200-fog.png).
+
+     THE FIX IS ALTITUDE, NOT WEATHER. The haze is real and it is
+     lovely, so it is SCALED rather than switched off: near x4.2 and
+     far x4.6 at 150 m, and everything inside a hundred metres of the
+     lens still hazes exactly as §2.4 asks. Nothing pops on the way
+     back down, because the multiplier rides ALTITUDE — which is
+     continuous — rather than a phase, which is not.
+
+     IT IS WRITTEN IN lateUpdate, AND THAT IS NOT A DETAIL. Two
+     modules write this object during the update stages —
+     world/lighting.js from its own damped weather range inside
+     sky.update(), and intro/intro.js, which keeps easing its aerial
+     fog toward the sky's — and sky is stage 4 against this module's
+     stage 8, so an update-time write here LOOKS safe. It is not:
+     measured, with the write in wally.update() and the machine at
+     200 m, the fog came back at 100 / 520, i.e. exactly the ground
+     value, every frame. Something downstream in the update pass puts
+     it back. main.js runs EVERY update() and then EVERY lateUpdate(),
+     so a lateUpdate write outranks all of them regardless of stage:
+     the same probe from here reads 420 / 2392. That is the whole
+     reason this one function does not live beside the rest of the
+     flight code.
+
+     IT RESTORES NOTHING, either. lighting.js re-derives fog.near/far
+     from scratch every frame, so the moment this stops writing its
+     own value is back on the very next one — and at zero altitude the
+     multiplier IS one, so there is nothing to hand back.
+     ---------------------------------------------------------------- */
+  function flyHaze(alt) {
+    const fog = ctx.scene?.fog;
+    if (!fog || !Number.isFinite(fog.near)) return;
+    const k = smoothstepLocal(6, 150, Math.max(0, alt)) * clamp(flyBlend, 0, 1);
+    flyFogK = k;
+    if (k <= 0.0005) return;
+    fog.near = fog.near * (1 + 3.2 * k);
+    fog.far = fog.far * (1 + 3.6 * k);
+  }
+
+  /* ----------------------------------------------------------------
+     THE SEA AT ALTITUDE — the other thing opening the haze uncovered.
+
+     WHAT IT LOOKS LIKE. From 200 m the whole ocean carries hard
+     horizontal striping: measured on the open water to the right of
+     the island at 1600x900, 0.371 luminance-gradient reversals per row
+     with a 12.32-code peak-to-trough ripple after the row profile is
+     detrended, on four independent frames, load 16.33.
+
+     WHAT IT IS. water.js displaces the ocean disc with four Gerstner
+     waves and each carries its own distance fade (uWaveFade, in
+     metres): 520-1400 for the 33 m swell down to 34-105 for the 3.9 m
+     chop. Those ramps are correct for the camera they were authored
+     against — a lens 0.9 m over Wally's soles, where scene.fog.far is
+     520 and NOTHING past the first fade is ever visible. The disc's
+     rings grow geometrically to 12 km, so at a kilometre out the
+     spacing between two rings of vertices is about 89 m and a 33 m
+     swell is carried by a third of a vertex. On the ground that is
+     free: it is all behind the fog. From a balloon it is not, because
+     flyHaze above deliberately pushes the fog to 2392 so the island
+     can be seen — and what it also uncovered was a kilometre of sea
+     beating against its own tessellation.
+
+     WHAT THIS DOES. Pulls those fades in as the LENS climbs — the lens
+     and not the machine, because the sampling is done by the camera —
+     so a wave is only displaced while there is geometry to carry it.
+     Bisected through water.js's own published uniforms rather than
+     guessed: with the fades scaled the ripple goes 12.32 -> 2.37 codes
+     and the RMS 2.544 -> 0.407, and the sea comes back as §2.1's
+     banded turquoise. Nothing else moved it — flattening the
+     amplitudes changed nothing, because water.js rewrites those every
+     frame in refreshWaves() and uWaveFade is the one part of the wave
+     table it does not touch.
+
+     IT IS A NO-OP BELOW 70 m, which is above every hill on this island
+     and above the whole of the flight the refusal will let you make
+     near the ground, so a walking frame and a low hop are the frames
+     they always were. And it restores from the authored values, so it
+     cannot drift: the numbers it hands back are the ones water.js
+     started with, not the ones this last wrote.
+
+     Written from lateUpdate for the same reason flyHaze is — see its
+     header — and unconditionally rather than only while flying, so
+     that coming down and getting out puts the sea back.
+     ---------------------------------------------------------------- */
+  const F_SEA_ON = 70, F_SEA_FULL = 240, F_SEA_MIN = 0.20;
+  let seaFade0 = null;
+  let seaFadeK = 1;
+  function flySea() {
+    const f = ctx.water?.uniforms?.uWaveFade?.value;
+    if (!f || !f.length) return;
+    if (!seaFade0) seaFade0 = f.map((v) => ({ x: v.x, y: v.y }));
+    const sea = ctx.world?.seaLevel ?? 0;
+    const h = (ctx.camera ? ctx.camera.position.y : 0) - sea;
+    const k = lerp(1, F_SEA_MIN, smoothstepLocal(F_SEA_ON, F_SEA_FULL, h));
+    if (Math.abs(k - seaFadeK) < 1e-4) return;
+    seaFadeK = k;
+    for (let i = 0; i < f.length; i++) f[i].set(seaFade0[i].x * k, seaFade0[i].y * k);
+  }
+
+  /* ----------------------------------------------------------------
+     THE CAMERA.
+
+     The follow rig is solved for a 1.6 m character on the ground with
+     a 4.3 m boom (camera.js RIG) and there is no preset in it for a
+     ten-metre object seen from two hundred metres up. It also has no
+     idea the subject can fly: `subj.grounded` comes off a controller
+     this file has just switched off.
+
+     So the balloon drives cam.override(), which camera.js publishes
+     for exactly this — "while an override is active this rig writes
+     what it is given and touches nothing else". The rig here is four
+     damped quantities, and it is SEEDED FROM THE LIVE LENS on the
+     frame the override starts, so the hand-over is not a cut: the
+     boom is exactly where the follow rig left it and then eases out
+     over the inflation. Coming back is the same trick from the other
+     end — releaseOverride() calls camera.js's adopt(), which re-seeds
+     its own springs from wherever this left the lens. Neither
+     direction can snap, which is §6's rule.
+
+     WHAT MOVES WITH ALTITUDE. The boom goes 20 m -> 30 m, the lens
+     6 m over the basket -> 17 m, the FOV 52 -> 61, and the aim walks
+     forward and down until it is on the ground a long way ahead. At
+     20 m the frame is a balloon over a city; at 200 m it is a city
+     with a balloon in the corner of it, which is the shot this whole
+     feature is for.
+
+     AND IT LOOKS ALONG THE DRIFT, NOT ALONG THE BASKET. The basket
+     rotates under the envelope (balloon.js FLIGHT.spin) because real
+     ones do; hanging the camera on that would swing the island round
+     the frame every forty seconds. The boom is on the velocity, so
+     the world holds still and the basket turns underneath it — which
+     is what the ride actually feels like from inside one.
+     ---------------------------------------------------------------- */
+  const flyCam = {
+    pos: new THREE.Vector3(), aim: new THREE.Vector3(), fov: 52, yaw: 0, seeded: false,
+    /* THE BOOM'S OWN GEOMETRY AT THE MOMENT OF THE HAND-OVER, in the
+       rig's coordinates, so the first TARGET is the follow rig's lens
+       rather than a point sixteen metres behind it. `ease` walks from
+       one to the other. See flyCamera(). */
+    ease: 0, sDist: 4.3, sHigh: 2.1, sAhead: 2.0, sDown: 0.55, sFloor: 1.5,
+  };
+  /** seconds the boom takes to walk out from where it was handed over
+      to where the flight solve wants it — a shade under the 4.6 s
+      inflation, so it is out by the time she leaves the grass. */
+  const F_CAM_EASE = 3.2;
+  /** rad/s the boom may swing while it comes round onto a new drift
+      heading. 0.38 = 22 deg/s: a deliberate pan, slower than anything
+      a player can ask the follow rig for. */
+  const F_CAM_YAW_RATE = 0.38;
+  /* WHERE THIS RIG HANDS THE LENS BACK. camera.js's RIG, expressed in
+     the fly rig's own coordinates: its boom is 3.15 m behind and its
+     lens 0.90 m over his soles (RIG.distance / RIG.height), which is
+     0.45 m over this rig's chest anchor, and it is tilted 2.1 DEGREES
+     UP (RIG.pitch) rather than down. `ahead`/`down` are the aim point
+     that reproduces that tilt: the aim sits 8 m in front of the anchor
+     and ( 8 + 3.15 ) * tan( 2.1 ) + 0.45 = 0.86 m ABOVE it, hence a
+     NEGATIVE `down`. If camera.js ever re-solves its boom these three
+     numbers go stale — the dismount assertion in tools/test-balloon.mjs
+     is what catches that, because it measures the delivered look
+     change across the hand-back rather than these constants. */
+  const F_CAM_HAND = { dist: 3.15, high: 0.45, ahead: 8.0, down: -0.86 };
+  const _fcp = new THREE.Vector3(), _fca = new THREE.Vector3();
+  /** b, moved by whole turns onto the side of a it is nearest. */
+  function wrapNear(a, b) {
+    let d = b - a;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return a + d;
+  }
+  function flyCamera(dt, alt) {
+    const cam = ctx.cam;
+    if (!cam || !cam.override) return;
+    const k = smoothstepLocal(4, 170, Math.max(0, alt));
+    let dist = lerp(20.0, 30.0, k);
+    let high = lerp(6.0, 17.0, k);
+    let ahead = lerp(2.0, 30.0, k);
+    /* HOW FAR BELOW THE BASKET THE AIM SITS. 2.6 m was wrong at ground
+       level and the take-off filmstrip is why: the override is seeded
+       from the follow rig, which is 4.3 m behind him at chest height,
+       so on the first frame of a boarding the lens is 1.3 m off the
+       grass — and an aim 2.6 m BELOW the basket from there points it
+       into the ground. The first second of every launch was a
+       close-up of the underside of the basket and its own shadow.
+       0.55 at ground level keeps the aim level until the boom has
+       actually got out. */
+    let down = lerp(0.55, 17.0, k);
+    let landLam = 1;
+    const fov = lerp(52, 61, k);
+    /* the anchor is his chest in the basket, not his soles: at 30 m of
+       boom that is a metre on screen, and at 20 m it is the difference
+       between framing the machine and framing the floor of it */
+    const ax = root.position.x, ay = root.position.y + BALLOON_FIT.WALL * 0.5, az = root.position.z;
+
+    if (!flyCam.seeded) {
+      /* SEED FROM THE LENS, not from the solve. This is the frame the
+         override takes over on, and starting anywhere but exactly
+         where the follow rig already is would be the camera snap §6
+         forbids by name.
+
+         AND THE YAW IS THE LENS'S OWN FORWARD, NOT ITS REVERSE. This
+         line read atan2(-x,-z) and it was a whole boarding's worth of
+         wrongness in one character each. `yaw` is consumed as
+         ( fx, fz ) = ( sin yaw, cos yaw ) = THE DIRECTION OF TRAVEL:
+         the boom goes to ax - fx*dist (behind the subject) and the aim
+         to ax + fx*ahead (in front of it). The update twelve lines
+         below sets it from atan2( vx, vz ), the drift heading — so the
+         seed has to be measured the same way round, and the negated
+         one was 180 degrees out of phase with its own update. The boom
+         target then landed 20 m in FRONT of the subject along the view
+         direction: the lens flew forward over Wally's head while the
+         aim retreated behind him, and the two crossed. Measured on the
+         boarding, load 27.32: 14.46 degrees of look change in a 12 ms
+         frame (1195 deg/s), pitch to -84.1, and the lens 2.48 m on the
+         WRONG SIDE of the subject at its worst. With the sign right,
+         same rig, load 22.30: 55.5 deg/s worst, pitch -18.4, and the
+         lens never once gets in front.
+
+         IT HAS TO BE RIGHT ON ITS OWN. The corrective damp below only
+         runs above 0.8 m/s of drift, so a balloon boarded on a calm
+         day never reaches it and holds whatever the seed said for as
+         long as the flight lasts — which is why tools/test-balloon.mjs
+         asserts the becalmed boarding as well as the drifting one. */
+      flyCam.pos.copy(ctx.camera.position);
+      ctx.camera.getWorldDirection(_fv2);
+      flyCam.aim.copy(ctx.camera.position).addScaledVector(_fv2, 12);
+      flyCam.fov = ctx.camera.fov;
+      flyCam.yaw = Math.atan2(_fv2.x, _fv2.z);
+      flyCam.seeded = true;
+      /* AND SEED THE TARGET TOO, WHICH THE STATE ALONE DOES NOT DO.
+         Seeding only the state leaves the rig damping toward a boom
+         sixteen metres further back and four metres higher from the
+         very first frame, and an exponential's biggest step is its
+         first one: measured across the join, load 23.92, the frame
+         after the hand-over moved the lens 1.03 m and swung the look
+         3.23 degrees — a visible flinch on every boarding, in the
+         opposite direction to the one the sign error caused and much
+         smaller, but still a step where the header promises none.
+
+         So the boom's geometry is recorded HERE, in the rig's own
+         coordinates, and `ease` walks the target from it out to the
+         flight solve over F_CAM_EASE seconds. The first target is the
+         lens itself, so the first step is zero by construction and
+         the pull-back is the four-second move the header describes
+         rather than a spring release. */
+      const sdx = flyCam.pos.x - ax, sdz = flyCam.pos.z - az;
+      flyCam.sDist = Math.max(1.0, Math.hypot(sdx, sdz));
+      flyCam.sHigh = flyCam.pos.y - ay;
+      const sfx = Math.sin(flyCam.yaw), sfz = Math.cos(flyCam.yaw);
+      flyCam.sAhead = (flyCam.aim.x - ax) * sfx + (flyCam.aim.z - az) * sfz;
+      flyCam.sDown = ay - flyCam.aim.y;
+      flyCam.sFloor = Math.max(0.35,
+        flyCam.pos.y - flySolidUnder(flyCam.pos.x, flyCam.pos.z, flyCam.pos.y + 4, _fcamGround).y);
+      /* THE WALK-OUT IS FOR A BOARDING, and only for one. Its whole
+         job is to take the boom from where the FOLLOW rig had it out
+         to where the flight wants it without a step, which is a claim
+         about a hand-over. A re-seed that is not a hand-over — the
+         screenshot rig's `balloon({alt: 200})`, a phase restarted
+         under a debug hook — starts from a lens that has nothing to
+         do with the follow rig and 210 m to travel, and easing the
+         TARGET as well as the state there just means the shot is not
+         framed yet three seconds later. The state damp still keeps
+         that continuous; only the target jumps. */
+      flyCam.ease = flyPhase === 'boarding' ? 0 : 1;
+      /* AND HAND OVER ON EXACTLY THAT, before a single damp step, so
+         the seed frame is bit-identical to the rig it is taking the
+         lens from. */
+      cam.override(flyCam.pos, flyCam.aim, flyCam.fov);
+      return;
+    }
+
+    /* the walk-out. smoothstep so it leaves and arrives at rest. */
+    if (flyCam.ease < 1) flyCam.ease = clamp(flyCam.ease + dt / F_CAM_EASE, 0, 1);
+    if (flyCam.ease < 1) {
+      const e = smoothstepLocal(0, 1, flyCam.ease);
+      dist = lerp(flyCam.sDist, dist, e);
+      high = lerp(flyCam.sHigh, high, e);
+      ahead = lerp(flyCam.sAhead, ahead, e);
+      down = lerp(flyCam.sDown, down, e);
+    }
+
+    /* ---- AND THE WALK BACK IN, which is the same seam from the other
+       end and was the worse of the two.
+
+       releaseOverride() calls camera.js's adopt(), and adopt re-seeds
+       that rig's springs FROM THE LIVE LENS — so the position is
+       continuous across the hand-back and the header's claim that
+       "neither direction can snap" was measured on the position. The
+       LOOK is not a spring: camera.js solves its aim from (dist,
+       height, pitch) every frame, and on the first follow frame those
+       are its own preset's, not this rig's. So the lens stayed put and
+       the frame pitched 7.85 degrees in one 33 ms frame — 234.9 deg/s,
+       load 28.49 — and then rolled the rest of the way out over five
+       more. Every dismount, and it is the largest single-frame look
+       change left anywhere in the sequence.
+
+       There is nothing to fix in camera.js. The fix is to ARRIVE in
+       the follow rig's geometry rather than to be taken out of a
+       flying one: over the 3.2 s of the deflation the boom walks from
+       20 m back and 6 m up in to camera.js's own RIG (3.15 m back,
+       0.90 m over his soles, tilted 2.1 degrees UP), so by the time
+       releaseOverride() runs the two rigs are looking at the same
+       thing from the same place and adopt() has nothing left to move.
+       It is also the better shot: the envelope comes down and the
+       camera comes back to him with it. */
+    if (flyPhase === 'landing') {
+      /* arrive early — the state damps toward this target and has to
+         be given time to actually reach it before the hand-back */
+      const lt = smoothstepLocal(0, 1, clamp(flyT / (F_ANIM.land * 0.72), 0, 1));
+      dist = lerp(dist, F_CAM_HAND.dist, lt);
+      high = lerp(high, F_CAM_HAND.high, lt);
+      ahead = lerp(ahead, F_CAM_HAND.ahead, lt);
+      down = lerp(down, F_CAM_HAND.down, lt);
+      landLam = lerp(1, 3.4, lt);
+    }
+
+    /* the boom sits behind the DRIFT; with no drift it holds the last
+       heading, so a becalmed balloon does not spin its own camera
+       hunting for one.
+
+       THE FADE AND THE CAP ARE BOTH THERE FOR THE BOARDING. `if (sp >
+       0.8)` is a cliff: on the frame the drift crosses it a damp at
+       1.1 opens on whatever angle happens to lie between the lens and
+       the new heading, and on a boarding into a following wind that
+       angle is most of a half-turn. Measured on the drifting boarding
+       before this, load 24.61: 2.59 degrees in one 17 ms frame,
+       154 deg/s, on the frame of the crossing and nowhere else.
+       Fading the authority in over 0.35-1.30 m/s removes the cliff;
+       capping the rate keeps the swing a pan rather than a whip when
+       the heading really does have to come half way round. After the
+       first seconds the exponential is slower than the cap and
+       neither term does anything, so cruise is untouched. */
+    const sp = Math.hypot(flyState.vx, flyState.vz);
+    const align = smoothstepLocal(0.35, 1.30, sp);
+    if (align > 0) {
+      const want = wrapNear(flyCam.yaw, Math.atan2(flyState.vx, flyState.vz));
+      const step = damp(flyCam.yaw, want, 1.1 * align, dt) - flyCam.yaw;
+      const cap = F_CAM_YAW_RATE * dt;
+      flyCam.yaw += clamp(step, -cap, cap);
+    }
+    const fx = Math.sin(flyCam.yaw), fz = Math.cos(flyCam.yaw);
+
+    /* DURING THE INFLATION THE SUBJECT IS THE ENVELOPE, not the ground
+       ahead: the fabric is coming up off the grass and standing itself
+       into a balloon, which is the best four seconds this machine has.
+       The aim rides the middle of it and hands back to the flying
+       framing as the boom gets out. */
+    const lift = flyPhase === 'boarding' && flyProp
+      ? (1 - k) * (BALLOON_FIT.MOUTH + BALLOON_FIT.ENV_H * 0.35) * flyProp.inflation : 0;
+    _fcp.set(ax - fx * dist, ay + high, az - fz * dist);
+    _fca.set(ax + fx * ahead, ay - down + lift, az + fz * ahead);
+
+    /* the boom is slower than the aim, which is what makes a big thing
+       read as heavy: the lens trails and the look leads. Stiffened
+       through the deflation (landLam) so the state actually ARRIVES at
+       the hand-back geometry the target above walks in to — a lagging
+       spring would hand back from wherever it had got to, which is the
+       seam again with a smaller number on it. */
+    const lam = (1.05 + 1.4 * clamp(flyBlend, 0, 1)) * landLam;
+    flyCam.pos.x = damp(flyCam.pos.x, _fcp.x, lam, dt);
+    flyCam.pos.y = damp(flyCam.pos.y, _fcp.y, lam * 0.8, dt);
+    flyCam.pos.z = damp(flyCam.pos.z, _fcp.z, lam, dt);
+    flyCam.aim.x = damp(flyCam.aim.x, _fca.x, lam * 1.9, dt);
+    flyCam.aim.y = damp(flyCam.aim.y, _fca.y, lam * 1.9, dt);
+    flyCam.aim.z = damp(flyCam.aim.z, _fca.z, lam * 1.9, dt);
+    flyCam.fov = damp(flyCam.fov, fov, 1.6, dt);
+    /* never inside the hill. The follow rig does this for gameplay
+       with lensFloor(); an override gets none of the rig's services,
+       so the one that matters is done here by hand.
+
+       AND THE MARGIN EASES IN WITH THE BOOM. The follow rig keeps its
+       lens lower than 1.5 m over the ground — measured at the moment
+       of a boarding on the lawn outside the Treasury, load 13.93, it
+       sits 0.94 m up — so applying this floor at full width on the
+       first override frame LIFTED THE LENS 0.56 m in one frame and
+       swung the look 2.68 degrees. That was the whole of the residual
+       step at the join once the seed's sign and the target were both
+       fixed: not a spring, a clamp. Starting the margin at whatever
+       the handed-over lens already had and walking it out to 1.5 m
+       keeps "never inside the hill" true on every frame — the floor
+       is never lower than the lens was standing at — while making the
+       lift part of the same four-second move as the boom. */
+    const gy = flySolidUnder(flyCam.pos.x, flyCam.pos.z, flyCam.pos.y + 4, _fcamGround).y;
+    const floor = flyCam.ease < 1
+      ? lerp(Math.min(flyCam.sFloor, 1.5), 1.5, smoothstepLocal(0, 1, flyCam.ease))
+      : 1.5;
+    if (flyCam.pos.y < gy + floor) flyCam.pos.y = gy + floor;
+    cam.override(flyCam.pos, flyCam.aim, flyCam.fov);
+  }
+
+  /**
+   * Get in, or get out. The public door is setBike() / setRide(),
+   * which routes any air machine here.
+   *
+   * GETTING OUT WHILE AIRBORNE IS A REQUEST, NOT AN EVENT. There is
+   * no honest way to step out of a basket at 180 m, so unequipping in
+   * the air sets `flyLandWanted`: she vents, comes down, flares, and
+   * the dismount happens on the ground. That is also what makes
+   * hud.js's door interaction safe from up here — it cannot warp him
+   * out of the sky, it can only ask him to land.
+   */
+  function setFly(on, o = {}) {
+    if (on) {
+      if (flyPhase === 'boarding' || flyPhase === 'aloft') { flyLandWanted = false; return api; }
+      rideId = 'balloon';
+      flyProp = showProp('balloon');
+      flyProp.group.visible = true;
+      /* IT COMES OFF ITS OWN SPOT AND UNDER HIM, and the order
+         matters: unparkProp() re-parents to `root` and clears the park
+         pose, so everything after this line is in his frame. */
+      unparkProp();
+      try { ctx.game?.actions?.clearParkSpot?.('balloon'); } catch (e) { /* headless */ }
+      /* HE STANDS ON THE DECK. The prop's origin is on the ground —
+         that is the park solve's contract — so it hangs at -DECK
+         under his soles for as long as he is aboard. */
+      flyProp.group.position.set(0, -BALLOON_FIT.DECK, 0);
+      flyProp.group.rotation.set(0, 0, 0);
+      flyProp.group.scale.set(1, 1, 1);
+      flyProp.park(false);
+
+      flyState = newFlight(root.rotation.y);
+      flyFloored = false;
+      flyPhase = 'boarding';
+      flyT = 0;
+      flyLandWanted = false;
+      flyRefusing = false;
+      flyCam.seeded = false;
+      /* HE IS STANDING, NOT SEATED — see the block header. */
+      locoManual = true; locoSpeed = 0; locoTurn = 0;
+      flyIkSaved = secondary.ikEnabled;
+      secondary.ikEnabled = false;          // his feet are on a deck
+      if (controller) {
+        controller.enabled = false;
+        controller.velocity.set(0, 0, 0);
+        controller.acceleration.set(0, 0, 0);
+      }
+      flyProp.setInflate(o.instant ? 1 : 0);
+      if (o.instant) {
+        flyPhase = 'aloft'; flyBlend = 1; flyT = 0;
+        flyState.heat = FLIGHT.trim;
+      }
+      ctx.bus?.emit('wally:fly', { flying: true, phase: flyPhase, ride: 'balloon' });
+    } else {
+      if (flyPhase === 'off') return api;
+      if (o.instant) { flyEnd(true); return api; }
+      if (flyPhase === 'aloft') {
+        const alt = root.position.y - flyGround - BALLOON_FIT.DECK;
+        if (alt > F_TOUCH_M + 0.35) { flyLandWanted = true; return api; }
+      }
+      if (flyPhase !== 'landing') { flyPhase = 'landing'; flyT = 0; }
+    }
+    return api;
+  }
+
+  /** Hard stop — cutscenes, debug hooks and the instant path. A studio
+      shot with an abandoned balloon in it is nobody's intent, so this
+      one puts the machine away rather than mooring it. */
+  function flyEnd(hide) {
+    if (flyProp) {
+      flyProp.setBurner(false, 0, 1);
+      if (hide) { unparkProp(); flyProp.setInflate(1); flyProp.group.visible = false; }
+    }
+    flyPhase = 'off'; flyBlend = 0; flyT = 0;
+    flyLandWanted = false; flyRefusing = false;
+    flyCam.seeded = false;
+    locoManual = false;
+    secondary.ikEnabled = flyIkSaved;
+    if (controller) {
+      controller.enabled = true;
+      controller.velocity.set(0, 0, 0);
+      /* 500 m, not 6. This is the cutscene/debug path and it may be
+         called with him two hundred metres up; a six-metre snap would
+         leave him there and then drop him. Put him on the ground. */
+      controller.snapToGround(500);
+      root.position.copy(controller.position);
+    }
+    flyStick = null; flyForceBurn = false;
+    ctx.cam?.releaseOverride?.();
+    ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
+  }
+
+  /** Write a position into the controller WITHOUT snapping it to the
+      ground. See the block header for why teleport() is the wrong
+      call and why all three positions have to move together. */
+  function flyPlaceController() {
+    const c = controller;
+    if (!c) return;
+    c.simPosition.copy(root.position);
+    c.position.copy(root.position);
+    c._prevPosition.copy(root.position);
+    c.velocity.set(flyState.vx, flyState.vy, flyState.vz);
+    c.acceleration.set(0, 0, 0);
+    c.yaw = flyState.yaw;
+    if (c._yawTarget !== undefined) c._yawTarget = flyState.yaw;
+    /* `grounded` false with airTime 0 keeps update()'s `air` test
+       (which needs airTime > 0.09) from starting the jump clip over a
+       man standing in a basket. */
+    c.grounded = flyPhase !== 'aloft';
+    c.airTime = 0;
+  }
+
+  function flyUpdate(dt) {
+    if (flyPhase === 'off') return false;
+    const prop = flyProp;
+    if (!prop) { flyEnd(true); return false; }
+
+    /* ---- what is under him ----
+       THE SEA COUNTS AS A SURFACE, and getting that wrong is how the
+       refusal below fails silently. heightAt() over open water answers
+       with the SEABED — measured at about -30 m out past the shore —
+       so "am I within nine metres of the thing under me" was asking
+       about the bottom of the ocean, and the machine sailed serenely
+       down to 28.79 m BELOW sea level before anything objected. The
+       surface she would land on over water is the water. */
+    let g = flySolidUnder(root.position.x, root.position.z, root.position.y);
+    /* THE LAST FOURTEEN METRES ARE FLOWN ON THE FOOTPRINT, not on the
+       centre ray — see flyFootprint's header for the two measurements
+       that is here for. Above that a balloon is over open air and one
+       ray is the honest answer, so the four extra casts are not paid. */
+    /* THE GATE IS ON EITHER SURFACE, and it has to be. Gating on the
+       centre ray alone is the same single-ray mistake one level up:
+       the frame the centre clears a parapet the ray drops thirty
+       metres, the gate opens to `false`, and the footprint — the
+       thing that was going to notice the roof under the other half of
+       the basket — is never run. Measured across the penthouse edge
+       at 0.4 m steps, that gate found the roof at 0 of the 8 offsets
+       it was there to catch. Last frame's landing surface is the
+       other half of the test. */
+    let foot = null;
+    if (root.position.y - g.y < F_FOOT_M || root.position.y - flyGround < F_FOOT_M) {
+      foot = flyFootprint(root.position.x, root.position.z, root.position.y, g);
+      g = foot;
+    }
+    const seaY = waterAt(root.position.x, root.position.z);
+    const overWater = !g.hit || g.y <= seaY + 0.35;
+    flyGround = overWater ? seaY : g.y;
+    const groundNY = overWater ? 1 : (g.normal ? g.normal.y : 1);
+    const deckY = flyGround + BALLOON_FIT.DECK;
+    const alt = root.position.y - deckY;
+    flyAlt = Math.max(0, alt);
+
+    /* ---- the input, read exactly where the controller would read it,
+       so ui/touch.js's thumbstick drives the balloon with no change to
+       a file this agent does not own: x/z is the drift wish, `jump` is
+       the burner and `run` is the vent ---- */
+    let raw = null;
+    try { raw = inputFn ? inputFn(dt, controller) : (ownInput ? defaultInput() : null); } catch (e) { raw = null; }
+    _fin.x = raw ? (raw.x || 0) : 0;
+    _fin.z = raw ? (raw.z || 0) : 0;
+    _fin.burn = !!(raw && (raw.jumpHeld || raw.jump));
+    _fin.vent = !!(raw && raw.run);
+
+    /* ---- THE REFUSAL ----
+       She will not put you in the sea and she will not put you on a
+       cliff, and both are the same rule: inside F_REFUSE_M of a
+       surface he could not stand on, the burner fires itself and
+       keeps firing. It is not a hidden clamp — the flame lights, the
+       envelope glows, the machine visibly declines — which is the
+       difference between a rule a player learns in one go and a bug
+       they report. */
+    const tooSteep = Math.acos(clamp(groundNY, -1, 1)) > (48 * Math.PI / 180);
+    flyRefusing = (overWater || tooSteep) && alt < F_REFUSE_M && flyPhase === 'aloft';
+    if (flyRefusing) { _fin.burn = true; _fin.vent = false; }
+
+    /* ---- THE FLARE ----
+       A balloon that arrives at 3.6 m/s puts its basket through a
+       lawn. Inside F_FLARE_M the burner is nudged so the sink rate is
+       proportional to the height left — half a metre a second at the
+       last metre — which is the same thing a pilot does on the last
+       hundred feet and is what makes every landing look deliberate
+       instead of survived. */
+    if (flyPhase === 'aloft' && !flyRefusing && flyState.vy < 0) {
+      const want = -0.55 - (alt / F_FLARE_M) * 2.4;
+      if (alt < F_FLARE_M && flyState.vy < want) { _fin.burn = true; _fin.vent = false; }
+    }
+    /* asked to come down: hold the vent until the flare takes over */
+    if (flyLandWanted && flyPhase === 'aloft' && !flyRefusing && alt > F_FLARE_M) {
+      _fin.vent = true; _fin.burn = false;
+    }
+
+    /* the verifier's held burner wins over everything above, because
+       what it is testing is that the burner is ALWAYS the way out */
+    if (flyForceBurn) { _fin.burn = true; _fin.vent = false; }
+    if (flyStick) { _fin.x = flyStick.x; _fin.z = flyStick.z; }
+
+    /* ---- the air ---- */
+    const w = ctx.wind?.vector?.(root.position.x, root.position.z);
+    _fenv.windX = w ? w.x : 0;
+    _fenv.windZ = w ? w.z : 0;
+
+    /* ================= the phases ================= */
+    if (flyPhase === 'boarding') {
+      flyT += dt;
+      const t = clamp(flyT / F_ANIM.board, 0, 1);
+      /* the burner is on for the whole inflation — that is what fills
+         it — and the heat it puts in is the heat she leaves with */
+      _fin.burn = true; _fin.vent = false; _fin.x = 0; _fin.z = 0;
+      prop.setInflate(smoothstepLocal(0.04, 0.94, t));
+      stepFlight(flyState, _fin, _fenv, dt);
+      flyBlend = smoothstepLocal(0.15, 0.75, t);
+      /* SHE LEAVES WHEN SHE IS READY. Enough envelope, and enough lift
+         to beat the weight. Until then the velocity is thrown away and
+         the basket sits on its runners, so there is no float before
+         the fabric is up and no jump at the end of a timer. */
+      const canLift = prop.inflation >= F_LIFT_INFLATE && flyState.vy > 0.02;
+      if (!canLift) {
+        flyState.vy = 0; flyState.vx = 0; flyState.vz = 0;
+        root.position.y = deckY;
+      } else {
+        root.position.y += flyState.vy * dt;
+      }
+      if (t >= 1) {
+        flyPhase = 'aloft'; flyT = 0;
+        ctx.bus?.emit('wally:fly', { flying: true, phase: 'aloft', ride: 'balloon' });
+      }
+    } else if (flyPhase === 'aloft') {
+      flyBlend = Math.min(1, flyBlend + dt * 1.4);
+      stepFlight(flyState, _fin, _fenv, dt);
+      root.position.x += flyState.vx * dt;
+      root.position.y += flyState.vy * dt;
+      root.position.z += flyState.vz * dt;
+      flyCollide(dt);
+      /* SHE FINDS THE ROOF. Coming down over a parapet, the footprint
+         probe knows which way the support is; this leans the machine
+         that way so the basket ends up ON the roof instead of standing
+         half over a fifteen-metre drop, or missing it by forty
+         centimetres and going all the way to the street. A shove, not
+         a snap — the same answer the envelope gives a terrace, and for
+         the same reason: a hard correction here would fight the stick
+         and the player would feel the building steering the machine.
+         It only exists while she is actually arriving (inside the
+         flare) and only when the corners genuinely disagree. */
+      if (foot && foot.spread > F_FOOT_STEP && alt < F_FLARE_M
+          && (foot.hiX !== 0 || foot.hiZ !== 0)) {
+        const l = Math.hypot(foot.hiX, foot.hiZ) || 1;
+        const k = F_FOOT_PUSH * (1 - alt / F_FLARE_M) * dt;
+        flyState.vx += (foot.hiX / l) * k;
+        flyState.vz += (foot.hiZ / l) * k;
+      }
+      /* THE FLOOR OVER WATER — the backstop under the refusal above. */
+      if (overWater) {
+        const wf = deckY + F_WATER_FLOOR;
+        if (root.position.y < wf) {
+          root.position.y = wf;
+          if (flyState.vy < 0) flyState.vy = 0;
+          flyFloored = true;
+        }
+      }
+      if (root.position.y <= deckY) {
+        root.position.y = deckY;
+        if (flyState.vy < 0) flyState.vy = 0;
+        /* DOWN IS NOT OUT. Touching the ground is not getting out — he
+           can burn again from here and go straight back up, which is
+           what makes "land on that roof and have a look" a thing you
+           are allowed to do. Only an explicit dismount ends a flight. */
+        if (flyLandWanted) { flyPhase = 'landing'; flyT = 0; flyLandWanted = false; }
+      }
+    } else if (flyPhase === 'landing') {
+      flyT += dt;
+      const t = clamp(flyT / F_ANIM.land, 0, 1);
+      _fin.burn = false; _fin.vent = true; _fin.x = 0; _fin.z = 0;
+      prop.setInflate(1 - smoothstepLocal(0.05, 0.92, t));
+      stepFlight(flyState, _fin, _fenv, dt);
+      flyState.vx *= 0.86; flyState.vz *= 0.86;
+      root.position.y = damp(root.position.y, deckY, 6, dt);
+      flyBlend = 1 - smoothstepLocal(0.45, 1.0, t);
+      if (t >= 1) {
+        /* ON HIS FEET, ON THE GROUND, AND THE MACHINE LEFT WHERE IT IS.
+           parkProp() is the same call the bicycle's dismount makes and
+           the same solve stands it on the hill. */
+        root.position.y = flyGround;
+        if (controller) {
+          controller.enabled = true;
+          controller.simPosition.copy(root.position);
+          controller.position.copy(root.position);
+          controller._prevPosition.copy(root.position);
+          controller.velocity.set(0, 0, 0);
+          controller.acceleration.set(0, 0, 0);
+          controller.snapToGround(3);
+          root.position.copy(controller.position);
+        }
+        locoManual = false;
+        secondary.ikEnabled = flyIkSaved;
+        flyPhase = 'off'; flyBlend = 0; flyAlt = 0;
+        flyCam.seeded = false;
+        prop.setBurner(false, 0, 1);
+        bike = prop;
+        parkProp();
+        ctx.cam?.releaseOverride?.();
+        ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
+        return true;
+      }
+    }
+
+    /* ---- write it all down ---- */
+    guardFinite('fly.integrate');
+    flyPlaceController();
+    root.rotation.y = flyState.yaw;
+    root.rotation.z = 0;
+    prop.setBurner(_fin.burn, flyState.heat, dt);
+    prop.roll(Math.hypot(flyState.vx, flyState.vz) * dt);
+    /* THE ENVELOPE TRAILS. A real one hangs back from the basket's own
+       acceleration, and this lean is the only place the machine admits
+       it is being pushed about: two degrees at full drift, damped over
+       half a second, in the machine's own frame rather than the
+       world's. */
+    if (flyEnvGroup) {
+      const bx = flyState.vx * Math.cos(flyState.yaw) - flyState.vz * Math.sin(flyState.yaw);
+      const bz = flyState.vx * Math.sin(flyState.yaw) + flyState.vz * Math.cos(flyState.yaw);
+      flyEnvGroup.rotation.z = damp(flyEnvGroup.rotation.z, clamp(-bx * 0.006, -0.055, 0.055), 2.2, dt);
+      flyEnvGroup.rotation.x = damp(flyEnvGroup.rotation.x, clamp(bz * 0.006, -0.055, 0.055), 2.2, dt);
+    }
+    flyCamera(dt, flyAlt);
+    return true;
+  }
   /* Ownership sync. The data agent emits 'bike' on buy and on equip;
      a SAVE LOAD may restore state.bike without one, so the state is
      also re-read on a slow timer. Twice a second, one object read —
      cheaper than a class of bug where the player's bicycle silently
      vanishes across a reload. */
+  /* ----------------------------------------------------------------
+     WHAT WAS LEFT LYING ABOUT LAST SESSION.
+
+     parkedIds is a runtime Set and always was, so before this every
+     machine left standing in the street came back under him after a
+     reload. game.js now keeps the fact (state.rides.parked, written by
+     parkProp) and this reads it once, the first time there is a game
+     layer to read.
+
+     ONLY THE POSITION AND THE HEADING COME BACK. Pitch, roll, height
+     and the mooring are re-SOLVED here against the terrain as it
+     exists now — solveParkPose is the only thing that has ever been
+     allowed to answer those, and a stored answer would be a second
+     opinion that a world rebuild could make wrong.
+
+     IT IS NOT A ONE-SHOT, and the first version was. A boolean set on
+     the first bikeSync looks right — the save loads inside game.js's
+     own init, before the first frame — and it is wrong for every path
+     where the state arrives LATER: a load from the menu, an imported
+     file, and the screenshot rig, which boots with ?shot=1 and
+     deliberately does not read the save at all until something asks
+     it to. In all three the restore had already run against an empty
+     record and latched.
+
+     So it is a RECONCILIATION instead, on the same half-second timer
+     as the ownership sync beside it: anything the game says is parked
+     and this module does not have standing gets stood up. It is a
+     handful of string compares over at most four entries, it is a
+     no-op on every tick after the first, and it cannot latch. Putting
+     a machine down adds it to `parkedIds` on the same frame, so the
+     next tick already knows about it; picking one up clears the
+     record, so it cannot be resurrected under him either.
+     ---------------------------------------------------------------- */
+  function restoreParked() {
+    const spots = ctx.game?.actions?.parkSpots;
+    if (!spots) return;
+    let list = null;
+    try { list = spots(); } catch (e) { return; }
+    if (!list) return;
+    const wasBike = bike, wasRide = rideId;
+    let did = false;
+    for (const id of Object.keys(list)) {
+      const key = rideKey(id);
+      const at = list[id];
+      if (!key || !at) continue;
+      if (parkedIds.has(key)) continue;                   // already standing
+      /* never stand up the machine he is currently on */
+      if (key === rideId && (bikePhase !== 'off' || flyPhase !== 'off')) continue;
+      bike = buildProp(key);
+      /* THE SAVED SPOT, not a spot beside him — parkProp(at) exists
+         for exactly this. Everything else about the pose is re-solved
+         against the terrain as it is now. */
+      parkProp(at);
+      did = true;
+    }
+    if (did) { bike = wasBike; rideId = wasRide; }
+  }
+
   function bikeSync(dt) {
     if (bikeForced) return;
     bikeSyncT -= dt;
     if (bikeSyncT > 0) return;
     bikeSyncT = 0.5;
+    restoreParked();
     const g = ctx.game?.actions?.bike;
     if (!g) return;
     let s = null;
@@ -2049,8 +3248,17 @@ export async function init(ctx) {
     else if (dt > 0.05) dt = 0.05;
     const c = controller;
 
+    /* ---- the balloon owns the position when it is flying ----
+       flyUpdate() integrates the machine and writes both `root` and
+       the controller's three positions, so the copy below is a no-op
+       that happens to be true rather than a fight. It runs FIRST
+       because every read after this line — the animator, the lean
+       additive, the secondary chains — wants this frame's position,
+       not last frame's. */
+    const flying = flyPhase !== 'off' && controlled ? flyUpdate(dt) : false;
+
     /* ---- root transform from the controller ---- */
-    if (c && controlled) {
+    if (c && controlled && !flying) {
       root.position.copy(c.position);
       root.rotation.y = c.yaw;
     }
@@ -2183,6 +3391,11 @@ export async function init(ctx) {
   }
 
   function lateUpdate(dt) {
+    /* THE HAZE, HERE AND NOWHERE ELSE — see flyHaze's header for the
+       two modules this has to outrank and the measurement that proved
+       it had to. */
+    if (flyPhase !== 'off') flyHaze(flyAlt);
+    flySea();
     if (!(dt > 0)) dt = 1e-4;
     else if (dt > 0.05) dt = 0.05;
     secondary.lateUpdate(dt, {
@@ -2322,7 +3535,37 @@ export async function init(ctx) {
     setBike(on, o) { return setBike(on, o || {}); },
     /** Put a named machine under him, or null to walk. */
     setRide(id, o) { return setRide(id, o || {}); },
-    get riding() { return bikePhase === 'on' || bikePhase === 'mounting'; },
+    get riding() {
+      return bikePhase === 'on' || bikePhase === 'mounting'
+        || flyPhase === 'aloft' || flyPhase === 'boarding';
+    },
+    /* --- the balloon ---
+       `flying` is the fact anything outside this module should ask;
+       `flightState` is the whole machine, for the HUD, the tests and
+       the screenshot rig. Altitude is over the SOLID under the basket
+       (a roof counts), not over sea level. */
+    get flying() { return flyPhase !== 'off'; },
+    get flightPhase() { return flyPhase; },
+    get flightState() {
+      return {
+        phase: flyPhase,
+        alt: +flyAlt.toFixed(2),
+        ground: +flyGround.toFixed(2),
+        heat: +flyState.heat.toFixed(3),
+        vy: +flyState.vy.toFixed(3),
+        drift: +Math.hypot(flyState.vx, flyState.vz).toFixed(3),
+        yawDeg: +(flyState.yaw * 180 / Math.PI).toFixed(1),
+        inflate: flyProp ? +flyProp.inflation.toFixed(3) : 0,
+        burner: flyProp ? +flyProp.burner.toFixed(3) : 0,
+        refusing: flyRefusing,
+        floored: flyFloored,
+        landWanted: flyLandWanted,
+        blend: +flyBlend.toFixed(3),
+        hazeK: +flyFogK.toFixed(3),
+        fog: ctx.scene?.fog ? [Math.round(ctx.scene.fog.near), Math.round(ctx.scene.fog.far)] : null,
+        at: [+root.position.x.toFixed(2), +root.position.y.toFixed(2), +root.position.z.toFixed(2)],
+      };
+    },
     get bike() { return bike; },
     /** The machine he is on / would mount: 'bike'|'scooter'|'motorcycle' */
     get rideId() { return rideId; },
@@ -2480,7 +3723,17 @@ export async function init(ctx) {
     },
     /** false = the intro/cutscene owns root.position and root.rotation. */
     setControlled(on) {
-      controlled = on !== false;
+      const want = on !== false;
+      /* A CUTSCENE TAKES THE BALLOON AWAY FIRST. flyUpdate is gated on
+         `controlled`, so handing control to the intro while he is
+         aloft would freeze the flight with the character controller
+         still disabled and the camera still in override — and nothing
+         would ever give either of them back. Put the machine away on
+         the way out; a cutscene with an abandoned balloon in it is
+         nobody's intent, which is the same rule setBike's instant path
+         has always followed. */
+      if (!want && flyPhase !== 'off') flyEnd(true);
+      controlled = want;
       if (controller) controller.enabled = controlled;
       return api;
     },
@@ -4030,6 +5283,184 @@ export async function init(ctx) {
      for the bicycle, for whichever machine is under him. This is what
      rides.js's SCOOT_BARS / MOTO_BARS were fitted to; never eyeball
      them off a screenshot. */
+  /* ================================================================
+     THE BALLOON — WALLY.debug.balloon(...) and friends.
+
+     The verifier's entry points, and the suite's. Every one of them
+     returns MEASURED numbers rather than the numbers that were asked
+     for, because the difference between the two is where every
+     screenshot-shaped lie in this project has come from.
+
+       WALLY.debug.balloon()                board it, here, for real
+       WALLY.debug.balloon(false)           put it away (instant)
+       WALLY.debug.balloon({alt: 200})      board it and be at 200 m
+       WALLY.debug.balloonInfo()            the flight, live
+       WALLY.debug.balloonCost()            what the machine costs,
+                                            differenced across frames
+       WALLY.debug.balloonPose(t)           freeze the inflation at t
+     ================================================================ */
+  dbg.balloon = (o = {}) => {
+    if (o === false || o === 'off' || o === null) {
+      bikeForced = false;
+      setFly(false, { instant: true });
+      api.setLocomotion(null);
+      return 'balloon off';
+    }
+    const opts = (o === true || typeof o !== 'object') ? {} : o;
+    bikeForced = true;
+    /* THE FORCE FLAG IS NOT OPTIONAL. bikeSync() reconciles against
+       ctx.game every half second and a fresh save owns nothing, so
+       without it the hook boards him and the next tick quietly puts
+       him back on the grass three seconds before the shutter. */
+    if (bikePhase !== 'off') setBike(false, { instant: true });
+    setFly(true, { instant: !!opts.instant || Number.isFinite(opts.alt) });
+    if (Array.isArray(opts.at) && opts.at.length === 3 && opts.at.every(Number.isFinite)) {
+      /* PUT THE MACHINE SOMEWHERE, without going through setPosition()
+         — that calls controller.teleport(), which snaps to the ground
+         and would drop a flying balloon onto whatever is under it. */
+      root.position.set(opts.at[0], opts.at[1], opts.at[2]);
+      flyState.vx = 0; flyState.vy = 0; flyState.vz = 0;
+      flyState.heat = FLIGHT.trim;
+      flyPlaceController();
+    }
+    if (Number.isFinite(opts.alt)) {
+      /* PUT HIM THERE, do not fly him there. The altitude hook exists
+         so a shot can be taken OF an altitude; flying up to it takes
+         fifty seconds and lands somewhere the wind chose. */
+      const gy = flySurfaceUnder(root.position.x, root.position.z, root.position.y + 400);
+      root.position.y = gy + BALLOON_FIT.DECK + opts.alt;
+      flyState.heat = FLIGHT.trim;
+      flyState.vy = 0;
+      if (Number.isFinite(opts.drift)) {
+        flyState.vz = opts.drift;
+        flyState.yaw = 0;
+      }
+      flyBlend = 1;
+      flyCam.seeded = false;
+      flyPlaceController();
+    }
+    return api.flightState;
+  };
+  /** Hold or release the burner. See flyForceBurn. */
+  dbg.balloonBurn = (on = true) => { flyForceBurn = on !== false; return flyForceBurn; };
+  /** Hold the stick. `null` hands it back to the keyboard. Set rather
+      than pushed, because a test that writes the VELOCITY writes over
+      the collision response it is trying to measure. */
+  dbg.balloonStick = (x, z) => {
+    flyStick = (x == null && z == null) ? null : { x: x || 0, z: z || 0 };
+    return flyStick;
+  };
+  /** THE FLY RIG'S OWN FOUR NUMBERS, so a seam can be measured rather
+      than inferred from the lens. `aimDist` is the one that matters:
+      when the aim point walks THROUGH the lens the look direction is
+      undefined and the frame whips — which is exactly what the
+      seed's sign error used to do on every boarding. */
+  dbg.balloonCam = () => ({
+    seeded: flyCam.seeded,
+    yawDeg: +(flyCam.yaw * 180 / Math.PI).toFixed(2),
+    pos: flyCam.pos.toArray().map((v) => +v.toFixed(3)),
+    aim: flyCam.aim.toArray().map((v) => +v.toFixed(3)),
+    aimDist: +flyCam.pos.distanceTo(flyCam.aim).toFixed(3),
+    fov: +flyCam.fov.toFixed(2),
+    /* signed metres the lens sits BEHIND the subject along the boom
+       heading. Negative means the camera has got in front of him,
+       which is the seam's signature. */
+    behind: +(-((flyCam.pos.x - root.position.x) * Math.sin(flyCam.yaw)
+             + (flyCam.pos.z - root.position.z) * Math.cos(flyCam.yaw))).toFixed(3),
+  });
+  dbg.balloonInfo = () => {
+    const p = props.balloon || null;
+    return {
+      ...api.flightState,
+      owned: bikeOwned, equipped: bikeEquipped, rideId,
+      cost: p ? triangleCost(p.group) : null,
+      fit: BALLOON_FIT, flight: FLIGHT,
+      parked: [...parkedIds],
+      spot: (() => { try { return ctx.game?.actions?.parkSpot?.('balloon') ?? null; } catch (e) { return null; } })(),
+    };
+  };
+  /** Hold the inflation still at `t` so a shot can be taken of the
+      middle of it. Returns the inflation the prop actually reports,
+      not the one that was asked for. */
+  dbg.balloonPose = (t = 0) => {
+    const p = buildProp('balloon');
+    p.group.visible = true;
+    p.setInflate(t);
+    return { asked: t, is: p.inflation, cost: triangleCost(p.group) };
+  };
+
+  /* ----------------------------------------------------------------
+     WHAT THE MACHINE COSTS, DIFFERENCED ACROSS REAL FRAMES.
+
+     renderer.js sets renderer.info.autoReset = FALSE and raises the
+     reset once a frame, so info accumulates across every pass —
+     shadow cascades, the outline pass, post. Reading it at one moment
+     and calling that "the draw calls" is how somebody in this project
+     once published 16 193 calls and 111 million triangles: they had
+     summed a frame's worth of passes and then summed several frames.
+
+     The only honest measurement is a DIFFERENCE between two whole
+     frames that are alike in everything but this prop, so that is
+     what this does: toggle `visible` on alternate frames, sample at
+     the END of each frame (after post, before the reset), and average
+     over `n` pairs. The shadow map has to be re-rendered on both
+     sides or the "off" frame reuses the "on" frame's cascades and the
+     answer comes back as zero.
+     ---------------------------------------------------------------- */
+  dbg.balloonCost = (n = 24) => new Promise((resolve) => {
+    const p = props.balloon || buildProp('balloon');
+    const info = ctx.render?.renderer?.info || ctx.renderer?.info;
+    if (!info) { resolve({ error: 'no renderer.info' }); return; }
+    /* IT IS MEASURED WITH THE MACHINE UNDER HIM, and it has to be:
+       a MOORED balloon's visibility belongs to parkedCull(), which
+       rewrites it on every frame, so an alternate-frame toggle on a
+       parked prop is overwritten before it is ever drawn and the
+       difference comes back as a flat zero. Board first if he is not
+       aboard, and put it back afterwards. */
+    const wasFlying = flyPhase !== 'off';
+    if (!wasFlying) { bikeForced = true; setFly(true, { instant: true }); }
+    const wasVisible = p.group.visible;
+    p.group.visible = true;
+    const on = [], off = [];
+    let i = 0;
+    /* A WALL-CLOCK FALLBACK, because a promise that only ever resolves
+       from requestAnimationFrame hangs for ever if rAF stalls — which
+       it does in a headless tab that loses its compositor. */
+    const t0 = performance.now();
+    const tick = () => {
+      const show = (i & 1) === 0;
+      p.group.visible = show;
+      requestAnimationFrame(() => {
+        /* sampled on the frame AFTER the toggle, so what is measured is
+           a frame that was drawn with the prop in the state we set */
+        (show ? on : off).push({
+          calls: info.render.calls, tris: info.render.triangles,
+          lines: info.render.lines, points: info.render.points,
+        });
+        i++;
+        if (i < n * 2 && performance.now() - t0 < 12000) tick();
+        else {
+          p.group.visible = wasVisible;
+          if (!wasFlying) setFly(false, { instant: true });
+          const med = (a, k) => {
+            const v = a.map((x) => x[k]).sort((x, y) => x - y);
+            return v.length ? v[v.length >> 1] : 0;
+          };
+          resolve({
+            frames: on.length + off.length,
+            withProp: { calls: med(on, 'calls'), tris: med(on, 'tris') },
+            without: { calls: med(off, 'calls'), tris: med(off, 'tris') },
+            balloon: { calls: med(on, 'calls') - med(off, 'calls'), tris: med(on, 'tris') - med(off, 'tris') },
+            geometry: triangleCost(p.group),
+            inflation: p.inflation,
+            note: 'medians of alternate frames; renderer.info.autoReset is false',
+          });
+        }
+      });
+    };
+    tick();
+  });
+
   dbg.rideInfo = () => {
     const info = dbg.bikeInfo();
     const cost = bike ? triangleCost(bike.group) : null;

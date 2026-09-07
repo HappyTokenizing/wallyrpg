@@ -94,6 +94,25 @@ export async function init(ctx) {
 
     uRimColor: { value: srgb(0xffe6bc) },
 
+    /* ---- THE ONE LOCAL LIGHT (see setLocalLight) ----
+       This pipeline is sun-only: `lights: true` on the material buys
+       the fog and shadow uniform blocks, and nothing in FRAG has ever
+       read pointLights[] — so a THREE.PointLight added to the scene by
+       any module lights precisely nothing and costs a uniform upload.
+       Which was fine for a game lit by one sun, and stayed fine right
+       up until something in it caught FIRE.
+
+       ONE, DELIBERATELY. A general local-light loop puts a per-light
+       cost on every fragment of every surface in the game for a
+       feature with exactly one caller. A single light is two vec3s
+       and a float behind a uniform branch that a whole draw takes
+       together: when uLocalCol is black — every frame in which nothing
+       is alight — it is one compare. If a second caller ever needs
+       one, that is the moment to make it an array, not before. */
+    uLocalPos: { value: new THREE.Vector3(0, -9999, 0) },
+    uLocalCol: { value: new THREE.Color(0, 0, 0) },
+    uLocalRange: { value: 24.0 },
+
     /* outline: world units per screen pixel at 1 m, refreshed each
        frame from the live camera + drawing buffer. Kept for any
        module that wants a world-space "one pixel"; the hull itself
@@ -282,6 +301,15 @@ uniform float uSSS;
 
 uniform vec3  uEmissiveColor;
 uniform float uEmissive;
+
+uniform vec3  uLocalPos;
+uniform vec3  uLocalCol;
+uniform float uLocalRange;
+
+#ifdef TOON_INGLOW
+/* ( first y, last y, floor ) in OBJECT space — see TOON_INGLOW below */
+uniform vec3  uGlowFade;
+#endif
 
 uniform float uAO;
 
@@ -561,7 +589,47 @@ void main() {
     col += uSSSColor * albedo * term * uSSS * 1.15 * sh * uSunIntensity * 0.35;
   #endif
 
-  col += uEmissiveColor * uEmissive;
+  /* ---------------- the one local light ----------------
+     A warm source close to the surface, banded like the key so it
+     belongs to the same drawing rather than arriving as a smooth
+     photographic falloff. The wrap term matters more than the band
+     does: this exists for a burner inside a seven-metre envelope,
+     which is a very large soft source at a very short range, and a
+     hard N.L on that reads as a torch. Squared attenuation, zero at
+     uLocalRange, so nothing has an edge.
+
+     Guarded on the colour, not the distance: the branch is uniform,
+     so a draw either pays for all of this or for none of it, and with
+     nothing alight it is one compare per fragment. */
+  if ( uLocalCol.r + uLocalCol.g + uLocalCol.b > 0.0 ) {
+    vec3 Lv = uLocalPos - vWorldPos;
+    float ld = length( Lv );
+    float att = max( 0.0, 1.0 - ld / uLocalRange );
+    att *= att;
+    float lnl = dot( Nsm, Lv / max( ld, 1e-4 ) );
+    float lb = smoothstep( -0.25, 0.42, lnl );
+    col += albedo * uLocalCol * att * ( 0.22 + 0.78 * lb );
+  }
+
+  #ifdef TOON_INGLOW
+    /* LIT FROM INSIDE, AND FALLING OFF THE WAY A LAMP IN A BAG DOES.
+       A flat emissive add over a whole envelope is a paint job: it
+       lifts the crown and the skirt by the same amount, which flattens
+       the very form the gores and the load tapes exist to describe.
+       The real thing is a burner at the mouth, so the fabric nearest
+       the throat is several times brighter than the crown, and the
+       gradient is in OBJECT space (uGlowFade is y at the throat, y
+       where it has died, and the floor it dies to) so it rides the
+       envelope's own lean and inflation without a single per-frame
+       write. Multiplied by the albedo, unlike the plain emissive
+       below, because a lit envelope shows its OWN livery — that is
+       what makes an inflated balloon at dusk read as orange and cream
+       panels rather than as one amber lamp. */
+    float eg = 1.0 - smoothstep( uGlowFade.x, uGlowFade.y, vObjPos.y );
+    col += albedo * uEmissiveColor * uEmissive * mix( uGlowFade.z, 1.0, eg * eg );
+  #else
+    col += uEmissiveColor * uEmissive;
+  #endif
 
   #endif  // TOON_EMISSIVE
 
@@ -904,6 +972,9 @@ void main() {
 
     emissive: 0,
     emissiveColor: 0xffffff,
+    /* [ y at full strength, y where it has gone, the floor it goes to ]
+       in object space. Opts the material into TOON_INGLOW. */
+    inGlow: null,
     ao: 1.0,
 
     map: null,
@@ -985,9 +1056,18 @@ void main() {
       uEmissive: { value: o.emissive },
       uAO: { value: o.ao },
 
+      /* shared by reference, so setLocalLight() moves every surface in
+         the game with three writes and no per-material walk */
+      uLocalPos: globals.uLocalPos,
+      uLocalCol: globals.uLocalCol,
+      uLocalRange: globals.uLocalRange,
+
       uUvScale: { value: new THREE.Vector2(o.uvScale[0], o.uvScale[1]) },
     };
 
+    if (o.inGlow) {
+      u.uGlowFade = { value: new THREE.Vector3(o.inGlow[0], o.inGlow[1], o.inGlow[2] ?? 0.15) };
+    }
     if (o.map) u.tMap = { value: o.map };
     if (o.alphaTest > 0) u.uAlphaTest = { value: o.alphaTest };
 
@@ -1032,6 +1112,7 @@ void main() {
     if (o.wind > 0) d.TOON_WIND = '';
     if (o.specBanded) d.TOON_SPEC_BANDED = '';
     if (o.emissiveOnly) d.TOON_EMISSIVE = '';
+    if (o.inGlow) d.TOON_INGLOW = '';
     return d;
   }
 
@@ -1456,6 +1537,41 @@ void main() {
      ---------------------------------------------------------------- */
   const hulls = [];
   const hullCull = { minPx: 9, cullFar: 185, on: true };
+
+  /* ----------------------------------------------------------------
+     ...AND THE BUDGET RIDES THE HAZE, because that is what it was
+     justified by.
+
+     The note above says "cullFar 185 is past the haze onset with room
+     to spare", and while the haze onset was a constant that was a
+     complete argument. It is not one any more: the balloon opens the
+     fog out as it climbs (character/wally.js flyHaze — near x4.2 and
+     far x4.6 at 150 m, so 100/520 on the ground becomes 420/2392 at
+     200 m) precisely so that the island can be SEEN from up there.
+     What that produced was an island with no ink in it. Measured at
+     200 m, 1600x900, load 29.69: 89 of 517 hulls drawn, and the mean
+     depth of the surviving stroke was 13.9 codes against 26.2 on the
+     ground — while the balloon, 40 m from the lens, kept a full one.
+     An inked balloon over an un-inked island is exactly the wrong way
+     round, and §2.2's outline is the game's signature.
+
+     So the two distances that retire the stroke — this budget and
+     uOutlineFade's width ramp — are multiplied by how far the haze
+     has actually been opened, measured off scene.fog every frame
+     rather than off any module's intentions. REF is the clear
+     ground-level value, so at ground level the multiplier is exactly
+     1.000 and every number in this file is the number it was: revert
+     the flight's fog write and the cull is 185 again to the metre.
+     Clamped at 1 from below on purpose — thick weather may pull the
+     fog IN, and letting that pull the ink in with it would change
+     frames that were already right. The haze may push the ink out. It
+     may not pull it back.
+     ---------------------------------------------------------------- */
+  const OUT_HAZE_REF = 520;      // scene.fog.far, clear, at head height
+  const OUT_HAZE_MAX = 5.0;      // never more than five times the reach
+  let hazeK = 1;
+  /* the authored width ramp; uOutlineFade carries it times hazeK */
+  const outlineFadeAuthored = new THREE.Vector3(120, 300, 0.55);
   const _hs = new THREE.Sphere();
   const _hc = new THREE.Vector3();
 
@@ -1789,6 +1905,7 @@ void main() {
      noise next to the four draw calls it saves per hull. */
   function cullHulls(cam, dbH) {
     if (!cam || !cam.isPerspectiveCamera) return;
+    const cullFarNow = hullCull.cullFar * hazeK;
     const fovScale = dbH / (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5));
     const camPos = cam.matrixWorld.elements;
     const cx = camPos[12], cy = camPos[13], cz = camPos[14];
@@ -1808,7 +1925,7 @@ void main() {
       _hc.copy(_hs.center);
       const d = Math.hypot(_hc.x - cx, _hc.y - cy, _hc.z - cz);
       const near = d - _hs.radius;
-      if (near > hullCull.cullFar) { h.visible = false; continue; }
+      if (near > cullFarNow) { h.visible = false; continue; }
       h.visible = (2 * _hs.radius / Math.max(0.05, d)) * fovScale >= hullCull.minPx;
     }
   }
@@ -1860,6 +1977,28 @@ void main() {
     if (saturation != null) globals.uAmbSat.value = saturation;
   }
 
+  /* ----------------------------------------------------------------
+     THE ONE LOCAL LIGHT. Position in world metres, colour, intensity
+     and the radius at which it reaches zero.
+
+       ctx.mat.setLocalLight( pos, 0xffa552, 2.4, 26 )
+       ctx.mat.setLocalLight( null )            // put it out
+
+     Intensity is in the same units as the sun's: a lit surface is
+     albedo * ( sun + ambient ) and setAmbient's note keeps that pair
+     near 1.0, so an intensity of 1 at point-blank range is "as bright
+     as noon" and anything much over 3 lands on the ACES shoulder and
+     stops being cel shaded. There is exactly one of these; a second
+     caller overwrites the first.
+     ---------------------------------------------------------------- */
+  function setLocalLight(pos, color, intensity = 1, range) {
+    if (!pos || !(intensity > 0)) { globals.uLocalCol.value.setRGB(0, 0, 0); return; }
+    globals.uLocalPos.value.set(pos.x, pos.y, pos.z);
+    const c = toColor(color ?? 0xffffff);
+    globals.uLocalCol.value.setRGB(c.r * intensity, c.g * intensity, c.b * intensity);
+    if (range != null) globals.uLocalRange.value = Math.max(0.1, range);
+  }
+
   /* The whole world's shadow colour, in one call. `amount` is the hue
      rotation toward the tint, `value` the modest value drop, `bleed`
      how much of the tint's own colour a shadow picks up on top of the
@@ -1879,13 +2018,17 @@ void main() {
   const api = {
     toon, clay, plaster, wood, foliage, emissive,
     register, outline, removeOutline, outlineColor, outlineColorFar,
+    setLocalLight,
 
     /* Live trim on the whole outline pass. scale multiplies every
        authored width; near/far/min are uOutlineFade (see the vertex
        shader). Any argument may be omitted. */
     setOutline({ scale, near, far, min, minPx, cullFar, cull } = {}) {
       if (scale != null) outlineScaleUser = scale;
-      const f = globals.uOutlineFade.value;
+      /* the AUTHORED ramp — update() multiplies it by hazeK on its way
+         to the uniform, so setting near/far here is not silently
+         overwritten on the next frame */
+      const f = outlineFadeAuthored;
       if (near != null) f.x = near;
       if (far != null) f.y = far;
       if (min != null) f.z = min;
@@ -1897,6 +2040,7 @@ void main() {
         scale: outlineScaleUser, px: globals.uOutlineScale.value,
         near: f.x, far: f.y, min: f.z,
         minPx: hullCull.minPx, cullFar: hullCull.cullFar, cull: hullCull.on,
+        hazeK: +hazeK.toFixed(3), cullFarNow: +(hullCull.cullFar * hazeK).toFixed(1),
         hulls: hulls.length, hullsDrawn: hulls.reduce((a, h) => a + (h.visible ? 1 : 0), 0),
       };
     },
@@ -1942,6 +2086,15 @@ void main() {
         const h = Math.max(1, _dbs.y);
         globals.uPixelScale.value = 2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) * 0.5) / h;
       }
+      /* how far the haze has been opened, this frame, off the live fog.
+         See OUT_HAZE_REF. Read here rather than in cullHulls so the
+         width ramp and the budget can never disagree about it. */
+      const fog = ctx.scene?.fog;
+      const ff = fog && Number.isFinite(fog.far) ? fog.far : OUT_HAZE_REF;
+      hazeK = Math.min(OUT_HAZE_MAX, Math.max(1, ff / OUT_HAZE_REF));
+      globals.uOutlineFade.value.set(
+        outlineFadeAuthored.x * hazeK, outlineFadeAuthored.y * hazeK, outlineFadeAuthored.z);
+
       cullHulls(cam, Math.max(1, _dbs.y));
 
       if (lab) lab.update(dt, elapsed);

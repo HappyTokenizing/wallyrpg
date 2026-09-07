@@ -29,11 +29,12 @@ import { clamp, lerp, damp, smoothstep } from '../core/contracts.js';
 import { ZONES, LOCATIONS, LOC_BY_ID, WORLD } from '../game/data.js';
 import {
   createKitLib, kitFor, Kit, makeAO, boxRound, cyl, sphereG, TRS, mixHex, shadeHex,
-  hexOf, C, linear,
+  hexOf, C, linear, setPartCensus,
 } from './kits.js';
 import { buildLocation, silhouette } from './buildings.js';
 import { createSign } from './signs.js';
-import { createProps, PROP_FOOTPRINT } from './props.js';
+import { createProps, PROP_FOOTPRINT, FLAP_HANG } from './props.js';
+import { dressLife, createWindInstruments } from './life.js';
 import { createFireworks } from './fireworks.js';
 import { HOME_TIERS, homeTierIndex, buildHomeTier } from './home.js';
 
@@ -95,6 +96,48 @@ const _rv = new THREE.Vector3();
    better answer than the earth under it. terrain.js's ROCK_RISE, for
    the same reason: surfacetest's SINK_TOL is 0.12. */
 const RUBBLE_RISE = 0.10;
+
+/* A CONTAINER IS 2.5 m TALL AND A STACK IS NOT A STAIRCASE. Both
+   placement paths — the port yard in 2b and the stack formPier hands
+   up on `meta.props` — stacked at 2.55, which opens a 5 cm slot of
+   daylight between every box and the one under it; from a balloon a
+   stacked row reads as a dashed line. The pitch is the prop's own
+   height, written once. props.js CATALOGUE.container is where the
+   2.5 comes from and PROP_FOOTPRINT.container is its plan radius. */
+const CONTAINER_H = 2.5;
+
+/* controller.js slopeLimit, ART_DIRECTION §4. */
+const COS_SLOPE = Math.cos(48 * PI / 180);
+
+/** How far a bedded ellipsoid may stand proud of flat ground before the
+    RIM of the exposed cap is steeper than the controller can walk.
+
+    THE STONE THAT COST MAIN STREET ITS SURFACE TEST. A berm stone is a
+    sphere scaled (1, ys, zs) and lifted clear of the earth by `yj`, and
+    the lift was a free parameter: crowns came out anywhere from 0.16 to
+    0.82 m proud. Measured on the Main Street office, one stood 0.237 m
+    proud with rim normals of n.y 0.57, 0.62 and 0.63 — BELOW cos 48°.
+    That is the worst possible number for a bump: too steep for the
+    controller to call it ground, too short for it to be stopped by,
+    and narrower in plan than the capsule's own radius, so his AXIS
+    never gets over it while his flank rides up the side. Walked into,
+    it lifted him 0.116 m off the berm he was standing on — reported as
+    "+0.161 m float, city.berm vs office.skirt" and blamed on both,
+    when groundAt() and the drawn skirt agreed to 0.000 m.
+
+    So the lift is not a free parameter any more. For semi-axes
+    (a, b, c) the shallowest exposed normal is at the rim on the LONGEST
+    horizontal axis; requiring it to clear cos 48° gives a closed form,
+    and a stone bedded to it is walkable everywhere it is exposed. It is
+    a geometric identity, not a tolerance: it never widens, and the only
+    thing it changes about the art is that the stones sit IN the earth
+    instead of ON it, which is what rubble does. */
+function beddedCrown(a, b, c) {
+  const k = Math.max(a, c) / b;
+  const q = COS_SLOPE * COS_SLOPE;
+  const g = q / (k * k);
+  return b * (1 - Math.sqrt(g / (1 - q + g)));
+}
 
 /* A handful of forms sprawl well past their nominal footprint — a
    temple's podium and colonnade, a pier's deck, the stadium bowl, a
@@ -562,7 +605,11 @@ function groundBerm(K, world, loc, groundY, o) {
     toWorldXZ(loc, lx, lz, _wp);
     const gy = world.heightAt(_wp.x, _wp.z) - groundY;
     const geo = sphereG(s, 7);
-    const m = TRS(lx, gy + yj, lz, rot, 1, ys, zs);
+    /* BEDDED, NOT DROPPED — see beddedCrown(). The draw order above is
+       untouched so vetoing a stone still never reshuffles the ones
+       after it; all that changes is how deep this one sits. */
+    const crown = Math.min(s * ys + yj, beddedCrown(s, s * ys, s * zs));
+    const m = TRS(lx, gy + crown - s * ys, lz, rot, 1, ys, zs);
     /* AND A STONE IS SOLID. Both threshold defects left over after the
        porch pads are these: a drawn boulder standing 0.15 to 0.20 m
        proud of the berm with nothing under it, at (-279.06, 146.26) on
@@ -578,7 +625,7 @@ function groundBerm(K, world, loc, groundY, o) {
        crown, and the whole point is that what he stands on and what he
        sees are the same surface. Read before K.add() because the kit
        merges and lets go of the geometry it is handed. */
-    if (o.collide && s * ys + yj > RUBBLE_RISE) {
+    if (o.collide && crown > RUBBLE_RISE) {
       const P = geo.attributes.position, I = geo.index;
       const pos = new Float32Array(P.count * 3);
       for (let k = 0; k < P.count; k++) {
@@ -595,6 +642,16 @@ export async function init(ctx) {
   const t0 = performance.now();
   const world = ctx.world;
   if (!world) { console.warn('[city] no ctx.world — nothing to build on'); return null; }
+
+  /* ?partcensus makes every Kit record the AABB of every part it is
+     handed, so tools/cliptest.mjs can assert that no piece of a
+     building floats clear of the rest of it. Set BEFORE the first Kit
+     is constructed — the flag is read in the constructor.
+
+     Read off the query string here rather than added to ctx.flags:
+     core/contracts.js is another module's file and this is a
+     world-only diagnostic. */
+  setPartCensus(new URLSearchParams(location.search).has('partcensus'));
 
   const lib = createKitLib(ctx);
   const root = new THREE.Group();
@@ -617,11 +674,46 @@ export async function init(ctx) {
   }
 
   const records = new Map();
+  /* props a building FORM asked for, held until every door is known —
+     see the block where they are pushed */
+  const formProps = [];
   const clothQueue = [];
   const collideQueue = [];
   const bermQueue = [];
   const signs = [];
   const ropeKit = new Kit(makeAO({ ground: 1, groundH: 0.01, under: 0.8 }));
+  /* what the life pass put where — printed once so the build log says
+     where the five one-offs are without anyone having to hunt them */
+  const oneOffs = [];
+  let strungRuns = 0;
+
+  /* ----------------------------------------------------------------
+     Hang one instanced run of bunting or washing between the two iron
+     hooks world/life.js wrote into a building's wall.
+
+     THE ORIENTATION IS THE WHOLE TRICK. The prototype is modelled
+     along local +X with its cloth growing UP from the cord at y = 0,
+     because TOON_WIND's bend grows with the LOCAL y attribute. Roll it
+     pi about X on the way in and the cord stays on the hooks while the
+     cloth falls from it and the hems — now the far end of the height
+     ramp — are what the gusts move. See mats.flap in kits.js.
+     ---------------------------------------------------------------- */
+  const _sa = new THREE.Vector3(), _sb = new THREE.Vector3();
+  function hangStrung(s, matrixWorld) {
+    if (!s) return;
+    _sa.set(s.u0, s.y, s.z).applyMatrix4(matrixWorld);
+    _sb.set(s.u1, s.y, s.z).applyMatrix4(matrixWorld);
+    const dx = _sb.x - _sa.x, dz = _sb.z - _sa.z;
+    const span = Math.hypot(dx, dz);
+    if (!(span > 3.4)) return;
+    const m = new THREE.Matrix4().compose(
+      _sa.clone().add(_sb).multiplyScalar(0.5),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.atan2(-dz, dx), 0)),
+      new THREE.Vector3(span / 5.2, 1, 1),
+    ).multiply(FLAP_HANG);
+    props.add('strung', m, { variant: s.kind, shadow: false });
+    strungRuns++;
+  }
 
   /* ================================================================
      1. The 28 buildings.
@@ -677,11 +769,32 @@ export async function init(ctx) {
       });
       footing(K, world, loc, S, groundY, { w: loc.size.w, d: loc.size.d, collide: meta.collide });
     }
+    /* --- EVIDENCE OF LIFE, into the building's OWN kit ---
+       This has to happen between buildLocation() handing the kit over
+       and lib.meshes() merging it: written here, the window boxes, the
+       birds on the eaves and the chalk on the wall land inside meshes
+       this building was drawing anyway and cost not one draw call. See
+       the header of world/life.js. */
+    try {
+      /* THE FOUNDING LINE IS NOT THE PAVEMENT. A building's local
+         y = 0 is where it was dug in, and the berm banks earth up
+         against it — so a dust sheet laid at y = 0.05 in front of a
+         door is under the ground you can see, which is exactly where
+         the first version of the cafe's paint job went. Measure the
+         drawn ground at the doorstep once and hand life.js the offset;
+         it is the same number the wall-hug props already stand on. */
+      toWorldXZ(loc, meta.door.x, meta.door.z, _wp);
+      const lift = world.heightAt(_wp.x, _wp.z) - groundY;
+      const note = dressLife(ctx, K, loc, S, meta, rng, { lift });
+      if (note) oneOffs.push(`${loc.id}: ${note}`);
+    } catch (e) { console.warn('[city] life failed', loc.id, e); }
+
     const group = new THREE.Group();
     group.name = `city.${loc.id}`;
     group.position.set(loc.world.x, groundY, loc.world.z);
     group.rotation.y = loc.yaw;
     group.updateMatrixWorld(true);
+    hangStrung(meta.strung, group.matrixWorld);
 
     const full = new THREE.Group(); full.name = `${loc.id}.full`;
     const meshes = lib.meshes(K, loc.id);
@@ -717,17 +830,29 @@ export async function init(ctx) {
       signs.push(sign);
     } catch (e) { console.warn('[city] sign failed', loc.id, e); }
 
-    /* --- props, lifted out of local space onto the ground --- */
+    /* --- props, lifted out of local space onto the ground.
+
+       HELD BACK RATHER THAN PLACED HERE. This was the one placement
+       path that never met the doorway guard: section 2 refuses a
+       scattered prop whose body reaches into a door corridor and
+       REMOVES it, precisely so that nothing is ever drawn without a
+       collider, but the props a FORM emits — the mine's ore carts, the
+       pier's bollards and lamp — came through here and were never
+       tested. wirePhysics then ran the same guard as a backstop and
+       took their colliders away instead, which is the worst of both
+       answers. Measured on the tree this was written against: 1549
+       props drawn, 1540 collided, and the nine in the gap were
+       solid-looking objects you could walk straight through.
+
+       The guard needs every door in the city and we are still building
+       them, so these are queued and placed together once
+       collectDoorGuards() has run. --- */
     for (const p of meta.props) {
-      const local = new THREE.Vector3(p.x, 0, p.z);
-      const wp = local.clone().applyMatrix4(group.matrixWorld);
-      const y = p.y != null ? groundY + p.y : world.heightAt(wp.x, wp.z);
-      const m = new THREE.Matrix4().compose(
-        new THREE.Vector3(wp.x, y + (p.stack ? p.stack * 2.55 : 0), wp.z),
-        new THREE.Quaternion().setFromEuler(new THREE.Euler(0, loc.yaw + (p.ry || 0), 0)),
-        new THREE.Vector3(1, 1, 1).multiplyScalar(p.scale || (0.94 + rng() * 0.14)),
-      );
-      props.add(p.type, m, { variant: p.gold ? 2 : undefined, shadow: !p.stack });
+      const wp = new THREE.Vector3(p.x, 0, p.z).applyMatrix4(group.matrixWorld);
+      formProps.push({
+        p, x: wp.x, z: wp.z, groundY, yaw: loc.yaw,
+        scale: p.scale || (0.94 + rng() * 0.14),
+      });
     }
 
     /* --- cloth (awnings, banners, laundry, canopies) --- */
@@ -762,6 +887,7 @@ export async function init(ctx) {
     const box = new THREE.Box3().setFromObject(full);
     records.set(loc.id, {
       loc, style: S, group, full, lod, sign, meta, box,
+      census: K.census || null,
       kit: S.form,
       center: box.getCenter(new THREE.Vector3()),
       groundY,
@@ -828,6 +954,18 @@ export async function init(ctx) {
   const reachOf = (kind) => PROP_FOOTPRINT[kind] ?? 0.7;
   collectDoorGuards();
   let doorVetoed = 0;
+
+  /* the form-emitted props, now that every door in the city is known */
+  for (const q of formProps) {
+    const p = q.p;
+    if (doorBlocked(q.x, q.z, reachOf(p.type))) { doorVetoed++; continue; }
+    const y = p.y != null ? q.groundY + p.y : world.heightAt(q.x, q.z);
+    props.add(p.type, new THREE.Matrix4().compose(
+      new THREE.Vector3(q.x, y + (p.stack ? p.stack * CONTAINER_H : 0), q.z),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler(0, q.yaw + (p.ry || 0), 0)),
+      new THREE.Vector3(1, 1, 1).multiplyScalar(q.scale),
+    ), { variant: p.gold ? 2 : undefined, shadow: !p.stack });
+  }
 
   /* ================================================================
      1b. THE REST OF THE DISTRICT.
@@ -953,13 +1091,23 @@ export async function init(ctx) {
       const gy = settleY(world, fake, w, dd);
       groundBerm(out.K, world, fake, gy, { w, d: dd, reach: clamp(w * 0.20, 2.4, 4.2), rng: frng2, door: out.meta.door });
       footing(out.K, world, fake, S, gy, { w, d: dd, collide: out.meta.collide });
+      /* THE UNNAMED NEIGHBOURS GET IT TOO, and they matter more than
+         the 28 do: there are 83 of them and they are what a lane is
+         actually made of. Their kits are about to be merged four at a
+         time, so this is still zero draw calls. */
+      try { dressLife(ctx, out.K, fake, S, out.meta, frng2); }
+      catch (e) { /* one shed's dressing is never worth losing the shed */ }
 
       const m = new THREE.Matrix4().compose(
         new THREE.Vector3(x, gy, zz),
         new THREE.Quaternion().setFromEuler(new THREE.Euler(0, fake.yaw, 0)),
         new THREE.Vector3(1, 1, 1),
       );
-      pending.push({ K: out.K, m, x, z: zz, rad });
+      /* the census is per-Kit and four of these are about to be merged
+         into one, so stamp each part with the building it came from
+         before appendKit carries it over */
+      hangStrung(out.meta.strung, m);
+      pending.push({ K: out.K, m, x, z: zz, rad, id, census: out.K.census || null });
       for (const b of out.meta.collide) collideQueue.push({ box: b, matrix: m.clone() });
       for (const p of out.meta.props.slice(0, 3)) {
         const wp = new THREE.Vector3(p.x, 0, p.z).applyMatrix4(m);
@@ -1008,6 +1156,9 @@ export async function init(ctx) {
         group: g,
         x: (cx0 + cx1) / 2, z: (cz0 + cz1) / 2,
         r: Math.hypot(cx1 - cx0, cz1 - cz0) / 2,
+        /* each shed keeps its OWN census, in its OWN frame — see the
+           appendKit block in kits.js */
+        sheds: chunk.map((p) => ({ id: p.id, census: p.census, m: p.m.elements.slice() })),
       });
     }
   }
@@ -1018,17 +1169,104 @@ export async function init(ctx) {
 
 
   const srng = ctx.makeRng('wally.city.scatter');
+  /* ================================================================
+     THE DISTRICT VOCABULARY.
+
+     These lists used to be the same nine pieces of street furniture in
+     ten different orders, which is why every district read as the same
+     street: a bin, a crate and a barrel say "a place", they do not say
+     WHICH place. Each district now leads with shapes that exist
+     nowhere else on the island — see the district block in props.js —
+     and the shared furniture is what is left over rather than what
+     carries the scene.
+
+     A repeated entry is a weight; the pick is uniform over the array.
+     The district's own shapes are listed two or three times so they
+     are what you actually meet walking down its street.
+
+     CONTAINERS ARE NOT IN ANY OF THESE. They were in `waterfront`, and
+     the waterfront district's centre is 190 m from the shore with a
+     scatter radius near a hundred — so shipping containers were landing
+     up to 290 m inland in open country, which is exactly the "random
+     red or blue containers" the user reported. They are placed
+     deliberately now, at the port, by the container yard below.
+     ================================================================ */
+  /* WHICH DISTRICT IS THIS, REALLY.
+
+     A zone's radius is derived from the spread of its own buildings,
+     so the ten discs overlap heavily — Waterfront's reaches 100 m from
+     its centre and swallows ground that is nearer Market Square than
+     it is to the sea. Placing by "inside this district's disc" is
+     therefore not placing by district at all, and it is the mechanism
+     that put shipping containers in a meadow.
+
+     Nearest centre is a partition: every point on the island belongs
+     to exactly one district, and a district's own vocabulary can never
+     appear in another district's ground. */
+  function nearestZone(x, z) {
+    let best = null, bd = Infinity;
+    for (const zid of Object.keys(ZONES)) {
+      const zc = ZONES[zid].world;
+      const d = (x - zc.x) * (x - zc.x) + (z - zc.z) * (z - zc.z);
+      if (d < bd) { bd = d; best = zid; }
+    }
+    return best;
+  }
+
   const KIND_BY_ZONE = {
-    rustyrow: ['bin', 'crate', 'barrel', 'bike', 'bollard', 'plant'],
-    mainstreet: ['bench', 'lamp', 'bin', 'plant', 'bollard', 'bike'],
-    learning: ['bench', 'lamp', 'plant', 'bollard', 'bin'],
-    marketsq: ['crate', 'produce', 'barrel', 'plant', 'cart', 'bin'],
-    greenedge: ['fence', 'hay', 'barrel', 'cart', 'crate'],
-    ironhills: ['orecart', 'barrel', 'crate', 'bollard', 'bin'],
-    waterfront: ['container', 'crate', 'barrel', 'bollard', 'bin'],
-    innovation: ['bench', 'plant', 'lamp', 'bike', 'bollard'],
-    stampede: ['bench', 'bin', 'bollard', 'lamp', 'crate'],
-    goldenheights: ['hedge', 'lamp', 'bench', 'plant', 'bollard'],
+    /* cheap rent, loud pipes: what a street with no money leaves out */
+    rustyrow: ['tyres', 'tyres', 'gasbottle', 'gasbottle', 'bin', 'bin', 'crate', 'barrel', 'bike'],
+    /* a civic high street pretending to be doing fine */
+    mainstreet: ['postbox', 'newsbox', 'newsbox', 'sandwich', 'bench', 'lamp', 'bin', 'plant', 'plant', 'bollard'],
+    /* chalk dust and second chances */
+    learning: ['chalkboard', 'chalkboard', 'bookbarrow', 'bookbarrow', 'sandwich', 'bench', 'bench', 'lamp', 'plant', 'bin'],
+    /* everything is for sale, loudly */
+    marketsq: ['pallets', 'pallets', 'sacks', 'sacks', 'produce', 'produce', 'sandwich', 'crate', 'barrel', 'cart'],
+    /* fields that stopped being profitable */
+    greenedge: ['churn', 'churn', 'trough', 'hay', 'hay', 'fence', 'fence', 'cart', 'barrel'],
+    /* the hills remember being rich */
+    ironhills: ['cabledrum', 'cabledrum', 'oildrum', 'oildrum', 'oildrum', 'orecart', 'crate', 'bin'],
+    /* cranes, gulls and cold coffee */
+    waterfront: ['ropecoil', 'ropecoil', 'lobsterpot', 'lobsterpot', 'bollard', 'bollard', 'crate', 'barrel', 'bin'],
+    /* six startups per building, four will fail */
+    innovation: ['escooter', 'escooter', 'techplanter', 'techplanter', 'bench', 'bench', 'bike', 'lamp', 'plant'],
+    /* a match-day approach */
+    stampede: ['barrier', 'barrier', 'turnstile', 'bin', 'bin', 'bench', 'bollard', 'lamp', 'crate'],
+    /* where the money already lives */
+    goldenheights: ['urn', 'urn', 'topiary', 'topiary', 'hedge', 'hedge', 'bench', 'lamp', 'bollard'],
+  };
+  /* ================================================================
+     MID-USE, AND RARE.
+
+     Five of the shapes this city is already full of carry a variant 2
+     that catches them in use rather than at rest — a jacket and a mug
+     on a bench, a mug and a dealt hand on a barrel, a mended panel in
+     a fence, a fork left standing in a bale, a gull on a mooring post.
+     They cost between 40 and 150 triangles each.
+
+     THE NUMBERS BELOW ARE THE POINT OF THEM. At one in six a bench
+     with a jacket on it is a bench with a jacket on it; at one in two
+     it is what benches look like here, and the object stops saying
+     anything. The gull is rarer still and is confined to the
+     waterfront, so a mooring post with a bird on it is something you
+     find at the harbour and cannot find anywhere else.
+
+     A variant asked for by name is also never collapsed away by the
+     saving in props.js — see collapseVariants there. */
+  const MIDUSE = { bench: 0.17, barrel: 0.13, fence: 0.16, hay: 0.22 };
+  const midUse = (kind, r, zid) =>
+    (kind === 'bollard'
+      ? (zid === 'waterfront' && r < 0.12 ? 2 : undefined)
+      : (MIDUSE[kind] && r < MIDUSE[kind] ? 2 : undefined));
+
+  /* DENSITY IS PART OF THE IDENTITY. A market square and a mining
+     hillside cannot carry the same number of objects per hectare and
+     still read as themselves — the flat 55 everywhere was half of why
+     they all felt alike. Golden Heights is deliberately sparse and
+     formal; Market Square and Rusty Row are cluttered. */
+  const DENSITY = {
+    rustyrow: 74, mainstreet: 58, learning: 50, marketsq: 82, greenedge: 44,
+    ironhills: 52, waterfront: 62, innovation: 46, stampede: 48, goldenheights: 34,
   };
   /* A BUILDING'S KEEP-OUT IS ITS FOOTPRINT, NOT ITS CLEARANCE CIRCLE.
      `loc.radius` is hypot(w,d)/2 + 4 — about 13 m for a normal lot — so
@@ -1061,8 +1299,9 @@ export async function init(ctx) {
     const kinds = KIND_BY_ZONE[zid] || ['bin', 'crate'];
     /* Eleven pieces of clutter across a whole district is a scattering,
        not a place where anyone lives. A Wind Waker street carries
-       something every four to six metres. */
-    const target = 55;
+       something every four to six metres — and not the same amount of
+       it everywhere: see DENSITY. */
+    const target = DENSITY[zid] ?? 55;
     let placed = 0, tries = 0;
     while (placed < target && tries < 2600) {
       tries++;
@@ -1071,6 +1310,8 @@ export async function init(ctx) {
       const x = z.world.x + Math.cos(a) * r;
       const zz = z.world.z + Math.sin(a) * r;
       if (!clearOf(x, zz, 0.6)) continue;
+      /* a district's own shapes stay in its own ground — see nearestZone */
+      if (nearestZone(x, zz) !== zid) continue;
       if (world.shoreDistAt(x, zz) < 20) continue;
       if (world.slopeAt(x, zz) > 0.26) continue;
       const road = world.pathAt(x, zz);
@@ -1084,7 +1325,7 @@ export async function init(ctx) {
         new THREE.Vector3(1, 1, 1).multiplyScalar(0.9 + srng() * 0.22),
       );
       if (doorBlocked(x, zz, reachOf(kind))) { doorVetoed++; continue; }
-      props.add(kind, m);
+      props.add(kind, m, { variant: midUse(kind, srng(), zid) });
       placed++;
     }
   }
@@ -1092,12 +1333,12 @@ export async function init(ctx) {
      ctx.world.paths.edges carry their carved polyline, so lamps and
      bollards can stand on the verge of a real lane instead of being
      scattered near one. This is what turns a road into a street. */
+  /* the verge is dressed from the district it is actually IN — the
+     nearest centre, and only if it is inside that district's reach */
   const zoneNear = (x, z) => {
-    for (const zid of Object.keys(ZONES)) {
-      const zz = ZONES[zid];
-      if (Math.hypot(x - zz.world.x, z - zz.world.z) < zz.world.radius * 0.95) return zid;
-    }
-    return null;
+    const zid = nearestZone(x, z);
+    const zz = ZONES[zid];
+    return Math.hypot(x - zz.world.x, z - zz.world.z) < zz.world.radius * 0.95 ? zid : null;
   };
   const edges = world.paths?.edges || [];
   for (const e of edges) {
@@ -1128,13 +1369,20 @@ export async function init(ctx) {
       const r = srng();
       /* one lamp heads each run of three, then two pieces of small
          furniture behind it — 18 m between lamps, 6 m between objects */
+      /* One in three of the non-lamp pieces on a verge comes out of the
+         district's own vocabulary, so the lane you walk down tells you
+         which district you are in even where there is no building in
+         frame. The rest stays generic street furniture — a verge of
+         nothing but cable drums is as wrong as a verge of nothing but
+         bins. */
+      const local = KIND_BY_ZONE[zid];
       const kind = nOnSide === 0 ? 'lamp'
-        : r < 0.17 ? 'bollard'
-        : r < 0.33 ? 'bin'
-        : r < 0.49 ? 'bench'
-        : r < 0.63 ? 'plant'
-        : r < 0.77 ? 'crate'
-        : r < 0.89 ? 'barrel'
+        : r < 0.30 ? local[Math.floor(srng() * local.length) % local.length]
+        : r < 0.42 ? 'bollard'
+        : r < 0.54 ? 'bin'
+        : r < 0.66 ? 'bench'
+        : r < 0.78 ? 'plant'
+        : r < 0.88 ? 'crate'
         : (zid === 'greenedge' || zid === 'ironhills' ? 'fence' : 'bike');
       if (doorBlocked(x, z, reachOf(kind))) { doorVetoed++; continue; }
       const yaw = Math.atan2(-tz * side, tx * side) + (kind === 'bench' ? PI / 2 : 0);
@@ -1142,9 +1390,216 @@ export async function init(ctx) {
         new THREE.Vector3(x, world.heightAt(x, z), z),
         new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
         new THREE.Vector3(1, 1, 1).multiplyScalar(0.94 + srng() * 0.14),
-      ), { variant: zid === 'goldenheights' && kind === 'lamp' ? 2 : undefined });
+      ), { variant: zid === 'goldenheights' && kind === 'lamp' ? 2 : midUse(kind, srng(), zid) });
     }
   }
+
+  /* ================================================================
+     2a. THE SEAMS.
+
+     Ten districts partition this island by nearest centre, and that
+     partition is load-bearing: it is what keeps a cable drum out of a
+     meadow and a lobster pot off the hillside. But a boundary that
+     nothing draws is a boundary nobody can read, and the place where
+     two districts meet is where a real town tells you the most —
+     which is why real towns put a fingerpost there.
+
+     WHERE THE SEAM IS, MEASURED. A point is on a seam when its two
+     nearest district centres are within SEAM_EQ metres of each other:
+     that is the Voronoi bisector, the same function nearestZone()
+     partitions by, so the post cannot land anywhere except exactly
+     where the vocabulary changes. Walked along the road ribbons rather
+     than sampled over the island, because a waymarker belongs on a
+     lane somebody is walking down and not in the middle of a field.
+
+     NOTHING LEAKS ACROSS IT. The previous pass's guarantee — a
+     district's own shapes never appear in another district's ground —
+     is untouched: the fingerpost belongs to neither side, which is
+     precisely what lets it stand on the line.
+     ================================================================ */
+  const SEAM_EQ = 7;
+  const SEAM_GAP = 78;
+  const seams = [];
+  function twoNearest(x, z) {
+    let b0 = Infinity, b1 = Infinity, z0 = null, z1 = null;
+    for (const zid of Object.keys(ZONES)) {
+      const c = ZONES[zid].world;
+      const d = Math.hypot(x - c.x, z - c.z);
+      if (d < b0) { b1 = b0; z1 = z0; b0 = d; z0 = zid; }
+      else if (d < b1) { b1 = d; z1 = zid; }
+    }
+    return { b0, b1, z0, z1 };
+  }
+  for (const e of edges) {
+    const pts = e.points;
+    if (!pts || pts.length < 3) continue;
+    for (let i = 1; i < pts.length; i++) {
+      const p = pts[i], q = pts[i - 1];
+      const n = twoNearest(p.x, p.z);
+      if (!n.z1 || n.b1 - n.b0 > SEAM_EQ) continue;
+      /* both districts have to actually reach this point — two centres
+         can be equidistant from open country a long way from either */
+      if (n.b0 > Math.max(ZONES[n.z0].world.radius, 96)) continue;
+      let near = false;
+      for (const s of seams) if (Math.hypot(s.x - p.x, s.z - p.z) < SEAM_GAP) { near = true; break; }
+      if (near) continue;
+      const seg = Math.hypot(p.x - q.x, p.z - q.z) || 1;
+      const tx = (p.x - q.x) / seg, tz = (p.z - q.z) / seg;
+      const off = (e.width || 5) * 0.5 + 1.6;
+      for (const side of [1, -1]) {
+        const x = p.x - tz * off * side, z = p.z + tx * off * side;
+        if (!clearOf(x, z, 0.8)) continue;
+        if (world.slopeAt(x, z) > 0.26) continue;
+        if (world.shoreDistAt(x, z) < 14) continue;
+        if (doorBlocked(x, z, reachOf('fingerpost'))) { doorVetoed++; continue; }
+        /* square the arms to the lane, so one points each way down it */
+        props.add('fingerpost', new THREE.Matrix4().compose(
+          new THREE.Vector3(x, world.heightAt(x, z), z),
+          new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.atan2(tx, tz) + PI / 2, 0)),
+          new THREE.Vector3(1, 1, 1).multiplyScalar(0.96 + srng() * 0.1),
+        ));
+        seams.push({ x, z, a: n.z0, b: n.z1 });
+        break;
+      }
+    }
+  }
+  if (seams.length) {
+    console.log(`[city] ${seams.length} fingerposts on district seams: ` +
+      seams.map((s) => `${s.a}|${s.b}`).join(', '));
+  }
+
+  /* ================================================================
+     2b. THE CONTAINER YARD.
+
+     THE COMPLAINT: "there are too many random red or blue containers,
+     those should only be by the port district."
+
+     THE CENSUS, before this pass: twenty containers drawn, and the
+     scatter that placed fourteen of them was keyed on the WATERFRONT
+     ZONE — whose centre sits at (-25, 193) with a scatter radius near
+     a hundred metres, because a zone's radius is derived from the
+     spread of its member buildings and the two waterfront buildings
+     are 145 m apart. Measured with world.shoreDistAt(), those fourteen
+     stood between 50 and 290 metres inland; nine of them were further
+     from the water than they were from Market Square. A 5.2 m steel
+     box in a meadow is the most placeholder-looking object it is
+     possible to put in a game.
+
+     So: a container is port furniture and it is placed like port
+     furniture. Nothing scatters it. It is stacked in ROWS on the hard
+     standing beside a pier — which is what a container actually looks
+     like when it is somewhere it belongs.
+
+     AND THEN THE RULE MATCHED A BLOCK OF FLATS. The test above was
+     `rec.kit === 'pier'`, and rec.kit is the FORM THE KIT LIBRARY
+     BUILT THE SHELL FROM, not a fact about the place. data.js gives
+     both waterfront locations kit 'water', kits.js maps 'water' to
+     form 'pier' — so "Harbour Residences", balconies and salt air,
+     satisfied a rule written about a cargo dock and got ten shipping
+     containers stacked on its residential grass hillside, measured
+     217 to 235 m from the sea. The bug was not removed by the last
+     pass, it was RELOCATED: it stopped being fourteen containers
+     scattered over the district and became ten in a tidy yard outside
+     somebody's front door, which is worse, because a yard looks
+     deliberate.
+
+     THE RULE NOW ASKS WHAT THE PLACE IS. data.js marks the one
+     working cargo port with `port: true` and nothing else on the
+     island carries it. A kit can be reused by any building that wants
+     piles under it; `port` cannot be acquired by accident.
+
+     WHAT REPLACES THEM AT THE RESIDENCES. Not a hole and not silence:
+     a pier that is NOT a port gets the quayside it should always have
+     had — mooring bollards, rope coils, lobster pots and planting
+     along the same landward flank. Same vocabulary as the district,
+     no cargo. tools/cliptest.mjs asserts that every container drawn on
+     the island stands within PORT_R of a `port`, and that none of them
+     floats clear of the ground it is stacked on.
+     ================================================================ */
+  /* metres from a port building, or from the waterline, that a
+     shipping container is allowed to stand. cliptest asserts it. */
+  const PORT_R = 40;
+  const PORT_SHORE = 26;
+  const yrng = ctx.makeRng('wally.city.port');
+  let containers = 0, quay = 0;
+  for (const rec of records.values()) {
+    if (rec.kit !== 'pier') continue;
+    const loc = rec.loc;
+    const isPort = loc.port === true;
+    /* the yard runs along the LANDWARD flank, clear of the deck the
+       player walks and clear of the door corridor */
+    const deckHalf = loc.size.d / 2 + (SPRAWL.water ?? 5);
+    for (let row = 0; row < 3; row++) {
+      const lz = -deckHalf - 4.6 - row * 3.6;
+      const n = 3 - (row > 1 ? 1 : 0);
+      for (let i = 0; i < n; i++) {
+        const lx = -loc.size.w * 0.34 + (loc.size.w * 0.68 * i) / Math.max(1, n - 1);
+        toWorldXZ(loc, lx + (yrng() - 0.5) * 0.5, lz + (yrng() - 0.5) * 0.5, _wp);
+        const x = _wp.x, zz = _wp.z;
+        const yaw = loc.yaw + PI / 2 + (yrng() - 0.5) * 0.06;
+        if (world.shoreDistAt(x, zz) < 3) continue;      // not in the surf
+        if (world.slopeAt(x, zz) > 0.30) continue;
+        if (!isPort) {
+          /* the residential quay: the same rows, dressed as a place
+             people live rather than a place cargo is stacked */
+          const kind = ['ropecoil', 'lobsterpot', 'bollard', 'plant', 'crate', 'bench'][(row * 3 + i) % 6];
+          if (doorBlocked(x, zz, reachOf(kind))) { doorVetoed++; continue; }
+          props.add(kind, new THREE.Matrix4().compose(
+            new THREE.Vector3(x, world.heightAt(x, zz), zz),
+            new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
+            new THREE.Vector3(1, 1, 1).multiplyScalar(0.92 + yrng() * 0.16),
+          ));
+          quay++;
+          continue;
+        }
+        if (doorBlocked(x, zz, reachOf('container'))) { doorVetoed++; continue; }
+        /* A 5.2 m BOX IS BEDDED ON ITS CORNERS, NOT ON ITS NAVEL.
+           heightAt() at the centre is one sample, and the stack is
+           5.2 x 2.3 m: on the 0.30 slope this pass still allows, the
+           downhill corner of a box pinned to its centre height hangs
+           more than half a metre clear of the ground. So the four
+           corners are sampled in the box's OWN rotated frame and the
+           lowest of them is what it sits on — a container beds into a
+           slope, it never hovers over one. */
+        const cs = Math.cos(yaw), sn = Math.sin(yaw);
+        let gy = Infinity;
+        for (const [cu, cv] of [[2.6, 1.15], [2.6, -1.15], [-2.6, 1.15], [-2.6, -1.15]]) {
+          gy = Math.min(gy, world.heightAt(x + cu * cs + cv * sn, zz - cu * sn + cv * cs));
+        }
+        /* AND BEDDED, NOT BALANCED. heightAt() is the collision world's
+           opinion; the terrain you SEE is a box-filtered LOD mesh that
+           runs up to a quarter of a metre either side of it, so a sole
+           laid exactly on heightAt() floats wherever the drawn tile
+           happens to sit low. Five centimetres into the dirt is
+           invisible on a 2.5 m box and it can only ever read as
+           bedded — the same argument as the berm having volume. */
+        gy -= 0.05;
+        /* two high on the front row, one high behind — a yard, not a
+           wall. The stack rides the container's own height. */
+        const high = row === 0 && i !== 1 ? 2 : 1;
+        for (let k = 0; k < high; k++) {
+          props.add('container', new THREE.Matrix4().compose(
+            new THREE.Vector3(x, gy + k * CONTAINER_H, zz),
+            new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
+            new THREE.Vector3(1, 1, 1),
+          ), { variant: (row + i + k) % 2, shadow: k === 0 });
+          containers++;
+        }
+      }
+    }
+    /* and the working end of the yard: a bollard line and rope */
+    for (let i = 0; i < 4; i++) {
+      toWorldXZ(loc, -loc.size.w * 0.5 - 2.2, -deckHalf - 2.0 - i * 2.4, _wp);
+      if (doorBlocked(_wp.x, _wp.z, reachOf('ropecoil'))) { doorVetoed++; continue; }
+      props.add(i % 2 ? 'ropecoil' : 'bollard', new THREE.Matrix4().compose(
+        new THREE.Vector3(_wp.x, world.heightAt(_wp.x, _wp.z), _wp.z),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yrng() * PI * 2, 0)),
+        new THREE.Vector3(1, 1, 1),
+      ));
+    }
+  }
+  console.log(`[city] ${containers} shipping containers, all of them in a port yard; ` +
+    `${quay} quayside pieces at the piers that are not ports`);
 
   /* ================================================================
      2c. AGAINST THE WALL.
@@ -1160,17 +1615,27 @@ export async function init(ctx) {
   /* the pier stands on a deck over water and the stadium bowl has no
      wall line at ground level — neither takes doorstep clutter */
   const HUG_SKIP = new Set(['pier', 'stadium']);
+  /* What gets pushed AGAINST a wall is a different list from what
+     stands in the open: a cable drum leans on a shed, an urn does not
+     lean on anything, and a crowd barrier stacks flat against a
+     stadium flank. Same district identity, chosen for the doorstep. */
+  /* A BROOM ONLY MAKES SENSE AGAINST A WALL. It is in this list and
+     not in the open-ground one for the same reason a real one is: you
+     lean it on something, and a besom standing on its own in the
+     middle of a square reads as a mistake. The A-board is here for the
+     opposite reason — a shop puts it out ON the pavement — and it is
+     in both lists. */
   const WALL_KIND = {
-    rustyrow: ['crate', 'barrel', 'bin', 'bike', 'crate', 'plant', 'barrel', 'bin'],
-    mainstreet: ['plant', 'crate', 'bike', 'bin', 'bench', 'plant', 'barrel'],
-    learning: ['plant', 'bike', 'bin', 'bench', 'crate', 'plant'],
-    marketsq: ['crate', 'produce', 'barrel', 'crate', 'produce', 'bin', 'cart'],
-    greenedge: ['hay', 'crate', 'barrel', 'fence', 'cart', 'hay'],
-    ironhills: ['barrel', 'crate', 'orecart', 'bin', 'crate', 'barrel'],
-    waterfront: ['crate', 'barrel', 'crate', 'bollard', 'bin', 'barrel'],
-    innovation: ['plant', 'bike', 'bench', 'plant', 'bin', 'crate'],
-    stampede: ['crate', 'bin', 'bench', 'bollard', 'barrel'],
-    goldenheights: ['plant', 'hedge', 'bench', 'plant', 'bollard'],
+    rustyrow: ['tyres', 'gasbottle', 'crate', 'broom', 'bin', 'bike', 'tyres', 'barrel', 'bin'],
+    mainstreet: ['newsbox', 'plant', 'crate', 'broom', 'sandwich', 'bike', 'bin', 'bench', 'plant'],
+    learning: ['bookbarrow', 'chalkboard', 'plant', 'broom', 'sandwich', 'bike', 'bin', 'bench', 'plant'],
+    marketsq: ['pallets', 'sacks', 'crate', 'produce', 'broom', 'sandwich', 'pallets', 'barrel', 'bin', 'cart'],
+    greenedge: ['churn', 'hay', 'crate', 'broom', 'barrel', 'fence', 'churn', 'cart'],
+    ironhills: ['oildrum', 'cabledrum', 'barrel', 'crate', 'oildrum', 'orecart', 'bin'],
+    waterfront: ['lobsterpot', 'ropecoil', 'crate', 'broom', 'barrel', 'lobsterpot', 'bollard', 'bin'],
+    innovation: ['escooter', 'techplanter', 'plant', 'sandwich', 'bike', 'bench', 'escooter', 'bin'],
+    stampede: ['barrier', 'crate', 'bin', 'broom', 'barrier', 'bench', 'bollard'],
+    goldenheights: ['urn', 'topiary', 'plant', 'hedge', 'bench', 'topiary', 'bollard'],
   };
   for (const rec of records.values()) {
     if (HUG_SKIP.has(rec.kit)) continue;
@@ -1187,26 +1652,100 @@ export async function init(ctx) {
       for (let i = 0; i < n; i++) {
         const u = -run / 2 + (run * (i + 0.20 + hrng() * 0.6)) / n;
         if (face === 0 && Math.abs(u - doorU) < 1.9) continue;
-        const t = d / 2 + (face === 0 ? front : 0.0) + 0.4 + hrng() * 2.1;
+        /* PUSHED AGAINST A WALL, NOT INTO ONE.
+
+           The stand-off used to be 0.4 m from the wall face whatever
+           was being placed, and a prop's collider is measured from its
+           own geometry: a potted plant is 0.38 m of half-width, so its
+           box reached 0.02 m short of the wall — and the wall has a
+           plinth standing 0.17 m proud of it and a berm banking up
+           against that. Wedged into that angle, the solver has nowhere
+           to push the capsule but UP.
+
+           Measured: with a plant landing in the Main Street office's
+           corner, surfacetest walked into it and reported +0.187 m of
+           float at (-161.69, 13.87). Asked what was touching him there,
+           the capsule had two contacts on `city` (near-vertical, 0.018
+           and 0.056 m deep), two on `city.berm`, and three on
+           `prop.plant` — he was not standing on anything, he was being
+           squeezed out of a corner.
+
+           So the stand-off starts where the prop's own body ends, plus
+           the plinth's 0.17 m projection and a little air. It still
+           reads as "against the wall": the closest it can put a bin is
+           0.24 m of daylight, which is a bin leaning on a shopfront. */
+        const kind = kinds[Math.floor(hrng() * kinds.length) % kinds.length];
+        /* A BROOM AND AN A-BOARD ARE NOT SCATTER. The random 0-1.7 m of
+           extra stand-off is what makes a row of crates read as dropped
+           rather than lined up, and it is exactly wrong for the two
+           objects whose whole meaning is their relationship to the
+           wall: photographed at 1.4 m out, the broom was a pole
+           standing on end in the middle of a plaza. These two go tight
+           against the wall and take their yaw from it. */
+        const loose = kind === 'broom' || kind === 'sandwich' ? 0.06 : hrng() * 1.7;
+        const t = d / 2 + (face === 0 ? front : 0.0)
+          + 0.24 + reachOf(kind) + loose;
         const lx = face === 0 ? u : -u;
         const lz = face === 0 ? t : -t;
         toWorldXZ(loc, lx, lz, _wp);
         if (world.shoreDistAt(_wp.x, _wp.z) < 6) continue;
-        const kind = kinds[Math.floor(hrng() * kinds.length) % kinds.length];
         if (doorBlocked(_wp.x, _wp.z, reachOf(kind))) { doorVetoed++; continue; }
         /* square up to the wall, then knock it a few degrees off — a
            crate pushed against a wall is never quite parallel to it */
-        const yaw = loc.yaw + (face === 0 ? 0 : PI) + (hrng() - 0.5) * 0.7;
+        /* A BROOM AND AN A-BOARD FACE THE OTHER WAY FROM A CRATE. One
+           is leaning ON the wall and one is turned OUT to the street;
+           both look wrong square-on to it, which is what the generic
+           yaw gave them. */
+        /* +PI/2 turns the broom's local +x — the way its handle
+           leans — into the building's -z, i.e. INTO the wall behind
+           it. The A-board turns its chalked face out to the street.
+           Both keep only a few degrees of jitter; a broom knocked 20
+           degrees off a wall is a broom falling over. */
+        const lean = kind === 'broom' ? PI / 2 : kind === 'sandwich' ? PI : 0;
+        const jit = kind === 'broom' || kind === 'sandwich' ? 0.24 : 0.7;
+        const yaw = loc.yaw + (face === 0 ? 0 : PI) + lean + (hrng() - 0.5) * jit;
         props.add(kind, new THREE.Matrix4().compose(
           new THREE.Vector3(_wp.x, world.heightAt(_wp.x, _wp.z) + 0.05, _wp.z),
           new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
           new THREE.Vector3(1, 1, 1).multiplyScalar(0.86 + hrng() * 0.26),
-        ));
+        ), { variant: midUse(kind, hrng(), loc.z) });
       }
     }
   }
 
+  /* ================================================================
+     2g. THE TWO INSTRUMENTS.
+
+     A vane on the library ridge and a windsock on the dock mast: the
+     only two objects on the island that read the wind's DIRECTION
+     rather than just bending in it. §2.3 says a still frame of this
+     game must feel windy, and a grass field bending tells you there is
+     wind while a vane tells you which way — once one thing on the
+     skyline is pointing, every other gust in the frame has somewhere
+     to be read against. They are one-offs on purpose: they are four
+     draw calls between them and they only work because they are rare.
+     ================================================================ */
+  const windRig = createWindInstruments(ctx, lib);
+  root.add(windRig.group);
+  {
+    const rl = records.get('library');
+    if (rl) {
+      const p = rl.group.position;
+      windRig.addVane(p.x, p.y + (rl.meta.eaveY || 8) + 1.45, p.z, 1.2);
+      oneOffs.push('library — a cockerel vane on the ridge, turning to the live wind');
+    }
+    const rd = records.get('docks');
+    if (rd) {
+      const mp = new THREE.Vector3(rd.loc.size.w * 0.42, 0, -rd.loc.size.d * 0.26)
+        .applyMatrix4(rd.group.matrixWorld);
+      windRig.addSock(mp.x, mp.y + 1.35, mp.z, 1.0);
+      oneOffs.push('docks — a windsock that reads the wind\'s strength as well as its direction');
+    }
+  }
+
   if (doorVetoed) console.log(`[city] ${doorVetoed} props refused a doorway approach`);
+  if (oneOffs.length) console.log(`[city] one-offs: ${oneOffs.join(' · ')}`);
+  if (strungRuns) console.log(`[city] ${strungRuns} instanced wind-driven runs strung on walls`);
   props.build();
 
   /* ================================================================
@@ -1847,6 +2386,28 @@ export async function init(ctx) {
     },
     zoneGroup(id) { return zoneGroups.get(id) || null; },
     get locations() { return records; },
+
+    /* THE PART CENSUS — see the block in kits.js. Null unless the page
+       was loaded with ?partcensus.
+
+       Boxes come back in the BUILDING'S OWN FRAME, with the matrix that
+       places it beside them, because that is the only frame in which a
+       box-shaped part's AABB is the part. tools/cliptest.mjs does its
+       touching test in that frame and only converts a defect to world
+       coordinates to print it. */
+    partCensus() {
+      const out = [];
+      const push = (id, kind, census, matrix) => {
+        if (census && census.length) out.push({ id, kind, parts: census, matrix });
+      };
+      for (const [id, rec] of records) {
+        push(id, rec.kit, rec.census, rec.group.matrixWorld.elements.slice());
+      }
+      for (const f of fills) {
+        for (const sh of f.sheds || []) push(sh.id, 'infill', sh.census, sh.m);
+      }
+      return out;
+    },
     get stats() { return dbg.cityStats(); },
 
     /* the show and the home ladder, for anything that wants them
@@ -1868,6 +2429,9 @@ export async function init(ctx) {
          the next frame. */
       fireworks.update(dt);
       applyShowLight();
+
+      /* the vane and the windsock read the same field the signs do */
+      windRig.update(dt);
 
       /* signs sway in the shared wind field */
       const wind = ctx.wind;

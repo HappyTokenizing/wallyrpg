@@ -378,6 +378,33 @@ export async function init(ctx) {
      (It used to have a sibling, lipCam, that ranked the sod tongues
      for you. The tongues are gone — see terrain.js — and this is the
      half that was about the terrain rather than about them.) */
+  /* THE ART-REVIEW CAMERA, and the reason it had to exist.
+
+     Every other debug camera in this file frames a PLACE — a district,
+     a building, a cliff. Reviewing a 40 cm object needed something
+     none of them do: stand at arm's length off a given world point and
+     look straight at it. Doing it through the gameplay camera instead
+     puts Wally's head between the lens and the thing (his boom is 4.2 m
+     behind him and the subject is 3 m in front), which is how a whole
+     gallery run of screenshots came back photographing the back of his
+     ears; and moving the eye off the boom by hand is the trap that
+     voided a previous agent's entire photo set.
+
+       WALLY.debug.lookAt(x, y, z, { dist: 3, az: 35, el: 14, fov: 38 })
+
+     az is degrees clockwise from +Z, el degrees above the subject. */
+  dbg.lookAt = (x, y = 0, z = 0, opts = {}) => {
+    const d = Math.max(0.4, opts.dist ?? 4);
+    const a = THREE.MathUtils.degToRad(opts.az ?? 35);
+    const el = THREE.MathUtils.degToRad(opts.el ?? 14);
+    const h = Math.cos(el) * d;
+    return takeCamera(
+      x + Math.sin(a) * h, y + Math.sin(el) * d, z + Math.cos(a) * h,
+      x, y, z,
+      opts.fov ?? 40, Math.max(0.1, d * 0.03), 4000, opts.fogFar ?? 0,
+    );
+  };
+
   dbg.spotCam = (x, z, opts = {}) => {
     const e = 6;
     const gx = (heightAt(x + e, z) - heightAt(x - e, z)) / (2 * e);
@@ -438,6 +465,32 @@ export async function init(ctx) {
      which of the two layers a measured hue shift came from. */
   dbg.groundTurf = (v = 1) => terrain.setTurf(v);
   dbg.worldPaths = (on = true) => { paths.group.visible = !!on; };
+
+  /* ================================================================
+     THE TERRAIN STREAM BUDGET.
+
+     update() below drives three of terrain.js's queues — collider
+     tiles, rock sectors, tile geometries — and terrain.js takes a
+     COUNT for each. A count is not a budget: three tile geometries in
+     one frame is three unbounded geometry builds, and a profile caught
+     one world frame at 9-10 ms doing exactly that. 1.2 ms matches the
+     foliage streamer's BUILD_MS, so the two streamers together cannot
+     claim more than a third of a 60 fps frame.
+
+     'count' is the rule that shipped and 'budget' the new one; both
+     live in update() and WALLY.debug.worldStreamMode() drives them on
+     one page load, so tools/_fa-stream.mjs can watch the old rule
+     produce a tail the new one does not.
+     ================================================================ */
+  const STREAM_MS = 1.2;
+  let streamMode = 'budget';
+  let streamMs = 0;
+  const slog = [];
+  const qOf = (a, p) => { if (!a.length) return 0; const v = a.slice().sort((x, y) => x - y); return +v[Math.min(v.length - 1, Math.max(0, Math.ceil(v.length * p) - 1))].toFixed(3); };
+  dbg.worldStream = () => ({ mode: streamMode, budgetMs: STREAM_MS, frames: slog.length,
+    p50: qOf(slog, 0.5), p95: qOf(slog, 0.95), p99: qOf(slog, 0.99), worst: qOf(slog, 1) });
+  dbg.worldStreamMode = (m) => { if ((m === 'count' || m === 'budget') && m !== streamMode) { streamMode = m; slog.length = 0; } return streamMode; };
+
   if (window.WALLY) window.WALLY.debug = dbg;
 
   const buildMs = performance.now() - t0;
@@ -507,13 +560,55 @@ export async function init(ctx) {
       }
 
       const f = currentFocus();
-      terrain.updateCollision(f.x, f.z, 2);
-      /* Rock is the geometry the heightfield cannot hold, so it streams
-         beside it: the talus and boulders he can walk into. */
-      terrain.updateRockCollision(f.x, f.z, 4);
+      const tS = performance.now();
 
-      terrain.updateLOD(ctx.camera);
-      terrain.processPending(ctx.quality.name === 'low' ? 1 : 3);
+      if (streamMode === 'count') {
+        /* THE RULE THAT SHIPPED, verbatim, kept as the revert switch.
+           Three COUNTERS: up to two collider tiles, four rock sectors
+           and three tile geometries in one frame, none of them costed.
+           foliage.js learned this lesson in its own comment — "the
+           streamer is a budget, not a counter" — and this call site
+           never did. Three tile geometries is where a single 9-10 ms
+           world frame came from. */
+        terrain.updateCollision(f.x, f.z, 2);
+        terrain.updateRockCollision(f.x, f.z, 4);
+        terrain.updateLOD(ctx.camera);
+        terrain.processPending(ctx.quality.name === 'low' ? 1 : 3);
+      } else {
+        /* ONE SHARED MILLISECOND BUDGET, spent in priority order.
+           terrain.js owns these three queues and takes a COUNT, so the
+           budget is applied here, at the call site, by asking for ONE
+           item at a time until the clock says stop. Each is cheap to
+           re-enter: updateCollision early-returns once its centre
+           matches and its queue is empty, and processPending returns
+           immediately on an empty queue, so the loop costs nothing on
+           the frames — the overwhelming majority — where there is no
+           work to do.
+
+           THE ORDER IS THE PRIORITY, and it is not the order of cost.
+           Collision first: ground he can fall through is a bug, a tile
+           still at its coarse LOD is not. Rock next, for the same
+           reason. Tile geometry last, because updateLOD has already
+           put a coarser geo on the mesh and the frame renders. */
+        const B = STREAM_MS;
+        const spent = () => performance.now() - tS >= B;
+        /* ALWAYS AT LEAST ONE of each, then more only while the clock
+           allows. A budget that can refuse every item is an island
+           that never sharpens and a player who falls through it; the
+           overshoot is now bounded by ONE item of one kind rather than
+           by two colliders plus four rock sectors plus three tile
+           geometries taken together. The counts are the ones that
+           shipped, so the streaming RATE is unchanged on a frame with
+           room and only clipped on a frame without. */
+        terrain.updateCollision(f.x, f.z, 1);
+        if (!spent()) terrain.updateCollision(f.x, f.z, 1);
+        for (let k = 0; k < 4; k++) { terrain.updateRockCollision(f.x, f.z, 1); if (spent()) break; }
+        terrain.updateLOD(ctx.camera);
+        const maxGeo = ctx.quality.name === 'low' ? 1 : 3;
+        for (let k = 0; k < maxGeo; k++) { terrain.processPending(1); if (spent()) break; }
+      }
+      streamMs = performance.now() - tS;
+      slog.push(streamMs); if (slog.length > 512) slog.shift();
       motes?.update(dt, elapsed);
     },
 

@@ -1,5 +1,7 @@
 /* ============================================================
    weather.js — clear / cloudy / rain / storm, and the wet signal.
+   THOSE FOUR AND NO OTHERS. There is no `overcast`; cloudy is the
+   name for it. See WEATHER_NAMES below.
 
    Two rules from the brief shape everything here:
 
@@ -50,6 +52,17 @@ export const WEATHER = {
 };
 
 const KEYS = ['cloud', 'sunMul', 'ambMul', 'fogMul', 'storm', 'rain', 'wet', 'windMul', 'exposureMul'];
+
+/* THE FOUR NAMES, EXPORTED, AND WHY THAT IS WORTH A LINE.
+   tools/_sky-minute.mjs documented its weather axis as "storm |
+   overcast | clear" for its whole life. There is no `overcast` state
+   here, set() returned false for it, and the rig ignored the false
+   and screenshotted a CLEAR sky under an OVERCAST heading — the ninth
+   instrument on this project found reporting something other than
+   what it measured. set() now says so out loud as well as returning
+   false, and the list is exported so a rig can name its axis from the
+   authority rather than from a comment. */
+export const WEATHER_NAMES = Object.keys(WEATHER);
 
 /* ------------------------------------------------------------------
    Rain — instanced view-space streaks.
@@ -195,7 +208,23 @@ export function createWeather(ctx) {
   const state = { ...WEATHER.clear, flash: 0 };
   const target = { ...WEATHER.clear };
   let name = 'clear';
+  let fromName = 'clear';
   let lambda = 4 / 150;               // ~150 s to settle
+
+  /* HOW FAR ALONG THE CHANGE IS — 0 at the set(), 1 once it has landed.
+
+     It is NOT a second integrator. It is damped with the SAME lambda in
+     the SAME update() as every field in KEYS, so it is by construction
+     the curve the cloud count, the fog and the rain amount are already
+     riding, and it cannot report a transition the sky is not making.
+
+     It exists because a second subsystem — the soundscape — has to
+     arrive and leave WITH the sky rather than switch on the event, and
+     the alternative was audio.js damping a private copy over its own
+     idea of the fade. Two integrators that agree today are two that can
+     disagree after one edit. One scalar, read by everyone, cannot.
+     Published as ctx.sky.weatherProgress. */
+  let progress = 1;
 
   /* wetness is deliberately NOT the preset's `wet` — it has its own,
      much slower integrator so puddles outlive the shower */
@@ -211,27 +240,55 @@ export function createWeather(ctx) {
     state,
     uniforms: { uWetness },
     get name() { return name; },
+    /* the state we are travelling FROM. Together with `name` and
+       `progress` this is the whole transition, which is what a listener
+       needs to blend anything of its own across it. */
+    get from() { return fromName; },
+    get progress() { return progress; },
     get wetness() { return wetness; },
 
     /* fade is in SECONDS. 0 snaps (debug only). */
     set(nameIn, fade = 150) {
       const preset = WEATHER[nameIn];
-      if (!preset) return false;
+      if (!preset) {
+        console.warn(`[weather] unknown state "${nameIn}" — weather.js authors ` +
+          `${WEATHER_NAMES.join(', ')}. NOTHING CHANGED; the sky is still "${name}". ` +
+          `A caller that ignores this false is measuring the previous state.`);
+        return false;
+      }
+      fromName = name;
       name = nameIn;
       for (const k of KEYS) target[k] = preset[k];
       if (fade <= 0) {
         for (const k of KEYS) state[k] = preset[k];
         wetness = preset.wet;
         lambda = 4 / 150;
+        progress = 1;
       } else {
         lambda = 4 / Math.max(0.5, fade);
+        progress = 0;
       }
-      ctx.bus.emit('weather', { name, fade, target: { ...target } });
+      /* `from` and `progress` ride along so a listener that arrives
+         between two frames can blend the transition rather than snap to
+         the end of it. Note the CHANNEL: this is `weather`, in the
+         world's own namespace — there is no `audio:weather` emitter
+         anywhere and there never was, which is how rain shipped silent.
+         See the bus wiring in src/audio/audio.js. */
+      ctx.bus.emit('weather', {
+        name, from: fromName, fade, progress, target: { ...target },
+      });
       return true;
     },
 
     update(dt, colors) {
       for (const k of KEYS) state[k] = damp(state[k], target[k], lambda, dt);
+      /* same lambda, same frame, same law — see the note on `progress`.
+         damp() is asymptotic, so it is snapped at the top or a listener
+         reading `progress === 1` would wait forever. */
+      if (progress < 1) {
+        const p = damp(progress, 1, lambda, dt);
+        progress = p > 0.9995 ? 1 : p;
+      }
 
       /* --- wetness: soaks in fast-ish, dries slowly --- */
       const wetTarget = clamp(state.rain * 1.4, 0, 1);

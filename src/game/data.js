@@ -812,7 +812,25 @@ export const LOCATIONS = [
     acts: ['market:mineral'] },
 
   /* --- Waterfront --- */
-  { id: 'docks', n: 'Waterfront Docks', z: 'waterfront', x: 406, y: 576, ico: '📦', see: { rep: 17 }, kit: 'water', dy: -1.4,
+  /* `port: true` — THE ONLY WORKING CARGO PORT ON THE ISLAND, and so
+     the only place a shipping container belongs.
+
+     THE FLAG EXISTS BECAUSE A KIT IS NOT A FACT ABOUT A PLACE. The
+     rule that keeps containers at the port was keyed on the kit that
+     BUILT the place — "within 40 m of something whose form is 'pier'"
+     — and both waterfront locations are built from the pier kit
+     ('water' -> form 'pier'). So the rule was satisfied while ten
+     steel boxes stood stacked on the grass hillside outside the
+     Harbour Residences, 217 m from the sea: balconies, salt air, and
+     a container yard. The user's complaint ("those should only be by
+     the port district") was still true of every one of them.
+
+     What a place IS belongs here, beside its name and its opening
+     hours. src/world/city.js reads this to site the yard and
+     tools/cliptest.mjs reads it to assert the yard is the only place
+     a container is ever drawn. Nothing else on the island carries it;
+     a second port would get a yard by adding one word. */
+  { id: 'docks', n: 'Waterfront Docks', z: 'waterfront', x: 406, y: 576, ico: '📦', see: { rep: 17 }, kit: 'water', dy: -1.4, port: true,
     hours: [5, 21], desc: 'Containers in, containers out, back permanently sore.',
     acts: ['job:warehouse', 'job:nightsort'] },
   { id: 'harbourhomes', n: 'Harbour Residences', z: 'waterfront', x: 538, y: 512, ico: '🌊', see: { rep: 20 }, kit: 'water', dy: 2.2,
@@ -844,7 +862,10 @@ export const LOCATIONS = [
     acts: ['market:exchange'] },
   { id: 'treasury', n: 'City Treasury', z: 'goldenheights', x: 852, y: 96, ico: '🏦', see: { skill: 'fundamentals' }, kit: 'gold', dy: 1.8,
     hours: [9, 15], desc: 'Bonds. Safe, slow, and quietly the backbone of everything.',
-    acts: ['market:treasury'] },
+    /* the 'bike' act is the ride forecourt, and this counter sells
+       exactly one machine: the survey balloon in the shed round the
+       back. See RIDES.balloon. */
+    acts: ['market:treasury', 'bike'] },
   { id: 'vance', n: 'Vance & Partners', z: 'goldenheights', x: 800, y: 184, ico: '💼', see: { rep: 62 }, kit: 'interior', tint: '#3A4050', dy: -2.5,
     hours: [8, 19], desc: 'The kind of money that never has to raise its voice.',
     acts: ['vance'] },
@@ -1301,6 +1322,89 @@ export const RIDES = Object.freeze({
     desc: 'The bike Dispatch retired because nobody could be trusted with it. Three times the bicycle, across the whole island, before the coffee goes cold.',
     line: 'It starts on the first press. Somewhere in Rusty Row, a window rattles in sympathy.',
   }),
+  /* ============================================================
+     THE ASSESSOR — the City Treasury's survey balloon, and the last
+     rung. It is the only ride that is not a way of getting to work.
+
+     WHOSE IS IT. The Treasury valued the island from the air once a
+     year — you cannot rate land you have not seen the shape of — and
+     the balloon did that job until somebody sold them aerial
+     photographs instead. It has been in the shed behind the Treasury
+     ever since. Selling it to the one person in Bull Bear City who is
+     turning the whole island into tokens is the joke and the point:
+     he is doing the Assessor's job, and now he can do it from the
+     Assessor's altitude.
+
+     THE PRICE IS $24,000, AND HERE IS THE ARITHMETIC.
+
+     The motorcycle's precedent is "measure a delivered client order
+     at the reputation you buy it at, and count the orders." Run
+     clients.makeOrder() over all 24 clients across 60 seeds with the
+     first-order crumb latched off, and net = budget + fee - what it
+     costs to source:
+
+       rep 50, trust 3   mean $395   median $301    (the motorcycle's gate)
+       rep 75, trust 5   mean $530   median $377
+       rep 80, trust 6   mean $558   median $393    (this one's)
+
+     and the OTHER late-game denominator, which the motorcycle did not
+     have to think about because nobody owns a portfolio in Act 4 —
+     economy.overnightIncome() with the city mostly tokenized:
+
+       50% of the 69 assets   $360/day
+       80%                    $479/day
+       100%                   $569/day
+
+     So $24,000 is 43 mean orders, or 61 median ones, or fifty days of
+     what the city pays him for having finished it. Against the ladder
+     it is 7.3x the motorcycle and 133x the bicycle, and it sits
+     between the Professional Office ($22,000) and the Waterfront
+     Apartment ($40,000) — the most expensive thing in Bull Bear City
+     that is not somewhere you live or work. The Tower ($150,000) and
+     the Penthouse ($220,000) stay where they are, as the two things
+     that are still ahead of you when this is behind you.
+
+     THE GATE IS NOT ONLY MONEY, and that is the difference between
+     "expensive" and "late". `assets: 40` is new: forty of the
+     sixty-nine assets tokenized, which is the same 58% the HUD is
+     already showing as "% CITY". A player who has banked $24,000
+     early — and the market makes that possible — still cannot buy it,
+     because the Treasury does not hand its survey balloon to somebody
+     who has not surveyed anything. Reputation 75 is the second gate
+     and it lands with the Professional Office.
+
+     SPEED 2.2 IS DELIBERATELY BELOW THE MOTORCYCLE'S 3. Buying the
+     balloon must not take the Thunderhead away from you, and the
+     table is what would do it: takeRide() auto-equips anything faster
+     than what you have, and bestRide() reads the head of RIDE_ORDER.
+     At 2.2 the motorcycle stays your best machine, the balloon is a
+     thing you choose, and the fare board still tells the truth — it
+     IS slower door to door, because 9 m/s of drift is a shade over a
+     bicycle sprint. What it buys instead is `effort: 0.04`: a balloon
+     costs almost nothing to ride, because you are not the one doing
+     any of the work. Time for energy, which is the exact opposite
+     trade to every other rung on this ladder.
+     ============================================================ */
+  balloon: Object.freeze({
+    id: 'balloon',
+    name: 'The Assessor', n: 'The Assessor', short: 'Balloon',
+    ico: '🎈',
+    speed: 2.2,
+    effort: 0.04,
+    unlock: Object.freeze({ kind: 'buy', price: 24000, rep: 75, assets: 40, locs: Object.freeze(['treasury']) }),
+    price: 24000,
+    questId: null,
+    /* THE ONE ROW WHOSE SPEED IS NOT ITS PITCH. ui/menus.js builds a
+       ride's headline from `speed` — "x2.2 the bicycle, 55% less time
+       on the road" — and every word of that is wrong here: a balloon
+       is not on the road, does not go where the road goes, and the
+       ratio is the least interesting thing about it. `pitch` is an
+       optional override the row uses instead, so a fifth machine that
+       is a normal machine still needs no UI code at all. */
+    pitch: 'It goes over the top of everything · slower than the motorcycle and it does not care',
+    desc: 'The Treasury’s survey balloon, retired the year somebody sold them photographs. Slower than the motorcycle and it does not care: it goes over the top of everything, and you can see the whole island at once.',
+    line: 'The shed doors fold back and it is enormous, and orange, and folded like a sleeping animal. The clerk hands you a logbook with forty years of the island’s shape in it.',
+  }),
 });
 export const RIDE_LIST = Object.freeze(Object.values(RIDES));
 export const RIDE_BY_ID = RIDES;
@@ -1364,7 +1468,26 @@ export const RACE = Object.freeze({
   mins: 25,                             // in-game minutes an attempt costs
   energy: 9,
   qualifies: Object.freeze(['scooter', 'motorcycle']),
-  street: Object.freeze({ foot: 5.9, bike: 8.8, scooter: 13.2, motorcycle: 26.4 }),
+  /* THE BALLOON IS IN THIS TABLE AND NOT IN `qualifies`, and both
+     halves are deliberate. It is not in `qualifies` because the
+     Mayor's Dash is five corners of Main Street and a balloon cannot
+     take a corner — but leaving it OUT of `street` would have been a
+     bug rather than a rule: game.js reads `RACE.street[rideId] ||
+     RACE.street.foot`, so an unlisted machine silently races at
+     walking pace and the Mayor's pace is then set from a lie.
+
+     9.0 IS THE DELIVERED DOWNWIND CEILING — the stick's own reach PLUS
+     the air it can ride: character/balloon.js FLIGHT.reach (6.20) plus
+     FLIGHT.windNom * FLIGHT.windGain (0.316 * 9.80 = 3.10). This used
+     to read "the balloon's real drift ceiling (FLIGHT.reach)", and
+     while the stick was the whole of the machine's speed that was the
+     same sentence. It is not any more: the air was re-split against the
+     stick, reach alone is 6.20, and quoting reach here would set a
+     balloon racer's pace at two thirds of what one actually makes over
+     the ground. The number did not change; the reason for it did.
+     tools/test-balloon.mjs asserts this against the flight model's own
+     integrated DOWNWIND rather than against either constant. */
+  street: Object.freeze({ foot: 5.9, bike: 8.8, scooter: 13.2, motorcycle: 26.4, balloon: 9.0 }),
   efficiency: 0.72,
   slack: 1.18,
   edge: 0.86,
@@ -1839,7 +1962,7 @@ export const HAPPY_ENDING = Object.freeze({
 export const TIPS = {
   map:      { t: 'Getting around', d: 'Only two things in this city carry you: the Metro and a Yoober. Pay, and you are there. Everything else — your feet, and whatever you have on wheels — points you at the place and leaves the going to you. Walking is free and always available, and it costs you the morning.' },
   bike:     { t: 'Buy a bicycle',  d: 'A second-hand bike is $180 at Dispatch or Vic’s. It does not skip the journey — nothing free does — but it makes it less than half as long and a third as tiring, forever, for nothing. It is the best money you will spend this week.' },
-  rides:    { t: 'Something faster', d: 'The bicycle is the first of three. A scooter is half again as quick and cannot be bought at any price — somebody has to give it to you. A motorcycle is three times the bicycle and costs about ten client orders. Only one of them comes with you at a time.' },
+  rides:    { t: 'Something faster', d: 'The bicycle is the first of four. A scooter is half again as quick and cannot be bought at any price — somebody has to give it to you. A motorcycle is three times the bicycle and costs about ten client orders. The Treasury’s balloon is slower than all of that and goes over the top of it. Only one of them comes with you at a time.' },
   ticker:   { t: 'Tickers',        d: 'Every asset in the city has a symbol — GOLD, WHEAT, B5Y, TEAM. Orders are written in them, and you can search by symbol or by name.' },
   office:   { t: 'Your office',    d: 'This is your desk. Clients turn up here through the day with a job, a budget and a deadline. Take the ones you can actually finish.' },
   order:    { t: 'Filling an order', d: 'You have an order. Travel to wherever that asset is sold, buy it, then come back here and deliver.' },

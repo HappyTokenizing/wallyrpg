@@ -1339,11 +1339,20 @@ export function createMenus(ctx, ui) {
      against the bicycle, and it says exactly how it is obtained: a
      price and a shop, or the quest that hands it over.
      ============================================================ */
-  const RIDE_ICON = { bike: 'bike', scooter: 'bike', motorcycle: 'bike' };
+  const RIDE_ICON = { bike: 'bike', scooter: 'bike', motorcycle: 'bike', balloon: 'bike' };
 
   /* "×1.5 · 50% faster than the bicycle" — the one number that makes
-     the whole table legible, said in both registers. */
+     the whole table legible, said in both registers.
+
+     UNLESS THE ROW SAYS OTHERWISE. data.js may carry a `pitch`, and
+     exactly one row does: a balloon's speed ratio is the least
+     interesting thing about it and "less time on the road" is three
+     words of which two are false — it is not on the road and it does
+     not go where the road goes. An override in the content table
+     rather than an `if (id === 'balloon')` here, so the fifth machine
+     costs the UI nothing. */
   function speedLine(r) {
+    if (r.pitch) return r.pitch;
     if (r.speed === 1) return 'The baseline · half the time of walking';
     const pct = Math.round((1 - 1 / r.speed) * 100);
     return '×' + r.speed + ' the bicycle · ' + pct + '% less time on the road';
@@ -1361,7 +1370,30 @@ export function createMenus(ctx, ui) {
     const shops = (r.locs || []).map((id) => game.data.locationById[id]).filter(Boolean);
     const known = shops.filter((l) => game.known(l.id));
     const where = (known.length ? known : shops).map((l) => l.n).join(' or ');
-    return (r.rep ? 'Reputation ' + r.rep + ' · ' : '') + (where ? 'sold at ' + where : 'sold in the city');
+    const bits = [];
+    if (r.rep) bits.push('Reputation ' + r.rep);
+    /* THE PROGRESS GATE, WITH THE PROGRESS IN IT. A locked row that
+       says only "40 assets" is a wall; one that says "40 of 69 assets
+       tokenized — you are at 23" is a goal with a distance on it,
+       which is what every other locked row in this game manages. */
+    if (r.assets) bits.push(r.assets + ' of ' + game.data.config.totalAssets
+      + ' assets tokenized · you are at ' + (r.assetsHave || 0));
+    if (where) bits.push('sold at ' + where);
+    return bits.length ? bits.join(' · ') : 'sold in the city';
+  }
+
+  /* WHERE HE LEFT IT. A machine you own is either with you or standing
+     somewhere, and until the balloon there was no reason to say which:
+     you could always assume a bicycle was under you. A balloon is ten
+     metres of it and the whole point is that it is SOMEWHERE, so the
+     row names the nearest place to wherever it is moored. */
+  function parkedLine(game, r) {
+    if (!r.parked) return null;
+    let n = null;
+    try { n = game.nearest(r.parked.x, r.parked.z); } catch (e) { n = null; }
+    const at = n && n.loc ? n.loc : null;
+    if (!at) return 'Moored out in the country';
+    return 'Moored ' + (n.dist > 40 ? Math.round(n.dist) + ' m from ' : 'at ') + at.n;
   }
 
   /* ONE RIDE, ONE ROW. `opts.onChange` is called after anything that
@@ -1375,10 +1407,11 @@ export function createMenus(ctx, ui) {
       /* No status word AND a button that says the same thing: the
          button is the status, and the row needs the width for the
          speed line more than it needs to say "Riding" twice. */
+      const parkedAt = parkedLine(game, r);
       const row = card({
         glyph: r.ico,
         t: r.n,
-        d: (on ? 'With you · ' : 'In the shed · ') + speedLine(r),
+        d: (on ? 'With you · ' : (parkedAt ? parkedAt + ' · ' : 'In the shed · ')) + speedLine(r),
       });
       row.classList.toggle('on', on);
       row.append(h('button.w-btn.sm.' + (on ? 'ghost' : 'prim') + '.w-pe', {

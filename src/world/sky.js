@@ -541,6 +541,22 @@ ${DOME_GLSL}
     get hour() { return hour; },
     get sunElevation() { return lighting.tod.sunEl; },
     get weatherName() { return weather.name; },
+
+    /* THE WEATHER, AS A NUMBER RATHER THAN A NAME.
+
+       `weatherName` is the state that was ASKED for; these are what the
+       sky is currently DOING, damped over the fade, and they are what
+       anything that has to change with the weather should read. The
+       soundscape rides `weatherProgress` so a storm arrives and leaves
+       over the same 150 s the clouds take instead of switching on the
+       event — see the WEATHER LAYER in src/audio/audio.js. Exposed
+       here for the same reason `uWetness` is: one damped scalar, read
+       by everyone, cannot disagree with itself. */
+    get weatherFrom() { return weather.from; },
+    get weatherProgress() { return weather.progress; },
+    get rainfall() { return weather.state.rain; },
+    get storminess() { return weather.state.storm; },
+
     get wetness() { return weather.wetness; },
     get cloudCover() { return wx.cloud; },
     get sunOcclusion() { return clouds.occlusion; },

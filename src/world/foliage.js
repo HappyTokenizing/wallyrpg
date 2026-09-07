@@ -543,9 +543,33 @@ export async function init(ctx) {
      frame on its own. One constant, used in both places. */
   const BAND_HYST = 4;
 
+  /* ------------------------------------------------------------
+     THE STREAM INSTRUMENT. Not a counter of chunks — a ring of the
+     MILLISECONDS each layer build actually took, keyed by layer name,
+     plus the per-frame tail cost. "Did amortising work" is a question
+     about a distribution's TAIL, and chunks-per-second cannot answer
+     it. Reads through ctx.foliage.streamStats().
+     ------------------------------------------------------------ */
+  const LOGN = 512;
+  const slog = [];                    // per-frame cost of the build tail
+  const llog = new Map();             // layer name -> per-build costs
+  function logLayer(name, ms) {
+    let a = llog.get(name); if (!a) llog.set(name, a = []);
+    a.push(ms); if (a.length > LOGN) a.shift();
+  }
+  function logFrame(ms) { slog.push(ms); if (slog.length > LOGN) slog.shift(); }
+  const qOf = (a, p) => { if (!a.length) return 0; const v = a.slice().sort((x, y) => x - y); return +v[Math.min(v.length - 1, Math.max(0, Math.ceil(v.length * p) - 1))].toFixed(3); };
+
   function buildLayer(c, L, slot) {
+    const _t = performance.now();
     const band = L.bandFor ? L.bandFor(layerDist(c, L) - BAND_HYST) : 0;
     const m = L.build(c.i, c.j, band);
+    /* Keyed by BAND, not just by layer. grass.js builds five density
+       bands off one call and they do not cost the same; a single
+       "grass p50" is an average over a mixture and hides which band
+       is the expensive one. That is the number the handoff to grass.js
+       needs. */
+    logLayer((L.name || 'layer') + '#' + band, performance.now() - _t);
     if (!m) return null;
     if (m.userData.band == null) m.userData.band = band;
     if (m.userData.built == null) m.userData.built = m.userData.total ?? m.count;
@@ -563,20 +587,115 @@ export async function init(ctx) {
     return m;
   }
 
+  /* ============================================================
+     THE UNIT OF STREAMING IS A LAYER, NOT A CHUNK.
+
+     THE BUG. buildChunk() built EVERY in-range layer of a chunk in one
+     call — five of them near the camera (grass, detail, bush, rock,
+     reed) — and the tail below exempted the first chunk of each frame
+     from the budget outright ("always allow the first one: a budget
+     that can refuse every chunk is a world that never grows any
+     grass"). Those two together mean the millisecond budget is
+     advisory: the true worst case is a whole five-layer chunk,
+     whatever it costs, on top of a budget already spent. That is the
+     1.1-3.3 ms excess a profile found on slow frames against a 0.1 ms
+     median, and it is why the QUIET districts have the worse tail —
+     Green Edge and Iron Hills are where the grass and scatter ranges
+     are full of ground to build, while the busy street is already
+     paved and its chunks are mostly empty.
+
+     THE FIX, and it keeps the rule that motivated the exemption. A
+     chunk is REGISTERED immediately (so rescanQueue never re-queues
+     it) with its in-range layers in `todo`, and the tail builds ONE
+     LAYER at a time, finishing half-built chunks before starting new
+     ground. The "always allow one" exemption survives, but it is now
+     one LAYER rather than five, so the amount by which a frame can
+     overshoot its budget is bounded by the single most expensive layer
+     instead of by the sum of them.
+
+     AND IT DID NOT WORK. MEASURED, so that nobody spends this week
+     again. tools/_fa-stream2.mjs, matched pairs with every chunk
+     dropped before each trial so both rules stream the same ground
+     from bare (390x844, tier high, limiter off, M1 Max / ANGLE Metal,
+     headless Chrome, load average 12-24), ONE layer build, by band:
+
+         grass#0  n 42  p50 4.7  p95 7.3  worst 14.9 ms
+         grass#1  n  8  p50 4.3
+         grass#2  n 17  p50 3.8
+         grass#3  n 17  p50 2.8
+         grass#4  n 11  p50 2.4  p95 3.3   <- the COARSEST band
+         detail#0 n 30  p50 0.2   bush#0 0.0   rock#0 0.0   reed#0 0.1
+
+     Two things follow and both are fatal to scheduling this here.
+     ONE: grass is 4.7 ms of a ~5.0 ms chunk, so splitting a chunk into
+     its five layers moves the atomic unit from 5.0 to 4.7 — 6 %, for a
+     chunk that is four times over the 1.2 ms budget either way.
+     TWO: the coarsest band, at a fifth of the density, still costs
+     2.4 ms. Half of band 0 for a fifth of the blades means the bill is
+     FIXED PER CHUNK, not per blade — so building coarse first and
+     letting the upgrade path promote it cannot work either, and
+     neither can any other reordering of whole builds.
+
+     Measured end to end, 'layer' was WORSE: the deferred cheap layers
+     put small work on more frames (Market Square foliage-tail p95
+     0.1 -> 4.8) without moving the spike (worst 9.5 -> 13.7). So
+     'chunk' — the rule that shipped — is what ships.
+
+     THE FIX IS IN grass.js, WHICH THIS AGENT DOES NOT OWN: build()
+     has to become resumable across frames, or its fixed per-chunk cost
+     has to be found. Everything above is the evidence for that ask.
+
+     THE REVERT SWITCH stays because it is what produced the numbers.
+     'chunk' is the shipped rule, 'layer' the one that lost; both live
+     here and WALLY.debug.foliageStreamMode() drives them on ONE page
+     load, so the next agent can re-run the comparison instead of
+     trusting this comment.
+     ============================================================ */
+  let streamMode = 'chunk';
+  const building = [];              // chunks with layers still in `todo`
+
   function buildChunk(i, j, dist) {
     const cx = (i + 0.5) * CHUNK, cz = (j + 0.5) * CHUNK;
-    const c = { i, j, cx, cz, cy: W.heightAt(cx, cz), meshes: [], layers: [], partial: false, dcam: dist };
+    const c = { i, j, cx, cz, cy: W.heightAt(cx, cz), meshes: [], layers: [], partial: false, dcam: dist, todo: null };
     ctx.camera.getWorldPosition(_cam);
-    for (const L of layers) {
-      /* A layer only exists inside its own range. Building the flower
-         and litter layer out to the grass radius made 88 chunks of
-         petals for the 12 that could ever be seen. */
-      if (dist > L.range) { c.partial = true; continue; }
-      buildLayer(c, L, -1);
+    /* A layer only exists inside its own range. Building the flower
+       and litter layer out to the grass radius made 88 chunks of
+       petals for the 12 that could ever be seen. */
+    if (streamMode === 'chunk') {
+      for (const L of layers) {
+        if (dist > L.range) { c.partial = true; continue; }
+        buildLayer(c, L, -1);
+      }
+    } else {
+      const todo = [];
+      for (const L of layers) {
+        if (dist > L.range) { c.partial = true; continue; }
+        todo.push(L);
+      }
+      if (todo.length) { c.todo = todo; building.push(c); }
     }
     chunks.set(ckey(i, j), c);
     queueDirty = true;
     return c;
+  }
+
+  /* Build ONE layer of the oldest unfinished chunk. Returns true if it
+     did work. Identity, not just the key, is compared: a chunk can be
+     evicted and a NEW record built for the same (i,j) while a stale
+     one is still sitting in `building`, and that stale record's meshes
+     would otherwise be added to a scene graph nothing will ever
+     dispose them from. */
+  function advanceBuild() {
+    while (building.length) {
+      const c = building[0];
+      if (!c.todo || !c.todo.length || chunks.get(ckey(c.i, c.j)) !== c) {
+        building.shift(); c.todo = null; continue;
+      }
+      buildLayer(c, c.todo.shift(), -1);
+      if (!c.todo.length) { c.todo = null; building.shift(); }
+      return true;
+    }
+    return false;
   }
 
   function disposeChunk(c) {
@@ -678,16 +797,40 @@ export async function init(ctx) {
     const now = performance.now();
     const budget = now < warmUntil ? WARM_MS : BUILD_MS;
     if (queueDirty) rescanQueue(fi, fj);
+    const tBuild = performance.now();
 
     let made = 0;
-    while (qn > 0) {
-      /* Always allow the first one: a budget that can refuse every
-         chunk is a world that never grows any grass. */
-      if (made > 0 && performance.now() - t0 > budget) break;
-      buildChunk(qi[0], qj[0], qd[0]);
-      for (let k = 1; k < qn; k++) { qi[k - 1] = qi[k]; qj[k - 1] = qj[k]; qd[k - 1] = qd[k]; }
-      qn--;
-      made++;
+    if (streamMode === 'chunk') {
+      while (qn > 0) {
+        /* Always allow the first one: a budget that can refuse every
+           chunk is a world that never grows any grass. */
+        if (made > 0 && performance.now() - t0 > budget) break;
+        buildChunk(qi[0], qj[0], qd[0]);
+        for (let k = 1; k < qn; k++) { qi[k - 1] = qi[k]; qj[k - 1] = qj[k]; qd[k - 1] = qd[k]; }
+        qn--;
+        made++;
+      }
+    } else {
+      /* Finish what is half-built before starting more ground: a chunk
+         with grass but no bushes reads as a field, a chunk with
+         nothing reads as a bug, and leaving several chunks each
+         missing a different layer is how you get both. */
+      while (building.length) {
+        if (made > 0 && performance.now() - t0 > budget) break;
+        if (!advanceBuild()) break;
+        made++;
+      }
+      while (qn > 0) {
+        if (made > 0 && performance.now() - t0 > budget) break;
+        buildChunk(qi[0], qj[0], qd[0]);
+        for (let k = 1; k < qn; k++) { qi[k - 1] = qi[k]; qj[k - 1] = qj[k]; qd[k - 1] = qd[k]; }
+        qn--;
+        /* Its first layer NOW, so a registered chunk is never a bare
+           one for even a single frame — this is the near-range layer,
+           `layers` being ordered near-first. */
+        advanceBuild();
+        made++;
+      }
     }
     /* Upgrades are strictly lower priority than new ground — bare
        terrain reads as a bug, a slightly thin chunk does not. */
@@ -695,6 +838,7 @@ export async function init(ctx) {
       buildLayer(upI[k], upL[k], upJ[k]);
     }
     upn = 0;
+    logFrame(performance.now() - tBuild);
   }
 
   /* ------------------------------------------------------------
@@ -752,7 +896,16 @@ export async function init(ctx) {
     ctx.camera.getWorldPosition(_cam);
     const t0 = performance.now();
     for (const c of want) {
-      buildChunk(c.i, c.j, c.d);
+      const ch = buildChunk(c.i, c.j, c.d);
+      /* THIS PATH MUST STAY ATOMIC. streamMode 'layer' defers a
+         chunk's layers to the frame tail, which is exactly right in
+         update() and exactly wrong here: primeAt exists to have the
+         world already built before the first gameplay frame, and a
+         hundred and twenty chunks registered with their layers still
+         in `todo` would hand the streamer the whole job back one
+         layer at a time. Finish each one where it is asked for. */
+      while (ch.todo && ch.todo.length) buildLayer(ch, ch.todo.shift(), -1);
+      if (ch.todo) { ch.todo = null; const k = building.indexOf(ch); if (k >= 0) building.splice(k, 1); }
       if (performance.now() - t0 > ms) break;
     }
     warmUntil = performance.now() + WARM_FOR;
@@ -829,6 +982,24 @@ export async function init(ctx) {
   };
 
   dbg.foliageStats = () => api.stats();
+  /* The build-tail distribution, and the switch between the shipped
+     chunk-atomic rule and the layer-at-a-time one. Driven by
+     tools/_fa-stream.mjs on one page load. */
+  dbg.foliageStream = () => api.streamStats();
+  dbg.foliageStreamMode = (m) => api.streamMode(m);
+  /* DROP EVERY CHUNK, so the next trial streams the SAME ground from
+     bare rather than finding the previous trial's work already done.
+     Without this an A/B walks identical ground twice and the second
+     run builds nothing at all — which reads as a fix and is an
+     artifact of the order. Debug only; the streamer refills it. */
+  dbg.foliageDrop = () => {
+    const n = chunks.size;
+    for (const c of [...chunks.values()]) disposeChunk(c);
+    building.length = 0;
+    slog.length = 0; llog.clear();
+    warmUntil = 0;              // no warm budget: measure the shipping one
+    return { dropped: n };
+  };
   dbg.foliageChunks = () => [...chunks.values()]
     .map((c) => [Math.round(c.dcam ?? -1), c.meshes[0]?.count | 0, c.meshes[0]?.userData.total | 0])
     .sort((a, b) => a[0] - b[0]);
@@ -879,6 +1050,29 @@ export async function init(ctx) {
 
     /** Ask the streamer to fill in around a point right now. */
     prime(x, z) { primeAt(x, z); },
+
+    /* THE TAIL, NOT THE MEAN. `frame` is the distribution of what the
+       build tail cost per frame; `layers` is the distribution of a
+       single layer build, per layer. Amortising moves the first and
+       leaves the second alone, which is the whole point and is
+       invisible to any average of the two. */
+    streamStats() {
+      const out = { mode: streamMode, chunks: chunks.size, unfinished: building.length,
+        budgetMs: BUILD_MS, frames: slog.length,
+        frame: { p50: qOf(slog, 0.5), p95: qOf(slog, 0.95), p99: qOf(slog, 0.99), worst: qOf(slog, 1) },
+        layers: {} };
+      for (const [k, a] of llog) out.layers[k] = { n: a.length, p50: qOf(a, 0.5), p95: qOf(a, 0.95), worst: qOf(a, 1) };
+      return out;
+    },
+    /** THE REVERT SWITCH — 'chunk' is the shipped rule, 'layer' the new
+        one. Clears the instrument so the two are never mixed. */
+    streamMode(m) {
+      if (m === 'chunk' || m === 'layer') {
+        if (m !== streamMode) { slog.length = 0; llog.clear(); }
+        streamMode = m;
+      }
+      return streamMode;
+    },
 
     stats() {
       let inst = 0, tri = 0, meshes = 0;

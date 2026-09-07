@@ -997,6 +997,18 @@ export function createPostFX(ctx, { composer }) {
       aoBlurMat.uniforms.uDir.value.set(0, 1.4 / (H * aoScale));
       composer.draw(aoBlurMat, T.ao);
 
+      /* FOLDING THIS INTO THE COMPOSITE SAVES NOTHING — MEASURED, so
+         it is still a pass. `scene *= tint(ao)` is a full-resolution
+         RGBA16F read and write and looked like free money; the
+         composite already samples this pixel and could do the multiply
+         itself. Built it, A/B'd it in one boot at the Bent Spoon
+         doorstep, 1600x900, high, GPU saturated (4 renders per rAF, so
+         the clock cannot drop out from under the reading), 4 rounds:
+         folded 9.99 ms, separate pass 9.89 ms — the fold is 0.10 ms
+         SLOWER than the pass it deletes, inside a run-to-run spread of
+         about 0.15. One dependent fetch and a branch in a full-res
+         pass costs what a tile-resident full-res copy costs on this
+         GPU. Reverted. */
       aoApplyMat.uniforms.tSrc.value = src.texture;
       aoApplyMat.uniforms.tAO.value = T.ao.texture;
       composer.draw(aoApplyMat, T.a);

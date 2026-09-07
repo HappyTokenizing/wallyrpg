@@ -31,7 +31,10 @@ import { h, icon, money, pad2, rgba, C, meterColour } from './style.js';
 /* NO KEY NAME IS WRITTEN IN THIS FILE. Every one comes from the action
    table in touch.js, which knows whether the player is holding a
    keyboard or a thumb — see the header there. */
-import { actionLabel, actionPhrase, paintChip, onInputMode, touchUI } from './touch.js';
+import {
+  actionLabel, actionPhrase, paintChip, onInputMode, touchUI,
+  isKeyName, setReach,
+} from './touch.js';
 
 /* The bottom-right row is the reminder tier and stays at four: the buy
    sheet's shortcut lives on the TICKER pill instead, which is a better
@@ -738,16 +741,129 @@ export function createHud(ctx, ui) {
   const prompts = new Map();          // id -> {el, pos, text, key, sub, action, ttl}
   let promptSeq = 0;
 
+  /* ============================================================
+     THE ANCHOR SLIDES. IT IS NOT A CONSTANT THAT WAS NUDGED.
+
+     The door prompt is anchored over the LINTEL — out past the facade
+     and, on a nine-metre building, five metres up. That is a good
+     place to read it FROM TEN METRES and an impossible one to read it
+     from the doorstep: walk in and the elevation from the boom to that
+     point climbs through 40, 60, 73 degrees against a 25 degree half
+     FOV, the point leaves the top of the frustum, and the label goes
+     dark at exactly the moment it is describing the thing under your
+     hand. Measured, walking in on the apartment with the boom behind
+     him: painted at 6 m, dark at 4 m, and dark the rest of the way in.
+     With the boom on its own auto-solved portrait azimuth — which sits
+     off his FRONT quarter, so the lens is between him and the door —
+     the lintel is behind the camera and the label was never painted at
+     any range at all.
+
+     Raising or lowering the constant cannot fix both ends: the height
+     that survives the doorstep is too low to sit over the door from
+     across the square, and no height whatsoever survives a lens that
+     is standing between you and the wall.
+
+     So the anchor is not a point any more, it is a SEGMENT: from the
+     lintel (A, where it belongs when you can see it) to a point just
+     above Wally's crown (B, which the follow rig frames by contract).
+     Every frame we take the SMALLEST t along A->B whose projection
+     puts the whole chip inside the viewport. Far away that is t = 0
+     and nothing about the old framing changes — the label still hangs
+     over its own door and cannot drift onto a neighbour's, because
+     every point it is allowed to occupy lies on the line between the
+     player and the door he is standing at. Close in, t rises and the
+     label slides down the doorway toward his head. Behind him, in
+     front of him, or anywhere in between, B is on screen, so some t
+     always is.
+
+     Solved in CLIP space, exactly and in constant time. Projection is
+     affine in homogeneous coordinates, so clip(lerp(A,B,t)) is
+     lerp(clipA, clipB, t); each edge of the box is then one linear
+     inequality in t, each feasible set a ray, and the intersection of
+     five rays is an interval. No sampling, no search that can step
+     over the answer.
+     ============================================================ */
+  const CLIP_W_MIN = 0.35;      // metres in front of the lens; never nearer
+  const _mvp = new ctx.THREE.Matrix4();
+  const _cA = new ctx.THREE.Vector4();
+  const _cB = new ctx.THREE.Vector4();
+  const _fall = new ctx.THREE.Vector3();
+  /* the feasible interval, accumulated by need() */
+  const _lim = { lo: 0, hi: 1, ok: true };
+  function need(fa, fb) {
+    const d = fb - fa;
+    if (Math.abs(d) < 1e-9) { if (fa < -1e-9) _lim.ok = false; return; }
+    const t = -fa / d;
+    if (d > 0) { if (t > _lim.lo) _lim.lo = t; }   // rising: feasible above t
+    else if (t < _lim.hi) _lim.hi = t;             // falling: feasible below t
+  }
+
+  /* THE REVERT SWITCH. 'slide' ships. 'lintel' is the behaviour this
+     block replaced — project the bare anchor, hide it the moment it
+     leaves a box sixty pixels wider than the screen — so the walk that
+     proves the fix can be run again against the defect on the same
+     page load. tools/touchtest.mjs drives it; nothing ships through it. */
+  let anchorMode = 'slide';
+
+  /* Just above his crown, and stable: position + height, not the head
+     bone, which bobs with the walk cycle and would shake the label. */
+  function playerAnchor(out) {
+    const w = ctx.wally;
+    const p = w && w.position;
+    if (!p || !Number.isFinite(p.x + p.y + p.z)) return null;
+    return out.set(p.x, p.y + (w.height || 1.7) + 0.30, p.z);
+  }
+
+  /* The chip's own size, so "in view" means the WHOLE CHIP is on
+     screen rather than its anchor point being nominally inside a box
+     that is wider than the screen. Measured when the text changes and
+     on resize — never per frame, which would be a forced layout every
+     frame for every prompt. */
+  function measurePrompt(p) {
+    p.ew = p.el.offsetWidth || 150;
+    p.eh = p.el.offsetHeight || 34;
+  }
+
+  /* ============================================================
+     A PERSON IS NOT A DOOR, AND THE PROMPT LAYER IS WHERE THE GAME
+     ALREADY KNOWS THE DIFFERENCE.
+
+     Two things put a prompt over something you can press Enter on, and
+     they are different objects: this file generates the DOOR prompt
+     from the nearest known location (`DOOR`, below), and npc.js
+     publishes a PERSON prompt under the id 'npc' whenever somebody is
+     inside its TALK_RANGE — one id, one at a time, taken down the
+     moment they walk out of it (src/character/npc.js updatePrompt).
+
+     So the id IS the fact, and this is the only table that has to know
+     it. npc.js cannot say `act: 'talk'` itself — ui.prompt() defaults
+     every caller to 'interact' before this file ever sees the spec, and
+     npc.js belongs to another agent — so the mapping lives here, beside
+     the layer that owns both prompts. The day npc.js does name the
+     action, this line becomes a no-op rather than a conflict. */
+  const PERSON = 'npc';
+  const PROMPT_ACT = { [PERSON]: 'talk' };
+
   /* THE CHIP ON THE FRONT OF A PROMPT.
      `spec.act` names an ACTION and gets whatever that action is called
-     on this input — 'E' with a keyboard, 'Enter' under a thumb, and
-     never a keycap in the second case. `spec.key` is the escape hatch
-     for chips that are NOT keyboard keys at all (the race prints the
-     checkpoint number and a chequered flag); those stay literal and
-     keep the cap treatment, because a numeral in a cap is a numeral,
-     not a promise about hardware the player does not have. */
+     on this input — 'E' with a keyboard, 'Enter' or 'Talk' under a
+     thumb, and never a keycap in the second case. `spec.key` is the
+     escape hatch for chips that are NOT keyboard keys at all (the race
+     prints the checkpoint number and a chequered flag, npc.say prints a
+     bullet); those stay literal and keep the cap treatment, because a
+     numeral in a cap is a numeral, not a promise about hardware the
+     player does not have.
+
+     AND A LITERAL KEY IS NOT ONE OF THOSE. This early return used to be
+     unconditional, so any caller that typed a key name skipped the
+     input-aware resolver entirely — which is how a hard 'E' went on
+     floating over every person in the city on a phone through the whole
+     round that removed the last of them (npc.js:632, `key: 'E'`). The
+     sweep that was supposed to catch it never had a person in range.
+     isKeyName() decides, in touch.js, next to the table it is checked
+     against; '•', '🏁' and '3' are still literals and still capped. */
   function paintPromptKey(p) {
-    if (p.lit != null) {
+    if (p.lit != null && !isKeyName(p.lit)) {
       if (p.key.textContent !== p.lit) p.key.textContent = p.lit;
       return;
     }
@@ -768,18 +884,24 @@ export function createHud(ctx, ui) {
         el.addEventListener('click', () => { ui.click(); spec.action(); });
       }
       promptLayer.append(el);
-      p = { el, key, label, sub, alpha: 0 };
+      p = { el, key, label, sub, alpha: 0, t: 0, ew: 0, eh: 0 };
       prompts.set(id, p);
     }
     p.pos = spec.pos;
     p.ttl = spec.ttl ?? Infinity;
     p.action = spec.action;
     p.lit = spec.key != null ? String(spec.key) : null;
-    p.act = spec.act || 'interact';
+    p.act = PROMPT_ACT[id] || spec.act || 'interact';
+    const chip = () => [p.key.textContent, p.label.textContent,
+      p.sub.textContent, p.sub.style.display].join('|');
+    const was = chip();
     paintPromptKey(p);
     if (p.label.textContent !== (spec.text || '')) p.label.textContent = spec.text || '';
     if (p.sub.textContent !== (spec.sub || '')) p.sub.textContent = spec.sub || '';
     p.sub.style.display = spec.sub ? '' : 'none';
+    /* the chip changed width, so the box its anchor has to fit inside
+       changed with it — one layout here, none in the frame loop */
+    if (!p.ew || was !== chip()) measurePrompt(p);
     return id;
   }
   function removePrompt(id) {
@@ -794,24 +916,99 @@ export function createHud(ctx, ui) {
     if (!prompts.size) return;
     const cam = ctx.camera;
     const w = window.innerWidth, hgt = window.innerHeight;
+    const B = anchorMode === 'slide' ? playerAnchor(_fall) : null;
+    if (B) _mvp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     for (const [id, p] of prompts) {
       if (p.ttl !== Infinity) {
         p.ttl -= dt;
         if (p.ttl <= 0) { removePrompt(id); continue; }
       }
       if (!p.pos) continue;
-      V.set(p.pos.x, p.pos.y, p.pos.z).project(cam);
-      const behind = V.z > 1;
-      const x = (V.x * 0.5 + 0.5) * w;
-      const y = (-V.y * 0.5 + 0.5) * hgt;
-      const inView = !behind && x > -60 && x < w + 60 && y > -20 && y < hgt + 40;
+      if (!p.ew) measurePrompt(p);
+
+      let x, y, inView;
+      /* the pixel box the chip's anchor must land in — the same box the
+         solve below is run against, so the final clamp can never move
+         the element off the position that was proved to be on screen */
+      let bx0 = 40, bx1 = w - 40, by0 = 46, by1 = hgt - 20;
+      if (!B) {
+        /* NO PLAYER TO SLIDE TOWARD — the intro owns him, or this ran
+           before wally booted. The old rule, unchanged. */
+        V.set(p.pos.x, p.pos.y, p.pos.z).project(cam);
+        x = (V.x * 0.5 + 0.5) * w;
+        y = (-V.y * 0.5 + 0.5) * hgt;
+        inView = !(V.z > 1) && x > -60 && x < w + 60 && y > -20 && y < hgt + 40;
+      } else {
+        /* The box the WHOLE CHIP has to sit inside, in pixels. The
+           element is translate(-50%,-100%): its anchor is the tip of
+           the tail at the bottom centre, so the top edge is eh above
+           the anchor and the tail hangs ~5 px below it. */
+        const mx = Math.min(p.ew * 0.5 + 10, w * 0.5 - 1);
+        const top = Math.min(p.eh + 12, hgt * 0.5 - 1);
+        const bot = Math.min(14, hgt * 0.5 - 1);
+        bx0 = mx; bx1 = w - mx; by0 = top; by1 = hgt - bot;
+        /* ...as NDC half-planes: nl <= ndcX <= nr, nbot <= ndcY <= ntop */
+        const nl = (2 * mx) / w - 1, nr = 1 - (2 * mx) / w;
+        const ntop = 1 - (2 * top) / hgt, nbot = (2 * bot) / hgt - 1;
+
+        _cA.set(p.pos.x, p.pos.y, p.pos.z, 1).applyMatrix4(_mvp);
+        _cB.set(B.x, B.y, B.z, 1).applyMatrix4(_mvp);
+        _lim.lo = 0; _lim.hi = 1; _lim.ok = true;
+        need(_cA.w - CLIP_W_MIN, _cB.w - CLIP_W_MIN);
+        /* the sub-interval that is merely IN FRONT OF THE LENS, banked
+           before the four edges narrow it — the last resort below */
+        const wOk = _lim.ok && _lim.lo <= _lim.hi + 1e-6;
+        const wlo = _lim.lo, whi = _lim.hi;
+        need(_cA.x - nl * _cA.w, _cB.x - nl * _cB.w);
+        need(nr * _cA.w - _cA.x, nr * _cB.w - _cB.x);
+        need(ntop * _cA.w - _cA.y, ntop * _cB.w - _cB.y);
+        need(_cA.y - nbot * _cA.w, _cB.y - nbot * _cB.w);
+
+        let t = -1;
+        if (_lim.ok && _lim.lo <= _lim.hi + 1e-6) {
+          const lo = clamp(_lim.lo, 0, 1), hi = clamp(_lim.hi, lo, 1);
+          /* IT RISES AT ONCE AND FALLS SLOWLY. Sliding up the segment
+             is what keeps the label on screen, so it may never wait a
+             frame; sliding back down is cosmetic, so it eases. Either
+             way the value is clamped into the feasible interval, which
+             is what makes "painted every frame" a property of the rule
+             and not of how fast the player happened to walk. */
+          const eased = p.t > lo ? damp(p.t, lo, 6, dt) : lo;
+          t = p.t = clamp(eased, lo, hi);
+        } else if (wOk) {
+          /* THE LAST RESORT, AND IT IS A REAL FRAME. Steer the boom
+             into the facade at the doorstep and the collision solver
+             crushes it to half a metre off his face: the crown is over
+             the top of the frame, the lintel is behind the lens, and
+             NO point on the segment can be placed truthfully. Measured
+             on the apartment and the depot with the boom held dead in
+             front, at 3.4 m and again at 0.6 m. Pin the chip to his
+             own point, clamped into the box below, and keep painting —
+             it is anchored to the player, so there is no neighbouring
+             building for it to wander onto, and a label the game
+             withholds while you stand in a doorway is the whole defect
+             this block exists to close. */
+          t = p.t = clamp(1, wlo, whi);
+        }
+        inView = t >= 0;
+        if (inView) {
+          const u = 1 - t;
+          const cw = u * _cA.w + t * _cB.w;
+          x = ((u * _cA.x + t * _cB.x) / cw * 0.5 + 0.5) * w;
+          y = (-(u * _cA.y + t * _cB.y) / cw * 0.5 + 0.5) * hgt;
+        } else {
+          p.t = 0;
+          x = w * 0.5; y = hgt * 0.5;
+        }
+      }
+
       const want = inView ? 1 : 0;
       p.alpha = damp(p.alpha, want, 12, dt);
       p.el.style.opacity = p.alpha.toFixed(3);
       if (p.alpha < 0.02) { p.el.style.visibility = 'hidden'; continue; }
       p.el.style.visibility = '';
-      p.el.style.left = Math.round(clamp(x, 40, w - 40)) + 'px';
-      p.el.style.top = Math.round(clamp(y, 46, hgt - 20)) + 'px';
+      p.el.style.left = Math.round(clamp(x, bx0, bx1)) + 'px';
+      p.el.style.top = Math.round(clamp(y, by0, by1)) + 'px';
       const s = 0.92 + 0.08 * p.alpha;
       p.el.style.transform = `translate(-50%,-100%) scale(${s.toFixed(3)})`;
     }
@@ -826,6 +1023,27 @@ export function createHud(ctx, ui) {
     nearTimer -= dt;
     if (nearTimer > 0) return;
     nearTimer = 0.16;
+    updateDoor();
+    publishReach();
+  }
+
+  /* WHAT IS IN FRONT OF HIM, MEASURED ON THE SAME POLL THAT FINDS THE
+     DOOR, because this is the only place both halves are visible at
+     once: the door is ours, and the person is npc.js's 'npc' prompt
+     sitting in the same map. Everything that has to NAME the one
+     interact control — the pad's corner button, this file's prompt
+     chip, the strip's sentence — reads the answer instead of guessing
+     from `ui.near`, which is the DOOR and has never been anything else.
+     That is why a person in range left the pad button dark and reading
+     'Enter': nothing was asking about people at all. */
+  function publishReach() {
+    const off = !!ui.modal || !ui.visible;
+    const person = !off && prompts.has(PERSON);
+    const door = !off && !!DOOR.loc;
+    return setReach(person ? (door ? 'both' : 'person') : door ? 'door' : 'none');
+  }
+
+  function updateDoor() {
     const g = game();
     const wally = ctx.wally;
     if (!g || !wally || ui.modal || !ui.visible) { dropDoor(); return; }
@@ -906,7 +1124,34 @@ export function createHud(ctx, ui) {
     ui.openPlace(l.id);
     return (interactWhy = `opened ${l.id}${wasInside ? ' (was already inside)' : ''}`);
   }
+  /* THE PERSON PROMPT, IF ONE IS UP. npc.js hands it its own action
+     (api.talk(id)), so talking to somebody is this module calling the
+     verb the people layer already published rather than reaching into
+     it. See A PERSON IS NOT A DOOR above. */
+  function personPrompt() {
+    const p = prompts.get(PERSON);
+    return p && typeof p.action === 'function' ? p : null;
+  }
+
   const interact = () => {
+    /* A PERSON OUTRANKS A DOOR, ON BOTH INPUTS. On a keyboard that was
+       already true and was never written down here: npc.js's KeyE
+       listener is registered at stage 11 and ui.js's at stage 13, so
+       with somebody in range it consumes the press with
+       stopImmediatePropagation and this function is never reached. The
+       pad's corner button, though, comes in through ui.interact() and
+       landed on the door — so the SAME press talked to Rico with a
+       keyboard and walked into the shop behind him with a thumb, and
+       named clients stand at doors by design (clients.js homes them
+       there), which makes that the normal case and not a corner one.
+       Now the label can be honest: the button says Talk because
+       pressing it talks. */
+    const person = personPrompt();
+    if (person) {
+      person.action();
+      interactWhy = `talked to the person in range (${person.label.textContent || 'unnamed'})`;
+      return true;
+    }
     if (DOOR.loc) { enterDoor(); return true; }
     /* WHAT TOOK THE DOOR AWAY IS THE USEFUL HALF. updatePointer() drops
        the door prompt outright while ui.modal is true, so a press in
@@ -914,7 +1159,8 @@ export function createHud(ctx, ui) {
        here — which is the shape of the one unexplained silence on
        record. Say which it was. */
     const up = [...prompts.keys()];
-    interactWhy = `no door in range (ui.modal ${!!ui.modal}, prompts ${JSON.stringify(up)})`;
+    interactWhy = `nothing in range (ui.modal ${!!ui.modal}, reach ${publishReach()}, `
+      + `prompts ${JSON.stringify(up)})`;
     return false;
   };
 
@@ -1008,6 +1254,9 @@ export function createHud(ctx, ui) {
        actually earn anything */
     demoDelta(text) { moneyPill.flash(); moneyPill.delta(text || '+$56', /^−/.test(text || '')); },
     get nearLocation() { return DOOR.loc; },
+    /** The person prompt npc.js has up, if any — the other half of
+        "what is in range", which `nearLocation` has never covered. */
+    get nearPerson() { const p = personPrompt(); return p ? (p.label.textContent || true) : null; },
     setObjective,
     /* THE ONE STRIP follows this until he gets there; null hands it
        back to the current objective. It retargets — it never spawns
@@ -1024,8 +1273,54 @@ export function createHud(ctx, ui) {
       projectPrompts(dt);
     },
     setHintsVisible(on) { hints.style.display = on ? '' : 'none'; },
+    /* THE CHIP CHANGED SIZE WITH THE VIEWPORT. --w-ts scales every
+       prompt with the window, and the cached width is what the anchor
+       solve fits inside the frame — so a stale one is a box that is
+       the wrong shape. ui.js's resize() calls this. */
+    resize() { for (const p of prompts.values()) measurePrompt(p); },
+    /** THE ANCHOR RULE, AS AN A/B SWITCH — see THE ANCHOR SLIDES
+        above. 'slide' ships: the anchor slides along lintel -> crown
+        until the whole chip is inside the frame. 'lintel' is the
+        pre-fix behaviour, kept so the walk that proves the fix can be
+        re-run against the defect ON THE SAME PAGE LOAD instead of
+        against a memory of another build. Debug only. */
+    promptAnchor(mode) {
+      if (mode === 'slide' || mode === 'lintel') {
+        anchorMode = mode;
+        for (const p of prompts.values()) p.t = 0;
+      }
+      return anchorMode;
+    },
+    /** WHAT THE BROWSER IS ACTUALLY PAINTING, per prompt: the chip's
+        own box on screen, its computed opacity and visibility, and
+        `t` — how far along lintel -> crown the anchor had to slide to
+        get there. The first three come from the DOM and the styles the
+        page resolved, not from this file's own bookkeeping: a prompt
+        layer that agrees with itself about being visible is exactly
+        the measurement this fix exists because of. */
+    promptState() {
+      const out = [];
+      for (const [id, p] of prompts) {
+        const st = getComputedStyle(p.el);
+        const r = p.el.getBoundingClientRect();
+        const on = st.visibility !== 'hidden' && +st.opacity > 0.5 && r.width > 4
+          && r.left >= 0 && r.top >= 0
+          && r.right <= window.innerWidth && r.bottom <= window.innerHeight;
+        out.push({
+          id, text: p.label.textContent, sub: p.sub.textContent,
+          op: +(+st.opacity).toFixed(3), vis: st.visibility,
+          x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
+          w: Math.round(r.width), h: Math.round(r.height),
+          t: +p.t.toFixed(3), painted: on,
+        });
+      }
+      return out;
+    },
     dispose() {
       offInputMode();
+      /* nothing is in front of him once this layer is gone, and the
+         pad's caption would otherwise keep the last word it was given */
+      setReach('none');
       removeEventListener('keydown', onHintKey);
       for (const t of litT.values()) clearTimeout(t);
       root.remove();

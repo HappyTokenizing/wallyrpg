@@ -1556,7 +1556,10 @@ export async function init(ctx) {
       hud.update(dt);
       dlg.update(dt);
     },
-    resize() { touch.measure(); },
+    /* The pad re-measures its own geometry; the HUD re-measures the
+       prompt chips, whose width is what the world-space anchor solve
+       has to fit inside the frame (see THE ANCHOR SLIDES in hud.js). */
+    resize() { touch.measure(); hud.resize(); },
     dispose() {
       flushArrival();
       closeAll();
@@ -1886,6 +1889,14 @@ export async function init(ctx) {
         broken input path looks exactly like a correct refusal. See the
         block above interact() and A REFUSAL HAS TO SAY WHY in hud.js. */
     d.interact = () => lastInteract;
+    /** WHAT THE WORLD-SPACE PROMPTS ARE ACTUALLY PAINTING — read off
+        the DOM and the resolved styles, not off hud.js's own idea of
+        itself. `WALLY.debug.prompts()`; see promptState() in hud.js. */
+    d.prompts = () => hud.promptState();
+    /** THE ANCHOR RULE AS AN A/B SWITCH: 'slide' ships, 'lintel' is
+        the defect. `WALLY.debug.promptAnchor('lintel')`; the walk in
+        tools/touchtest.mjs runs both arms on ONE page load. */
+    d.promptAnchor = (mode) => hud.promptAnchor(mode);
     /** WHO OWNS THE NEXT SPACE. The pad's shortcuts answer a detail-0
         click so a keyboard or screen-reader player can activate them,
         and that inference goes stale the moment the player picks the

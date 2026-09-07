@@ -41,14 +41,15 @@
      duckFor(seconds, amount)     duck music+ambience for dialogue
      musicVolume / sfxVolume / masterVolume   get + set (0..1, persisted)
      mute(on) / toggleMute() / muted
-     setWeather(name)             'clear' | 'rain' | 'storm'
+     setWeather(name)             'clear'|'cloudy'|'rain'|'storm' -> BOOLEAN
      setTimeOfDay(hour)           auto day/night context in auto mode
      setSpace(name)               force a reverb preset
      stop() / stopMusic()
      voices                       live voice count (for the test harness)
+     env                          the live environment the beds ride
    ============================================================ */
 
-import { clamp, damp } from '../core/contracts.js';
+import { clamp, damp, lerp, smoothstep } from '../core/contracts.js';
 import { createReverb, SPACES } from './reverb.js';
 import { createMusic, SCORES, CONTEXT_NAMES } from './music.js';
 import { createSfx, SURFACES } from './sfx.js';
@@ -74,12 +75,128 @@ const AMBIENCE = {
   heights:   { wind: 0.55, gulls: 0.24 },
 };
 
-/* Rain and storm layer on top of whatever the context asked for. */
-const WEATHER = {
-  clear: { rain: 0 },
-  rain:  { rain: 0.55 },
-  storm: { rain: 0.90, wind: 0.90 },
+/* ============================================================
+   WHICH DISTRICT SOUNDS LIKE WHAT — and the one thing this table is
+   for that the identical table in ui.js could never do.
+
+   ui.js has carried this map since the districts were named, and it
+   is complete: all ten. It has also never once fired from walking.
+   Its only caller is the `place` event, which only state.setLoc()
+   emits, which only game.js's travel/enter emit — so a player heard a
+   district ONLY by entering a building in it. MEASURED before this
+   change, walked (warped, then 3 s of real frames) to the centre of
+   six districts with nothing entered, M1 Max / headless Chrome
+   channel=chrome / SwiftShader / 1280x720 / load average 14-25 across
+   the run, four other headless-Chrome workflows live in this tree:
+
+     marketsq      world.zoneAt marketsq       ctx.audio.context explore
+     ironhills     world.zoneAt ironhills      ctx.audio.context explore
+     greenedge     world.zoneAt greenedge      ctx.audio.context explore
+     waterfront    world.zoneAt waterfront     ctx.audio.context explore
+     goldenheights world.zoneAt goldenheights  ctx.audio.context explore
+     mainstreet    world.zoneAt mainstreet     ctx.audio.context explore
+
+   market bed 0.000 and cave bed 0.000 in all six, confirmed by an
+   AnalyserNode on the bed's own gain node and not by bedLevel(). The
+   world knew where he was the whole time. That is a citation, not a
+   revert check — WALLY.debug.audioRevertZone() is the revert check,
+   and it is a switch in this module driven on one page load.
+
+   TWO TABLES, ONE AUTHORITY. Deleting ui.js's copy is not mine to do,
+   so instead the `game:zone` listener resolves the DISTRICT ID it
+   carries through this table first and only falls back to the context
+   name ui.js computed. Both paths — the sampler below and ui.js's
+   door — therefore land on these ten lines, and ui.js's copy cannot
+   drift away from them because nothing reads it.
+   ============================================================ */
+const ZONE_CONTEXT = {
+  rustyrow: 'town', mainstreet: 'town', learning: 'town', marketsq: 'market',
+  greenedge: 'farm', ironhills: 'mine', waterfront: 'explore',
+  innovation: 'town', stampede: 'town', goldenheights: 'heights',
 };
+
+/* The contexts the walking driver is allowed to overwrite. Everything
+   else — title, cinematic, sail, tense, interior, silence — is somebody
+   else's decision about the whole frame, and a sampler that stomps the
+   opening cinematic 250 ms after main.js names it is a worse bug than
+   the one this fixes. The driver stands down until the context comes
+   back to one of its own. */
+const ZONE_OWNED = new Set([...Object.values(ZONE_CONTEXT), 'explore', 'night']);
+
+/* WHICH DISTRICTS YIELD TO THE NIGHT SCORE, AND WHY IT IS NOT ALL OF
+   THEM. `town`, `market` and `farm` are sounds of daytime ACTIVITY —
+   chatter, hawkers, birdsong — and a market bed at 0.80 at two in the
+   morning is a market that never closes. `mine` and `heights` are
+   properties of the PLACE: a cave drone and a ridge wind are the same
+   at 2 a.m. as at noon, and silencing them would make the two most
+   distinctive districts on the island the two that vanish after dark.
+   The night bed and its crickets are layered over both by mixFor()'s
+   env.night rule regardless, so Iron Hills at night is drone + crickets
+   rather than either one alone. */
+const NIGHT_YIELDS = new Set(['town', 'market', 'farm', 'explore']);
+
+/* ============================================================
+   THE WEATHER LAYER.
+
+   THE WEATHER HAD NEVER BEEN AUDIBLE. Measured end to end on this
+   build before the fix (headless Chrome, real page load, a real
+   gesture, WALLY.debug.setWeather(n, 0) for each of the four states):
+   ctx.sky.weatherName went clear -> rain -> storm -> cloudy while
+   ctx.audio.weather stayed "clear" and bedLevel('rain') stayed 0.000
+   throughout. Three faults in the same few lines produced that:
+
+     · audio.js listened on `audio:weather` and NOTHING ANYWHERE emits
+       it. The world's own event is `weather`, emitted by
+       src/world/weather.js set(). The listener had never once fired,
+       so rain and storm shipped silent for the life of the game.
+     · this table authored clear / rain / storm. weather.js authors
+       FOUR — clear, cloudy, rain, storm — so `cloudy`, a state the
+       world can really be in, fell through to `clear`.
+     · setWeather() returned the api object, which is truthy, so a
+       caller could not tell an applied state from a dropped one. That
+       is the tenth instance on this project of a component reporting
+       something other than what it did, and the identical defect
+       weather.js's own header now warns about for `overcast`.
+
+   All three are fixed below and asserted by tools/audiotest.mjs
+   PASS W. The names here are weather.js's WEATHER_NAMES and no
+   others; an unknown one is refused loudly and setWeather returns a
+   boolean.
+
+   Each row is what that state sounds like AT FULL STRENGTH:
+
+     rain   the rain bed heard in the open, around you
+     roof   rain heard ON something — a roof, an awning, a bridge —
+            which is a different sound, not a quieter one
+     wind   a FLOOR under the wind bed, over whatever the context asked
+     hush   how far the LIVING beds duck (gulls, birdsong, market
+            chatter, crowd). Nothing sings in a downpour and the market
+            square empties in a storm. That, more than the hiss, is
+            what makes weather read as weather.
+
+   NOTHING HERE IS APPLIED AS A STEP. The live row is
+   lerp(from, to, progress) where progress is ctx.sky.weatherProgress —
+   weather.js's own damped scalar, the one its clouds and its fog ride
+   — so a storm arrives and leaves over the sky's 150 s instead of
+   switching on the event. weatherRow() below names the fallback branch
+   for a boot with no sky.
+   ============================================================ */
+const WEATHER = {
+  clear:  { rain: 0.00, roof: 0.00, wind: 0.00, hush: 0.00 },
+  cloudy: { rain: 0.00, roof: 0.00, wind: 0.34, hush: 0.16 },
+  rain:   { rain: 0.62, roof: 0.72, wind: 0.50, hush: 0.62 },
+  storm:  { rain: 0.95, roof: 0.96, wind: 0.92, hush: 0.88 },
+};
+export const WEATHER_NAMES = Object.keys(WEATHER);
+
+/* The beds weather, altitude and shelter are allowed to duck. Every
+   one of them is something ALIVE and outdoors; `room`, `cave` and
+   `waves` are deliberately not in the list. */
+const HUSHED = ['gulls', 'forest', 'market', 'crowd'];
+/* Contexts whose surf is allowed to be silenced by the world. See
+   the sea note in mixFor() for why the three cinematic ones are not. */
+const SEA_CAPPED = new Set(['explore', 'night', 'town', 'market', 'farm',
+  'mine', 'heights', 'tense', 'interior']);
 
 /* A no-op stand-in used when Web Audio is unavailable or blocked. Every
    method exists and returns something sane, so no caller ever has to
@@ -92,6 +209,9 @@ function nullAudio(reason) {
     contexts: CONTEXT_NAMES, sfxNames: [], beds: [], surfaces: SURFACES,
     spaces: Object.keys(SPACES), stings: [], notes: [],
     voices: 0, bar: 0, bpm: 0,
+    weather: 'clear', weatherNames: WEATHER_NAMES,
+    env: { rain: 0, roof: 0, wind: 0, hush: 0, shelter: 0, shore: 0, sea: 1,
+      altitude: 0, night: 0, zone: null, zoneRaw: null, zoneDwell: 0 },
     musicVolume: 0, sfxVolume: 0, masterVolume: 0,
     init: () => api, resume: () => Promise.resolve(false),
     setContext: () => api, timeToTransition: () => 0,
@@ -99,7 +219,10 @@ function nullAudio(reason) {
     sting: () => api, duckFor: () => api,
     setMusicVolume: () => api, setSfxVolume: () => api, setMasterVolume: () => api,
     mute: () => api, toggleMute: () => api,
-    setWeather: () => api, setTimeOfDay: () => api, setAutoNight: () => api,
+    /* FALSE, not the api object: "I did not apply that" is the honest
+       answer from a module that cannot make a sound at all. */
+    setWeather: () => false,
+    setTimeOfDay: () => api, setAutoNight: () => api,
     setSpace: () => api, bed: () => false, bedLevel: () => 0,
     stop: () => api, stopMusic: () => api,
     update() {}, dispose() {},
@@ -138,9 +261,47 @@ export async function init(ctx) {
      back on. */
   let wantPlaying = false;
   let wantWeather = 'clear';
+  let wxFrom = 'clear';           // the state the blend is travelling FROM
+  let wxFade = 150;               // seconds, as the world reported it
+  let wxLocal = 1;                // the no-sky fallback's own progress
+  let wxSource = 'local';         // which branch weatherRow() last took
   let autoNight = true;
+  /* THE REVERT SWITCH for this round, flipped by
+     WALLY.debug.audioRevertZone(). False = the rule this file shipped
+     with: no zone driver at all, and a surf floor that ignores where
+     the sea is. See the hook at the bottom of the file. */
+  let zoneRule = true;
   let hour = 10;
   let forcedSpace = null;
+
+  /* ============================================================
+     THE ENVIRONMENT — what the soundscape reacts to that is not a
+     musical context.
+
+     SAMPLED, NOT PUSHED, and 4 Hz is the whole cost. The modules that
+     own these facts (world, sky, phys, wally) do not import us and
+     mostly do not emit anything about them: sky.js emits `sky:hour`
+     and nothing else, world.js emits nothing at all, and the events
+     physics DOES emit are named phys:* while this file was listening
+     for wally:*. Waiting for six other agents to emit six new events
+     is how the weather stayed silent for a year. So we read ctx.
+
+     Everything in here is a 0..1 scalar and everything is damped —
+     nothing steps. Read live from ctx.audio.env. */
+  const env = {
+    rain: 0,        // the open-air rain bed, blended across the change
+    roof: 0,        // rain heard on a roof above you
+    wind: 0,        // weather's floor under the wind bed
+    hush: 0,        // how far the living beds duck
+    shelter: 0,     // 0 in the open, 1 with something over his head
+    shore: 0,       // 0..1, how close the water is — the surf FLOOR
+    sea: 1,         // 0..1, how much sea is audible here — the CEILING
+    altitude: 0,    // 0..1, height over the ground (the balloon)
+    night: 0,       // the sky's own night factor
+    zone: null,     // the district he is COMMITTED to (post-hysteresis)
+    zoneRaw: null,  // what world.zoneAt() says this instant
+    zoneDwell: 0,   // seconds the candidate has been held
+  };
 
   const detailFor = (q) => (q === 'low' || q === 'med' ? 0.45 : 1);
 
@@ -225,13 +386,450 @@ export async function init(ctx) {
       music.tick();
     }
 
-    const mix = { ...(AMBIENCE[name] || {}) };
-    const w = WEATHER[wantWeather] || WEATHER.clear;
-    for (const k in w) mix[k] = Math.max(mix[k] || 0, w[k]);
-    sfx.ambience(mix, immediate ? 0.3 : Math.max(1.2, fade));
+    bedsOff = false;              // an explicit context un-stops the beds
+    sfx.ambience(mixFor(name), immediate ? 0.3 : Math.max(1.2, fade));
+    pushed.clear();               // the whole mix has just been re-issued
 
     const space = forcedSpace || SCORES[name].space || 'outdoor';
     reverb.setSpace(space, immediate ? 0.05 : Math.max(0.8, fade));
+  }
+
+  /* ============================================================
+     THE MIX — one function, so the context and the environment can
+     never be applied from two different places and disagree.
+
+     applyContext() issues the WHOLE mix on a zone change, at the zone
+     change's own fade. refreshEnv() then nudges only the handful of
+     beds the environment moves, and only when one of them has actually
+     drifted — because re-issuing the whole mix four times a second
+     would cancel and shorten every crossfade a context change had in
+     flight (sfx.bed() does cancelScheduledValues), which is a smooth
+     transition turned into a 0.6 s chase.
+     ============================================================ */
+
+  /** The live weather row: lerp(from, to, progress). */
+  function weatherRow() {
+    const to = WEATHER[wantWeather] || WEATHER.clear;
+    const from = WEATHER[wxFrom] || WEATHER.clear;
+    /* THE BRANCH, NAMED.
+
+       `sky` is the shipping path. ctx.sky.weatherProgress is
+       weather.js's own damped 0->1, stepped in the same update() with
+       the same lambda as the cloud cover and the fog, so the soundscape
+       physically cannot be part-way through a change the sky is not
+       making. tools/audiotest.mjs W6 asserts audio's blended rain
+       against ctx.sky.rainfall at a point mid-fade, which is a
+       cross-check against another module's number rather than against
+       our own.
+
+       `local` is the fallback, and it is a real path, not a guard:
+       tools/test-audio.mjs drives this whole module against an
+       OfflineAudioContext with no ctx.sky at all. It damps the same
+       0->1 with the same law and the same lambda (4 / fade) that
+       weather.js uses, from the fade the `weather` event carried.
+       W7 asserts it by deleting ctx.sky for the duration. */
+    let p;
+    if (ctx?.sky && typeof ctx.sky.weatherProgress === 'number') {
+      p = ctx.sky.weatherProgress; wxSource = 'sky';
+    } else {
+      p = wxLocal; wxSource = 'local';
+    }
+    p = clamp(p, 0, 1);
+    return {
+      rain: lerp(from.rain, to.rain, p),
+      roof: lerp(from.roof, to.roof, p),
+      wind: lerp(from.wind, to.wind, p),
+      hush: lerp(from.hush, to.hush, p),
+    };
+  }
+
+  /** The full bed mix for a context, under the current environment. */
+  function mixFor(name) {
+    const mix = { ...(AMBIENCE[name] || {}) };
+
+    /* --- weather. `roof` and `rain` are two BEDS, not one level:
+       rain on an awning is a different sound from rain in the open, so
+       stepping under one crossfades rather than turns anything down. */
+    const open = 1 - env.shelter;
+    mix.rain = Math.max(mix.rain || 0, env.rain * open);
+    mix.roof = Math.max(mix.roof || 0, env.roof * env.shelter);
+    if (env.wind > 0) mix.wind = Math.max(mix.wind || 0, env.wind * (1 - env.shelter * 0.55));
+
+    /* --- THE SEA, WHICH USED TO IGNORE WHERE THE SEA IS.
+       `explore` authors waves 0.34 and, until this line, that was the
+       level everywhere the context was explore — MEASURED at the
+       centre of Iron Hills, 218.4 m from the water and 40 m above it,
+       waves bed 0.340, AnalyserNode RMS 0.0279 on the bed's own gain.
+       Surf, in a mine. The old rule below only ever RAISED the level,
+       so a floor authored for a beach became a floor for the whole
+       island: a floor that ignores the world is a floor in the wrong
+       place.
+
+       So there are two rules now and they are not the same rule:
+         shore  the FLOOR — a beach in `town` is audible surf whatever
+                the context wanted;
+         sea    the CEILING — 218 m inland the sea is inaudible
+                whatever the context wanted.
+       Applied ceiling-then-floor, which on a beach is a no-op because
+       both read 1 there.
+
+       ELEVATION IS DELIBERATELY NOT IN THIS. The mine is 44 m up and
+       height makes surf MORE audible in the real world, not less — it
+       is the 218 metres that silences it, and folding in a height term
+       would be a second knob tuned to make one measurement come out
+       right. Distance only.
+
+       THE CINEMATIC CONTEXTS ARE EXEMPT. `title`, `cinematic` and
+       `sail` frame the camera somewhere the sampler is not looking:
+       env reads ctx.wally.position first, so the intro's flight over
+       the water would be scored from wherever his body was parked and
+       the title card would lose its surf to a number about the wrong
+       point in space. */
+    if (zoneRule && SEA_CAPPED.has(name) && mix.waves) {
+      mix.waves *= env.sea * (1 - env.shelter * 0.6);
+    }
+
+    /* --- the shore. The waves bed is a context decision, but standing
+       on a beach in `town` should still be audible surf; this only ever
+       raises it. */
+    if (env.shore > 0) {
+      /* the shelter term is part of THIS round and so is gated with the
+         rest of it — a revert that leaves half a rule behind is not a
+         revert. */
+      mix.waves = Math.max(mix.waves || 0, env.shore * 0.62 * (zoneRule ? 1 - env.shelter * 0.6 : 1));
+    }
+
+    /* --- night. `night` used to arrive only with the night CONTEXT, so
+       2 a.m. in town had no crickets in it at all. The sky already
+       publishes its own night factor; ride that instead, and only
+       outdoors. */
+    if (env.night > 0) {
+      mix.night = Math.max(mix.night || 0, env.night * 0.5 * (1 - env.shelter * 0.7));
+    }
+
+    /* --- what ducks. Weather, shelter and height all quieten the
+       living beds, and they compound rather than compete. */
+    const quiet = clamp(1 - Math.max(env.hush, env.shelter * 0.5, env.altitude * 0.92), 0, 1);
+    for (const k of HUSHED) if (mix[k]) mix[k] *= quiet;
+
+    /* --- altitude. Up in the balloon the ground goes away and the wind
+       is the whole world. */
+    if (env.altitude > 0.02) {
+      mix.wind = Math.max(mix.wind || 0, 0.30 + env.altitude * 0.55);
+      mix.gulls = Math.max(mix.gulls || 0, env.altitude * 0.30);
+    }
+
+    return mix;
+  }
+
+  /* Only the beds the environment can move. Everything else belongs to
+     the context and is left alone between zone changes. */
+  const ENV_BEDS = ['rain', 'roof', 'wind', 'waves', 'night', ...HUSHED];
+  const pushed = new Map();
+  /* Set by stop(), cleared by applyContext(). See refreshEnv(). */
+  let bedsOff = false;
+
+  /** Nudge the environment-driven beds toward the live mix. */
+  function refreshEnv(fade = 0.7) {
+    if (!built) return 0;
+    /* STOP MEANS STOP — the same rule `wantPlaying` enforces for the
+       transport, and for the same reason. stop() fades every bed out;
+       a sampler that runs 250 ms later and pushes the context's wind
+       and gulls straight back up has un-stopped the module without
+       anybody asking, and tools/test-audio.mjs caught exactly that
+       (82 voices still scheduled after a stop). Only an explicit
+       applyContext clears it. */
+    if (bedsOff) return 0;
+    const mix = mixFor(wantContext);
+    let moved = 0;
+    for (const k of ENV_BEDS) {
+      const v = mix[k] || 0;
+      const was = pushed.has(k) ? pushed.get(k) : sfx.bedLevel(k);
+      /* A DEAD BAND, and it is what keeps this cheap: a settled world
+         issues no AudioParam ramps at all. 0.012 is under a third of a
+         dB at these levels — inaudible, and small enough that a 150 s
+         fade still gets ~50 steps rather than reading as a staircase. */
+      if (Math.abs(v - was) < 0.012) continue;
+      /* sfx.bed() returns FALSE for a name the bank has no recipe for,
+         and the old code here would have thrown that away — a mix that
+         asks for a bed nobody built is a level that silently never
+         moves. It is the same class of failure as the bar that fails
+         inside its own try/catch, so it climbs the same ladder. */
+      if (!sfx.bed(k, v, fade)) {
+        throw new Error(`ambience bed "${k}" does not exist in the bank `
+          + `(have: ${sfx.beds.join(', ')}) — the mix is asking for a level `
+          + 'nothing can produce');
+      }
+      pushed.set(k, v);
+      moved++;
+    }
+    return moved;
+  }
+
+  /* ============================================================
+     THE SAMPLER. Four times a second, and this is its whole cost:
+     one heightAt, one shoreDistAt, and — only while rain is actually
+     audible — one DDA ray straight up. Measured below in
+     ctx.audio.env.ms.
+     ============================================================ */
+  const UP = { x: 0, y: 1, z: 0 };
+  let envAcc = 0;
+  /* A WINDOW, NOT A SAMPLE. One pass of this is well under Chrome's
+     performance.now() resolution and reads as a flat 0.000 ms, which
+     is a number that says nothing — the same mistake as quoting one
+     frame's reciprocal as an fps. Sum and count instead, and publish
+     the mean with n beside it so the reader can see what it is a mean
+     of. */
+  let envMsSum = 0, envSamples = 0;
+  const envMs = () => (envSamples ? envMsSum / envSamples : 0);
+
+  /* SHELTER IS THE ONE SIGNAL THAT COULD FAIL WITHOUT SAYING SO.
+     Every other scalar here comes from a module that publishes it; this
+     one is a query whose answer is "no" both when he is standing in the
+     open and when the roofs were never registered as collision
+     geometry. Those are indistinguishable from the level, so the rays
+     and the hits are COUNTED and published: `shelterRays` climbing with
+     `shelterHits` stuck at 0 for a whole rainy walk through Main Street
+     is the shape of the second case, and tools/audiotest.mjs W5 asserts
+     a hit under a real building rather than asserting the level. */
+  let shelterRays = 0, shelterHits = 0;
+  let steps = 0, strikes = 0;
+
+  /* WHICH FOOTSTEP RECIPE THE GROUND UNDER HIM ASKS FOR.
+
+     Asked of ctx.world at the step position rather than tracked as a
+     mode somebody has to remember to set: setSurface() is a global on
+     the bank and it has exactly one caller in the whole repo — the
+     debug hook. A surface that is queried is right on a beach, in the
+     shallows and on a road for free, and it cannot drift.
+
+     NO try/catch. If one of these queries starts throwing, the
+     listener's safe() wrapper counts it and prints a stack; swallowing
+     it here would give us a game that silently walks on grass forever.
+     Rural districts have dirt roads, the built ones have paving —
+     ironhills and greenedge are the two the city never reached. */
+  const RURAL = new Set(['greenedge', 'ironhills']);
+
+  function surfaceAt(pos) {
+    const w = ctx?.world;
+    if (!w || !pos) return undefined;          // let sfx.js use its own default
+    if (w.isWater?.(pos.x, pos.z)) return 'water';
+    if (w.isRoad?.(pos.x, pos.z)) {
+      return RURAL.has(w.zoneAt?.(pos.x, pos.z)?.id) ? 'dirt' : 'stone';
+    }
+    if (w.isBeach?.(pos.x, pos.z)) return 'sand';
+    return 'grass';
+  }
+
+  /* Metres. SEA_FAR is past the far edge of the built-up interior —
+     Market Square sits 398 m from the water and Main Street 331 m, so
+     the middle of this island is silent surf, which is the point. */
+  const SEA_NEAR = 14, SEA_FAR = 190;
+
+  /* ============================================================
+     THE WALKING DRIVER — the emitter the district map never had.
+
+     HYSTERESIS, AND WHY IT IS DWELL AND NOT A DEADBAND. Ten districts
+     on one island means a great many seams, and terrain.js's zoneAt()
+     is a raster lookup with a smoothstep weight and a 0.14 cutoff:
+     along a seam two districts trade the cell back and forth, and
+     between them is unclaimed ground that reads `null` (= explore).
+     A player walking a seam would otherwise hear the score change bar
+     after bar. There is no distance-to-boundary to threshold on —
+     zoneAt returns a district or nothing — so the guard is TIME, which
+     is the dimension the player actually experiences:
+
+       a candidate district must hold for ZONE_HOLD seconds of
+       CONTINUOUS sampling before it is committed.
+
+     At 4 Hz that is five consecutive agreeing samples. A player
+     standing exactly on a seam where the answer alternates never
+     accumulates five of anything and never flips at all — the failure
+     mode is "stays on the old district", which is the right one.
+     ZONE_HOLD is 1.25 s: shorter than the bar the change is committed
+     on anyway (music.js queues a context to the next bar line, 2.3 s
+     at the explore score's tempo, so a genuine crossing costs the
+     player nothing), and at a 4.2 m/s run it is 5.3 m of overshoot
+     past the line, which is under half a house.
+
+     DOES ENTERING A BUILDING STILL OVERRIDE? It does not, and it does
+     not need to: there are no interiors in this game. ui.js's arrive()
+     warps him to city.doorPosition(), a point 1.5 m off the facade,
+     OUTDOORS and inside that location's own district — so the door and
+     the ground he is standing on resolve through ZONE_CONTEXT to the
+     same answer by construction. If interiors are ever built, the
+     override goes here, as a `forced` that outranks the candidate.
+
+     WHAT IT WILL NOT TOUCH: anything outside ZONE_OWNED. See that set.
+     ============================================================ */
+  const ZONE_HOLD = 1.25;
+  let zoneCand = null, zoneDwellT = 0, zoneCommitted = null, zoneArmed = false;
+
+  /* ============================================================
+     IS IT DARK — and the reason this is not simply `hour >= 20`.
+
+     THE NIGHT SCORE WAS UNREACHABLE IN PLAY. Not unmeasured:
+     unreachable. audio.js learned the time from the `sky:hour` event,
+     and `sky:hour` is emitted in exactly one place in this repo —
+     inside sky.js's setHour(), whose only caller is
+     WALLY.debug.setHour. The clock the GAME runs is a different
+     wire: game.js's tickClock/advance emits `hour`, sky.js turns that
+     into an eased `hourTarget`, and its own drifting hour is never
+     published to anybody.
+
+     MEASURED on this build before the fix, playing the clock forward
+     with game.time.advance() the way a bus ride does — no debug
+     setHour anywhere (M1 Max, headless Chrome channel=chrome,
+     SwiftShader, 1280x720, load average 14-25 across the run — four
+     other headless-Chrome workflows were live in this tree):
+
+       game hour   7  ->  8  -> 11 -> 15 -> 19 -> 22 -> 0
+       sky.hour  9.50  8.62  11.36 15.31 19.35 22.45 0.57
+       sky.night 0.000 0.000 0.000 0.000 0.725 1.000 1.000
+       audio.hour  10    10    10    10    10    10    10
+
+     Ten o'clock in the morning, at midnight, with the sky fully dark.
+     autoNight has never once fired in a real session in the life of
+     this game. The night bed still arrived (env.night reads
+     ctx.sky.night directly and that is why it climbed to 0.499), so
+     the crickets were there and the SCORE never was — which is
+     exactly how this looks like a working feature from the outside.
+
+     The repair is this file's own house rule, the one in the header
+     of THE ENVIRONMENT above: sample it, do not wait to be told. The
+     sampler already reads ctx.sky four times a second for `night`, so
+     it reads the hour on the same tick, and the decision itself now
+     rides ctx.sky.night — the world's OWN dusk curve, the one the
+     lighting uses — rather than a pair of hour literals that have to
+     be kept in step with a palette table in another file.
+
+     A DEADBAND, not a threshold: 0.55 to fall, 0.45 to lift. Same
+     reason as the district dwell. sky.night is monotonic in the
+     clock so it should not chatter, but a threshold that CAN chatter
+     is one someone else's retune away from doing it.
+     ============================================================ */
+  let isNightNow = false;
+
+  function updateNight() {
+    const n = ctx?.sky?.night;
+    if (zoneRule && typeof n === 'number') {
+      if (isNightNow ? n < 0.45 : n >= 0.55) isNightNow = !isNightNow;
+      return;
+    }
+    /* No sky, or the revert switch: the rule as it shipped, on the
+       hour this module was last TOLD about. */
+    isNightNow = hour < 5.5 || hour >= 20;
+  }
+  /** Pure read — nightNow() is called from getters and must not move. */
+  const nightNow = () => isNightNow;
+
+  /** What the world says the score should be, right here, right now. */
+  function contextForZone(zid) {
+    const c = (zid && ZONE_CONTEXT[zid]) || 'explore';
+    return (nightNow() && NIGHT_YIELDS.has(c)) ? 'night' : c;
+  }
+
+  function driveZone(dt, p, world) {
+    const raw = world.zoneAt(p.x, p.z)?.id ?? null;
+    /* KEPT LIVE EVEN WHEN REVERTED, because it is the whole finding:
+       under the old rule the world still knows the district and the
+       score still does not. */
+    env.zoneRaw = raw;
+    if (!zoneRule) { env.zone = null; env.zoneDwell = 0; zoneArmed = false; return; }
+
+    if (!zoneArmed) {
+      /* THE FIRST SAMPLE COMMITS. A dwell on the opening sample would
+         spend the first second and a quarter of the session in the
+         wrong district, and there is nothing to be sticky about yet. */
+      zoneCommitted = raw; zoneArmed = true; zoneCand = null; zoneDwellT = 0;
+    } else if (raw === zoneCommitted) {
+      zoneCand = null; zoneDwellT = 0;          // back inside: forget the wobble
+    } else if (raw === zoneCand) {
+      zoneDwellT += dt;
+      if (zoneDwellT >= ZONE_HOLD) { zoneCommitted = raw; zoneCand = null; zoneDwellT = 0; }
+    } else {
+      zoneCand = raw; zoneDwellT = dt;          // a new candidate, from this sample
+    }
+    env.zone = zoneCommitted;
+    env.zoneDwell = +zoneDwellT.toFixed(2);
+
+    /* The driver only ever writes over its own. A cinematic, a sail or
+       a stop() parks it until the context comes back. */
+    if (!ZONE_OWNED.has(wantContext)) return;
+    const want = contextForZone(zoneCommitted);
+    if (want !== wantContext) applyContext(want, { fade: 4 });
+  }
+
+  function sampleEnv(dt) {
+    const t0 = globalThis.performance?.now?.() ?? 0;
+
+    /* the no-sky fallback's own progress — same law, same lambda as
+       weather.js. Stepped unconditionally so the branch is exercised
+       whether or not the sky is the one being read. */
+    if (wxLocal < 1) {
+      const p = damp(wxLocal, 1, 4 / Math.max(0.5, wxFade), dt);
+      wxLocal = p > 0.9995 ? 1 : p;
+    }
+
+    const row = weatherRow();
+    env.rain = row.rain; env.roof = row.roof;
+    env.wind = row.wind; env.hush = row.hush;
+
+    const sky = ctx?.sky;
+    env.night = typeof sky?.night === 'number' ? clamp(sky.night, 0, 1) : 0;
+    /* THE CLOCK, SAMPLED. See the long note on updateNight(): the only
+       emitter of `sky:hour` in this repo is a debug hook, so the event
+       this module used to wait for does not arrive during play. */
+    if (zoneRule && typeof sky?.hour === 'number' && Number.isFinite(sky.hour)) {
+      hour = ((sky.hour % 24) + 24) % 24;
+    }
+    updateNight();
+
+    const world = ctx?.world;
+    const p = ctx?.wally?.position || ctx?.camera?.position || null;
+    if (p && world && Number.isFinite(p.x + p.y + p.z)) {
+      if (typeof world.heightAt === 'function') {
+        /* 6 m of clearance before "aloft" begins, so a hill and a
+           rooftop do not read as a balloon. */
+        env.altitude = clamp((p.y - world.heightAt(p.x, p.z) - 6) / 44, 0, 1);
+      }
+      if (typeof world.shoreDistAt === 'function') {
+        /* shoreDistAt is signed: negative out at sea, 0 at the line. */
+        const d = world.shoreDistAt(p.x, p.z);
+        env.shore = smoothstep(64, 5, Math.abs(d));
+        /* On or over the water the sea is the whole world; inland it
+           fades out over SEA_NEAR..SEA_FAR. Both edges are metres and
+           both are visible in ctx.audio.env. */
+        env.sea = d <= 0 ? 1 : smoothstep(SEA_FAR, SEA_NEAR, d);
+      }
+      if (typeof world.zoneAt === 'function') driveZone(dt, p, world);
+      let want = 0;
+      if (typeof ctx?.phys?.raycast === 'function') {
+        shelterRays++;
+        /* From above his head, straight up. The DDA flips the normal
+           toward the ray, so a roof modelled one-sided still registers.
+
+           CAST UNCONDITIONALLY, not only while it is raining. Gating it
+           on rain was cheaper by one ray every 250 ms and cost the
+           signal its only self-diagnosis: `shelterHits` stuck at 0 is
+           supposed to mean "the roofs are not in the collision world",
+           and under a rain gate it also means "it has not rained yet",
+           which are not the same finding. Measured cost of the whole
+           sampler INCLUDING this ray: 0.0126 ms mean over n=262
+           (M1 Max, headless Chrome, SwiftShader, 1280x720, load avg
+           4.7) against a 16.7 ms vsync-capped frame. */
+        const hit = ctx.phys.raycast({ x: p.x, y: p.y + 2.0, z: p.z }, UP, 14);
+        if (hit) { want = 1; shelterHits++; }
+      }
+      /* ~1.8 s to cross, so walking under an awning is a move rather
+         than a cut, and a lamppost overhead does not flicker. */
+      env.shelter = damp(env.shelter, want, 2.2, dt);
+    }
+
+    const moved = refreshEnv();
+    envMsSum += (globalThis.performance?.now?.() ?? 0) - t0;
+    envSamples++;
+    return moved;
   }
 
   /* ---------- teardown of the graph (not of the module) ---------- */
@@ -873,6 +1471,13 @@ export async function init(ctx) {
         voices: music.voices,
         tracked: music.tracked,
         busGain: +music.out.gain.value.toFixed(3),
+        /* The environment layer's own liveness. `steps` not climbing
+           while the player walks is a dead footstep wire, which is
+           precisely the failure that shipped; `shelterRays` climbing
+           with `shelterHits` at 0 through a rainy town is roofs that
+           are not in the collision world. */
+        steps, strikes, shelterRays, shelterHits,
+        envMs: +envMs().toFixed(4), envSamples,
       };
     },
     /** Force a watchdog pass. The test harness uses it; so can a player
@@ -971,20 +1576,74 @@ export async function init(ctx) {
     },
     toggleMute() { return api.mute(!vol.muted); },
 
-    /* --- world state --- */
-    setWeather(name) {
-      wantWeather = WEATHER[name] ? name : 'clear';
-      if (built) applyContext(wantContext, { fade: 3 });
-      return api;
+    /* --- world state ---
+
+       RETURNS A BOOLEAN, and an unknown name is refused rather than
+       quietly mapped to `clear`. The old signature returned the api
+       object — truthy for every input, including the three-quarters of
+       weather.js's vocabulary this table did not author — so a caller
+       had no way to tell an applied state from a dropped one. Same
+       defect, same shape, same missing state as the `overcast` note in
+       src/world/weather.js; that one cost a screenshot campaign a whole
+       axis. The wording below is deliberately its wording.
+
+       `opts.from` and `opts.fade` come off the world's `weather` event
+       and are what makes the change ARRIVE rather than switch. */
+    setWeather(name, opts = {}) {
+      if (!WEATHER[name]) {
+        console.error(`[audio] unknown weather "${name}" — audio.js authors `
+          + `${WEATHER_NAMES.join(', ')} (weather.js's four, and no others). `
+          + `NOTHING CHANGED; the soundscape is still "${wantWeather}". `
+          + 'A caller that ignores this false is hearing the previous state.');
+        return false;
+      }
+      if (name === wantWeather) return true;
+      wxFrom = wantWeather;
+      wantWeather = name;
+      wxFade = Number(opts.fade);
+      if (!Number.isFinite(wxFade) || wxFade < 0) wxFade = 150;
+      wxLocal = wxFade <= 0 ? 1 : 0;
+      /* Do NOT re-issue the context here. The beds move on the sampler,
+         over the sky's own fade; a fade:3 applyContext was the old
+         switch and it is exactly what "a storm should arrive and leave"
+         rules out. A fade of 0 is the debug snap, so settle it now. */
+      if (built && wxFade <= 0) { sampleEnv(1 / 30); refreshEnv(0.05); }
+      return true;
     },
     get weather() { return wantWeather; },
+    get weatherNames() { return WEATHER_NAMES; },
+    /** The live environment the beds are riding. Read-only in practice. */
+    get env() {
+      return {
+        ...env,
+        source: wxSource, from: wxFrom, to: wantWeather, fade: wxFade,
+        /* read defensively: the sampler decided the branch up to 250 ms
+           ago and ctx.sky can be gone by now (PASS W10 removes it). */
+        progress: (wxSource === 'sky' && typeof ctx?.sky?.weatherProgress === 'number')
+          ? +clamp(ctx.sky.weatherProgress, 0, 1).toFixed(4)
+          : +wxLocal.toFixed(4),
+        shelterRays, shelterHits,
+        ms: +envMs().toFixed(4), samples: envSamples,
+      };
+    },
     get hour() { return hour; },
 
     /** Feed the sky's clock in; in auto mode this flips explore <-> night. */
     setTimeOfDay(h) {
       hour = ((+h || 0) % 24 + 24) % 24;
-      if (autoNight) {
-        const isNight = hour < 5.5 || hour >= 20;
+      updateNight();
+      /* TWO WRITERS, ONE DECISION. Once the walking driver has armed
+         (i.e. there is a world and a body to sample), IT decides the
+         context, night included — contextForZone() runs the same
+         nightNow() predicate this branch does. Leaving both live meant
+         dawn in a town fired explore from here and town from the
+         sampler 250 ms later: two queued bar changes for one sunrise.
+         This branch is the no-world fallback and is still the only
+         path when audio runs without ctx.world (tools/test-audio.mjs,
+         the offline context) — which is the branch PASS Z's Z9 drives
+         by turning the driver off. */
+      if (autoNight && !(zoneRule && zoneArmed)) {
+        const isNight = nightNow();
         if (isNight && wantContext === 'explore') applyContext('night', { fade: 6 });
         else if (!isNight && wantContext === 'night') applyContext('explore', { fade: 6 });
       }
@@ -1007,6 +1666,8 @@ export async function init(ctx) {
       if (!built) return api;
       music.stop({ fade: 0.8 });
       sfx.stopBeds(0.8);
+      bedsOff = true;
+      pushed.clear();
       return api;
     },
 
@@ -1040,6 +1701,18 @@ export async function init(ctx) {
 
       const w = ctx?.wind?.strength;
       safe('sfx.update', () => sfx.update(dt, { wind: typeof w === 'number' ? w : 0.4 }));
+
+      /* The environment, four times a second, on its OWN guard. It
+         reads four other modules' public queries and any one of them
+         can start throwing after somebody else's edit — and a sampler
+         that fails quietly is a world that stops responding to the
+         weather with a green console, which is the exact bug this file
+         was found with. safe() counts it and prints a stack. */
+      envAcc += dt;
+      if (envAcc >= 0.25) {
+        const d = envAcc; envAcc = 0;
+        safe('env', () => sampleEnv(d));
+      }
 
       listenerAcc += dt;
       if (listenerAcc >= 1 / 30) {
@@ -1076,13 +1749,54 @@ export async function init(ctx) {
   }, 120);
   keepAlive?.unref?.();   // no-op in a browser; lets a node test exit cleanly
 
-  /* ---------- bus wiring ----------
-     Other subsystems are built in parallel and none of them import this
-     module. Everything below is a *listener*: emit the event and audio
-     responds if it can. All are harmless no-ops if nobody emits them. */
+  /* ============================================================
+     BUS WIRING.
+
+     A LISTENER NOBODY CALLS IS NOT WIRING, AND THIS BLOCK WAS MOSTLY
+     LISTENERS NOBODY CALLS. Counted across src/ on the tree this note
+     was written on: of the 28 events subscribed here, 22 had ZERO
+     emitters anywhere in the codebase. The soundscape was not
+     under-tuned, it was unplugged — and every one of them looked
+     plausible in review because the names were the names another agent
+     would obviously have used.
+
+     What was really being emitted, and what this file was listening
+     for, are two different vocabularies:
+
+       emitted                    listened for        result
+       ------------------------   -----------------   -----------------
+       weather   (weather.js)     audio:weather       rain SILENT
+       sky:lightning (weather.js) — nothing —         storms SILENT
+       phys:step (physics.js)     wally:step          NO FOOTSTEPS AT ALL
+       phys:land / phys:jump      wally:land/jump     silent
+       water:splash               wally:splash        (water.js re-emits
+                                                       `sfx`, so covered)
+       money / quest (state.js)   game:money/:quest   ui.js plays its own
+
+     So every listener below is now bound to a name something in this
+     repo ACTUALLY emits, verified by grep and by tools/audiotest.mjs
+     PASS W. The old `audio:*` and `wally:*` names are kept alongside,
+     not replaced: they are the module's public command channel and
+     tools/test-audio.mjs and the debug hooks drive them.
+
+     EVERY NEW HANDLER RUNS UNDER safe(). ctx.bus's own emit() catches
+     and console.errors a throwing handler, which keeps the emitter
+     alive but feeds nothing to the escalation ladder — the same shape
+     as the caught-per-bar scheduleBar() that made the score fail
+     silently while the console stayed green. A handler that starts
+     throwing has to climb the same rungs as everything else.
+     ============================================================ */
   const bus = ctx?.bus;
+  /* The unsubscribers for the listeners this round added, and the
+     switch WALLY.debug.audioRevertWiring() throws. */
+  const newWiring = [];
+  let wireEnvironment = () => {};
+  let reverted = false;
   if (bus) {
-    bus.on('sfx', (p) => {
+    /** Bind a listener that cannot fail quietly. */
+    const on = (type, where, fn) => bus.on(type, (p) => safe(where, () => fn(p)));
+
+    on('sfx', 'bus.sfx', (p) => {
       if (typeof p === 'string') api.sfx(p);
       else if (p && p.name) api.sfx(p.name, p);
     });
@@ -1091,10 +1805,97 @@ export async function init(ctx) {
     bus.on('audio:duck', (p) => duckFor(typeof p === 'number' ? p : p?.seconds ?? 2, p?.amount ?? 0.35));
     bus.on('audio:mute', (p) => api.mute(!!p));
     bus.on('audio:surface', (p) => api.setSurface(typeof p === 'string' ? p : p?.name));
-    bus.on('audio:weather', (p) => api.setWeather(typeof p === 'string' ? p : p?.name));
 
-    /* Convenience wiring for the events the other agents are most likely
-       to emit. Names deliberately mirror their namespaces. */
+    /* `audio:weather` is the module's COMMAND channel and stays exactly
+       where it was — which is also what makes the revert below honest:
+       back the new wiring out and this is all that is left, i.e. the
+       shipping code, i.e. silence. */
+    bus.on('audio:weather', (p) => api.setWeather(typeof p === 'string' ? p : p?.name, p || {}));
+
+    /* ============================================================
+       THE FIVE THE WORLD ACTUALLY EMITS — registered together, and
+       unsubscribable together, so WALLY.debug.audioRevertWiring(false)
+       can put the module back into the state this round found it in
+       ON THE SAME PAGE LOAD. That is the strong form of a revert check
+       (contracts.js rule 1, first bullet: a switch in the module,
+       shipping rule and prior rule side by side): the alternative is
+       quoting a before-number, which stays in the file reading like
+       evidence long after the code it describes is gone.
+       ============================================================ */
+    wireEnvironment = () => {
+      /* ---- THE WEATHER. `weather` is the world's own event, emitted
+         by src/world/weather.js set(). The payload's `from` and `fade`
+         are what let the change arrive over the sky's minutes instead
+         of switching. */
+      newWiring.push(on('weather', 'bus.weather', (p) => api.setWeather(
+        typeof p === 'string' ? p : p?.name, (p && typeof p === 'object') ? p : {})));
+
+      /* ---- THUNDER. weather.js has been emitting this since lightning
+         shipped, with a comment saying "audio can schedule the thunder
+         itself" — and nothing anywhere listened, so every storm in this
+         game has flashed in silence. The flash carries its own delay;
+         that delay IS the distance, so read it as one: a strike four
+         seconds out is a long dull roll, one at half a second is a
+         crack. */
+      newWiring.push(on('sky:lightning', 'bus.lightning', (p) => {
+        const d = clamp(Number(p?.delay ?? 1.2), 0, 6);
+        const near = clamp(1 - d / 4.2, 0, 1);
+        api.sfx('thunder', {
+          delay: d,
+          gain: (0.45 + 0.85 * clamp(Number(p?.intensity ?? 0.8), 0, 1.4)) * (0.30 + 0.80 * near),
+          pitch: 0.50 + 0.60 * near,
+          length: 1.9 - near * 0.8,
+          vary: 0.10,
+        });
+        strikes++;
+      }));
+
+      /* ---- FOOTSTEPS, WHICH THIS GAME HAS NEVER HAD.
+         sfx.js has authored six surface recipes since it was written —
+         grass, sand, wood, stone, water, dirt — and nothing in the repo
+         has ever called one of them. physics/controller.js has emitted
+         a stride event the whole time, on `phys:step`; this file
+         listened on `wally:step`, which has no emitter. One name.
+
+         The surface comes from ctx.world's own queries rather than from
+         a flag somebody has to remember to set, so it is right on a
+         beach, in the shallows and on a road without anybody
+         maintaining it. And it is WET: sky.wetness is a signal
+         weather.js publishes that nothing was reading, so a stone
+         street after rain now has puddles in it. */
+      newWiring.push(on('phys:step', 'bus.step', (p) => {
+        const pos = p?.position;
+        if (!pos) return;
+        const surf = surfaceAt(pos);
+        const run = !!p?.running;
+        api.sfx('step', {
+          position: pos, surface: surf,
+          gain: (run ? 1.0 : 0.72) * (0.85 + 0.3 * (ctx?.rng?.() ?? 0.5)),
+          pitch: run ? 1.06 : 1.0,
+        });
+        /* A puddle underfoot. Only on hard ground — grass and sand do
+           not hold water in a way you can hear. */
+        const wet = clamp(Number(ctx?.sky?.wetness ?? 0), 0, 1);
+        if (wet > 0.35 && (surf === 'stone' || surf === 'dirt' || surf === 'wood')
+            && (ctx?.rng?.() ?? 1) < wet * 0.45) {
+          api.sfx('splash.small', { position: pos, gain: 0.10 + wet * 0.16, pitch: 1.5 + wet * 0.5 });
+        }
+        steps++;
+      }));
+      newWiring.push(on('phys:land', 'bus.land', (p) => {
+        const impact = clamp(Number(p?.impact ?? 0.3), 0, 1);
+        api.sfx(impact > 0.55 ? 'land.heavy' : 'land', {
+          position: p?.position, surface: surfaceAt(p?.position),
+          gain: 0.5 + impact * 0.7,
+        });
+      }));
+      newWiring.push(on('phys:jump', 'bus.jump',
+        (p) => api.sfx('jump', { position: p?.position, gain: 0.75 })));
+    };
+    wireEnvironment();
+
+    /* Kept: the module's own command channel, and what the other
+       character agents were told to emit. */
     bus.on('wally:step', (p) => api.sfx('step', { position: p?.position, surface: p?.surface, gain: p?.gain ?? 0.9 }));
     bus.on('wally:land', (p) => api.sfx(p?.heavy ? 'land.heavy' : 'land', { position: p?.position, surface: p?.surface }));
     bus.on('wally:jump', (p) => api.sfx('jump', { position: p?.position }));
@@ -1113,7 +1914,16 @@ export async function init(ctx) {
     bus.on('game:money', () => api.sfx('coins'));
     bus.on('game:levelup', () => { api.sfx('levelup'); api.sting('victory'); });
     bus.on('game:quest', () => { api.sfx('quest.done'); api.sting('quest'); });
-    bus.on('game:zone', (p) => api.setContext(typeof p === 'string' ? p : p?.audio || p?.name));
+    /* ONE TABLE DECIDES. ui.js emits { name, zone } from the `place`
+       event, where `name` is ITS copy of the district map. Resolve the
+       DISTRICT through ZONE_CONTEXT first so the door and the ground
+       cannot disagree, and fall back to the name for any caller that
+       emits a bare context (the intro, WALLY.debug.audioContext). */
+    bus.on('game:zone', (p) => {
+      if (typeof p === 'string') return api.setContext(p);
+      const byZone = p?.zone && ZONE_CONTEXT[p.zone];
+      api.setContext(byZone ? contextForZone(p.zone) : (p?.audio || p?.name));
+    });
     bus.on('sky:hour', (p) => api.setTimeOfDay(typeof p === 'number' ? p : p?.hour));
     bus.on('intro:start', () => api.setContext('cinematic', { immediate: true, fade: 1.5 }));
     bus.on('intro:title', () => api.sting('title'));
@@ -1129,6 +1939,163 @@ export async function init(ctx) {
     dbg.audioSting = (n) => api.sting(n);
     dbg.audioResume = () => api.resume();
     dbg.audioPump = (why) => api.pump(why || 'debug');
+
+    /* ---- the environment layer, for tools/audiotest.mjs PASS W ----
+       These read and drive the SHIPPING path; none of them is a
+       parallel implementation. audioEnv() is api.env verbatim plus the
+       bed levels the mix actually produced, so an assertion can check
+       the level rather than the intent. */
+    dbg.audioEnv = () => ({
+      ...api.env,
+      weather: wantWeather,
+      beds: built
+        ? Object.fromEntries(sfx.beds.map((b) => [b, +sfx.bedLevel(b).toFixed(4)]))
+        : null,
+      skyWeather: ctx?.sky?.weatherName ?? null,
+      skyRain: typeof ctx?.sky?.rainfall === 'number' ? +ctx.sky.rainfall.toFixed(4) : null,
+      skyProgress: typeof ctx?.sky?.weatherProgress === 'number'
+        ? +ctx.sky.weatherProgress.toFixed(4) : null,
+    });
+    /** How many of each one-shot the bank has actually scheduled — the
+        only visibility there is into the five EMITTER beds (gulls, and
+        the shout / bird / drip / cricket layers), which have no
+        continuous signal for an analyser to read. */
+    dbg.audioEmitted = () => (built ? sfx.emitted : null);
+    /** Force a sampler pass now rather than waiting for the 4 Hz tick. */
+    dbg.audioSampleEnv = (dt = 0.25) => { sampleEnv(dt); return dbg.audioEnv(); };
+    /** A window onto the SHIPPING surface query, not a copy of it —
+        this is the same function the phys:step handler calls. */
+    dbg.audioSurfaceAt = (x, z) => surfaceAt({ x, y: 0, z });
+    /** Drive setWeather directly, bypassing the world. Returns the BOOLEAN. */
+    dbg.audioWeather = (n, fade = 0) => api.setWeather(n, { fade });
+
+    /* ============================================================
+       THE TAP — a real AnalyserNode on a real gain node.
+
+       Everything else on this object reports an INTENT. bedLevel() is
+       the number mixFor() asked for; env is what the sampler decided;
+       `beds` in audioEnv() is bedLevel() by another name. All three
+       stay correct while the bed is silent — the node never built, the
+       ramp never scheduled, the graph disconnected by a rebuild — and
+       that is the exact shape of failure this project keeps finding.
+
+       So: hang an analyser off the node the signal really passes
+       through and read the samples. The analyser has no OUTPUT
+       connection, so it is a tap and not an insert: it cannot change
+       what the player hears.
+
+         audioTap('waves')  a bed, at sfx.js's `mod` node
+         audioTap('amb')    every bed summed  (sfx.ambOut)
+         audioTap('sfx')    the one-shot bank (sfx.out) — the ONLY
+                            place gulls, crickets, birds, market shouts
+                            and cave drips exist, because those five
+                            beds are emitters with no continuous
+                            signal of their own
+         audioTap('music')  the score
+         audioTap('master') everything, post-duck
+
+       Returns null for a bed that has never been built, which is a
+       finding and not a failure of the instrument.
+       ============================================================ */
+    dbg.audioTap = (name) => {
+      if (!built) return null;
+      const node = name === 'amb' ? sfx.ambOut
+        : name === 'sfx' ? sfx.out
+        : name === 'music' ? music.out
+        : name === 'master' ? master
+        : sfx.bedNode(name);
+      if (!node) return null;
+      const an = actx.createAnalyser();
+      an.fftSize = 2048;
+      an.smoothingTimeConstant = 0;      // no averaging: raw samples
+      node.connect(an);                  // tap, not insert — no output
+      const buf = new Float32Array(an.fftSize);
+      return {
+        name,
+        /** RMS of the last 2048 samples (~46 ms at 44.1 kHz). */
+        rms() {
+          an.getFloatTimeDomainData(buf);
+          let s = 0;
+          for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+          return Math.sqrt(s / buf.length);
+        },
+        /** Absolute peak, for one-shots that fall between RMS windows. */
+        peak() {
+          an.getFloatTimeDomainData(buf);
+          let m = 0;
+          for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > m) m = v; }
+          return m;
+        },
+        dispose() { try { node.disconnect(an); } catch { /* already gone */ } },
+      };
+    };
+    /* ============================================================
+       RUNTIME REVERT for THIS round — the walking driver and the sea
+       ceiling, off, on the same page load, with the module put back
+       into the state this round found it in. contracts.js rule 1,
+       first bullet: a switch in the module, shipping rule and prior
+       rule side by side, rather than a before-number quoted in a
+       comment that goes on reading like evidence after the code it
+       describes is gone.
+
+       OFF is exactly the old file:
+         · no zone is ever committed and nothing is ever driven from
+           where he is standing, so the score is whatever the last
+           `place` event said — which, walking, is nothing;
+         · mixFor()'s surf is a floor and only a floor, so `explore`
+           authors 0.34 waves at the bottom of a mine again;
+         · setTimeOfDay() goes back to owning the day/night flip on
+           its own, because with the driver off nothing else would.
+
+       tools/audiotest.mjs PASS Z, Z9-Z11, flips it and re-runs the
+       same three assertions, which must then fail.
+       ============================================================ */
+    dbg.audioRevertZone = (on = false) => {
+      zoneRule = !!on;
+      zoneCand = null; zoneDwellT = 0; zoneArmed = false; zoneCommitted = null;
+      env.zone = null; env.zoneDwell = 0;
+      updateNight();
+      /* Put the module back where the un-driven build always sat:
+         `explore`, because the only thing that ever moved it was a
+         door. Same reasoning as audioRevertWiring's reset to `clear`. */
+      applyContext(nightNow() ? 'night' : 'explore', { fade: 0.4 });
+      return { zoneRule, context: wantContext };
+    };
+    /** The driver's live state — candidate, dwell, and what it committed. */
+    dbg.audioZone = () => ({
+      raw: env.zoneRaw, committed: env.zone, dwell: env.zoneDwell,
+      hold: ZONE_HOLD, night: nightNow(), rule: zoneRule, armed: zoneArmed,
+      hour: +hour.toFixed(2), skyNight: typeof ctx?.sky?.night === 'number' ? +ctx.sky.night.toFixed(3) : null,
+      context: wantContext, want: contextForZone(env.zone),
+      sea: +env.sea.toFixed(4), shore: +env.shore.toFixed(4),
+    });
+
+    /* RUNTIME REVERT — the shipping wiring and the wiring as it was,
+       side by side on one page load, which is the strong form this
+       project asks for (contracts.js, HOW THIS PROJECT PROVES A FIX,
+       rule 1). `off` unsubscribes the four listeners this round added
+       and puts back exactly what was there before: a listener on
+       `audio:weather`, which nothing emits. tools/audiotest.mjs W8
+       flips it and re-runs the same assertions, which must then fail. */
+    dbg.audioRevertWiring = (on = false) => {
+      if (!bus) return null;
+      if (!on && !reverted) {
+        for (const off of newWiring) off();
+        newWiring.length = 0;
+        reverted = true;
+      } else if (on && reverted) {
+        wireEnvironment();
+        reverted = false;
+      }
+      /* Put the module back to the state the un-wired build was always
+         in — `clear`, because nothing ever told it otherwise — so the
+         reverted run starts where the shipping build started rather
+         than wherever the last assertion left it. */
+      wxFrom = 'clear'; wantWeather = 'clear'; wxLocal = 1; wxFade = 150;
+      steps = 0; strikes = 0; shelterRays = 0; shelterHits = 0;
+      sampleEnv(1 / 30); refreshEnv(0.05);
+      return { reverted, listeners: newWiring.length, weather: wantWeather };
+    };
     /* Simulate cause (3): a fade-out left at zero, so the score plays
        perfectly into a muted bus. heal() must put it back. */
     dbg.audioBreakBus = () => {
@@ -1197,6 +2164,7 @@ export async function init(ctx) {
       transport: api.transport,
       pending: api.pendingContext, bar: api.bar, bpm: Math.round(api.bpm),
       voices: api.voices, muted: api.muted, weather: wantWeather,
+      env: api.env,
       space: built ? reverb.space : null,
       layers: built ? music.layerGains() : null,
       beds: built ? Object.fromEntries(sfx.beds.map((b) => [b, sfx.bedLevel(b)])) : null,

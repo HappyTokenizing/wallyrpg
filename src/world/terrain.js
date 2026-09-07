@@ -164,6 +164,45 @@ export function createTerrain(ctx) {
   const PHI_IRON = bearingOf(ironZone.world.x, ironZone.world.z);
   const PHI_COVE = 2.845;
 
+  /* THE HARBOUR HAD TO ACTUALLY REACH THE DOCKS.
+
+     This notch has been called "the harbour that the docks look out of"
+     since it was written, and it was 0.165 of the ellipse radius —
+     which put the waterline 109 m from the Waterfront Docks, measured
+     with shoreDistAt() at the docks' own world position. A pier on
+     piles standing in a green meadow is invisible at head height and
+     unmissable from 200 m up, and the balloon is about to put every
+     player 200 m up.
+
+     0.37 brings the water to 30 m of the plot: past the container yard
+     on the seaward flank, with the beach running the last few metres.
+     The number is chosen against three things and not one —
+
+       * the BAY: the notch is angular, so deepening it swings the
+         whole coast round with it. Modelled against every location in
+         data.js, this moves exactly one of them by more than 10 m:
+         the docks, 109 -> 30. The next nearest by bearing is the
+         noodle cart at 88 -> 78, and the apartment — the furthest
+         flung, with only ~29 m of dry land under it — moves 36 -> 36.
+       * the PAD: terrain.js pins each location's ground to loc.world.y
+         over radius*1.02 and feathers to 1.85 (padPass), which for the
+         docks is 16 m and 29 m. Any deeper and the pad is holding a
+         plateau of dry earth out over the water and the coastline
+         steps off it. At 30 m the pad wants 1.87 m and the beach
+         profile wants 1.5 m: they agree, and nothing steps.
+       * the YARD: city.js refuses to stack a container within 3 m of
+         the waterline and the outer row stands 24 m off the plot
+         centre on the seaward flank. 30 m leaves it standing on the
+         quay instead of deleting it.
+
+     WHAT IT DOES NOT DO is put the deck over water. The pier's piles
+     stay bedded in its own pad, and the deck and door still face the
+     district anchor inland, because loc.yaw is "face your district"
+     for every building on the island. Turning a port to face the sea
+     is a change to the projection in data.js and it moves the door
+     corridor out over the water — see the report. */
+  const HARBOUR_BITE = 0.37;
+
   function shoreScale(phi) {
     const w = Math.sin(phi * 3 + 0.7) * 0.55
             + Math.sin(phi * 5 - 1.9) * 0.30
@@ -175,7 +214,7 @@ export function createTerrain(ctx) {
     const c = angDiff(phi, PHI_COVE) / 0.24;
     A += 0.052 * Math.exp(-g * g);                // Golden Heights headland
     A += 0.030 * Math.exp(-i * i);                // Iron Hills cape
-    A -= 0.165 * Math.exp(-h * h);                // the harbour
+    A -= HARBOUR_BITE * Math.exp(-h * h);         // the harbour
     A -= 0.035 * Math.exp(-c * c);                // west cove
     return 1 + A;
   }

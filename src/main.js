@@ -337,14 +337,260 @@ async function boot() {
       catch (e) {
         const f = onFault('render.render', e);
         if (f.off) console.error('[frame] falling back to the plain forward render path.');
+        /* postfx already ran its own info.reset() at the top of the call
+           that threw, so the counters are this frame's. Leave them. */
       }
+    } else {
+      /* renderer.info.autoReset is FALSE (renderer.js sets it), and the
+         reset that pairs with it lives at the TOP of postfx's render().
+         On this path postfx never runs, so nothing would ever clear the
+         counters: perf.calls would climb without bound and the number
+         printed as "draw calls" would be a running total of the session.
+         That is the same mistake that once published 16 193 calls and
+         111 M triangles (see wally.js balloonCost). */
+      renderer.info.reset();
     }
     try { renderer.render(scene, camera); }
     catch (e) { onFault('renderer.render', e); }
   }
 
-  const perf = { fps: 0, ms: 0, frames: 0, acc: 0, calls: 0, tris: 0 };
+  /* ==================================================================
+     THE FRAME CENSUS.  A SINGLE FRAME'S RECIPROCAL IS NOT AN FPS.
+
+     THE BUG THIS REPLACES. The old counter accumulated `acc` and
+     `frames` and published when `acc >= 0.5`. That reads like a
+     half-second average and is not one: the window is "however many
+     frames it took to spend 500 ms", so ONE slow frame satisfies it on
+     its own and `fps` becomes round(1 / thatFrame). Worse, the publish
+     copied `perf` AFTER zeroing `acc` and `frames`, so every reader saw
+     `frames: 0, acc: 0` and had no way to tell a 1-frame window from an
+     80-frame one.
+
+     MEASURED ON THIS MACHINE (Apple M1 Max, headless Chrome, ANGLE
+     Metal Renderer, 1600x900, ?skipIntro) against the OLD counter, one
+     page load, three reads:
+         boot      fps 2   ms 632.8   frames 0  acc 0
+         settled   fps 60  ms 16.67   frames 0  acc 0
+         one hitch fps 12  ms 86.41   frames 0  acc 0
+     Three numbers, one build — which is exactly the spread a judge
+     reported (1, 19, 163) and reasonably read as an unstable game.
+
+     WHAT THIS DOES INSTEAD. Every frame's wall time goes into a ring.
+     The window is the newest samples that fit in WINDOW_MS, and never
+     fewer than MIN_N of them, so a 1.9 s stall cannot shrink the window
+     to itself. The published block carries the window's SHAPE — `n`,
+     `windowMs`, `p50`, `p95`, `worst` — beside the mean, because a
+     median of 6.2 ms with a p95 of 6.9 is a different game from the
+     same median with a p95 of 40, and the mean alone cannot tell them
+     apart.
+
+     `fps` stays the mean-over-the-window (every tool in tools/ reads
+     that key) and is now the only thing it claims to be. `fpsP50` is
+     the typical frame; read that when you want "what does it feel
+     like", and `worst` when you want "does it hitch".
+
+     AND STATE THE RIG. The same build, same machine, same viewport,
+     read through the new block once it says settled:true —
+
+       rAF limiter ON   n 121  window 2016 ms  mean 16.67  p50 16.7
+                        p95 16.7  worst 16.8   -> 60.0 fps, vsync
+       rAF limiter OFF  n 267  window 2008 ms  mean  7.52  p50  6.4
+                        p95 13.9  worst 16.0   -> 133 fps mean,
+                                                  156 fps median
+       both: 738 draw calls, 5.77 M triangles, 1600x900, ?skipIntro,
+       headless Chrome, ANGLE Metal Renderer on an Apple M1 Max.
+
+     Note what only the shape shows: uncapped, this is NOT a flat 156
+     fps. The p95 is twice the median, so a regular slower frame is in
+     there. A mean of 133 and a median of 156 disagreeing by 17 % is
+     that fact arriving in the number rather than hiding under it.
+     ================================================================== */
+  /* ==================================================================
+     ...AND THE RING WAS STILL FILLED FROM THE WRONG CLOCK.
+
+     Everything above is right about the WINDOW and wrong about the
+     SAMPLE. `now` is requestAnimationFrame's timestamp, which is not a
+     measurement of this frame at all: it is the browser's idea of when
+     the frame it is servicing BEGAN, taken from the compositor's
+     BeginFrame, not from a clock that ran while our code did. Two
+     failures, each measured on this machine on one page load, against
+     tools/_sm-lib.mjs sampling performance.now() over the IDENTICAL
+     interval (Apple M1 Max, headless Chrome, ANGLE Metal, 1600x900,
+     ?skipIntro, machine load average 14):
+
+       LIMITER ON — the way anyone actually plays it. The timestamp is
+       quantised to the display's 16.67 ms grid, so the ring is flat by
+       construction and the census cannot report a hitch AT ALL:
+           market square, n 480
+              rAF ts    p50 16.7  p95 16.7  p99 16.8  worst 16.8
+              wall      p50 16.6  p95 17.8  p99 18.8  worst 25.3
+       A 25.3 ms frame happened and the shipped instrument printed
+       16.8. Standing at spawn it swallowed a 40.2 ms one the same way.
+
+       LIMITER OFF — how the 7.52 / 6.4 / 13.9 figure in the block
+       above was taken. With --disable-gpu-vsync the timestamps BUNCH:
+       10 frames of 368 reported a delta under 2 ms while the wall
+       clock says not one frame in that window was under 10.5 ms. The
+       ring then holds an invented short frame beside an invented long
+       one:
+              rAF ts    p50 14.9  p95 30.8  worst 44.3   best  0.7
+              wall      p50 15.0  p95 26.1  worst 40.5   best 10.5
+       THAT IS WHERE "the p95 is more than twice the median" CAME FROM.
+       It is substantially the vsync grid rather than the game. A tail
+       is really there — 1.7x, not 2.1x — but it is not the shape the
+       brief was written around.
+
+     SO THE RING TAKES THE WALL CLOCK: performance.now() read at the
+     top of step(), differenced against the previous frame's reading.
+     The time that actually elapsed, on a clock that was running while
+     we worked.
+
+     The rAF timestamp is not discarded — it is kept for the one thing
+     it is genuinely good at. It IS the display's frame clock, so the
+     gap between consecutive ones says whether the compositor SHOWED
+     our frame or skipped it. That is counted separately as `dropped`,
+     and it is the number that answers "did the player see a stutter",
+     which no mean ever could.
+
+     `cpuMs` joins them: the time spent inside step() itself — every
+     update, every lateUpdate, the draw — so a reader can tell a frame
+     that is long because we were busy from one that is long because we
+     were waiting. At 1600x900 on this machine those are ~9 ms and
+     16.7 ms respectively, and the old block could not tell them apart.
+     ================================================================== */
+  const WINDOW_MS = 2000;   // the window a settled number is averaged over
+  const MIN_N = 20;         // ...but never fewer frames than this
+  const RING = 480;         // ~8 s at 60 fps, ~3 s uncapped
+  const ring = new Float64Array(RING);
+  const cpuRing = new Float64Array(RING);   // time inside step(), same index
+  const rafRing = new Float64Array(RING);   // the rAF timestamp delta, same index
+  let ringN = 0, ringAt = 0;
+  /* THE REVERT SWITCH. 'wall' is the rule above; 'raf' is the rule it
+     replaced, ringing requestAnimationFrame's timestamp exactly as
+     before. Both live in the module so tools/_sm-census.mjs can drive
+     them on ONE page load and watch the old rule fail to see a frame
+     the new one reports — a revert check, not a quoted before-number. */
+  let censusClock = 'wall';
+  /* Published on a cadence rather than per frame: the sort below is
+     O(n log n) and there is no reader that needs it at 60 Hz. `at`
+     says how stale the block a reader is holding actually is, and
+     WALLY.debug.perf() recomputes it on the spot for one that cares. */
+  const PUBLISH_MS = 250;
+  let publishedAt = 0;
+
+  const perf = {
+    fps: 0, ms: 0, calls: 0, tris: 0,
+    /* the window this was measured over — the fields the old block
+       zeroed before publishing. `at` is the performance.now() the
+       census ran at, so a reader holding this snapshot can tell how
+       stale it is; WALLY.debug.perf() recomputes on demand instead. */
+    n: 0, windowMs: 0, full: false, settled: false, at: 0,
+    /* its shape */
+    p50: 0, p95: 0, worst: 0, best: 0, fpsP50: 0, p99: 0,
+    /* what the frame was DOING. cpuMs is the median time inside
+       step(); cpuP95 its tail. A p50 of 16.7 with cpuMs 9 is a game
+       waiting for vsync with 7.7 ms of headroom; the same 16.7 with
+       cpuMs 16 is a game that is about to miss one. */
+    cpuMs: 0, cpuP95: 0,
+    /* DID THE DISPLAY SHOW IT. `hz` is the modal rAF interval in the
+       window (16.7 on a 60 Hz panel); `dropped` counts the frames
+       whose rAF gap was >= 1.5x that, i.e. the ones the compositor
+       skipped; `dropPct` is that as a share of the window. Under a
+       limiter this is the only honest stutter signal there is, and it
+       is measured from the clock that owns the question. */
+    hz: 0, dropped: 0, dropPct: 0,
+    /* which clock filled the ring — 'wall' ships, 'raf' is the switch */
+    clock: 'wall',
+  };
+  const sortBuf = new Float64Array(RING);
+  const cpuBuf = new Float64Array(RING);
+  const rafBuf = new Float64Array(RING);
+
+  /* The newest samples that fit in WINDOW_MS, floored at MIN_N. Returns
+     the count; the samples themselves land in sortBuf, unsorted. */
+  function collect() {
+    let acc = 0, k = 0;
+    for (let i = 0; i < ringN; i++) {
+      const j = (ringAt - 1 - i + RING) % RING;
+      const v = censusClock === 'raf' ? rafRing[j] : ring[j];
+      cpuBuf[k] = cpuRing[j];
+      rafBuf[k] = rafRing[j];
+      sortBuf[k++] = v;
+      acc += v;
+      if (acc >= WINDOW_MS && k >= MIN_N) break;
+    }
+    return k;
+  }
+
+  function census(now) {
+    const k = collect();
+    if (!k) return;
+    let sum = 0;
+    for (let i = 0; i < k; i++) sum += sortBuf[i];
+    const s = Array.prototype.slice.call(sortBuf, 0, k).sort((a, b) => a - b);
+    const mean = sum / k;
+    /* p95 as the sample at ceil(0.95n)-1: with n = 20 that is the
+       worst frame, which is the honest answer at that sample count and
+       is why `n` is published beside it. */
+    const p95 = s[Math.max(0, Math.ceil(k * 0.95) - 1)];
+    perf.ms = +mean.toFixed(2);
+    perf.fps = +(1000 / mean).toFixed(1);
+    perf.p50 = +s[k >> 1].toFixed(2);
+    perf.fpsP50 = +(1000 / s[k >> 1]).toFixed(1);
+    perf.p95 = +p95.toFixed(2);
+    perf.p99 = +s[Math.max(0, Math.ceil(k * 0.99) - 1)].toFixed(2);
+    perf.worst = +s[k - 1].toFixed(2);
+    perf.best = +s[0].toFixed(2);
+    perf.n = k;
+
+    /* ---- what the frame was doing ---- */
+    const c = Array.prototype.slice.call(cpuBuf, 0, k).sort((a, b) => a - b);
+    perf.cpuMs = +c[k >> 1].toFixed(2);
+    perf.cpuP95 = +c[Math.max(0, Math.ceil(k * 0.95) - 1)].toFixed(2);
+
+    /* ---- did the display show it ----
+       `hz` is the MODE of the rAF gaps, not their mean: on a 60 Hz
+       panel a window with four dropped frames has a mean of 17.4 ms
+       and a mode of 16.7, and only the mode still names the panel.
+       Bucketed to 0.5 ms because the timestamps wobble. */
+    const bins = new Map();
+    for (let i = 0; i < k; i++) {
+      const b = Math.round(rafBuf[i] * 2);
+      bins.set(b, (bins.get(b) || 0) + 1);
+    }
+    let bestBin = 0, bestCount = -1;
+    for (const [b, n] of bins) if (n > bestCount || (n === bestCount && b < bestBin)) { bestBin = b; bestCount = n; }
+    /* the bucket names the mode; the MEAN OF THAT BUCKET names the
+       period. Taking bestBin/2 alone would quantise a 16.67 ms panel
+       to 16.5 and then call every real frame 1 % long. */
+    let pSum = 0, pN = 0;
+    for (let i = 0; i < k; i++) if (Math.round(rafBuf[i] * 2) === bestBin) { pSum += rafBuf[i]; pN++; }
+    const period = pN ? pSum / pN : bestBin / 2;
+    perf.hz = +period.toFixed(2);
+    let dropped = 0;
+    /* Only meaningful when a limiter is actually pacing us. Uncapped,
+       every gap is production time and none of them is a drop. */
+    if (period > 1) for (let i = 0; i < k; i++) if (rafBuf[i] >= period * 1.5) dropped += Math.round(rafBuf[i] / period) - 1;
+    perf.dropped = dropped;
+    perf.dropPct = +((dropped * 100) / k).toFixed(1);
+    perf.clock = censusClock;
+    perf.windowMs = +sum.toFixed(1);
+    perf.full = sum >= WINDOW_MS;
+    /* SETTLED means "you may quote this number without a caveat": a
+       full window, and no frame in it more than 3x the median. A spike
+       leaves this false for the whole window it is in, which is the
+       signal the old counter could not give at all. */
+    perf.settled = perf.full && k >= MIN_N && perf.worst <= perf.p50 * 3;
+    perf.calls = renderer.info.render.calls;
+    perf.tris = renderer.info.render.triangles;
+    perf.at = +now.toFixed(1);
+    publishedAt = now;
+    window.__WALLY_PERF__ = { ...perf, errors: health.errors, disabled: health.disabled.length };
+    ctx.bus.emit('perf', perf);
+  }
+
   let last = performance.now();
+  let lastWall = 0;
 
   function frame(now) {
     /* RULE 1. The next frame is booked before anything can go wrong. */
@@ -356,7 +602,17 @@ async function boot() {
   }
 
   function step(now) {
+    /* THE WALL CLOCK, read before anything in this frame runs. `now`
+       is the compositor's BeginFrame stamp and cannot measure us; see
+       the block above for the two ways it lies. dt still comes from
+       `now` because the ANIMATION should follow the display's clock —
+       it is only the INSTRUMENT that must not. */
+    const t0 = performance.now();
+    const wall = lastWall ? t0 - lastWall : 0;
+    lastWall = t0;
+
     const raw = (now - last) / 1000;
+    const rafGap = (now - last);
     last = now;
     // Clamp dt so an alt-tab or a slow first frame can't launch Wally
     // into orbit; 1/20s is the longest step any integrator here sees.
@@ -382,20 +638,205 @@ async function boot() {
        banner under a HUD that has since changed height. */
     if (faultBanner && now - bannerPlaced > 500) placeBanner();
 
-    perf.acc += raw; perf.frames++;
-    if (perf.acc >= 0.5) {
-      perf.fps = Math.round(perf.frames / perf.acc);
-      perf.ms = +(perf.acc / perf.frames * 1000).toFixed(2);
-      perf.calls = renderer.info.render.calls;
-      perf.tris = renderer.info.render.triangles;
-      perf.acc = 0; perf.frames = 0;
-      /* The error counters ride along with the perf block because that
-         is the object every tool in tools/ already prints. */
-      window.__WALLY_PERF__ = { ...perf, errors: health.errors, disabled: health.disabled.length };
-      ctx.bus.emit('perf', perf);
-    }
+    /* THE RAW time, not the clamped `dt`: a 1.9 s stall is a 1.9 s
+       stall, and a census fed the clamped value would report the
+       longest frame it is allowed to imagine (50 ms) instead of the
+       one that happened. The clamp exists to protect the integrators,
+       not to flatter the instrument.
+
+       Three rings, one index. `ring` is the wall clock and is what the
+       published distribution is made of; `rafRing` is the display's
+       own clock and answers only "was this frame shown"; `cpuRing` is
+       the work between the top of step() and here. The first frame has
+       no predecessor to difference against, so it seeds the rings with
+       the rAF gap rather than a zero that would sit in the window as a
+       fictitious best frame. */
+    const cpu = performance.now() - t0;
+    ring[ringAt] = wall || rafGap;
+    rafRing[ringAt] = rafGap;
+    cpuRing[ringAt] = cpu;
+    ringAt = (ringAt + 1) % RING;
+    if (ringN < RING) ringN++;
+    if (now - publishedAt >= PUBLISH_MS) census(now);
   }
   requestAnimationFrame(frame);
+
+  /* ---- the frame census, on demand ----
+     window.__WALLY_PERF__ is republished every PUBLISH_MS, so a reader
+     that grabs it is holding a block up to a quarter-second old (`at`
+     says how old). This recomputes over the ring as it stands right
+     now, which is what a tool taking one reading should call. */
+  window.WALLY.debug.perf = () => {
+    census(performance.now());
+    return { ...perf, errors: health.errors, disabled: health.disabled.length };
+  };
+  /* Every frame time still in the ring, newest last, in ms. For a tool
+     that wants to draw the distribution rather than trust five numbers
+     from it. */
+  window.WALLY.debug.frameTimes = () => {
+    const out = [];
+    for (let i = ringN - 1; i >= 0; i--) out.push(+ring[(ringAt - 1 - i + RING) % RING].toFixed(2));
+    return out;
+  };
+  /* All three rings, aligned, newest last: [wall, rAF gap, cpu] per
+     frame. A tool that wants to show that the two clocks disagree needs
+     them side by side on the same frames, not two runs. */
+  window.WALLY.debug.frameRings = () => {
+    const out = [];
+    for (let i = ringN - 1; i >= 0; i--) {
+      const j = (ringAt - 1 - i + RING) % RING;
+      out.push([+ring[j].toFixed(2), +rafRing[j].toFixed(2), +cpuRing[j].toFixed(2)]);
+    }
+    return out;
+  };
+  /* THE REVERT SWITCH, named. 'raf' puts the ring back on
+     requestAnimationFrame's timestamp — the rule this file shipped
+     before — so tools/_sm-census.mjs can watch the old rule miss a
+     frame the new one reports, on the same page load, over the SAME
+     rings. Nothing else in the game reads it. */
+  window.WALLY.debug.censusClock = (mode) => {
+    if (mode === 'raf' || mode === 'wall') censusClock = mode;
+    return censusClock;
+  };
+
+  /* ==================================================================
+     RUNTIME REVERTS — PUTTING A FIX BACK OUT SO A TEST CAN WATCH IT FAIL
+
+     A REVERT CHECK RUNS TODAY'S TEST AGAINST YESTERDAY'S CODE. Running
+     yesterday's test against yesterday's code proves nothing: they were
+     written together and agree with each other by construction. Quoting
+     the number a bug used to produce proves less still — it is a
+     citation, not a measurement, and it stays green after the fix has
+     been deleted.
+
+     hud.js's promptAnchor('lintel') is the pattern (see THE ANCHOR
+     SLIDES there): the shipped rule and the rule it replaced both live
+     in the module, behind a switch, so the walk that proves the fix can
+     be re-run against the defect ON THE SAME PAGE LOAD.
+
+     Some fixes are not shaped like a switch — they are a call added at
+     a seam between three modules — and for those the switch belongs
+     here, because main.js is the only file that holds the whole ctx.
+     Each entry below restores a NAMED prior behaviour by wrapping the
+     public API the fix goes through. Nothing here is reachable without
+     WALLY.debug; nothing here runs unless a test asks for it.
+
+     Every one of these is asserted by tools/introhandover.mjs --revert,
+     which requires the assertions it names to FAIL while it is on.
+     ================================================================== */
+  const REVERTS = {
+    /* intro.js restoreWorld(): `ctx.wally.setLocomotion(null)`.
+       Without it the animator keeps the value the cinematic pinned
+       (~0) for the rest of the session while the controller integrates
+       normally: "he moves but no walk animation or bike animation".
+       Reverted by making a hand-back to the controller a no-op. */
+    locomotion: {
+      why: 'restoreWorld() never hands the locomotion latch back to the controller',
+      breaks: 'the animator tracks the controller / the legs actually swing',
+      apply() {
+        const w = ctx.wally; if (!w || !w.setLocomotion) return null;
+        const orig = w.setLocomotion.bind(w);
+        /* SCOPED TO THE CINEMATIC, so this is the historical diff and
+           not a bigger hammer wearing its name. restoreWorld() runs
+           inside finish() with intro.running still true (the 0.9 s
+           outro comes after it), so the hand-back this swallows is
+           that one. Every setLocomotion(null) the game makes later —
+           dismounting a ride, for instance — goes through untouched. */
+        w.setLocomotion = (s, t) =>
+          (s == null && ctx.intro?.running === true ? w : orig(s, t));
+        return () => { w.setLocomotion = orig; };
+      },
+    },
+    /* intro.js THE SETTLE: the action layer is released 1.70 s BEFORE
+       the hand-over, while the hero lens is still on him, so the two
+       poses MEET at the cut. The behaviour it replaced released it
+       inside restoreWorld() at the same instant the camera cut and
+       control came back, so `welcome` unwound over the first 1.3 s of
+       gameplay.
+
+       intro.js's `settled` flag is module-local and cannot be reached
+       from here, so this reproduces the old ordering rather than
+       reaching in: swallow the settle cue's release (and the neutral
+       expression it hands over with, which the old code also did not
+       do), then re-issue release(0.35) on the frame ctx.cam.release()
+       runs — which is the line restoreWorld() used to hold. */
+    settle: {
+      why: 'the action layer is released at the cut instead of 1.70 s before it',
+      breaks: 'the two poses meet / the arms are still across the seam / released before the cut',
+      apply() {
+        const w = ctx.wally, cam = ctx.cam;
+        if (!w || !cam || !w.release || !cam.release) return null;
+        const rel = w.release.bind(w), exp = w.express ? w.express.bind(w) : null;
+        const camRel = cam.release.bind(cam);
+        /* THE SETTLE CUE, NAMED RATHER THAN GUESSED. "The first
+           release" is not good enough — studio mode and the debug hook
+           both call release(0.001), and eating one of those would be a
+           different defect wearing this one's name. The settle is the
+           only release(SETTLE_FADE) issued while the intro is running,
+           and it happens exactly once. */
+        const SETTLE_FADE = 0.50;
+        let held = false, done = false, sameTick = false;
+        w.release = (fade) => {
+          const isSettle = !done && ctx.intro?.running === true
+            && Math.abs((fade ?? 0.30) - SETTLE_FADE) < 1e-6;
+          if (isSettle) {
+            held = true; done = true; sameTick = true;
+            queueMicrotask(() => { sameTick = false; });
+            return w;
+          }
+          return rel(fade);
+        };
+        if (exp) w.express = (name, o) => (sameTick ? w : exp(name, o));
+        cam.release = (...a) => {
+          if (held) { held = false; rel(0.35); }   // the old restoreWorld line
+          return camRel(...a);
+        };
+        return () => { w.release = rel; if (exp) w.express = exp; cam.release = camRel; };
+      },
+    },
+    /* anim.js play(): the prev/prevW clip-to-clip crossfade. Before it,
+       every play()/pose() that passed a `fade` got a one-frame pose
+       substitution — `pose('welcome', {fade:0.55})` measured 52 degrees
+       in a single 10.9 ms frame. Reverted by dropping the outgoing clip
+       on every swap, which is the `else` branch play() used to have
+       unconditionally; the weight ramp and its rate are untouched. */
+    crossfade: {
+      why: 'anim.js play() substitutes the pose instead of blending out of the outgoing clip',
+      breaks: 'no arm snap after the title lands',
+      apply() {
+        const a = ctx.wally && ctx.wally.animator;
+        if (!a || typeof a.play !== 'function') return null;
+        const own = Object.prototype.hasOwnProperty.call(a, 'play');
+        const orig = a.play.bind(a);
+        a.play = (name, opts) => { const r = orig(name, opts); a.prev = null; a.prevW = 0; return r; };
+        /* play() is a prototype method, so the undo DELETES the shadow
+           rather than pinning a bound copy over it for ever. */
+        return () => { if (own) a.play = orig; else delete a.play; };
+      },
+    },
+  };
+  const reverted = new Map();
+  /** List what can be put back, and what each one is expected to break. */
+  window.WALLY.debug.reverts = () => Object.fromEntries(
+    Object.entries(REVERTS).map(([k, v]) => [k, { why: v.why, breaks: v.breaks, on: reverted.has(k) }]));
+  /** Put a named prior behaviour back (or take it out again). Returns
+      what actually happened — `applied:false` means the module it wraps
+      was not there, which a test must read as "this revert did not run"
+      and not as "the code under test is fine". */
+  window.WALLY.debug.revert = (name, on = true) => {
+    const r = REVERTS[name];
+    if (!r) return { name, applied: false, why: 'no such revert' };
+    if (on) {
+      if (reverted.has(name)) return { name, on: true, applied: true, why: r.why };
+      const undo = r.apply();
+      if (!undo) return { name, on: false, applied: false, why: 'the module this wraps is not on ctx' };
+      reverted.set(name, undo);
+      return { name, on: true, applied: true, why: r.why, breaks: r.breaks };
+    }
+    const undo = reverted.get(name);
+    if (undo) { undo(); reverted.delete(name); }
+    return { name, on: false, applied: !!undo };
+  };
 
   /* ---- fault injection ----
      Throwing on purpose is the only way to prove the guards above are

@@ -70,6 +70,10 @@ export async function init(ctx) {
      boot default) would light-bleed through Wally's ears. */
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.shadowMap.autoUpdate = false;           // we drive it per frame
+  /* The first frame renders at the tier's `pixelRatio`, which is 1 on
+     every tier — i.e. exactly the frame this project has always
+     measured. Anything above that is climbed to, later, by the
+     governor below, and only on evidence from this device. */
   renderer.setPixelRatio(q.pixelRatio);
   renderer.setClearColor(new THREE.Color().setHex(SKY.horizon, THREE.SRGBColorSpace), 1);
   /* One frame is many render() calls now; let main.js see the total. */
@@ -85,7 +89,19 @@ export async function init(ctx) {
   /* The scene target owns a real depth TEXTURE now — see the resolve
      pass at the top of postfx.js. That one full-screen un-projection
      is what the depth+normal prepass below has been replaced by. */
-  const rtScene = composer.target('main.scene', 1, { depthBuffer: true, depthTexture: true });
+  /* MSAA ON THE MAIN PASS. `msaa` has been in every quality tier since
+     the tiers were written and nothing read it, so the game shipped
+     with FXAA as its only anti-aliasing — a post filter that cannot
+     recover an edge narrower than a pixel, which is most of what the
+     detail pass added (0.05 m is a third of a pixel at 30 m). three
+     resolves the DEPTH attachment as well as the colour when
+     `resolveDepthBuffer` is on, so the depth TEXTURE the ND pass
+     un-projects still arrives single-sampled and correct — that is the
+     thing to check first if this is ever suspected. `?msaa=N` forces
+     it on any tier; see pickQuality. */
+  const rtScene = composer.target('main.scene', 1, {
+    depthBuffer: true, depthTexture: true, samples: Math.max(0, q.msaa | 0),
+  });
   const rtND = composer.target('main.nd', 1, { depthBuffer: true });
 
   /* ---------------- shadows ---------------- */
@@ -234,6 +250,10 @@ export async function init(ctx) {
        viewport reconciler below — this is the backstop for a rotation
        or a fullscreen change that arrived without a usable event. */
     tickViewport();
+    /* ...and is the frame sharp as it can afford to be? See THE
+       SHARPNESS GOVERNOR. Runs before the draw so a step taken this
+       frame is the size this frame is drawn at. */
+    governorTick();
     /* SANITISE dt BEFORE IT REACHES THE POST CHAIN.
        main.js seeds its clock after the boot loop, so the first
        requestAnimationFrame timestamp predates that call by however
@@ -387,8 +407,157 @@ export async function init(ctx) {
       );
     } catch (e) { return 4096; }   // conservative, and true of every ES3 device
   })();
+
+  /* ================================================================
+     THE SHARPNESS GOVERNOR.
+
+     THE BUG. `maxPixelRatio` was `min(q.pixelRatio, GL_LIMIT/…)`, and
+     q.pixelRatio is 1 on every tier, so this function could only ever
+     clamp DOWNWARD from 1 and its own guard comment above — "a phone
+     at dpr 3 is the case that finds this" — could never bind on
+     anything. MEASURED on a 390x844 mobile context before the change:
+     renderer.getPixelRatio() was 1 at devicePixelRatio 1, 2 AND 3,
+     backing store 390x844 in all three. On a 1170x2532 iPhone that is
+     0.33 Mpx drawn and scaled 3x by the compositor, which is the whole
+     of why the game looks soft on a phone. It was never a performance
+     decision; it was a desktop conclusion written into a constant.
+
+     WHY THIS IS A GOVERNOR AND NOT A BIGGER CONSTANT. The cost shape
+     is known — at 390x844 the frame is submission-bound, and GPU time
+     measured FLAT across dpr 1/2/3 — but it was measured on an M1 Max
+     and says nothing whatever about an iPhone 12 or a mid-range
+     Android, where the raster fraction of that frame is a different
+     size. A fixed 2 would be spending a budget nobody here has ever
+     seen. So the device measures itself:
+
+       · the ladder is [1, 1.5, 2]. IT STARTS AT 1 — the exact frame
+         that shipped before this, on hardware nobody has profiled;
+       · one notch per clean window, so the worst case this can ever
+         leave a player in is the frame they already had;
+       · the signal is MISSED 60 fps, not "headroom". Under vsync a
+         frame time is quantised to the display grid and headroom is
+         INVISIBLE — every healthy frame reads 16.7 whether it had 2 ms
+         of work or 16. What the grid does show is a frame the
+         compositor could not service. So the governor does not try to
+         measure what it cannot: it takes one step, watches, and locks
+         the ladder permanently below the first notch that misses.
+         That is a search, and it converges in two windows;
+       · a demotion is PERMANENT for the session. An oscillating
+         governor is worse than a slightly soft one, and the state it
+         locks into is the state it booted in.
+
+     `late` is a frame over GOV_LATE_MS = 20 ms — one missed vsync on a
+     60 Hz panel (16.7 -> 33.3) with a wide margin either side. On a
+     120 Hz panel a fall from 120 to 60 is deliberately NOT late: 60 is
+     the promise in BUILD_BRIEF, and a governor that defends 120 would
+     refuse to sharpen a phone that is doing fine. Anything over
+     GOV_IGNORE_MS = 250 ms is not a sample at all — that is a
+     backgrounded tab or a one-shot boot stall, and demoting the player
+     for switching apps would be its own bug.
+
+     THE A/B. `WALLY.debug.governor(false)` compiles it out live and
+     `WALLY.debug.pixelRatio(1)` pins the old rule, both on ONE page
+     load — the shipping rule and the rule it replaced, side by side,
+     which is the strong form this project asks for. tools/mobilebugs
+     PR-1..7 drives exactly that.
+     ================================================================ */
+  const PR_LADDER = [1, 1.5, 2];
+  const GOV_WINDOW = 60;     // frames per decision window (~1 s at 60 fps)
+  const GOV_SETTLE = 24;     // frames discarded after a size change
+  const GOV_BOOT = 120;      // ...and after boot: shader compiles, streaming
+  const GOV_LATE_MS = 20;    // a frame the 60 Hz compositor could not service
+  const GOV_IGNORE_MS = 250; // not a sample: tab throttle, boot stall
+  const GOV_DROP_LATE = 3;   // >= 5 % of a window; one hitch must not demote
+
+  /* A shot run must be reproducible between builds, so the governor is
+     off under ?shot unless it is asked for explicitly. */
+  let govOn = !ctx.flags?.shot;
+  try {
+    const gp = new URLSearchParams(location.search).get('govern');
+    if (gp != null) govOn = !/^(0|off|false|no)$/i.test(gp);
+  } catch (e) {}
+  let govStep = 0;                       // index into PR_LADDER
+  let govCap = PR_LADDER.length - 1;     // learned ceiling, lowered on failure
+  let govSettle = GOV_BOOT;
+  let govN = 0, govLate = 0, govLast = 0, govIgnored = 0, govFrame = -1;
+  const govLog = [];
+  let prOverride = null;                 // debug / measurement pin
+
+  const glClamp = (pr, cssW, cssH) =>
+    Math.max(0.5, Math.min(pr, GL_LIMIT / Math.max(1, Math.max(cssW, cssH))));
+
+  /* The ceiling for THIS viewport. A megapixel budget, not a dpr
+     constant: it is orientation-invariant and it self-limits on a big
+     panel, which is what makes it safe on hardware nobody measured.
+     See the pixel-ratio block at the top of contracts.js. */
+  function pixelRatioCeiling(cssW, cssH) {
+    const dpr = (typeof devicePixelRatio === 'number' && devicePixelRatio > 0) ? devicePixelRatio : 1;
+    const tierMax = Number.isFinite(q.pixelRatioMax) ? q.pixelRatioMax : (q.pixelRatio || 1);
+    const budgetMpx = Number.isFinite(q.pixelBudget) ? q.pixelBudget : 1.6;
+    const byBudget = Math.sqrt((budgetMpx * 1e6) / Math.max(1, cssW * cssH));
+    return glClamp(Math.max(1, Math.min(tierMax, dpr, byBudget)), cssW, cssH);
+  }
+  /* What the ladder asks for at step `i`, after the ceiling. */
+  const stepRatio = (i, cssW, cssH) =>
+    Math.min(PR_LADDER[Math.max(0, Math.min(PR_LADDER.length - 1, i))], pixelRatioCeiling(cssW, cssH));
+
   function maxPixelRatio(cssW, cssH) {
-    return Math.max(0.5, Math.min(q.pixelRatio, GL_LIMIT / Math.max(cssW, cssH)));
+    if (prOverride != null) return glClamp(prOverride, cssW, cssH);
+    return Math.max(0.5, stepRatio(govStep, cssW, cssH));
+  }
+
+  function governorTick() {
+    /* ONE SAMPLE PER FRAME, NOT PER render() CALL. render() is called
+       more than once per rAF by more than one thing in tools/ — the
+       profiler's stress mode re-renders the same frame to saturate the
+       GPU clock, and the black-square hunt re-renders to bisect a
+       material. Each of those extra calls is microseconds apart, and
+       counting them would fill a "clean window" with samples that are
+       not frames at all, then lift the ratio on the strength of it.
+       ctx.frame is main.js's own counter and is the only thing here
+       that means "a new frame". */
+    if (ctx.frame === govFrame) return;
+    govFrame = ctx.frame;
+    const now = performance.now();
+    const d = govLast ? now - govLast : 0;
+    govLast = now;
+    if (!govOn || prOverride != null) return;
+    if (d <= 0) return;
+    if (d > GOV_IGNORE_MS) { govIgnored++; return; }
+    if (govSettle > 0) { govSettle--; return; }
+    govN++;
+    if (d > GOV_LATE_MS) govLate++;
+    if (govN < GOV_WINDOW) return;
+
+    const late = govLate;
+    govN = 0; govLate = 0;
+
+    if (late >= GOV_DROP_LATE && govStep > 0) {
+      /* This notch missed 60. Never try it again this session. */
+      govCap = govStep - 1;
+      setStep(govCap, `drop: ${late}/${GOV_WINDOW} frames > ${GOV_LATE_MS} ms`);
+    } else if (late === 0 && govStep < govCap) {
+      const [cw, ch] = measure();
+      /* Already at the viewport's ceiling — a further notch would
+         change nothing, so stop rather than log a lift that isn't one. */
+      if (stepRatio(govStep + 1, cw, ch) > stepRatio(govStep, cw, ch) + 1e-6) {
+        setStep(govStep + 1, 'lift: clean window');
+      } else {
+        govCap = govStep;
+      }
+    }
+  }
+
+  function setStep(i, why) {
+    const prev = govStep;
+    govStep = Math.max(0, Math.min(PR_LADDER.length - 1, i));
+    govSettle = GOV_SETTLE;
+    const moved = syncViewport(false);
+    if (govLog.length < 32) {
+      govLog.push({ frame: ctx.frame, from: PR_LADDER[prev], to: PR_LADDER[govStep],
+        pr: +renderer.getPixelRatio().toFixed(3), moved, why });
+    }
+    return moved;
   }
 
   /* The measured truth. Falls back to the window only when the canvas
@@ -404,19 +573,94 @@ export async function init(ctx) {
     return [Math.max(1, Math.round(w)), Math.max(1, Math.round(h))];
   }
 
+  /* ================================================================
+     WHAT THE BACKING STORE IS ACTUALLY SIZED TO — AND THE HEALTH FLAG
+     THAT GOT IT WRONG THE MOMENT THE RATIO STOPPED BEING 1.
+
+     three.js allocates the drawing buffer with
+     `canvas.width = Math.FLOOR(cssW * pixelRatio)`
+     (WebGLRenderer.setSize), and every post target follows it through
+     getDrawingBufferSize(), which floors too. `inSync` and
+     syncViewport's early-out both computed the expected size with
+     Math.ROUND. While `pixelRatio` was 1 on every tier those two
+     agreed for every viewport that exists and the mistake could not
+     show. The megapixel budget made the ratio irrational, and floor
+     and round now agree only when the product's fractional part
+     happens to land under a half. MEASURED — headless Chrome, ANGLE
+     Metal, M1 Max, tier high, the governor taking its own notch
+     (tools/_k30-insync.mjs):
+
+       1600x900  pr 1.2638  buffer 2022x1137  round 2022x1137  agreed
+       1440x900  pr 1.3322  buffer 1918x1198  round 1918x1199  LIED
+       1366x768  pr 1.4807  buffer 2022x1137  round 2023x1137  LIED
+       1280x800  pr 1.4987  buffer 1918x1198  round 1918x1199  LIED
+        390x844  pr 1.5     buffer  585x1266  round  585x1266  agreed
+
+     Three of five shapes reported DESYNC on a frame that was correct
+     in every respect — and this is the flag anyone debugging a
+     resolution problem reaches for first, in the round that just made
+     the ratio dynamic. The two that agreed did so by luck (1600x900's
+     fractional part is 0.43), not by law.
+
+     AND IT WAS NEVER ONLY A FLAG. syncViewport's early-out compared
+     the same rounded number against the same floored canvas, so on
+     those three shapes it could NEVER match: every poll — once per 32
+     frames forever, and twelve frames running after any resize event
+     — re-ran renderer.setSize, api.resize, the composer's whole
+     target pool and every other module's resize hook, for a viewport
+     that had not moved. `resyncs` counts the times syncViewport did
+     work, so that is a number rather than an argument.
+
+     THE A/B, ON ONE PAGE LOAD: `WALLY.debug.sizeRule('round')` puts
+     the rule this replaced back into BOTH call sites and
+     `sizeRule('floor')` returns the shipping one — the module-switch
+     form contracts.js asks for, not a quoted before-number.
+     tools/mobilebugs.mjs VP-1..VP-4 drives it.
+     ================================================================ */
+  let sizeRule = 'floor';        // 'floor' ships; 'round' is the rule it replaced
+  let resyncs = 0;               // times syncViewport actually rebuilt the chain
+  /* exactly what WebGLRenderer.setSize does, from the MEASURED css box
+     rather than from the renderer's own stored one — reading it back
+     off the renderer would agree with itself and could never see the
+     desync this flag exists to catch. */
+  const bufferPx = (css, pr) => (sizeRule === 'round' ? Math.round(css * pr) : Math.floor(css * pr));
+
   function viewportState() {
     const [cw, ch] = measure();
     const pr = renderer.getPixelRatio();
     return {
       css: [cw, ch],
       buffer: canvasEl ? [canvasEl.width, canvasEl.height] : null,
-      want: [Math.round(cw * pr), Math.round(ch * pr)],
+      want: [bufferPx(cw, pr), bufferPx(ch, pr)],
+      /* THE RESIDUAL, WHICH IS REAL AND IS NOT A FAULT, so it gets its
+         own name instead of being folded into a boolean. Flooring
+         leaves up to one device pixel at the right and bottom edges
+         covered by stretching rather than by a texel of its own. It is
+         inherent to three's sizing and always under 1 CSS px; it is
+         also the only thing `inSync:false` could honestly have meant
+         on those three shapes. */
+      slackCss: (canvasEl && pr > 0)
+        ? [+(cw - canvasEl.width / pr).toFixed(3), +(ch - canvasEl.height / pr).toFixed(3)]
+        : null,
+      sizeRule,
+      resyncs,
       pixelRatio: pr,
+      /* what the tier would ALLOW here, vs what the ladder has earned */
+      prCeiling: +pixelRatioCeiling(cw, ch).toFixed(3),
+      prStep: PR_LADDER[govStep],
+      prBudgetMpx: Number.isFinite(q.pixelBudget) ? q.pixelBudget : null,
+      mpx: canvasEl ? +((canvasEl.width * canvasEl.height) / 1e6).toFixed(3) : null,
+      /* THE TARGET'S OWN COUNT, not the tier's wish. See dbg.msaa. */
+      samples: rtScene.samples | 0,
       camAspect: ctx.camera ? +ctx.camera.aspect.toFixed(4) : null,
       sceneRT: [rtScene.width, rtScene.height],
+      /* TRUE MEANS: the buffer is the surface. The canvas is sized to
+         the box the browser is actually laying out, at the ratio the
+         renderer is actually using, and the scene target the whole
+         post chain runs at is that same canvas. */
       inSync: !!canvasEl
-        && canvasEl.width === Math.round(cw * pr)
-        && canvasEl.height === Math.round(ch * pr)
+        && canvasEl.width === bufferPx(cw, pr)
+        && canvasEl.height === bufferPx(ch, pr)
         && rtScene.width === canvasEl.width && rtScene.height === canvasEl.height,
     };
   }
@@ -428,14 +672,17 @@ export async function init(ctx) {
     const [cw, ch] = measure();
     const pr = maxPixelRatio(cw, ch);
     if (pr !== renderer.getPixelRatio()) renderer.setPixelRatio(pr);
-    const wantW = Math.round(cw * pr);
-    const wantH = Math.round(ch * pr);
+    /* SAME RULE AS setSize, OR THIS NEVER EARLY-OUTS. See the block
+       above viewportState(). */
+    const wantW = bufferPx(cw, pr);
+    const wantH = bufferPx(ch, pr);
     if (!force
       && cw === appliedW && ch === appliedH
       && canvasEl.width === wantW && canvasEl.height === wantH
       && rtScene.width === wantW && rtScene.height === wantH) return false;
 
     appliedW = cw; appliedH = ch;
+    resyncs++;
 
     const cam = ctx.camera;
     if (cam && cam.isPerspectiveCamera) {
@@ -550,7 +797,6 @@ export async function init(ctx) {
       const t = typeof nameOrTier === 'string' ? null : nameOrTier;
       const tier = t || null;
       if (tier) Object.assign(q, tier);
-      renderer.setPixelRatio(q.pixelRatio);
       csm.setMapSize(q.shadowSize);
       csm.setFar(SHADOW_FAR[tierName(q.name)] ?? 110);
       post.params.ssao = q.ssao !== false;
@@ -558,7 +804,12 @@ export async function init(ctx) {
       post.params.dof = q.dof !== false;
       post.params.grain = q.grain !== false;
       needND = post.params.ssao || post.params.dof;
-      api.resize(window.innerWidth, window.innerHeight);
+      /* The new tier carries its own pixelRatioMax and pixelBudget, so
+         the ladder restarts from the bottom and re-earns its way up on
+         this tier's evidence rather than inheriting the last one's. */
+      govStep = 0; govCap = PR_LADDER.length - 1;
+      govSettle = GOV_SETTLE; govN = 0; govLate = 0;
+      syncViewport(true);
       ctx.bus.emit('quality', q);
     },
 
@@ -636,6 +887,83 @@ export async function init(ctx) {
      object; `inSync:false` is the hard-edged frame the user shot. */
   dbg.viewport = () => viewportState();
   dbg.syncViewport = (force) => syncViewport(force !== false);
+  /* THE SIZING-RULE SWITCH — the shipping rule and the rule it
+     replaced, side by side on one page load. 'round' is what `inSync`
+     and syncViewport's early-out used to compare against; 'floor' is
+     what three.js actually allocates. Returns the rule now in force. */
+  dbg.sizeRule = (r) => {
+    if (r === 'round' || r === 'floor') { sizeRule = r; syncViewport(true); }
+    return sizeRule;
+  };
+  /* ---- MSAA, SWITCHED LIVE, SO THE TRADE CAN BE TAKEN ON ONE LOAD ----
+     `msaa` is baked into the scene target at construction, so the only
+     way to A/B it used to be `?msaa=N` and one page load per value —
+     and a page load changes the streamed foliage, the NPC positions
+     and the wind phase along with the setting, which is exactly the
+     confound that makes an edge-width difference unreadable. `samples`
+     is a plain field on WebGLRenderTarget and three re-creates the
+     framebuffer from it after dispose(); rtScene.texture survives as
+     the same object, so every post uniform pointing at it stays
+     valid. That makes msaa a sibling of pixelRatio(v): both notches
+     of the same trade, driven on one page load, same world, same
+     clock. Returns what the target actually got — the driver clamps
+     to MAX_SAMPLES, and a request that was clamped must not be
+     reported as the number that was asked for. */
+  dbg.msaa = (n) => {
+    const want = Math.max(0, Math.min(8, n | 0));
+    if (want !== (rtScene.samples | 0)) {
+      rtScene.samples = want;
+      rtScene.dispose();          // three rebuilds the FBO at the new count
+      q.msaa = want;              // so ENVSTATE/viewport() cannot disagree
+    }
+    let maxS = 0;
+    try { const g = renderer.getContext(); maxS = g.getParameter(g.MAX_SAMPLES) | 0; } catch (e) {}
+    return { want, samples: rtScene.samples | 0, maxSamples: maxS };
+  };
+  /* ---- THE SHARPNESS GOVERNOR, and its A/B ----
+     `governor(false)` stops it dead where it stands; `pixelRatio(v)`
+     pins a ratio through the shipped resize path (v = 1 is the rule
+     this replaced, exactly); `pixelRatio(null)` hands it back. Both on
+     one page load, which is what makes this a revert check and not a
+     quoted before-number. `governorState()` is what it has decided and
+     why. */
+  dbg.governor = (on) => {
+    govOn = on !== false;
+    if (govOn) { govSettle = GOV_SETTLE; govN = 0; govLate = 0; govLast = 0; }
+    return govOn;
+  };
+  dbg.pixelRatio = (v) => {
+    prOverride = (v == null || v === false) ? null : Math.max(0.25, Math.min(8, +v || 1));
+    syncViewport(true);
+    return renderer.getPixelRatio();
+  };
+  dbg.governorState = () => ({
+    on: govOn, override: prOverride,
+    step: govStep, ladder: PR_LADDER.slice(), cap: govCap,
+    pixelRatio: renderer.getPixelRatio(),
+    window: GOV_WINDOW, lateMs: GOV_LATE_MS, dropLate: GOV_DROP_LATE,
+    inWindow: govN, lateInWindow: govLate, settle: govSettle, ignored: govIgnored,
+    tier: q.name, pixelRatioMax: q.pixelRatioMax, pixelBudget: q.pixelBudget,
+    log: govLog.slice(),
+  });
+  /* Force a decision now instead of waiting a real second. THE POINT
+     OF THIS HOOK IS THAT IT TAKES THE SAME DECISION governorTick()
+     TAKES — it just does not have to sit through 60 frames to see it —
+     so a lift here obeys the learned cap exactly as the frame loop
+     does. It first shipped without that guard, and tools/mobilebugs
+     PR-15 caught it climbing back over a notch that had already
+     failed: an instrument that reported something other than the thing
+     it was pointed at, which is the one thing this project keeps
+     paying for. `force` is the deliberate escape hatch, and it says so
+     in the log. */
+  dbg.governorStep = (dir, force) => {
+    const before = renderer.getPixelRatio();
+    if (dir < 0) { if (govStep > 0) { govCap = govStep - 1; setStep(govCap, 'forced drop'); } }
+    else if (force) setStep(govStep + 1, 'forced lift (past cap)');
+    else if (govStep < govCap) setStep(govStep + 1, 'forced lift');
+    return { before, after: renderer.getPixelRatio(), step: govStep, cap: govCap,
+      capped: !force && govStep >= govCap };
+  };
   /* Off, the frame goes back to trusting main.js's single resize
      event — which is the state the landscape bug was reported in. */
   dbg.viewportAuto = (on) => { vpAuto = on !== false; return vpAuto; };

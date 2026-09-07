@@ -53,9 +53,10 @@
    ============================================================ */
 
 import { SEA } from '../core/palette.js';
-/* ONE BICYCLE IN THE GAME, NOT TWO. See createBicycle at the foot of
-   this file for why the intro's private model is gone. */
-import { createBike } from '../character/bike.js';
+/* ONE OF EACH MACHINE IN THE GAME, NOT TWO. See createBicycle at the
+   foot of this file for why the intro's private model is gone, and
+   arrival.js for the four it can build instead. */
+import { ARRIVAL, createArrivalProp } from './arrival.js';
 
 /* 54 bpm, 4/4 — one bar of SCORES.cinematic in src/audio/music.js. */
 export const BAR = 4 * 60 / 54;          // 4.4444 s
@@ -80,9 +81,40 @@ const RIDE = {
   t0: 19.30,                             // rolls into shot before the cut
   brake: TIMING.hero - 1.25,
   stop: TIMING.hero,
+  /* which machine the road is being staged for, and where SEQ C's
+     lenses aim on it. Both are rewritten by setRideProfile(). */
+  id: 'bike',
+  aimY: 1.15,
+  air: false,
 };
 /* v * ( (brake - t0) + 0.5 * brakeTime ) = dist */
-RIDE.speed = RIDE.dist / ((RIDE.brake - RIDE.t0) + 0.5 * (RIDE.stop - RIDE.brake));
+const rideSolve = () => {
+  RIDE.speed = RIDE.dist / ((RIDE.brake - RIDE.t0) + 0.5 * (RIDE.stop - RIDE.brake));
+};
+rideSolve();
+
+/**
+ * Stage the road for one of the four machines. Called by intro.js's
+ * arm() BEFORE chooseStage and storyboard, because both of them read
+ * RIDE: the stage picker probes a corridor `dist` long behind the
+ * anchor, and the storyboard's SEQ C aim points are positions on it.
+ *
+ * IT IS A MUTATION OF ONE RECORD RATHER THAN A PARAMETER THREADED
+ * THROUGH SIX FUNCTIONS, and that is deliberate: `ridePath` and
+ * `rideSpeed` are pure functions of t that intro.js calls every frame
+ * and tools call without a director, and giving them a second argument
+ * that four call sites would have to keep in step is exactly the
+ * two-copies-of-one-number failure this file's header is about.
+ */
+export function setRideProfile(id) {
+  const a = ARRIVAL[id] || ARRIVAL.bike;
+  RIDE.id = a.id;
+  RIDE.dist = a.dist;
+  RIDE.aimY = a.aimY;
+  RIDE.air = !!a.air;
+  rideSolve();
+  return RIDE;
+}
 
 /* Metres of road behind him at time t (0 at t0, dist at stop). */
 export function ridePath(t) {
@@ -101,6 +133,44 @@ export function rideSpeed(t) {
   return RIDE.speed * (1 - (t - RIDE.brake) / (RIDE.stop - RIDE.brake));
 }
 export { RIDE };
+
+/* ------------------------------------------------------------------
+   THE DESCENT — the balloon's version of ridePath, and it is a
+   different curve because a balloon does not brake, it FLARES.
+
+   Constant sink at balloon.js FLIGHT's own full-descent rate, then a
+   flare that takes the rate to zero at the mooring. The flare
+   duration is SOLVED from the two numbers rather than dialled, so
+   raising the entry altitude lengthens the cruise and leaves the
+   flare alone instead of driving her into the grass:
+
+     dist = sink * (T - 0.5 * flare)  ->  flare = 2 * (T - top / sink)
+
+   With top 28 m, sink 4.5 m/s and T = 7.37 s that is a 5.08 s sink
+   and a 2.29 s flare covering the last 5.15 m — which is the beat the
+   burner is lit on, and the burner being visible near the ground is
+   the balloon module's own rule.
+   ------------------------------------------------------------------ */
+const AIR = ARRIVAL.balloon;
+const airT = () => RIDE.stop - RIDE.t0;
+const airFlare = () => Math.max(0.2, 2 * (airT() - AIR.top / AIR.sink));
+
+/** Metres of the machine's ORIGIN over the mooring at director time t. */
+export function airAlt(t) {
+  if (t <= RIDE.t0) return AIR.top;
+  if (t >= RIDE.stop) return 0;
+  const e = RIDE.stop - t;               // seconds to touchdown
+  const tf = airFlare();
+  if (e >= tf) return AIR.sink * (e - 0.5 * tf);
+  return (AIR.sink * e * e) / (2 * tf);
+}
+/** Sink rate in m/s (positive = descending) at director time t. */
+export function airSink(t) {
+  if (t <= RIDE.t0 || t >= RIDE.stop) return 0;
+  const e = RIDE.stop - t;
+  const tf = airFlare();
+  return e >= tf ? AIR.sink : (AIR.sink * e) / tf;
+}
 
 /* ------------------------------------------------------------------
    THE STAGE — chosen against the world that is actually there.
@@ -134,6 +204,32 @@ const PROBES = [                      // [forward, right, up, fanTheFrame]
   [3.50, 11.0, 5.40, 0], [6.00, 26.0, 34.0, 0],
 ];
 
+/* ------------------------------------------------------------------
+   AND THE AIR ARRIVAL PROBES ITS OWN CAMERAS, because they are not
+   these ones and the difference is the whole point of the stage
+   picker.
+
+   SEQ C AIR stands 36 m out at head height — a balloon is 30 m of
+   subject and no closer lens has both it and the horizon in frame —
+   and the picker above never looked further than 26.7 m laterally, at
+   34 m of ELEVATION where a ray clears almost everything. The first
+   frame shot with the far camera unprobed came back as the inside of
+   a stucco wall with two window heads in it: the camera was standing
+   in a building the picker had never been asked about. With these
+   probes it rotates the stage until the sightline is clear — see
+   shots/ih-balloon-20p4.png.
+
+   So the air fork scores the shots it will actually use. It is a
+   SEPARATE list rather than four more rows on the one above, because
+   adding a 36 m ground-level probe to the shared set would rescore
+   every bearing for the bicycle too, and the bicycle's framing is
+   measured and shipped.
+   ------------------------------------------------------------------ */
+const PROBES_AIR = [
+  [28.0, 22.5, 2.40, 1], [15.0, 13.5, 2.60, 1],
+  [7.50, 9.00, 3.25, 1], [6.60, 2.28, 1.75, 1],
+];
+
 /* Horizontal fan across the frame, in radians off the aim axis. The
    hero lens is 32 deg vertical on 16:9, i.e. +/- 0.47 rad horizontal,
    so nine rays put a sample every 0.13 rad — 6 % of frame width. Five
@@ -154,7 +250,7 @@ function scoreYaw(ctx, anchor, yaw, fanRays) {
   let s = 0;
   void T;
 
-  for (const [a, b, h, fan] of PROBES) {
+  for (const [a, b, h, fan] of (RIDE.air ? PROBES_AIR : PROBES)) {
     p.set(anchor.x + fx * a + rx * b, anchor.y + h, anchor.z + fz * a + rz * b);
     d.subVectors(p, eye);
     const len = d.length() || 1;
@@ -281,6 +377,19 @@ export function storyboard(anchor, ground, yaw = RIDE_YAW) {
     const back = RIDE.dist - ridePath(t);
     return [W.x - f.x * back, W.y + h, W.z - f.z * back];
   };
+  /* Where the BASKET is at director time t: the same 8 m of drift the
+     ground path uses, and airAlt over it. The aim is his chest on the
+     deck, so the envelope hangs in the top of the frame rather than
+     the lens looking at ten metres of fabric with a man under it. */
+  const air = (t, k = 1) => {
+    const back = RIDE.dist - ridePath(t);
+    /* `k` aims SHORT of the basket. At k 1 the lens points at the man
+       on the deck and the envelope hangs above him; the opening shot
+       wants the envelope in the top half and the island across the
+       bottom, so it aims at roughly half the machine's height and lets
+       the crown ride the top of the frame. */
+    return [W.x - f.x * back, W.y + (airAlt(t) + AIR.deck + 1.15) * k, W.z - f.z * back];
+  };
 
   return {
     f, r, yaw, anchor: W, groundY: y,
@@ -330,16 +439,63 @@ export function storyboard(anchor, ground, yaw = RIDE_YAW) {
        The aim points are where he WILL be, so the camera tracks a
        moving subject with a static spline. Drops 34 m to 2 m while
        closing from 50 m to 8: the descent and the approach are the
-       same move. */
-    arrival: {
+       same move.
+
+       THE AIM HEIGHT IS THE MACHINE'S, NOT A CONSTANT. 1.15 is a
+       bicycle rider's chest. anim.js folds him down over a
+       motorcycle's tank and stands him on a scooter's floor, so
+       RIDE.aimY carries the number and arrival.js owns it. A lens set
+       for a bicycle and pointed at a motorcyclist from 40 m puts his
+       head in the top third of the frame.
+
+       AND THE BALLOON DOES NOT USE THIS SHOT AT ALL. It is not a
+       different prop on the same road — it is not on the road, it
+       does not have a road, and a camera that drops 34 m to meet a
+       thing that is itself descending 28 m is two moves cancelling.
+       See `air` below: the balloon's SEQ C is a separate storyboard
+       entry and `arrival` is chosen between them at build time. */
+    arrival: RIDE.air ? {
+      /* ---- SEQ C, AIR — she comes down, the camera stays put ----
+         The whole grammar inverts. Every ground arrival is the camera
+         moving toward a subject travelling across the frame; a balloon
+         arrival is a subject travelling DOWN the frame and a camera
+         that barely moves at all, because the descent is the shot. So
+         the lens starts low and looks up at a lit envelope against the
+         dawn sky, then levels as she settles, and the last control
+         point is a long lens on the basket at head height — the same
+         framing the ground shots hand to SEQ D, so the cut is the same
+         cut.
+
+         Rising 1.9 m over the sequence and closing 4 m: less camera
+         movement than any other beat in the opener, on purpose. */
+      name: 'arrival',
+      fog: [110, 1200],
+      grade: 'day',
+      opts: { handheld: 0.26, letterbox: true, tension: 0.46 },
+      shots: [
+        /* 36 m out at head height. Solved, not eyeballed: the crown at
+           30 m subtends 35 deg of elevation from here and the lens is
+           44 deg (22 deg half), so aiming at 12 deg puts the crown on
+           the top edge, the basket a little over half way up, and the
+           horizon 12 deg below the aim — a little over half way down.
+           Everything in one frame, which the 28 m version could not
+           do at any focal length. */
+        { position: P(28.0, 22.5, 2.40), target: air(TIMING.arrival, 0.50), fov: 44,
+          dof: { aperture: 4.2, focus: 40 }, duration: 3.333, ease: 'in' },
+        { position: P(15.0, 13.5, 2.60), target: air(TIMING.arrival + 3.333), fov: 40,
+          dof: { aperture: 5.2, focus: 21 }, duration: 3.334, ease: 'out' },
+        { position: P(7.5, 9.0, 3.25), target: [W.x, W.y + 1.35, W.z], fov: 36,
+          dof: { aperture: 6.6, focus: 11.5 }, duration: 1.2, ease: 'hold' },
+      ],
+    } : {
       name: 'arrival',
       fog: [110, 900],
       grade: 'day',
       opts: { handheld: 0.30, letterbox: true, tension: 0.5 },
       shots: [
-        { position: P(6.0, 26.0, 34.0), target: at(TIMING.arrival, 1.15), fov: 42,
+        { position: P(6.0, 26.0, 34.0), target: at(TIMING.arrival, RIDE.aimY), fov: 42,
           dof: { aperture: 4.6, focus: 52 }, duration: 3.333, ease: 'in' },
-        { position: P(3.5, 11.0, 5.4), target: at(TIMING.arrival + 3.333, 1.15), fov: 38,
+        { position: P(3.5, 11.0, 5.4), target: at(TIMING.arrival + 3.333, RIDE.aimY), fov: 38,
           dof: { aperture: 6.0, focus: 18 }, duration: 3.334, ease: 'out' },
         { position: P(2.2, 7.5, 2.3), target: [W.x, W.y + 1.10, W.z], fov: 36,
           dof: { aperture: 6.6, focus: 8.4 }, duration: 1.2, ease: 'hold' },
@@ -565,87 +721,18 @@ export function createGulls(ctx, opts = {}) {
    This is that. Both files are now owned by the same agent, so the
    rename risk that argued for a private copy is gone too.
 
-   WHAT THIS WRAPPER ADDS is the intro's own idiom and nothing else:
-   park() here takes a WORLD placement (the intro's bicycle is a scene
-   prop, not a child of Wally's root), where the prop's own park() only
-   knows about the stand and the lean.
+   THE WRAPPER ITSELF HAS MOVED TO arrival.js, because the intro can
+   now stage any of the four machines and the wrapper was never about
+   bicycles: it is about a scene prop rather than a child of Wally's
+   root. `createBicycle` stays here, as the one line it always should
+   have been, so nothing that imports it from the shot list breaks.
 
-   Forward is +Z, on both models, so `group.rotation.y = yaw` still
+   Forward is +Z, on all four models, so `group.rotation.y = yaw` still
    matches the convention data.js uses for every building on the island.
    ================================================================== */
-export function createBicycle(ctx) {
-  const prop = createBike(ctx);
-  prop.group.name = 'intro.bicycle';
+export function createBicycle(ctx) { return createArrivalProp(ctx, 'bike'); }
 
-  const api = {
-    group: prop.group,
-    /** Where the rider's pelvis has to land. The intro reads it rather
-        than keeping a second copy — that constant getting out of step
-        with the frame is exactly how the feet left the pedals. */
-    SADDLE: prop.SADDLE,
-    PEDAL: prop.PEDAL,
-    R: prop.R,
-
-    /** Axle to axle, read off the prop rather than typed in again. */
-    wheelbase: prop.wheels.length > 1
-      ? Math.abs(prop.wheels[0].position.z - prop.wheels[1].position.z) : 0,
-
-    /** Roll the wheels by `metres` of ground. See bike.js `roll`. */
-    roll(metres) { return prop.roll(metres); },
-
-    /** The parked lean and the stand's design contact point, read off
-        the prop. parkArrival() hands both to solveParkPose; keeping a
-        second copy of either here is how the intro's park solve came to
-        be a generation behind the gameplay one. */
-    get parkLean() { return prop.parkLean; },
-    get standFoot() { return prop.standFoot; },
-
-    /** Take it off the stand — it is being RIDDEN again.
-        Only the debug seek needs this: seeking to the hero mark parks
-        the machine, and seeking BACK to the ride mark handed it to
-        driveCharacter with the kickstand still out and the park lean
-        still on the group. A ridden bicycle standing on its stand is
-        the same defect as a parked one without. */
-    unpark() {
-      prop.park(false);
-      prop.group.rotation.order = 'XYZ';
-      prop.group.rotation.set(0, 0, 0);
-    },
-
-    /** Turn the cranks to a pedal phase in radians. The intro takes
-        this from the ride clip's own cycle, never from the wheel. */
-    setCrankPhase(ph) { prop.setCrankPhase(ph); },
-
-    /**
-     * Lean it on its stand at a world placement, pitched `pitch` about
-     * its own lateral axis so both wheels touch a sloping stage.
-     *
-     * ROTATION ORDER IS LOAD-BEARING. Default 'XYZ' composes Rx*Ry*Rz,
-     * which applies the pitch OUTSIDE the yaw — about the world x axis
-     * — so a bicycle parked facing east would tip sideways instead of
-     * nose-up. 'YXZ' gives Ry*Rx*Rz: yaw in the world, pitch about the
-     * machine's own lateral axis, and then prop.park()'s lean on z,
-     * innermost, about its own forward axis. wally.js's parkProp() sets
-     * the same order for the same reason; see the note there, and the
-     * measured before/after that made it necessary.
-     *
-     * @param {number} pitch radians, NEGATIVE for nose-up (three.js Rx
-     *        sends (0,0,L) to y = -L sin x, so +z falls on a positive x)
-     * @param {number} [roll] radians about its own forward axis. Omit
-     *        for the flat-ground lean; parkArrival passes the conformed
-     *        roll so the kickstand sits on the ground's cross-slope
-     *        rather than on the machine's own contact plane.
-     */
-    park(x, y, z, yaw, pitch = 0, roll) {
-      prop.group.position.set(x, y, z);
-      prop.group.rotation.order = 'YXZ';
-      prop.group.rotation.set(Number.isFinite(pitch) ? pitch : 0, yaw, 0);
-      prop.park(true, roll);
-    },
-
-    dispose() { prop.dispose(); },
-  };
-  return api;
-}
-
-export default { storyboard, MARKS, TIMING, BAR, createGulls, createBicycle };
+export default {
+  storyboard, MARKS, TIMING, BAR, createGulls, createBicycle,
+  setRideProfile, airAlt, airSink,
+};

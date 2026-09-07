@@ -287,9 +287,17 @@ export function coarsePointer() {
    control's own wording — taken from the pad below, so the button and
    the sentence pointing at it can never drift apart. */
 export const ACTIONS = {
-  /* the corner button: 'Enter / Talk' at rest, 'More' mid-conversation */
-  interact: { key: 'E', touch: 'Enter', cap: 'Enter / Talk' },
-  advance: { key: 'E', touch: 'More' },
+  /* THE CORNER BUTTON HAS THREE NAMES — one per thing it can actually
+     do — and which one it wears is decided by WHAT IS IN REACH (see
+     below). It used to have one name for two verbs: 'Enter / Talk',
+     which is what a compromise caption is — a button that will not say
+     whether pressing it opens a shop or starts a conversation. The
+     player's words were "it should just be the button on the bottom
+     saying talk instead of enter", and a person in front of you is the
+     branch that must read Talk and nothing else. */
+  interact: { key: 'E', touch: 'Enter', cap: 'Enter' },   // a door
+  talk: { key: 'E', touch: 'Talk', cap: 'Talk' },         // a person
+  advance: { key: 'E', touch: 'More', cap: 'More' },      // a card is up
   jump: { key: 'Space', touch: 'Jump' },
   phone: { key: 'P', touch: 'Phone' },
   places: { key: 'M', touch: 'Places' },
@@ -297,6 +305,79 @@ export const ACTIONS = {
   menu: { key: 'Esc', touch: 'Menu' },
   buy: { key: 'B', touch: 'Buy' },
 };
+
+/* ============================================================
+   A LITERAL KEY MUST NOT OUTRANK THE INPUT MODE.
+
+   Every call site is supposed to name an ACTION and get back the label
+   for the input the player is holding. There is one escape hatch, for
+   chips that are not keyboard keys at all — the race prints checkpoint
+   numbers and a chequered flag, npc.say prints a bullet — and that
+   hatch was a plain "if a literal was passed, print it", which any
+   caller could reach by typing a key name. One did: npc.js asked for a
+   chip that said 'E' and got one, on a phone, floating over every
+   person in the city, for the whole of the round that was supposed to
+   have removed the last of them.
+
+   So the hatch is narrowed to what it was FOR. A literal that names a
+   keyboard key is not a literal — it is a keyboard label, and it goes
+   back through the action table like everything else.
+
+   'Enter' is deliberately absent, and so is the digit/emoji/bullet
+   vocabulary the race and the speech bubbles use: in this game Enter is
+   a verb and the name of the pad's own button, which is exactly what
+   tools/touchtest.mjs's sweep says about it. */
+const KEY_NAME = /^(?:[A-Za-z]|F(?:[1-9]|1[0-2])|Esc|Escape|Tab|Space|Spacebar|Shift|Ctrl|Control|Alt|Option|Cmd|Command|Meta|Win|Return|Backspace|Del|Delete|PgUp|PgDn|Home|End|[←↑→↓])$/;
+
+/** Does this literal string name a key on a keyboard? */
+export function isKeyName(s) {
+  return typeof s === 'string' && KEY_NAME.test(s.trim());
+}
+
+/* ============================================================
+   REACH — WHAT IS IN FRONT OF HIM, AND THEREFORE WHAT THE ONE
+   INTERACT CONTROL IS CALLED.
+
+   A PERSON IS NOT A DOOR. The pad's corner button, the world-space
+   prompt over the thing itself and the sentence on the objective strip
+   are three renderings of ONE verb, and they were all reading the same
+   compromise word because nothing told them which verb it was this
+   frame.
+
+   hud.js owns the world-space prompt layer, which is the only place in
+   the game that knows both halves at once: the door it generates for
+   itself, and the person prompt npc.js publishes when somebody is
+   inside TALK_RANGE. So it measures, and publishes here, and everything
+   that has to NAME the control reads the answer from one place.
+
+     'none'    open ground
+     'door'    a doorway in range
+     'person'  somebody in range
+     'both'    both at once
+
+   BOTH IS A PERSON. That is not a taste call — it is what the game
+   already does: npc.js's KeyE listener is registered at stage 11, ui.js's
+   at stage 13, and when a person is in range it consumes the event with
+   stopImmediatePropagation before the door handler ever sees it. So on a
+   keyboard the person has always won, and a door-hugging client is the
+   normal case rather than a corner one (they are placed at doors). The
+   pad went through hud.interact(), which asked about the door first —
+   the same press, two different verbs, on the two inputs. Person first
+   on both now; see hud.js's interact().
+   ============================================================ */
+let reachNow = 'none';
+
+/** hud.js publishes; nobody else should. */
+export function setReach(kind) {
+  reachNow = kind === 'door' || kind === 'person' || kind === 'both' ? kind : 'none';
+  return reachNow;
+}
+/** 'none' | 'door' | 'person' | 'both' */
+export function reachKind() { return reachNow; }
+/** The ACTION the one interact control performs on what is in reach. */
+export function reachAction() {
+  return reachNow === 'person' || reachNow === 'both' ? 'talk' : 'interact';
+}
 
 /* null = no layer has spoken yet, so the media query decides. */
 let layerOn = null;
@@ -427,10 +508,19 @@ export function createTouch(ctx, ui) {
      one you press by accident is the incidental one. (This used to be
      the other way round — jump big in the corner — which put the
      game's main verb in the harder-to-reach seat.) */
-  const actCap = h('span.cap.long', { text: ACTIONS.interact.cap });
+  /* TWO GLYPHS, ONE BUTTON. A door under a caption that says TALK is
+     the same lie the caption was, one layer down, so the icon turns
+     over with the word: a door for a doorway, a speech bubble for a
+     person. Both are built once and swapped by display — a button that
+     rebuilt its own child on a 5 Hz poll would be a new element under
+     the player's thumb every time they walked past somebody. */
+  const actIconDoor = icon('door', 27);
+  const actIconTalk = icon('chat', 27);
+  actIconTalk.style.display = 'none';
+  const actCap = h('span.cap', { text: ACTIONS.interact.cap });
   const actBtn = h('button.w-abtn.big.act.off', {
-    type: 'button', 'aria-label': 'Enter or talk',
-  }, icon('door', 27), actCap);
+    type: 'button', 'aria-label': ACTIONS.interact.cap,
+  }, actIconDoor, actIconTalk, actCap);
   const jumpBtn = h('button.w-abtn.mid.jump', {
     type: 'button', 'aria-label': 'Jump',
     /* NOT `w-up`: that class is the producer upgrade CARD (a 70% white
@@ -1266,7 +1356,7 @@ export function createTouch(ctx, ui) {
      PAD-15 monkey-patches the two sheet verbs so neither can hide the
      pad, and both stubs run. PAD-15b touches nothing: it presses ENTER
      and Menu together on OPEN GROUND, where Enter's real verb refuses
-     for a game reason (no door in range) and so raises no sheet to
+     for a game reason (nothing in range) and so raises no sheet to
      occlude anything — the loser's release then measures a live,
      non-zero pad rect and Menu's real verb opens the real pause sheet.
      Two verbs, no stubs, the same conclusion.
@@ -2045,7 +2135,7 @@ export function createTouch(ctx, ui) {
     clearTimeout(liveTimer); liveTimer = 0; root.classList.remove('w-idlewake');
     /* the caption latches are stale the moment the layer is put away —
        drop them so the first update after it comes back repaints */
-    actWas = null; talkWas = null;
+    actWas = null; actNameWas = null;
     /* the seam: ui.js re-installs this after every modal grab */
     ui.setBaseInput(enabled ? input : null);
     /* THE LABELS FOLLOW THE SWITCH. Settings › Touch controls calls
@@ -2061,7 +2151,8 @@ export function createTouch(ctx, ui) {
      frame
      ------------------------------------------------------------ */
   let acc = 0;
-  let mutedWas = null, actWas = null, talkWas = null, toastY = -1;
+  let mutedWas = null, actWas = null, actNameWas = null, toastY = -1;
+  let pollN = 0;
   function update(dt) {
     /* BEFORE the enabled gate and before the muted gate, every frame
        rather than on the 0.2 s cadence below. Before `enabled` because
@@ -2084,6 +2175,12 @@ export function createTouch(ctx, ui) {
     acc += dt;
     if (acc < 0.2) return;
     acc = 0;
+    /* HOW MANY TIMES THIS BLOCK HAS ACTUALLY RUN. Everything below is
+       on a 5 Hz poll, so "the caption is still the old word" and "the
+       caption has not been repainted yet" look identical from outside
+       and a test that sleeps a fixed 900 ms is asserting against the
+       machine's load. tools/touchtest.mjs waits on this instead. */
+    pollN++;
 
     /* keep the relocated toasts clear of the objective strip, which
        grows a line whenever the quest name is long */
@@ -2107,14 +2204,19 @@ export function createTouch(ctx, ui) {
       }
     }
 
-    const near = !!ui.near;
+    /* `ui.near` IS THE DOOR AND ONLY THE DOOR (it is hud.nearLocation),
+       which is why a person in range used to leave this button dark and
+       still reading Enter. hud.js publishes the whole answer now — see
+       REACH at the top of this file. */
+    const reach = reachKind();
+    const near = reach !== 'none';
     const talking = !!ui.dialogueOpen;
     const live = near || talking;
 
     /* TWO CONCERNS, TWO LATCHES — and they are deliberately not the
        same condition. The button LIGHTS UP whenever there is anything
-       at all to press: a door, a conversation, either. The CAPTION
-       says which, and only a conversation changes it.
+       at all to press: a door, a person, a conversation, any of them.
+       The CAPTION says WHICH, and it is a three-way answer.
 
        They used to share one latch on `live`, and standing at a door
        already makes `live` true, so opening a conversation there never
@@ -2126,22 +2228,39 @@ export function createTouch(ctx, ui) {
            of every door. That is the damaging one: the button read
            'More' while pressing it walked you inside a building.
        The one branch that worked is also the only one the test drove,
-       which is why 57/57 was green while this was broken. */
+       which is why 57/57 was green while this was broken.
+
+       The caption's latch is now the ACTION NAME rather than a boolean,
+       because there are three of them and a boolean cannot hold three:
+       'advance' while a card is up, then whatever is in reach. Walking
+       from a door to a person changes neither `live` nor `talking`, so
+       under the old latch the word would not have moved. */
     if (live !== actWas) {
       actWas = live;
       actBtn.classList.toggle('on', live);
       actBtn.classList.toggle('off', !live);
     }
-    if (talking !== talkWas) {
-      talkWas = talking;
+    const act = talking ? 'advance' : reachAction();
+    if (act !== actNameWas) {
+      actNameWas = act;
+      const a = ACTIONS[act];
       /* An EXPLICIT reference to the caption span, never lastChild.
          lastChild is a Node, not an Element: the day anybody appends
          an icon, a badge or even a stray text node after the caption,
          `lastChild.textContent = …` silently writes into that instead
          and the caption stops updating with no error anywhere. */
-      actCap.textContent = talking ? ACTIONS.advance.touch : ACTIONS.interact.cap;
-      /* 'More' is short; only the resting caption overhangs the button */
-      actCap.classList.toggle('long', !talking);
+      actCap.textContent = a.cap;
+      /* the 12-letter compromise caption is gone, so nothing here needs
+         the tightened tracking any more — but the class is kept keyed
+         on the actual string so a longer word cannot silently overhang */
+      actCap.classList.toggle('long', a.cap.length > 7);
+      /* the glyph turns over with the word */
+      actIconTalk.style.display = act === 'talk' ? '' : 'none';
+      actIconDoor.style.display = act === 'talk' ? 'none' : '';
+      /* AND SO DOES THE SCREEN-READER NAME. 'Enter or talk' was the
+         same compromise said out loud to the one player who cannot
+         see which of the two is in front of them. */
+      actBtn.setAttribute('aria-label', a.cap);
     }
   }
 
@@ -2187,6 +2306,20 @@ export function createTouch(ctx, ui) {
     get active() { return stick.id !== null; },
     /** raw stick read, for tools/touchtest.mjs */
     get axes() { return { t: stick.t, x: stick.dx, z: stick.dz, run: stick.run, R: stick.R }; },
+    /** WHAT THE CORNER BUTTON IS CALLED, AND WHY. `kind` is what hud.js
+        measured in front of him; `act` is the branch this poll took to
+        name the button; the rest is what the player actually sees. A
+        test that reads only the caption cannot tell "Talk because a
+        person is there" from "Talk because the reach never updated". */
+    get reach() {
+      return {
+        kind: reachKind(), act: actNameWas, polls: pollN,
+        cap: actCap.textContent,
+        aria: actBtn.getAttribute('aria-label'),
+        icon: actIconTalk.style.display === 'none' ? 'door' : 'chat',
+        lit: actBtn.classList.contains('on'),
+      };
+    },
     /** Jump's held flag AND which contact owns it — the second half is
         what tools/touchtest.mjs needs to tell "he let go" from "the
         wrong finger let go for him". */

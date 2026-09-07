@@ -141,22 +141,46 @@ function windowUnit(K, S, rng, M, o = {}) {
   /* lintel or a shallow relieving arch */
   if (o.arch) {
     const N = 5;
+    /* the springing points sit ON the soffit rather than 0.13 m over
+       it — same fault as the flat lintel below, same arithmetic */
+    const spring = Math.cos(1.05) * 0.16;
     for (let i = 0; i < N; i++) {
       const a = lerp(-1, 1, i / (N - 1));
-      const yy = wh / 2 + jw + 0.20 + Math.cos(a * 1.05) * 0.16;
+      const yy = wh / 2 + jw + 0.11 + Math.cos(a * 1.05) * 0.16 - spring;
       push('stone', boxRound((ww + 0.5) / N * 1.14, 0.30, rv + 0.16, 0.06, 1),
         TRS(a * (ww + 0.4) * 0.5, yy, rv * 0.4, 0, 1, 1, 1, 0, -a * 0.42), o.archCol ?? S.trim);
     }
   } else if (o.lintel !== false) {
+    /* A LINTEL RESTS ON THE HEAD IT SPANS. At +0.16 its underside sat
+       0.05 m clear of the head soffit's top — the same 5 cm over every
+       window in the city, and the part census caught 42 of them where
+       nothing else happened to be within reach to hide it. +0.09 beds
+       it 0.02 m into the soffit, which is what a course of stone does. */
     push('stone', boxRound(ww + 2 * jw + 0.40, 0.22, rv + 0.22, 0.06, 1),
-      TRS(0, wh / 2 + jw + 0.16, rv * 0.38), o.sillCol ?? S.trim);
+      TRS(0, wh / 2 + jw + 0.09, rv * 0.38), o.sillCol ?? S.trim);
   }
   /* shutters, hinged off the outer jamb, thrown open at slightly
      different angles */
   if (o.shutters) {
-    const sg = boxRound(ww * 0.52, wh * 0.94, 0.075, 0.025, 1);
-    push('wood', sg, TRS(-(ww / 2 + jw + ww * 0.26), 0, rv + 0.10, jit(rng, 0.32) - 0.28), o.shutterCol ?? S.trim);
-    push('wood', sg, TRS(ww / 2 + jw + ww * 0.26, 0, rv + 0.10, jit(rng, 0.32) + 0.28), o.shutterCol ?? S.trim);
+    /* A SHUTTER SWINGS ON A HINGE, and this one was translated instead
+       of rotated: its centre was parked 0.10 m in front of the jamb
+       face and then spun about its own middle, so whenever the random
+       open angle came out shallow the whole leaf stood 2-6 cm clear of
+       the wall with nothing behind it. Twenty-nine of those in the
+       census, most of them on the market stalls.
+
+       Built about the hinge line instead — the outer front edge of the
+       jamb — so the leaf pivots on the wall the way a shutter does and
+       its inner edge is buried in the jamb at EVERY angle. */
+    const sw = ww * 0.52, L = sw * 0.5;
+    const sg = boxRound(sw, wh * 0.94, 0.075, 0.025, 1);
+    for (const side of [-1, 1]) {
+      const phi = 0.16 + rng() * 0.34;              // thrown open, off the wall
+      push('wood', sg, TRS(
+        side * (ww / 2 + jw + L * Math.cos(phi)), 0, rv + L * Math.sin(phi),
+        -side * phi,
+      ), o.shutterCol ?? S.trim);
+    }
   }
 }
 
@@ -619,8 +643,25 @@ function formShop(ctx, K, loc, S, rng, meta) {
         w: 0.36, h: 0.22, d: 0.36,
         x: doorU + sx * pw * 0.5, y: 0.60, z: d / 2 + pd, step: true,
       });
-      K.add('wood', boxRound(0.34, 0.14, 0.42, 0.04, 1),
-        TRS(doorU + sx * pw * 0.42, 0.5 + ph - 0.22, d / 2 + pd * 0.55, 0, 1, 1, 1, 0, -sx * 0.7), shadeHex(pc, 0.88));
+      /* THE KNEE BRACE, AND IT WAS BRACING NOTHING.
+
+         This piece sat at z = d/2 + 0.55*pd — roughly halfway between
+         the wall and the post line — and was tilted in the XY plane.
+         Its nearest neighbour was the porch ROOF, 0.072 m over its
+         head; the post it is supposed to stiffen was 0.44 m behind it
+         and the wall 0.5 m in front. Twenty-two of them in the city,
+         two per porch, each a dark stub hanging in the middle of a
+         doorway. It is the most photographed defect in the report the
+         user sent, and every shopfront with a porch has a pair.
+
+         A knee brace lives in the PLANE OF THE POST, running from the
+         post up to the head rail it carries. Length 0.86 for a 0.56 m
+         rise and run, so both ends bury about 3 cm into the members
+         they meet instead of stopping short of them. */
+      const brZ = d / 2 + pd;
+      K.add('wood', boxRound(0.86, 0.13, 0.16, 0.035, 1),
+        TRS(doorU + sx * (pw * 0.5 - 0.34), 0.5 + ph - 0.34, brZ,
+          0, 1, 1, 1, 0, PI / 2 - sx * PI / 4), shadeHex(pc, 0.88));
     }
     K.add('wood', boxRound(pw + 0.4, 0.20, 0.22, 0.06, 1), TRS(doorU, 0.5 + ph, d / 2 + pd), pc);
     K.add('roof', roofSolid({
@@ -1103,8 +1144,12 @@ function formStall(ctx, K, loc, S, rng, meta) {
       K.add('wood', boxRound(pw2, pw2 * 1.25, 0.10, 0.03, 1),
         TRS(bx2, sill + fh * 0.24, rz - 0.29, 0, 1, 1, 1, 0, jit(rng, 0.11)),
         i % 2 ? mixHex(BRAND.paper, S.tint, 0.34) : mixHex(pick(rng, S.fabric), BRAND.paper, 0.40));
+      /* the hood over the notice board. At 0.69 * pw2 it cleared the
+         top of its own board by up to 0.046 m on the widest boards —
+         the last five floats in the city. The board's half-height is
+         0.625 * pw2, so that is where the hood beds. */
       K.add('wood', boxRound(pw2 * 1.12, 0.09, 0.13, 0.03, 1),
-        TRS(bx2, sill + fh * 0.24 + pw2 * 0.69, rz - 0.32), shadeHex(S.trim, 0.86));
+        TRS(bx2, sill + fh * 0.24 + pw2 * 0.625 + 0.015, rz - 0.32), shadeHex(S.trim, 0.86));
     }
     K.add('wood', boxRound(Math.min(w * 0.46, 9.0), 0.78, 0.26, 0.08, 1),
       TRS(0, eaveY - 0.95, rz - 0.16), mixHex(S.trim, S.tint, 0.42));
@@ -1546,8 +1591,26 @@ function formPier(ctx, K, loc, S, rng, meta) {
   band(K, { part: 'wood', w: w + 0.7, h: 0.28, d: d + 0.7, y: eaveY - 0.05, color: S.trim });
   const top = roofOn(K, S, rng, { w, d, y: eaveY, wallH, ridge: clamp(Math.min(w, d) * 0.36, 1.6, 4.6), hip: 0.35, along: 'x' });
 
+  /* THE CARGO GEAR BELONGS TO THE PORT, NOT TO THE KIT.
+
+     Everything below this line — the gantry crane and the container
+     stack on the deck — is a cargo dock's equipment, and it was
+     conditioned on S.feat.crane, which comes from the KIT. data.js
+     builds both waterfront locations from kit 'water', so the Harbour
+     Residences got a 12 m gantry crane over its balconies and a
+     three-high stack of shipping containers on its front deck. The
+     stack never actually appeared, which is worse than if it had: the
+     door-corridor guard happened to veto it, so "containers only at
+     the port" was true by luck rather than by rule.
+
+     `loc.port` is the fact (see data.js). A pier form that is not a
+     port is a building on piles — the residences, a boathouse, a
+     ferry hall — and gets the deck, the piles, the netting and the
+     mooring bollards, but no cargo handling. */
+  const isPort = loc.port === true;
+
   /* gantry crane */
-  if (S.feat.crane) {
+  if (S.feat.crane && isPort) {
     const cx = w / 2 + 3.6, ch = H * 1.1;
     for (const sz of [-1.4, 1.4]) {
       K.add('metal', boxRound(0.34, ch, 0.34, 0.09, 1), TRS(cx, ch / 2 + deckY, sz, 0, 1, 1, 1, 0, sz > 0 ? -0.05 : 0.05), C.tinDark);
@@ -1558,7 +1621,11 @@ function formPier(ctx, K, loc, S, rng, meta) {
     }
     const jib = 9.0;
     K.add('metal', boxRound(jib, 0.42, 0.5, 0.11, 1), TRS(cx - jib * 0.34, deckY + ch + 0.3, 0, 0, 1, 1, 1, 0, -0.06), BRAND.warn);
-    K.add('metal', boxRound(2.4, 0.9, 1.5, 0.16, 1), TRS(cx + 1.1, deckY + ch - 0.7, 0), BRAND.warn);
+    /* THE MACHINERY HOUSE WAS HANGING IN THE AIR: 0.071 m under the
+       jib, 0.48 m inboard of both mast legs, touching neither. Widened
+       so it straddles the legs it is bolted to and lifted so its roof
+       meets the underside of the jib where the jib actually is. */
+    K.add('metal', boxRound(2.4, 0.9, 3.4, 0.16, 1), TRS(cx + 1.1, deckY + ch - 0.56, 0), BRAND.warn);
     K.add('metal', cyl(0.05, 0.05, 3.4, 5, false), TRS(cx - jib * 0.62, deckY + ch - 1.6, 0), C.lead);
     K.add('metal', boxRound(1.0, 0.5, 0.9, 0.12, 1), TRS(cx - jib * 0.62, deckY + ch - 3.5, 0), C.rust);
     meta.collide.push({ w: 1.2, h: ch, d: 3.4, x: cx, y: deckY + ch / 2 });
@@ -1574,10 +1641,13 @@ function formPier(ctx, K, loc, S, rng, meta) {
      stack sitting on the deck. */
   const stackX = w * 0.1 + jit(rng, 1.2);
   for (let i = 0; i < 3; i++) {
-    meta.props.push({
+    /* the draws happen either way, so a non-port pier does not
+       reshuffle the rest of its own building */
+    const p = {
       type: 'container', x: stackX + jit(rng, 0.30),
       z: d / 2 + 3.4 + jit(rng, 0.22), ry: jit(rng, 0.10), stack: i, y: deckY,
-    });
+    };
+    if (isPort) meta.props.push(p);
   }
   meta.cloths.push({
     kind: 'net',
@@ -1682,7 +1752,19 @@ function formGlass(ctx, K, loc, S, rng, meta) {
         K.add('hedge', sphereG(0.95, 10), TRS(x, eaveY + 2.3, z, 0, 1, 0.82, 1), C.leaf);
       }
     }
-    K.add('metal', boxRound(w + 0.2, 0.09, 0.09, 0.03, 1), TRS(0, eaveY + 1.5, d / 2 + 0.12), C.lead);
+    /* A HANDRAIL NEEDS SOMETHING UNDER IT. This bar ran the full width
+       of the building 1.5 m over the parapet on nothing at all — 0.265 m
+       of daylight to the nearest piece of the tower, on nine of them,
+       and the one piece of every Innovation skyline you see against the
+       sky. Posts down to the cornice, and a kick rail to tie them. */
+    const rail = eaveY + 1.5;
+    K.add('metal', boxRound(w + 0.2, 0.09, 0.09, 0.03, 1), TRS(0, rail, d / 2 + 0.12), C.lead);
+    K.add('metal', boxRound(w + 0.2, 0.06, 0.06, 0.02, 1), TRS(0, eaveY + 0.72, d / 2 + 0.12), shadeHex(C.lead, 0.9));
+    const nStan = Math.max(3, Math.round(w / 2.2));
+    for (let i = 0; i <= nStan; i++) {
+      K.add('metal', boxRound(0.08, 1.62, 0.08, 0.025, 1),
+        TRS(-w * 0.5 + (w * i) / nStan, eaveY + 0.72, d / 2 + 0.12), C.lead);
+    }
   }
 
   /* entrance: a glass canopy on slim posts */
@@ -1916,8 +1998,15 @@ function formTemple(ctx, K, loc, S, rng, meta) {
     ];
     for (let i = 0; i < 3; i++) {
       const bxx = lerp(-bx0, bx0, i / 2);
+      /* the rail the banner hangs off, AND THE TWO ARMS THAT CARRY IT
+         BACK TO THE ENTABLATURE. Without them it was a bar floating
+         1.05 m clear of the portico, 0.177 m from the nearest stone. */
       K.add('metal', cyl(0.05, 0.05, 1.5, 6, false),
         TRS(bxx, entY - 0.22, d / 2 + 1.05, 0, 1, 1, 1, 0, PI / 2), C.lead);
+      for (const sx of [-1, 1]) {
+        K.add('metal', cyl(0.04, 0.04, 1.16, 5, false),
+          TRS(bxx + sx * 0.68, entY - 0.16, d / 2 + 0.52, 0, 1, 1, 1, PI / 2), C.lead);
+      }
       meta.cloths.push({
         kind: 'banner',
         origin: new THREE.Vector3(bxx - 0.62, entY - 0.30, d / 2 + 1.05),

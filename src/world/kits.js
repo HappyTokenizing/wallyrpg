@@ -198,16 +198,77 @@ export class Builder {
    in the vertex attribute, so nothing is lost by merging them. */
 const PART_ALIAS = { stone: 'wall', woodH: 'wood' };
 
+/* ------------------------------------------------------------------
+   THE PART CENSUS — how "a piece of the building is floating" stops
+   being an argument and becomes a number.
+
+   Every mass, moulding, bracket, rail and pad in this city arrives
+   through Kit.add(), and once it is there it is merged into one of six
+   vertex-coloured meshes and its identity is gone forever. That is
+   what made the user's report — "pieces of the building floating" —
+   impossible to answer: nothing downstream of the merge knows where
+   one part ends and the next begins.
+
+   So, behind ?partcensus, every add() also records the part's AABB in
+   the kit's own frame. tools/cliptest.mjs then asserts the invariant
+   that a building is one object: EVERY PART TOUCHES AT LEAST ONE
+   OTHER PART OF THE SAME BUILDING.
+
+   AN AABB IS THE RIGHT INSTRUMENT HERE PRECISELY BECAUSE IT IS SLOPPY.
+   It is a superset of the geometry, so two boxes that do not overlap
+   belong to two solids that certainly do not touch — the test cannot
+   raise a false alarm. It can miss a float (two AABBs can overlap
+   while the shapes inside them do not), and that is the direction an
+   assertion is allowed to be wrong in: everything it reports is real.
+
+   Off unless asked for: the flag costs one Box3 per part and there are
+   about thirty thousand of them in a built city. */
+let CENSUS_ON = false;
+export function setPartCensus(on) { CENSUS_ON = !!on; }
+export function partCensusEnabled() { return CENSUS_ON; }
+
+const _cb = new THREE.Box3();
+
 /* A named set of Builders, one per material family. */
 export class Kit {
-  constructor(ao) { this.ao = ao; this.parts = new Map(); }
+  constructor(ao) {
+    this.ao = ao;
+    this.parts = new Map();
+    this.census = CENSUS_ON ? [] : null;
+  }
   b(name) {
     name = PART_ALIAS[name] || name;
     let x = this.parts.get(name);
     if (!x) { x = new Builder(this.ao); this.parts.set(name, x); }
     return x;
   }
-  add(name, geo, m, color, opt) { this.b(name).add(geo, m, color, opt); return this; }
+  add(name, geo, m, color, opt) {
+    if (this.census && geo) {
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      _cb.copy(geo.boundingBox);
+      if (m) _cb.applyMatrix4(m);
+      this.census.push({
+        part: name,
+        min: [_cb.min.x, _cb.min.y, _cb.min.z],
+        max: [_cb.max.x, _cb.max.y, _cb.max.z],
+      });
+    }
+    this.b(name).add(geo, m, color, opt);
+    return this;
+  }
+  /* THE CENSUS DELIBERATELY DOES NOT FOLLOW appendKit.
+
+     A census is only worth anything in the frame it was recorded in.
+     Every box in it is axis-aligned in the KIT's own frame, where a
+     wall really is the box its AABB says it is; put the same box
+     through a building's yaw and its world AABB becomes a diamond
+     half again as wide, and every bracket floating in front of the
+     facade lands inside the wall's world box and reads as attached.
+     That is not a hypothetical — it is how the first run of this
+     census reported 7 floating parts in a city with 111 of them.
+
+     So a merged chunk keeps no census, and city.js carries each shed's
+     own local census beside the matrix that places it. */
   appendKit(other, m) { for (const [k, b] of other.parts) if (!b.empty) this.b(k).append(b, m); return this; }
   get empty() { for (const b of this.parts.values()) if (!b.empty) return false; return true; }
 }
@@ -491,7 +552,29 @@ export function post(r, h, bow = 0.02, seg = 8) {
 }
 export function sphereG(r, seg = 12) { return new THREE.SphereGeometry(r, seg, Math.max(6, seg >> 1)); }
 export function coneG(r, h, seg = 12) { return new THREE.ConeGeometry(r, h, seg, 1); }
-export function torusG(r, tube, seg = 16, rad = 8) { return new THREE.TorusGeometry(r, tube, rad, seg); }
+/* THE SAME LINE boxRound DRAWS AT 0.13 m, DRAWN ROUND A TUBE.
+
+   `seg` is how many facets go AROUND the ring and is what makes a hoop
+   a circle rather than a polygon — it stays. `rad` is how many facets
+   go around the TUBE'S OWN cross-section, and on the rings this city
+   is actually made of that cross-section is tiny: a barrel hoop is a
+   3.5 cm tube, a bin hoop 3 cm, a bike rim 3.5 cm, a lamp collar
+   2.8 cm. At those diameters the difference between a six-sided and a
+   four-sided tube is under half a millimetre of silhouette, and the
+   inverted-hull outline (§2.2, ~1.6 px) is already drawing that edge
+   as a stroke wider than the whole tube.
+
+   Measured with tools' triangle budget over the prop catalogue:
+   default rad=6 cost 168 triangles on a barrel hoop and 192 on a bike
+   rim; at rad=4 they are 112 and 128. Across the built city that is a
+   six-figure triangle saving for a change nothing in a screenshot can
+   resolve. Anything genuinely chunky — a stacked tyre is a 13 cm tube —
+   is over the threshold and keeps every facet it had. */
+export function torusG(r, tube, seg = 16, rad = 8) {
+  if (tube < 0.05) rad = Math.min(rad, 4);
+  else if (tube < 0.10) rad = Math.min(rad, 5);
+  return new THREE.TorusGeometry(r, tube, rad, seg);
+}
 export function latheG(pts, seg = 14) { return new THREE.LatheGeometry(pts, seg); }
 export function planeG(w, h) { return new THREE.PlaneGeometry(w, h, 1, 1); }
 
@@ -779,6 +862,52 @@ export function createKitLib(ctx) {
   mats.glassCool = M.emissive({ name: 'city.glass.cool', color: C.glassDay, intensity: 0.88 });
   mats.lampBulb = M.emissive({ name: 'city.lamp', color: BUILD.glassLit, intensity: 0.5 });
 
+  /* ----------------------------------------------------------------
+     FLAP — cloth that costs a vertex shader instead of a solver.
+
+     §2.3 lists laundry, bunting and awnings as signature wind carriers
+     and §6 wants something moving in every frame, but every one of
+     them in this city is a verlet grid: ctx.phys.createCloth, its own
+     material, its own draw call, and a hard ceiling of 56 of them on
+     the whole island because that is what the solver and the call
+     count will bear. That ceiling is why the washing is only ever on
+     the buildings the mason chose.
+
+     A shirt on a line does not need a solver. toon.js already carries
+     TOON_WIND, which reads the SAME global uniforms as the grass and
+     the canopies (core/wind.js) and bends a vertex quadratically in
+     its own height — so a hanging garment built as instanced geometry
+     gusts with everything else for the cost of two extra lines in a
+     shader that was compiled anyway.
+
+     TWO THINGS ABOUT THE HEIGHT TERM, both learned the hard way.
+
+     `wH = clamp((position.y - windBase) / windHeight, 0, 1)` reads the
+     LOCAL attribute, not the world position — which is precisely why
+     these have to be InstancedMesh and not merged world-space
+     geometry: merged, `position.y` would be the metres above sea level
+     of whichever hillside the piece is on, and the whole island would
+     saturate at full bend.
+
+     And the term GROWS with y — roots planted, tips whipping — which
+     is right for grass and upside down for washing. So a flap prop is
+     modelled growing UP from its rail at local y = 0 and hung by
+     rolling the instance pi about X. See makeFlap() in props.js. */
+  mats.flap = M.toon({
+    name: 'city.flap', color: 0xffffff, vertexColors: true, side: THREE.DoubleSide,
+    term: 0.10, bandSoft: 0.032, band2: 0.24, core: 0.5,
+    spec: 0.05, specPow: 18, rim: 0.55, skyBounce: 0.22,
+    sss: 0.6, sssColor: BRAND.paper,
+    grain: 0.013, grainScale: 8.0, grainAlbedo: 0.14,
+    /* 0.5 puts about 9 cm of travel on the hem of a 0.7 m garment at
+       the base wind and about twice that in a gust — a flutter, not a
+       flag in a gale. */
+    wind: 0.5, windBase: 0, windHeight: 0.8,
+    /* NO HULL, for the reason the fabric material gives below: a
+       single-layer sheet's inverted hull is coplanar with the sheet. */
+    outline: false, noOutline: true,
+  });
+
   const fabricCache = new Map();
   /** Cloth needs its own material per colour — cloth geometry has no
       vertex colours (it is rebuilt every frame by the solver). */
@@ -808,7 +937,7 @@ export function createKitLib(ctx) {
   /* Which material family each Builder name belongs to. */
   const FAMILY = {
     wall: 'wall', roof: 'roof', wood: 'wood', metal: 'metal',
-    gold: 'gold', hedge: 'hedge',
+    gold: 'gold', hedge: 'hedge', flap: 'flap',
     glassWarm: 'glassWarm', glassCool: 'glassCool', lamp: 'lampBulb',
   };
 

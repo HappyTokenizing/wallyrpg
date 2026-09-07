@@ -125,8 +125,16 @@ const _d = new THREE.Vector3();
    scales it), the band softness and the outline width are what make the
    bicycle read as a made object next to clay. Copying them is the point;
    the only thing that changes machine to machine is the colour.
+
+   IT IS EXPORTED NOW, AND THE FOURTH MACHINE IS THE REASON. balloon.js
+   builds a basket, a burner frame and a set of rigging out of exactly
+   these primitives, and the paragraph above — one paint shop, one grain
+   amplitude, one outline weight — is the whole argument for it importing
+   this rather than copying it. The function itself is unchanged: it
+   still hands back a kit whose dispose() owns only what that caller
+   made, so two kits can never free each other's geometry.
    ================================================================== */
-function makeKit(ctx, tag) {
+export function makeKit(ctx, tag) {
   const owned = [];
   const mats = [];
 

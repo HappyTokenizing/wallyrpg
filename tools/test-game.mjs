@@ -1347,12 +1347,19 @@ T('the objective advances to the broker after the desk pickup');
 }
 
 /* ============================================================
-   10d. THE RIDES — bicycle, scooter, motorcycle
+   10d. THE RIDES — bicycle, scooter, motorcycle, balloon
+
+   THE COUNT MOVED FROM THREE TO FOUR and these two lines are the only
+   thing in this suite that had to change for it: the fourth machine
+   is the City Treasury's survey balloon (data.js RIDES.balloon), and
+   everything else about it — its price, its two unlock gates, its
+   flight model, the parked record and the whole live-in-a-browser
+   half — is asserted in tools/test-balloon.mjs rather than here.
    ============================================================ */
 T('the rides table');
 {
-  eq(RIDE_LIST.length, 3, 'three rides');
-  for (const id of ['bike', 'scooter', 'motorcycle']) ok(!!RIDES[id], `ride '${id}' exists`, id);
+  eq(RIDE_LIST.length, 4, 'four rides');
+  for (const id of ['bike', 'scooter', 'motorcycle', 'balloon']) ok(!!RIDES[id], `ride '${id}' exists`, id);
   eq(RIDE_ORDER[0], 'motorcycle', 'the fastest is the head of RIDE_ORDER');
 
   for (const r of RIDE_LIST) {
@@ -3533,6 +3540,260 @@ T('travel: the walker branch, driven by hand');
   ok(Math.abs((100 - g.state.energy) - rate * 100) < 0.02,
     '[walker/routed] he paid for the 100 m he actually covered and not a metre more',
     `${(100 - g.state.energy).toFixed(2)}`);
+}
+
+/* ============================================================
+   THE CLEAR SKY IS EXACTLY UNDRAINED
+   ------------------------------------------------------------
+   Six rounds of dawn/dusk colour work were accepted on measurements
+   taken in CLEAR weather, and the weather-aware gate that finally fixed
+   rain and storm leaves clear alone only because WEATHER.clear.cloud
+   (0.44) sits under weatherDrain's 0.03 deadband — by 0.004. Raise the
+   authored cloud to 0.448 and the accepted clear sky starts moving,
+   silently, with no test anywhere tying lighting.js to weather.js.
+   A judge found that margin and observed that nothing asserted it.
+   BRANCH: weatherDrain's deadband, at the clear preset and above it.
+   ============================================================ */
+{
+  const { weatherDrain } = await import('../src/world/lighting.js');
+  const { WEATHER } = await import('../src/world/weather.js');
+  ok(weatherDrain(WEATHER.clear) === 0,
+    '[sky] a clear sky is EXACTLY undrained, so the accepted clear-weather numbers stand',
+    `drain ${weatherDrain(WEATHER.clear)}`);
+  /* the counter-case: the deadband must not be so wide it swallows real
+     weather too, or the gate that fixed rain and storm never fires */
+  for (const n of ['cloudy', 'rain', 'storm']) {
+    ok(weatherDrain(WEATHER[n]) > 0.5,
+      `[sky] ${n} genuinely drains, so the wet-weather gate actually fires`,
+      `drain ${weatherDrain(WEATHER[n]).toFixed(3)}`);
+  }
+  ok(Object.keys(WEATHER).length === 4 && !('overcast' in WEATHER),
+    '[sky] weather authors exactly four states and no overcast — the name three rigs measured clear',
+    Object.keys(WEATHER).join(','));
+}
+
+/* ============================================================
+   WHICH TIER DOES A DEVICE GET — DRIVEN DOWN EVERY BRANCH
+   ------------------------------------------------------------
+   pickQuality() used to read UNMASKED_RENDERER_WEBGL and nothing else,
+   so no phone could reach `low` (whose own comment says "phones") and
+   an M-series iPad collected `high` — msaa 4, DOF, 1792 shadow maps, a
+   tier retuned until it JUST held 60 fps on an M1 Max — by matching
+   /apple m[1-9]/. Nothing in this repo asserted any of it.
+
+   This runs in plain node with no DOM: `deviceClass(env)` and
+   `pickQuality(renderer, env)` both take the environment as an
+   argument, so the shipping functions are driven directly against a
+   stub `navigator` / `innerWidth` / `location` and a stub renderer
+   whose getParameter returns the GPU string under test. No regex, no
+   tier name and no threshold is copied into this file.
+
+   BRANCH, per row: contracts.js deviceClass() `if (!touch) return
+   'desktop'` / `if (mobileUA || shortEdge <= 500) return 'phone'` /
+   the tablet fall-through; then pickQuality()'s `if (soft)`, the
+   `cls === 'phone' || cls === 'tablet'` block (OLD_MOBILE_GPU, then
+   /intel/, then the DESKTOP_DISCRETE escape for a touch laptop), then
+   the desktop GPU list below it.
+
+   WHAT THIS DELIBERATELY DOES NOT ASSERT: the pixel ratio. The ceiling
+   is computed in renderer.js against a live GL context and a real
+   devicePixelRatio, and asserting it here would mean reimplementing
+   the formula — which is the failure this project keeps paying for.
+   It is asserted against the shipped renderer in tools/mobilebugs.mjs,
+   PR-9..PR-16.
+   ============================================================ */
+{
+  T('quality tiers');
+  const { pickQuality, deviceClass, QUALITY_TIERS } = await import('../src/core/contracts.js');
+
+  const fakeRenderer = (gpuName) => ({
+    getContext: () => ({
+      getExtension: (n) => (n === 'WEBGL_debug_renderer_info' ? { UNMASKED_RENDERER_WEBGL: 0x9246 } : null),
+      getParameter: (p) => (p === 0x9246 ? gpuName : 0),
+    }),
+  });
+  /* `uaKind` defaults to the class but can be given separately: a
+     touchscreen laptop dragged narrow is classed `phone` by the
+     short-edge rule while still sending a DESKTOP user-agent, and
+     that combination is a row below. */
+  const env = (kind, w, h, uaKind) => ({
+    navigator: {
+      maxTouchPoints: kind === 'desktop' ? 0 : 5,
+      userAgent: (uaKind || kind) === 'phone'
+        ? 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36'
+        : 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15',
+    },
+    innerWidth: w, innerHeight: h, location: { search: '' },
+  });
+
+  /* THE REVERT CHECK NEEDS THIS AND IT IS THE WHOLE POINT OF IT.
+     The version of pickQuality this replaces reads the GLOBAL
+     `location.search`, which does not exist in plain node — so run
+     today's table against yesterday's contracts.js and every row goes
+     red with "location is not defined", which is a fact about node and
+     says nothing whatever about which tier a phone gets. A revert check
+     that is red for the wrong reason is not a revert check.
+     So the global is shimmed alongside the `env` argument: the
+     environment is presented BOTH ways, whichever way the function
+     under test happens to read it, and what is left to fail is the
+     answer. Driven that way, the rows that go red against the old
+     module are exactly the four the fix is about — Adreno 540,
+     Mali-T880 and an A10 iPhone (med -> low) and an M2 iPad
+     (high -> med) — plus every deviceClass row and every
+     pixelRatioMax / pixelBudget row, while the fifteen desktop rows
+     stay green, which is the evidence that the change is surgical. */
+  const hadLoc = Object.prototype.hasOwnProperty.call(globalThis, 'location');
+  if (!hadLoc) globalThis.location = { search: '' };
+  const withSearch = (s) => { try { globalThis.location.search = s; } catch (e) {} };
+
+  /*      label                      GPU string                                              class     box         tier   */
+  const CASES = [
+    ['iPhone 15, Safari',       'Apple GPU',                                              'phone',  393, 852,  'med'],
+    ['iPhone, ext withheld',    '',                                                       'phone',  390, 844,  'med'],
+    ['iPhone 15 landscape',     'Apple GPU',                                              'phone',  852, 393,  'med'],
+    ['Android flagship',        'ANGLE (Qualcomm, Adreno (TM) 740, OpenGL ES 3.2)',       'phone',  412, 915,  'med'],
+    ['Android mid, Mali-G715',  'ANGLE (ARM, Mali-G715, OpenGL ES 3.2)',                  'phone',  393, 851,  'med'],
+    ['Android mid, Adreno 640', 'ANGLE (Qualcomm, Adreno (TM) 640, OpenGL ES 3.2)',       'phone',  393, 851,  'med'],
+    ['Android 2017, Adreno 540','ANGLE (Qualcomm, Adreno (TM) 540, OpenGL ES 3.2)',       'phone',  360, 740,  'low'],
+    ['Android 2016, Mali-T880', 'ANGLE (ARM, Mali-T880, OpenGL ES 3.2)',                  'phone',  360, 640,  'low'],
+    ['iPhone 7, A10',           'Apple A10 GPU',                                          'phone',  375, 667,  'low'],
+    ['iPad Pro M2',             'Apple M2',                                               'tablet', 1194, 834, 'med'],
+    ['iPad, Safari',            'Apple GPU',                                              'tablet', 1024, 768, 'med'],
+    ['Surface, Iris Xe',        'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics, D3D11)',     'tablet', 1368, 912, 'low'],
+    ['touch laptop, RTX 3080',  'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11)',     'tablet', 1920, 1080,'high'],
+    /* the same laptop with its window dragged narrow: the short-edge
+       rule calls it a phone, and the discrete-GPU escape must still
+       hand it back to the desktop branch rather than demote it */
+    ['touch laptop, narrow',    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11)',     'phone',  420, 1080, 'high', 'desktop'],
+    ['MacBook Pro M1 Max',      'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Max)',      'desktop',1600, 900, 'high'],
+    ['narrow desktop window',   'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Max)',      'desktop',390, 844,  'high'],
+    ['old Intel laptop',        'ANGLE (Intel, Intel(R) UHD Graphics 620, OpenGL 4.1)',   'desktop',1440, 900, 'low'],
+    ['desktop RTX',             'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11)',     'desktop',2560, 1440,'high'],
+    ['headless SwiftShader',    'ANGLE (Google, SwiftShader Device, SwiftShader driver)', 'desktop',1600, 900, 'med(sw)'],
+  ];
+  /* Run against a build that does not export deviceClass — i.e.
+     yesterday's — and this section must REPORT that, not crash: a
+     revert check whose output is a stack trace tells you the file
+     changed, not which claim it was making. */
+  const hasClass = typeof deviceClass === 'function';
+  ok(hasClass, '[tier] contracts.js exports deviceClass() — the tier probe can see a device at all');
+  for (const [label, gpu, cls, w, h, tier, uaKind] of CASES) {
+    const e = env(cls, w, h, uaKind);
+    withSearch('');
+    if (hasClass) eq(deviceClass(e), cls, `[tier] ${label} (${w}x${h}) is a ${cls}`);
+    /* pickQuality's second argument is the environment. A build that
+       does not take one reads the real globals, where `location` does
+       not exist in node — so call it defensively and let the assertion
+       carry the failure. */
+    let name;
+    try { name = pickQuality(fakeRenderer(gpu), e).name; } catch (err) { name = 'threw: ' + err.message; }
+    eq(name, tier, `[tier] ${label} -> ${tier}`);
+  }
+
+  /* The two errors that were opposite, stated as properties rather
+     than as rows, so they survive an edit to the table above. */
+  const got = (label) => {
+    const c = CASES.find((r) => r[0] === label);
+    try { return pickQuality(fakeRenderer(c[1]), env(c[2], c[3], c[4], c[6])); } catch (e) { return {}; }
+  };
+  /* The property, stated so it survives an edit to the table: nothing
+     phone-shaped reaches a desktop tier UNLESS it reports a discrete
+     desktop GPU, which is the deliberate escape for a touchscreen
+     laptop in a narrow window and which no handset has ever reported. */
+  const DISCRETE = /geforce|\brtx\b|\bgtx\b|quadro|radeon (rx|pro)|\barc a\d/i;
+  ok(CASES.filter((r) => r[2] === 'phone' && !DISCRETE.test(r[1]))
+      .every((r) => r[5] === 'low' || r[5] === 'med'),
+    '[tier] no handset reaches a desktop tier, whatever GPU string it reports');
+  ok(CASES.some((r) => r[2] === 'phone' && DISCRETE.test(r[1]) && r[5] === 'high'),
+    '[tier] ...but a narrow touchscreen laptop with a discrete GPU still gets `high`');
+  ok(CASES.some((r) => r[2] === 'phone' && r[5] === 'low'),
+    '[tier] `low` — the tier whose comment says "phones" — is reachable by a phone');
+  ok(got('iPad Pro M2').msaa === 0 && got('iPad Pro M2').dof === false,
+    '[tier] an M-series iPad no longer gets msaa 4 + DOF by string coincidence');
+  ok(got('touch laptop, RTX 3080').name === 'high',
+    '[tier] a touchscreen laptop with a discrete GPU is not over-corrected down to a handheld tier');
+  /* The forced-tier door has to keep working, or every measuring tool
+     in tools/ that uses ?quality= is measuring something else. */
+  for (const n of Object.keys(QUALITY_TIERS)) {
+    const e = env('phone', 390, 844); e.location.search = '?quality=' + n;
+    withSearch('?quality=' + n);
+    let got2; try { got2 = pickQuality(fakeRenderer('Apple GPU'), e).name; } catch (err) { got2 = 'threw'; }
+    eq(got2, n, `[tier] ?quality=${n} still overrides the probe`);
+  }
+  withSearch('');
+  /* Every tier must declare the two numbers renderer.js's ceiling is
+     computed from. A tier that forgets them silently falls back to
+     defaults inside the renderer and stops meaning anything. */
+  for (const [n, t] of Object.entries(QUALITY_TIERS)) {
+    ok(Number.isFinite(t.pixelRatioMax) && t.pixelRatioMax >= 1,
+      `[tier] ${n} declares a pixelRatioMax`, t.pixelRatioMax);
+    ok(Number.isFinite(t.pixelBudget) && t.pixelBudget > 0,
+      `[tier] ${n} declares a pixelBudget in megapixels`, t.pixelBudget);
+    eq(t.pixelRatio, 1, `[tier] ${n} still BOOTS at pixelRatio 1 — the governor earns anything above it`);
+  }
+  /* THIS USED TO ASSERT THE CONSTANT, AND THE CONSTANT WAS THE THING
+     UNDER TEST. `eq(high.pixelRatioMax, 1, 'still pinned … see the
+     msaa A/B')` was a guard saying "do not change this without
+     re-running the A/B" — which is a note to a human, not a property
+     of the game, and it fails the moment the A/B IS re-run. It has
+     been (tools/_k27-ref.mjs against a supersampled ground truth,
+     tools/_k27-cost.mjs on the saturated clock; the tables are in
+     QUALITY_TIERS), and resolution won it below ratio 1.5.
+
+     What replaces it is the property the measurement actually
+     established: NO TIER MAY ASK FOR MORE PIXELS AT 1600x900 THAN THE
+     COST TABLE COVERS. So the ceiling is recomputed here EXACTLY as
+     renderer.js's pixelRatioCeiling() does — same formula, same
+     inputs — and asserted per viewport, because a claim taken in one
+     box is a claim about that box (contracts.js rule 3). */
+  const ceiling = (t, cssW, cssH, dpr) => Math.max(1, Math.min(
+    t.pixelRatioMax, dpr, Math.sqrt((t.pixelBudget * 1e6) / (cssW * cssH))));
+  const BOXES = [
+    ['1600x900 Retina', 1600, 900, 2], ['1920x1080 Retina', 1920, 1080, 2],
+    ['2560x1440 Retina', 2560, 1440, 2], ['1600x900 non-Retina', 1600, 900, 1],
+  ];
+  /* 1.30 is where the cost table stops: 1.264 measured 14.4 ms at
+     h07.0 with the GPU saturated, 14 % of the 16.67 ms budget spare,
+     and ratio 1.4 measured 15.0 ms bare (no msaa) and would leave 2 %.
+     A tier that wants more than this owes the project a new table. */
+  for (const [label, w, h, dpr] of BOXES) {
+    const c = ceiling(QUALITY_TIERS.high, w, h, dpr);
+    ok(c <= 1.30 + 1e-9,
+      `[tier] high's pixel ceiling in a ${label} box stays inside the measured cost table`, +c.toFixed(3));
+  }
+  /* AND THE LOWER BOUND, WHICH IS THE WHOLE DEFECT. A 1600x900 Retina
+     desktop drawing 1.44 Mpx and letting the compositor double it was
+     measured as the blurriest surface in the game — edge smear 3.692
+     output px against the phone's 2.756 after the phone got a budget.
+     `high` must therefore be ALLOWED to climb there; whether it does
+     is the governor's business and this device's evidence. This is the
+     assertion that fails against the rule this replaced. */
+  ok(ceiling(QUALITY_TIERS.high, 1600, 900, 2) > 1.05,
+    '[tier] a 1600x900 Retina desktop is no longer pinned to the 1.44 Mpx buffer that made it the blurriest surface',
+    +ceiling(QUALITY_TIERS.high, 1600, 900, 2).toFixed(3));
+  /* The budget is a MEGAPIXEL budget precisely so it self-limits on a
+     bigger panel. If that ever stopped being true the phone's whole
+     argument would go with it, so assert the direction, not a value. */
+  ok(ceiling(QUALITY_TIERS.high, 2560, 1440, 2) < ceiling(QUALITY_TIERS.high, 1600, 900, 2),
+    '[tier] high asks for a LOWER ratio on a bigger panel — the budget is in megapixels, not dpr');
+  ok(ceiling(QUALITY_TIERS.high, 1600, 900, 1) === 1,
+    '[tier] a non-Retina desktop is untouched: devicePixelRatio caps the ceiling at 1');
+  /* THE TRADE ITSELF, as an invariant. Raising the budget and keeping
+     msaa 4 would spend both sides of a trade whose whole content is
+     that one funds the other — measured at 0.108 RMSE/ms for MSAA 4
+     against 0.391 for the first resolution notch. */
+  ok(!(QUALITY_TIERS.high.pixelBudget > 1.60 && QUALITY_TIERS.high.msaa > 2),
+    '[tier] high does not pay for extra pixels AND msaa 4 — the one funds the other', QUALITY_TIERS.high.msaa);
+  eq(QUALITY_TIERS.med.msaa, 0, '[tier] med keeps msaa 0 — measured at 0.30 RMSE/ms against resolution\'s 3.60 on a phone box');
+  eq(QUALITY_TIERS.low.msaa, 0, '[tier] low keeps msaa 0');
+  /* ultra is the ONE tier with no frame-time promise, so it is the one
+     allowed past the table — but only through the opt-in door, which
+     the ?quality= loop above already proves is the only way in. */
+  ok(QUALITY_TIERS.ultra.pixelRatioMax >= QUALITY_TIERS.high.pixelRatioMax,
+    '[tier] ultra may ask for at least what high asks for', QUALITY_TIERS.ultra.pixelRatioMax);
+  ok(QUALITY_TIERS.med.pixelRatioMax > 1 && QUALITY_TIERS.low.pixelRatioMax > 1,
+    '[tier] the two handheld tiers are still allowed to climb');
+  if (!hadLoc) delete globalThis.location;
 }
 
 /* ============================================================

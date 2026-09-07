@@ -229,12 +229,16 @@ ok(pad.act.w >= 44 && pad.jump.w >= 44, 'both pad buttons clear 44 px',
 ok(pad.act.l > pad.jump.l && pad.act.b > pad.jump.b,
   'ENTER sits LOWER-RIGHT of JUMP (the thumb\'s resting corner)',
   `enter l${pad.act.l} b${pad.act.b} vs jump l${pad.jump.l} b${pad.jump.b}`);
-ok(pad.cap === 'Enter / Talk', 'the resting caption says what the button does',
+/* 'Enter', not the old compromise 'Enter / Talk': the caption names
+   ONE verb now and which one is decided by what is in reach. On open
+   ground, where this runs, there is nothing in reach and a door is the
+   default the button falls back to. See PERSON vs DOOR below. */
+ok(pad.cap === 'Enter', 'the resting caption says what the button does',
   JSON.stringify(pad.cap));
 /* The caption is absolutely positioned at left:50% under a 66 px
    button whose right edge is 12 px off the screen. */
 ok(pad.actCap.r <= pad.vw - 4 && pad.actCap.l >= 0,
-  '"Enter / Talk" stays inside the frame', `${pad.actCap.l}..${pad.actCap.r} of ${pad.vw}`);
+  'the caption stays inside the frame', `${pad.actCap.l}..${pad.actCap.r} of ${pad.vw}`);
 const capsClear = pad.actCap.l > pad.jumpCap.r || pad.actCap.t > pad.jumpCap.b
   || pad.jumpCap.t > pad.actCap.b;
 ok(capsClear, 'the two captions never overlap each other',
@@ -260,7 +264,7 @@ ok(land.act.w > land.jump.w && land.act.l > land.jump.l && land.act.b > land.jum
   'landscape: ENTER is still the bigger, lower-right button',
   `enter ${land.act.w}px @${land.act.l},${land.act.b}  jump ${land.jump.w}px @${land.jump.l},${land.jump.b}`);
 ok(land.actCap.r <= land.vw - 4 && land.actCap.b <= land.vh - 4,
-  'landscape: "Enter / Talk" clears the right and bottom edges',
+  'landscape: the caption clears the right and bottom edges',
   `cap r${land.actCap.r}/${land.vw}, b${land.actCap.b}/${land.vh}`);
 ok(land.actCap.l > land.jumpCap.r || land.actCap.t > land.jumpCap.b,
   'landscape: the captions still do not overlap');
@@ -301,7 +305,7 @@ ok(line1 !== line0 && line1.length > 0, 'tapping ENTER advances the dialogue —
 await page.evaluate(() => { WALLY.ctx.ui.hide('dialogue'); WALLY.ctx.ui.closeAll(); });
 await page.waitForTimeout(800);
 const restCap = await page.evaluate(() => document.querySelector('.w-abtn.act .cap').textContent);
-ok(restCap === 'Enter / Talk', 'and the caption goes back to "Enter / Talk"', JSON.stringify(restCap));
+ok(restCap === 'Enter', 'and the caption goes back to "Enter"', JSON.stringify(restCap));
 
 await page.setViewportSize({ width: 390, height: 844 });
 await page.waitForTimeout(900);
@@ -345,21 +349,21 @@ ok(openNear === null, 'A: back on open ground, nothing is in range', `ui.near ${
 await talk();
 ok(await cap() === 'More', 'A: a conversation in open ground says "More"');
 await hush();
-ok(await cap() === 'Enter / Talk', 'A: ... and reverts when it ends');
+ok(await cap() === 'Enter', 'A: ... and reverts when it ends');
 
 /* (B) — the same conversation, standing at a door. */
 await page.evaluate(() => WALLY.debug.arrive('apartment', true));
 await page.waitForTimeout(1400);
 const doorNear = await nearId();
 ok(doorNear !== null, 'B: warped to a door, ui.near is a real location', `ui.near ${doorNear}`);
-ok(await cap() === 'Enter / Talk', 'B: at rest in a doorway the caption is "Enter / Talk"');
+ok(await cap() === 'Enter', 'B: at rest in a doorway the caption is "Enter"');
 await talk();
 const capB = await cap();
 ok(capB === 'More' && (await nearId()) !== null,
   'B: a conversation AT A DOOR says "More" too — the caption is not gated on `live`',
   JSON.stringify(capB));
 await hush();
-ok(await cap() === 'Enter / Talk', 'B: ... and reverts with the door still in range');
+ok(await cap() === 'Enter', 'B: ... and reverts with the door still in range');
 
 /* (C) — begin in open ground, end in a doorway. The stuck case. */
 await toOpenGround();
@@ -372,9 +376,231 @@ ok(await cap() === 'More', 'C: walking to a door mid-conversation does not cut i
 await hush();
 const capC = await cap();
 const stillNear = await nearId();
-ok(capC === 'Enter / Talk' && stillNear !== null,
-  'C: a conversation that ENDS at a door leaves the button reading "Enter / Talk", not "More"',
+ok(capC === 'Enter' && stillNear !== null,
+  'C: a conversation that ENDS at a door leaves the button reading "Enter", not "More"',
   `${JSON.stringify(capC)} with ui.near ${stillNear}`);
+await toOpenGround();
+await page.waitForTimeout(900);
+
+/* ================= PERSON vs DOOR =================
+
+   THE REPORT WAS: "fix the E that shows up on mobile in front of
+   people, it should just be the button on the bottom saying talk
+   instead of enter."  Both halves of that sentence were true and the
+   suite below was green through all of it.
+
+   HOW THE SWEEP MISSED THE E. The key-name sweep further down walks
+   every visible string on every surface a thumb can reach and fails on
+   a keyboard key. It never had a PERSON IN RANGE — its 'door prompt'
+   surface warps to a doorway, and no surface has ever stood in front of
+   anybody — so npc.js's prompt was never in the document while it ran.
+   A measurement that cannot see the case it is measuring agrees with
+   itself: `key: 'E'` (src/character/npc.js) took hud.js's literal
+   escape hatch, skipped the input-aware resolver entirely and printed a
+   keycap over every named person in the city, on a phone.
+
+   HOW THE CAPTION MISSED THE TALK. `interact` had one label for two
+   verbs — 'Enter / Talk' — and the pad read `ui.near`, which is
+   hud.nearLocation, which is the DOOR and has never been anything
+   else. Standing in front of a person the button was DARK and said
+   ENTER.
+
+   THE FOUR BRANCHES, named, because each of these is a different line
+   of code and three of them had no assertion at all:
+     · reach 'person'  the person prompt is up, no door       -> Talk
+     · reach 'door'    hud.js's own door prompt, nobody there -> Enter
+     · reach 'both'    both at once                           -> Talk
+     · reach 'none'    open ground                            -> Enter
+   plus 'advance' (a card is up) which outranks all four, and the
+   LITERAL escape hatch, which must survive the narrowing: a chip that
+   is genuinely not a key ('•', a checkpoint numeral) is still printed
+   as it stands.
+   ================= */
+
+/* The rig: put a person in front of him, or him in front of a person,
+   and put everything back. Installed in the page because the sweep's
+   surface list needs the same verbs later, and because both the mobile
+   and the desktop page need their own copy. */
+const PERSON_RIG = () => {
+  /* WALLY, not window: every other setup in this file reaches the game
+     through that one namespace, and `window.__TT` looks identical from
+     here while being invisible to `WALLY.__TT` in the next evaluate. */
+  const W = window.WALLY;
+  if (W.__TT) return W.__TT.ready;
+  const T = W.__TT = {};
+  const w = () => WALLY.ctx.wally;
+  const boot = w().position.clone();
+  const homes = new Map();
+  const get = (cid) => {
+    const npc = WALLY.ctx.npc;
+    const h = npc.named.get(cid) || npc.spawn(cid);
+    if (h && !homes.has(cid)) homes.set(cid, h.root.position.clone());
+    /* a client is not a wanderer and normally has no agent, but if one
+       is ever given one, a frozen agent is the difference between a
+       measurement and a coin toss */
+    if (h && h.agent) h.agent.frozen = true;
+    return h || null;
+  };
+  /* HIM to THEM — open ground, nothing else in reach */
+  T.stand = (cid, d = 2.2) => {
+    const h = get(cid);
+    if (!h) return null;
+    const p = h.root.position, yaw = h.root.rotation.y;
+    const x = p.x + Math.sin(yaw) * d, z = p.z + Math.cos(yaw) * d;
+    const y = WALLY.ctx.world.heightAt(x, z);
+    w().warpTo(x, y + 0.2, z, { face: { x: p.x, z: p.z } });
+    return { who: h.client ? h.client.n : h.name, gap: +w().position.distanceTo(p).toFixed(2) };
+  };
+  /* THEM to HIM — used where he has to be somewhere specific already
+     (a doorway), so the door stays in reach and the person arrives */
+  T.bring = (cid, d = 2.0) => {
+    const h = get(cid);
+    if (!h) return null;
+    const p = w().position, yaw = w().rotation.y;
+    const x = p.x + Math.sin(yaw) * d, z = p.z + Math.cos(yaw) * d;
+    h.root.position.set(x, WALLY.ctx.world.heightAt(x, z), z);
+    h.root.rotation.y = yaw + Math.PI;
+    return { who: h.client ? h.client.n : h.name, gap: +h.root.position.distanceTo(p).toFixed(2) };
+  };
+  /* everybody back where they were, and him back on open ground */
+  T.away = () => {
+    for (const [cid, home] of homes) {
+      const h = WALLY.ctx.npc.named.get(cid);
+      if (h) h.root.position.copy(home);
+    }
+    w().warpTo(boot.x, boot.y + 0.3, boot.z, {});
+    return true;
+  };
+  T.ready = true;
+  return true;
+};
+await page.evaluate(PERSON_RIG);
+
+/* THE PAD REPAINTS ON A 5 Hz POLL, so a fixed sleep is not a
+   synchronisation — it is an assertion about how loaded the machine is.
+   Measured while writing this: 250 ms after the person arrived the
+   reach already read 'person' and the caption still read 'Enter',
+   because the poll had not come round yet; at 500 ms it had. Wait for
+   the CONTROL TO HAVE HAD ITS SAY — two of its own polls — and then
+   read. This is not waiting for the answer to be right: `polls` counts
+   the block running, whatever it decides. */
+const settled = async (n = 3) => {
+  const from = await page.evaluate(() => WALLY.ctx.ui.touch.reach.polls);
+  await page.waitForFunction(
+    ([a, k]) => WALLY.ctx.ui.touch.reach.polls >= a + k, [from, n],
+    /* NOT the default 'raf' polling: a stalled frame loop is one of the
+       things this waits through, and a rAF-driven wait would hang on
+       exactly the case it exists to survive. */
+    { polling: 100, timeout: 15000 });
+};
+
+/* what the player can actually see, in one read: the pad's word, the
+   chip on the world prompt over the thing itself, and the branch the
+   pad says it took to get there */
+const label = () => page.evaluate(() => {
+  const chip = (sel) => document.querySelector(sel)?.textContent ?? null;
+  const prompts = [...document.querySelectorAll('.w-prompt')].map((e) => ({
+    key: e.querySelector('.key')?.textContent ?? null,
+    text: e.querySelector('span:not(.key):not(.sub)')?.textContent ?? '',
+  }));
+  return {
+    ...WALLY.ctx.ui.touch.reach,
+    near: WALLY.ctx.ui.near?.id ?? null,
+    prompts,
+    promptKeys: prompts.map((p) => p.key).join('|'),
+    hintKey: chip('.w-hint .kb'),
+  };
+});
+
+/* --- BRANCH reach 'person': in front of somebody, on open ground.
+       This is the report, both halves of it, in one assertion. --- */
+const standing = await page.evaluate(() => WALLY.__TT.stand('mabel'));
+await settled();
+const person = await label();
+ok(person.kind === 'person' && person.near === null,
+  'PT-1 [branch reach=person]: standing in front of a person, with no door in reach',
+  `${JSON.stringify(standing)} -> ${JSON.stringify({ kind: person.kind, near: person.near })}`);
+ok(person.cap === 'Talk' && person.act === 'talk',
+  'PT-2: THE BUTTON ON THE BOTTOM SAYS "Talk" — not "Enter", not "Enter / Talk"',
+  JSON.stringify(person.cap));
+ok(person.lit === true, 'PT-3: ...and it is lit, which a person in range never used to do');
+ok(person.aria === 'Talk' && person.icon === 'chat',
+  'PT-4: the screen-reader name and the glyph turn over with the word',
+  `${person.aria} / ${person.icon}`);
+ok(person.promptKeys.includes('Talk') && !/\bE\b/.test(person.promptKeys),
+  'PT-5 [branch paintPromptKey -> paintChip]: THE E OVER THE PERSON IS GONE — the world prompt reads "Talk"',
+  JSON.stringify(person.prompts));
+
+/* --- BRANCH reach 'door': the same button, the other verb. --- */
+await page.evaluate(() => WALLY.__TT.away());
+await page.evaluate(() => WALLY.debug.arrive('apartment', true));
+await settled();
+const door = await label();
+ok(door.kind === 'door' && door.near !== null,
+  'PT-6 [branch reach=door]: warped to a doorway with nobody in range',
+  `${door.kind} / ui.near ${door.near}`);
+ok(door.cap === 'Enter' && door.act === 'interact' && door.icon === 'door',
+  'PT-7: a door still says "Enter" and still draws a door', JSON.stringify(door.cap));
+ok(door.promptKeys.includes('Enter') && !/\bE\b/.test(door.promptKeys),
+  'PT-8: and the prompt over the door says "Enter" under a thumb', JSON.stringify(door.prompts));
+
+/* --- BRANCH reach 'both': a person AT a door, which is the NORMAL
+       case rather than a corner one — clients.js homes them at doors.
+       The person wins, because that is what the keyboard has always
+       done (npc.js consumes KeyE at stage 11, ui.js binds at 13). --- */
+const brought = await page.evaluate(() => WALLY.__TT.bring('mabel'));
+await settled();
+const both = await label();
+ok(both.kind === 'both' && both.near !== null,
+  'PT-9 [branch reach=both]: a person and a door in reach at the same time',
+  `${JSON.stringify(brought)} -> kind ${both.kind}, ui.near ${both.near}`);
+ok(both.cap === 'Talk' && both.act === 'talk',
+  'PT-10: with both in reach the button says "Talk" — the person outranks the door',
+  JSON.stringify(both.cap));
+/* AND THE VERB FOLLOWS THE LABEL. A button that says Talk and opens a
+   shop is the same lie in the other direction, and it is exactly what
+   ui.interact() did here before: hud.interact() asked about the door
+   first, so the pad walked him inside while the keyboard talked. */
+await page.evaluate(() => WALLY.ctx.ui.interact());
+await settled();
+const didTalk = await page.evaluate(() => WALLY.debug.interact());
+ok(didTalk.dialogue === true && !didTalk.panels.includes('place') && /talked/.test(didTalk.why),
+  'PT-11: pressing it with both in reach TALKS — it does not walk him into the building',
+  JSON.stringify(didTalk));
+/* --- BRANCH 'advance' still outranks both of them --- */
+ok(await cap() === 'More',
+  'PT-12 [branch advance]: with the card up the caption is "More", person in reach or not');
+await hush();
+await settled();
+ok(await cap() === 'Talk',
+  'PT-13: ...and it goes back to "Talk", not to "Enter", with the person still there');
+
+/* --- BRANCH reach 'none', and the literal escape hatch, which the
+       narrowing must NOT have taken with it: a chip that is genuinely
+       not a keyboard key is still printed exactly as it stands. --- */
+await page.evaluate(() => WALLY.__TT.away());
+await settled();
+const none = await label();
+ok(none.kind === 'none' && none.cap === 'Enter',
+  'PT-14 [branch reach=none]: back on open ground the button rests on "Enter"',
+  `${none.kind} / ${none.cap}`);
+const literals = await page.evaluate(() => {
+  const p = WALLY.ctx.wally.position;
+  const at = (dx) => ({ x: p.x + dx, y: p.y + 2.4, z: p.z });
+  WALLY.ctx.ui.addPrompt({ id: 'tt.bullet', pos: at(-2), key: '•', text: 'a line of speech' });
+  WALLY.ctx.ui.addPrompt({ id: 'tt.corner', pos: at(2), key: '3', text: 'a checkpoint' });
+  WALLY.ctx.ui.addPrompt({ id: 'tt.flag', pos: at(0), key: '🏁', text: 'the finish' });
+  return true;
+});
+await page.waitForTimeout(600);
+const kept = await page.evaluate(() =>
+  [...document.querySelectorAll('.w-prompt .key')].map((e) => e.textContent));
+ok(literals && kept.includes('•') && kept.includes('3') && kept.includes('🏁'),
+  'PT-15 [branch paintPromptKey -> literal]: a bullet, a numeral and a flag are still printed as they stand',
+  JSON.stringify(kept));
+await page.evaluate(() => {
+  for (const id of ['tt.bullet', 'tt.corner', 'tt.flag']) WALLY.ctx.ui.removePrompt(id);
+});
 await toOpenGround();
 await page.waitForTimeout(900);
 
@@ -2217,7 +2443,7 @@ await page.waitForTimeout(600);
 
        THE SECOND SOURCE NEEDS NO STUBS, only a winner whose REAL verb
        raises no sheet. ENTER ON OPEN GROUND is exactly that: its verb
-       runs, refuses for a game reason — path 'door', "no door in range"
+       runs, refuses for a game reason — path 'door', "nothing in range"
        — and puts nothing over the pad, so the loser's release-inside
        test measures a live, non-zero .w-acts and Menu's real verb opens
        the real pause sheet. Both verbs, both effects, no patching.
@@ -2248,7 +2474,12 @@ ok(near15b === null && p15b.nDown === 2 && p15b.downs.every((d) => d.inPad)
   && p15b.ups.length === 2 && String(p15b.ups[1].acts) !== '0,0',
   `PAD-15c [the case is really set up]: ${menuB.label} and Enter both armed and both released on open ground, and the winner's verb left the pad at a LIVE rect for the loser — the mirror of PAD-14a's 0x0`,
   `ui.near ${near15b}, ups ${JSON.stringify(p15b.ups.map((u) => [u.inPad, u.acts]))}`);
-ok(p15b.act === 1 && why15b.path === 'door' && /no door in range/.test(why15b.why)
+/* the reason reads "nothing in range" rather than "no door in range":
+   a person in range is now a reason for that verb to do something too,
+   so the refusal has to be the absence of BOTH, and it prints the
+   reach it measured. See PERSON vs DOOR. */
+ok(p15b.act === 1 && why15b.path === 'door' && /nothing in range/.test(why15b.why)
+  && /reach none/.test(why15b.why)
   && p15b.sc === 1 && pn15b.includes('pause'),
   'PAD-15b [two pad buttons at once, nothing in the way — WITHOUT the stubs]: Enter\'s real verb ran and declined for a game reason, and Menu\'s real verb opened the real sheet, so the header\'s "both fire" rests on two independent sources and not on a monkey-patch',
   `act entries ${p15b.act}, reason ${JSON.stringify(why15b.why)}, shortcut entries ${p15b.sc}, panels ${JSON.stringify(pn15b)}`);
@@ -2529,7 +2760,8 @@ const openGroundWhy = await page.evaluate(() => {
   return { ran, ...WALLY.debug.interact() };
 });
 ok(openGroundWhy.ran === false && openGroundWhy.path === 'door'
-  && /no door in range/.test(openGroundWhy.why) && /ui\.modal false/.test(openGroundWhy.why),
+  && /nothing in range/.test(openGroundWhy.why) && /reach none/.test(openGroundWhy.why)
+  && /ui\.modal false/.test(openGroundWhy.why),
   'PAD-25 [the refusal says why]: interact() on open ground refuses and names the cause instead of returning a bare false — the shape that made one silent no-op indistinguishable from a broken input path',
   JSON.stringify(openGroundWhy));
 const sheetWhy = await page.evaluate(() => {
@@ -2548,7 +2780,7 @@ await page.waitForTimeout(600);
        phone-plus-desk pair, closed, then Enter at the door
        immediately afterwards. With the reason visible a miss can no
        longer hide — updatePointer() drops the door prompt outright
-       while ui.modal is true, so "no door in range" straight after a
+       while ui.modal is true, so "nothing in range" straight after a
        close is the shape this would take. --- */
 const door26 = await toDoor();
 await page.evaluate(() => { WALLY.ctx.ui.openPhone(); });
@@ -3248,6 +3480,16 @@ function sweepPage() {
 const SURFACES = [
   ['HUD', null],
   ['door prompt', () => { WALLY.ctx.ui.closeAll(); WALLY.debug.arrive('apartment', true); }],
+  /* THE TWO SURFACES THE SWEEP NEVER HAD, and the whole reason an 'E'
+     survived a sweep that was written to find exactly that. A prompt
+     over a PERSON comes from a different module by a different path
+     (npc.js -> ui.prompt -> hud.addPrompt with a literal key) and no
+     surface in this list has ever stood in front of anybody. */
+  ['person prompt', () => { WALLY.ctx.ui.closeAll(); WALLY.__TT.away(); WALLY.__TT.stand('mabel'); }],
+  ['person at a door', () => {
+    WALLY.ctx.ui.closeAll(); WALLY.__TT.away();
+    WALLY.debug.arrive('apartment', true); WALLY.__TT.bring('mabel');
+  }],
   ['dialogue', () => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('dialogue'); }],
   ['dialogue · more pages', () => { WALLY.ctx.ui.closeAll(); WALLY.ctx.ui.dialogue({ speaker: 'Mabel', text: ['One.', 'Two.'] }); }],
   ['phone · home', () => { WALLY.ctx.ui.closeAll(); WALLY.ctx.ui.openPhone(null); }],
@@ -3262,6 +3504,11 @@ const SURFACES = [
   ['market', () => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('market'); }],
   ['travel', () => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('travel'); }],
   ['map', () => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('map'); }],
+  /* LAST, and it is not a surface: the two above move a person and move
+     him, and the hybrid block below reads "the first .w-prompt" — which
+     would be whichever of a door and a person happened to be built
+     first. Hand the page back the way it was found. */
+  ['open ground', () => { WALLY.ctx.ui.closeAll(); WALLY.__TT.away(); }],
 ];
 
 async function sweepAll(pg, tag) {
@@ -5202,6 +5449,53 @@ ok(deskKeys.ticker === 'B' && /·\s*B$/.test(deskKeys.tickerTitle),
 ok(deskKeys.near !== null && deskKeys.prompt === 'E',
   'desktop: the door prompt still shows the E keycap', `${deskKeys.near} -> ${deskKeys.prompt}`);
 ok(deskKeys.promptCap === true, 'desktop: and it is still drawn AS a keycap');
+
+/* --- AND A PERSON, ON A DESKTOP. The touch build's 'Talk' is a
+       TRANSLATION of this branch, not a deletion of it: a player with a
+       keyboard must still be told which key talks. Same rig as PERSON
+       vs DOOR above, other input. --- */
+await dpage.evaluate(PERSON_RIG);
+const deskPerson = await dpage.evaluate(() => {
+  WALLY.ctx.ui.closeAll(); WALLY.__TT.away(); return WALLY.__TT.stand('mabel');
+});
+/* the pad never polls on a desktop (update() returns at the enabled
+   gate), so there is no `polls` to wait on here — wait for hud.js's own
+   0.16 s prompt poll to have caught up instead. Timer polling, not
+   rAF, for the same reason as `settled`.
+
+   AND WAIT FOR THE RIGHT PROMPT. This used to wait for `.w-prompt .key`
+   to be in the document, which the DOOR PROMPT LEFT BEHIND: he had
+   just been stood in the apartment doorway by the block above, and
+   hud.js does not take an element out of the DOM until 280 ms after it
+   drops the prompt. So the wait returned on the previous section's
+   chip, before the poll that was supposed to move the world, and the
+   reads below raced it — measured on both the fixed and the unfixed
+   anchor: reach 'door' / 'none' with `ui.near apartment` 97 metres
+   from the apartment. Wait for the fact the assertions are about:
+   npc.js's own 'npc' prompt, up, and the door gone. */
+await dpage.waitForFunction(
+  () => WALLY.debug.prompts().some((r) => r.id === 'npc') && !WALLY.ctx.ui.near,
+  null, { polling: 100, timeout: 15000 });
+const deskTalk = await dpage.evaluate(() => ({
+  keys: [...document.querySelectorAll('.w-prompt .key')].map((e) => e.textContent),
+  cap: (() => {
+    const e = document.querySelector('.w-prompt .key');
+    if (!e) return null;
+    const st = getComputedStyle(e);
+    return st.display === 'grid' && st.backgroundColor !== 'rgba(0, 0, 0, 0)';
+  })(),
+  reach: WALLY.ctx.ui.touch.reach.kind,
+  near: WALLY.ctx.ui.near?.id ?? null,
+}));
+ok(deskTalk.reach === 'person' && deskTalk.near === null,
+  'desktop [branch reach=person]: the same measurement runs — a person in range, no door',
+  `${deskTalk.reach} / ui.near ${deskTalk.near}  ${JSON.stringify(deskPerson)}`);
+ok(deskTalk.keys.includes('E'),
+  'desktop: the prompt over a PERSON still shows the E keycap — the touch label is a translation, not a deletion',
+  JSON.stringify(deskTalk.keys));
+ok(deskTalk.cap === true, 'desktop: and that one is still drawn AS a keycap too');
+await dpage.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.__TT.away(); });
+await dpage.waitForTimeout(700);
 await dpage.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('dialogue'); });
 await dpage.waitForTimeout(3600);
 const deskMore = await dpage.evaluate(() => {
@@ -5217,10 +5511,410 @@ await dpage.waitForTimeout(500);
 /* And the other half of the sweep: on a desktop it must find things.
    Same rules, same surfaces, opposite verdict — this is what proves
    the touch pass is a translation and not a deletion. */
+await dpage.evaluate(PERSON_RIG);
 const deskHits = await sweepAll(dpage, 'desktop');
 ok(deskHits.length >= 4,
   'desktop: the SAME sweep still finds key names — the labels were translated, not deleted',
   `${deskHits.length} key name(s) across ${SURFACES.length} surfaces`);
+
+
+/* ================= THE DOOR PROMPT SURVIVES THE APPROACH =================
+   The label over a door — the building's NAME, its opening hours, and
+   the verb chip — used to switch off at the exact moment it became
+   useful. Walking in on the apartment with the boom behind him it was
+   painted at 6 m, dark at 4 m, and dark for the rest of the way in;
+   with the boom on its own auto-solved portrait azimuth, which sits
+   off his FRONT quarter, it was never painted at any range at all.
+   The cause was geometric, not a bug in the reach test: the anchor sat
+   over the LINTEL, five metres up and 1.2 m out from the facade, so
+   the elevation from the boom to it climbed past the 25 degree half
+   FOV as you closed. hud.js now slides the anchor along lintel ->
+   crown until the whole chip is inside the frame (see THE ANCHOR
+   SLIDES there).
+
+   THIS IS A CASE A SCREENSHOT CANNOT SETTLE, so nothing here looks at
+   a picture. Every rung reads what the browser resolved — the chip's
+   own box, its computed opacity, its visibility — through
+   WALLY.debug.prompts(), and calls it painted only when the WHOLE chip
+   is on screen at better than half opacity.
+
+   Two shapes, on BOTH inputs:
+     WALK    a real approach from 10 m, steered every 150 ms. Movement
+             is camera-relative and the boom turns as he goes, so a
+             fixed key held from 10 m out walks a curve to somewhere
+             else; the loop re-solves the door direction in camera
+             space each sample and holds the controls that point at it.
+             It ends standing still at the door long enough for the
+             boom to swing onto its OWN solved azimuth, which is the
+             frame the defect actually lived in.
+     LADDER  fixed ranges from the edge of reach to the threshold, in
+             four decided azimuths — the auto-solved one, the lens
+             behind him, both sides, and the lens between him and the
+             wall, which is the one the collision solver crushes.
+
+   And the REVERT CHECK: WALLY.debug.promptAnchor('lintel') puts the
+   old rule back on the SAME PAGE LOAD, and the same walk and the same
+   ladder are re-run against it. If they do not go dark there, this
+   suite is measuring nothing and the green above is worthless.
+
+   THAT IS WHAT A REVERT CHECK IS, and it is worth saying which way
+   round: it runs TODAY'S TEST AGAINST YESTERDAY'S CODE. The other
+   direction — yesterday's test against yesterday's code — passes by
+   construction and proves nothing, because the two were written
+   together. The rule and the two weaker substitutes for it are written
+   down in src/core/contracts.js, HOW THIS PROJECT PROVES A FIX.
+   ================= */
+
+/* Installed in both pages: where the door is, how far he is from it,
+   and the one control the walk steers by. */
+const PROMPT_RIG = () => {
+  const W = window.WALLY, ctx = W.ctx;
+  if (W.__PR) return true;
+  const T = W.__PR = {};
+  const V3 = () => new ctx.THREE.Vector3();
+  /* the point the prompt is generated from — hud.js's own door axis */
+  T.doorPoint = (id) => {
+    const l = ctx.game.data.locationById[id];
+    const out = l.size.d * 0.5 + 1.2;
+    return { x: l.world.x + Math.sin(l.yaw) * out, z: l.world.z + Math.cos(l.yaw) * out, n: l.n };
+  };
+  T.known = () => ctx.game.data.locations.filter((l) => ctx.game.known(l.id)).map((l) => l.id);
+  /* the edge of hud.js's reach, expressed on the same axis the rungs
+     are measured on, so a ladder never starts outside it */
+  T.reachEdge = (id) => {
+    const l = ctx.game.data.locationById[id];
+    return Math.max(9, Math.hypot(l.size.w, l.size.d) * 0.5 + 5.5) - (l.size.d * 0.5 + 1.2);
+  };
+  /* stand him d metres out along the door axis, facing the door */
+  T.stand = (id, d) => {
+    const a = T.doorPoint(id), l = ctx.game.data.locationById[id];
+    const x = a.x + Math.sin(l.yaw) * d, z = a.z + Math.cos(l.yaw) * d;
+    const y = ctx.world.heightAt(x, z);
+    ctx.ui.closeAll();
+    ctx.wally.warpTo(x, y + 0.25, z, { face: { x: l.world.x, z: l.world.z } });
+    return +Math.hypot(a.x - ctx.wally.position.x, a.z - ctx.wally.position.z).toFixed(2);
+  };
+  /* the boom, NAMED FROM WHERE HE IS STANDING rather than from the
+     building's own yaw — he does not always arrive square to it.
+     'behind' is the lens behind him looking at the door; 'front' puts
+     it between him and the wall. */
+  T.az = (id, which) => {
+    const a = T.doorPoint(id), p = ctx.wally.position;
+    const to = Math.atan2(a.x - p.x, a.z - p.z);
+    if (which === 'auto') ctx.cam.warp({});
+    else ctx.cam.warp({ yaw: to + (which === 'front' ? Math.PI
+      : which === 'left' ? Math.PI / 2 : which === 'right' ? -Math.PI / 2 : 0) });
+    return which;
+  };
+  /* the door direction in CAMERA space — the basis the controls move
+     him along, re-read every sample because the boom turns as he walks */
+  T.aim = (id) => {
+    const a = T.doorPoint(id), p = ctx.wally.position;
+    const dx = a.x - p.x, dz = a.z - p.z, g = Math.hypot(dx, dz) || 1e-6;
+    const f = V3(); ctx.camera.getWorldDirection(f); f.y = 0; f.normalize();
+    return {
+      gap: +g.toFixed(2),
+      fwd: +((dx / g) * f.x + (dz / g) * f.z).toFixed(2),
+      right: +((dx / g) * -f.z + (dz / g) * f.x).toFixed(2),
+    };
+  };
+  /* ONE SAMPLE: how far out he is, and what the browser is painting */
+  T.sample = (id) => {
+    const a = T.doorPoint(id), p = ctx.wally.position;
+    const row = W.debug.prompts().find((r) => r.id === 'door') || null;
+    return {
+      gap: +Math.hypot(a.x - p.x, a.z - p.z).toFixed(1),
+      near: ctx.ui.near ? ctx.ui.near.id : null,
+      row, name: a.n,
+    };
+  };
+  return true;
+};
+/* A FRESH PHONE, NOT THE ONE ABOVE. ctxMobile is closed by the time
+   this block runs, and re-opening it here is worth more than the ten
+   seconds it costs anyway: the walk wants a phone that has not been
+   dragged through forty pad scenarios first, with nobody standing in
+   the doorway and no idle-hide clock part-way through a cycle. */
+const ctxWalk = await browser.newContext({
+  viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, deviceScaleFactor: 1,
+});
+const wpage = await ctxWalk.newPage();
+wpage.on('pageerror', e => { console.log('PAGEERROR(walk)', e.message.split('\n')[0]); fails++; });
+await wpage.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 60000 });
+await wpage.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 120000 });
+await wpage.waitForTimeout(3000);
+const wcdp = await ctxWalk.newCDPSession(wpage);
+const wtouch = (type, x, y) => wcdp.send('Input.dispatchTouchEvent', {
+  type, touchPoints: type === 'touchEnd' || type === 'touchCancel' ? []
+    : [{ x, y, id: 1, radiusX: 14, radiusY: 14, force: 1 }],
+});
+const wstick = await wpage.evaluate(() => {
+  const el = document.querySelector('.w-stick');
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+    R: WALLY.debug.touchState().R || 60 };
+});
+ok(!!wstick && wstick.R > 20, 'PROMPT-R: the fresh phone brought its thumbstick', JSON.stringify(wstick));
+
+await wpage.evaluate(PROMPT_RIG);
+await dpage.evaluate(PROMPT_RIG);
+
+/* `4.1P` painted at 4.1 m, `4.1r` in reach and dark, `4.1-` no prompt
+   yet — the judge's own trace format, which is the right shape for the
+   assertion as well as for reading. */
+const mark = (s) => `${s.gap.toFixed(1)}${!s.row ? '-' : s.row.painted ? 'P' : 'r'}`;
+const lit = (s) => !!(s.row && s.row.painted);
+const allLit = (rows) => rows.length > 0 && rows.every(lit);
+
+/* THE WALK'S CLAIM, EXACTLY: the label comes up as he enters reach and
+   then NEVER GOES DARK AGAIN, all the way to the threshold.
+
+   The one sample it is allowed to be dark on is the first after it
+   appears, because a brand new prompt is FADING IN there: hud.js damps
+   its opacity up from zero (lambda 12) and style.js eases it over
+   .26 s, so 150 ms after it is created the resolved opacity can
+   honestly still be under a half and climbing. That is the label
+   ARRIVING — the opposite of the defect, which is a label that has
+   been up for metres and switches off as you reach the door. Measured
+   on these three walks it is painted by the second sample every time,
+   and on the phone's depot walk by the first. Allowing more than one
+   would start to allow the defect back in, so it is exactly one. */
+const steady = (rows) => {
+  const i = rows.findIndex(lit);
+  return i >= 0 && i <= 1 && rows.slice(i).every(lit);
+};
+
+/* the two inputs, behind one verb. `fwd`/`right` are camera-space
+   components in -1..1; the keyboard quantises them, the thumb does not. */
+const keyDrive = (pg) => {
+  const held = new Set();
+  const set = async (want) => {
+    for (const k of [...held]) if (!want.has(k)) { await pg.keyboard.up(k); held.delete(k); }
+    for (const k of want) if (!held.has(k)) { await pg.keyboard.down(k); held.add(k); }
+  };
+  return {
+    async hold(fwd, right) {
+      const want = new Set();
+      if (fwd > 0.3) want.add('w'); else if (fwd < -0.3) want.add('s');
+      if (right > 0.3) want.add('d'); else if (right < -0.3) want.add('a');
+      await set(want);
+    },
+    async stop() { await set(new Set()); },
+  };
+};
+const stickDrive = () => {
+  let down = false;
+  const D = wstick.R * 0.95;
+  return {
+    async hold(fwd, right) {
+      if (!down) { await wtouch('touchStart', wstick.x, wstick.y); down = true; }
+      await wtouch('touchMove', wstick.x + Math.max(-1, Math.min(1, right)) * D,
+        wstick.y - Math.max(-1, Math.min(1, fwd)) * D);
+    },
+    async stop() { if (down) await wtouch('touchEnd', wstick.x, wstick.y); down = false; },
+  };
+};
+
+/* THE WALK. Ends standing still for long enough that the boom has
+   settled on its own solved azimuth — the frame that was never painted
+   at any range before this fix. */
+async function walkIn(pg, drive, id) {
+  await pg.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.hideUI(false); });
+  await pg.evaluate(([i, d]) => WALLY.__PR.stand(i, d), [id, 10]);
+  await pg.evaluate(() => WALLY.debug.camWarp());
+  await pg.waitForTimeout(900);
+  const rows = [];
+  for (let i = 0; i < 90; i++) {
+    const a = await pg.evaluate((i2) => WALLY.__PR.aim(i2), id);
+    await drive.hold(a.fwd, a.right);
+    await pg.waitForTimeout(150);
+    rows.push(await pg.evaluate((i2) => WALLY.__PR.sample(i2), id));
+    if (a.gap < 0.9) break;
+  }
+  await drive.stop();
+  await pg.waitForTimeout(2600);
+  const restRow = await pg.evaluate((i2) => WALLY.__PR.sample(i2), id);
+  return { rows, restRow };
+}
+
+/* ==================================================================
+   PROMPT-5: THE ANCHOR SLIDES ONLY AS FAR AS THE FRAME MAKES IT.
+
+   WHAT THIS ASSERTION USED TO SAY, AND WHY IT WAS WORTH NOTHING.
+
+   It read `rows[0].row.t <= 0.2` and called it "AT RANGE it has not
+   moved — still hung on its own lintel". That is a claim about where
+   the anchor RESTS, and it was measured in the single camera angle
+   where it happens to hold, because it was gated on `az === 'behind'`.
+   Measured on the far rung of the same ladder, same door, same page —
+   desktop, apartment, edge - 0.3 m:
+
+       behind t = 0.03      auto t = 0.93
+       left   t = 0.86      right  t = 0.89      front t = 0.94
+
+   Four fifths of the thing it named were never looked at, and in four
+   fifths of them the statement is flatly false. It had been green
+   since it was written and it would have stayed green through any
+   change to the rule that left the behind-azimuth alone.
+
+   WHAT IS ACTUALLY TRUE IN ALL FIVE. hud.js does not hang the label on
+   the lintel; it takes the SMALLEST t along lintel -> crown whose
+   projection puts the whole chip inside the frame (see THE ANCHOR
+   SLIDES there). The smallest t is 0 exactly when 0 is feasible. So
+   the property is MINIMALITY, and the switch to test it with is
+   already in the file:
+
+       t at range is ~0   <=>   the OLD lintel rule paints the same rung
+
+   Both directions carry weight. Left to right: if the anchor did not
+   move then nothing about the old framing changed, so the lintel must
+   still be paintable. Right to left, and this is the half no version
+   of PROMPT-5 could ever catch: if the anchor DID move, the move was
+   FORCED — the lintel rule cannot paint that rung at all. An anchor
+   that slid when it did not have to would sit the label over Wally's
+   head from across the square for no reason, pass PROMPT-4, and fail
+   here.
+
+   THE THRESHOLD IS NOT TUNED, AND THE CENSUS IS NOT ONE DOOR. All
+   thirty far-rung cells were measured before this was written — two
+   viewports (desktop 1280x720, phone 390x844) x three doors
+   (apartment, trunkdepot, cafe) x five azimuths, headless Chrome,
+   ANGLE Metal Renderer on an Apple M1 Max, 2026-09-06:
+
+       behind                     t = 0.03 in all six,
+                                  and the lintel rule paints all six
+       auto / left / right / front  t = 0.82 to 1.00 in all
+                                  twenty-four, and the lintel rule is
+                                  dark in all twenty-four
+
+   Thirty for thirty. Any cut anywhere in (0.05, 0.80) returns the same
+   verdict on every cell; 0.15 is quoted because it is inside that
+   empty band, not because anything sits near it.
+
+   The real t is PRINTED in every row rather than frozen into a table:
+   it depends on the building's height and on the viewport, and a
+   hard-coded per-azimuth constant would be the same mistake one level
+   up — a number that agrees with the configuration it was taken in.
+   ================================================================== */
+const SLIDE_EPS = 0.15;
+
+/* The far rung, read twice under the two anchor rules. promptAnchor()
+   zeroes p.t on every live prompt, so each reading is that rule's own
+   resting value for this frame and not the tail of the previous rung's
+   ease-down (hud.js eases t DOWN at lambda 6 and raises it instantly,
+   so a carried-over value can only ever read too high). */
+async function restingAnchor(pg, id, az) {
+  const edge = await pg.evaluate((i) => WALLY.__PR.reachEdge(i), id);
+  const d = Math.max(0.5, edge - 0.3);
+  const at = async (mode) => {
+    await pg.evaluate((m) => WALLY.debug.promptAnchor(m), mode);
+    await pg.evaluate(([i, dd]) => WALLY.__PR.stand(i, dd), [id, d]);
+    await pg.evaluate(([i, a]) => WALLY.__PR.az(i, a), [id, az]);
+    await pg.waitForTimeout(600);
+    return pg.evaluate((i) => WALLY.__PR.sample(i), id);
+  };
+  const slide = await at('slide');
+  const lintel = await at('lintel');
+  await pg.evaluate(() => WALLY.debug.promptAnchor('slide'));
+  return { d, slide, lintel };
+}
+
+/* THE LADDER: decided ranges, decided azimuths, settled before every
+   read. 600 ms is four time constants of the prompt's own opacity damp
+   (lambda 12) and two of hud.js's 0.16 s door poll, so a rung that
+   reads dark here is dark, not mid-fade. */
+async function ladder(pg, id, az) {
+  const edge = await pg.evaluate((i) => WALLY.__PR.reachEdge(i), id);
+  const rungs = [edge - 0.3, edge * 0.72, edge * 0.45, 2, 1.2, 0.6].map((n) => Math.max(0.5, n));
+  const out = [];
+  for (const d of rungs) {
+    await pg.evaluate(([i, dd]) => WALLY.__PR.stand(i, dd), [id, d]);
+    await pg.evaluate(([i, a]) => WALLY.__PR.az(i, a), [id, az]);
+    await pg.waitForTimeout(600);
+    out.push(await pg.evaluate((i) => WALLY.__PR.sample(i), id));
+  }
+  return out;
+}
+
+const AZ = ['auto', 'behind', 'left', 'right', 'front'];
+/* THE INTERSECTION, NOT ONE PAGE'S LIST. The two contexts have been
+   driven through different suites to get here and either may have
+   discovered a location the other has not; a door the phone has never
+   heard of generates no prompt at all, which would read as this fix
+   failing rather than as the rig asking for the wrong building. */
+const knownD = await dpage.evaluate(() => WALLY.__PR.known());
+const knownM = await wpage.evaluate(() => WALLY.__PR.known());
+const known = knownD.filter((id) => knownM.includes(id));
+ok(known.length >= 3, 'PROMPT-0: several buildings are known to BOTH builds to walk in on',
+  `${JSON.stringify(known)}  desk ${knownD.length} / phone ${knownM.length}`);
+const WALK_DOORS = known.slice(0, 2);
+const LADDER_DOORS = known.slice(0, 2).concat(known.slice(3, 4));   // 3 buildings if there are 4
+
+for (const [pg, drive, who] of [[dpage, keyDrive(dpage), 'desktop'], [wpage, stickDrive(), 'phone']]) {
+  await pg.evaluate(() => { if (WALLY.__TT) WALLY.__TT.away(); WALLY.ctx.ui.closeAll(); });
+  for (const id of WALK_DOORS) {
+    const { rows, restRow } = await walkIn(pg, drive, id);
+    const seen = rows.filter((r) => r.row);
+    ok(seen.length >= 6 && rows[rows.length - 1].gap < 1.2,
+      `PROMPT-1 ${who} [${id}]: the walk really did reach the threshold`,
+      `${seen.length} samples with a prompt, ended at ${rows[rows.length - 1].gap} m`);
+    ok(steady(seen),
+      `PROMPT-2 ${who} [${id}]: painted at EVERY step of the approach after it fades in, including the last two metres`,
+      rows.map(mark).join(' '));
+    ok(lit(restRow),
+      `PROMPT-3 ${who} [${id}]: ...and still painted standing at the door on the boom's OWN solved azimuth`,
+      mark(restRow) + (restRow.row ? ` t=${restRow.row.t}` : ''));
+  }
+  for (const id of LADDER_DOORS) {
+    for (const az of AZ) {
+      const rows = await ladder(pg, id, az);
+      ok(allLit(rows), `PROMPT-4 ${who} [${id}/${az}]: painted at every range in this azimuth`,
+        rows.map(mark).join(' '));
+      /* PROMPT-5 — IN EVERY AZIMUTH, not just the one it holds in. See
+         THE ANCHOR SLIDES ONLY AS FAR AS THE FRAME MAKES IT above. */
+      const r5 = await restingAnchor(pg, id, az);
+      const t = r5.slide.row ? r5.slide.row.t : null;
+      const slid = t === null ? null : t > SLIDE_EPS;
+      const oldPaints = lit(r5.lintel);
+      ok(lit(r5.slide) && slid !== null && slid === !oldPaints,
+        `PROMPT-5 ${who} [${id}/${az}]: at range the anchor sits at the SMALLEST t the frame allows — it leaves the lintel only where the lintel cannot be painted`,
+        `t=${t === null ? 'n/a' : t.toFixed(2)} at ${r5.slide.gap} m — ${slid ? 'slid' : 'still on its own lintel'}`
+        + `, and the old rule ${oldPaints ? 'still paints' : 'goes dark on'} the same rung`
+        + ` [slide ${mark(r5.slide)} | lintel ${mark(r5.lintel)}]`);
+    }
+  }
+}
+
+/* ---- THE REVERT CHECK ----
+   Same page, same walk, same ladder, old anchor rule. This has to FAIL
+   or nothing above means anything. */
+const revert = async (pg, drive, who, id) => {
+  const back = await pg.evaluate(() => WALLY.debug.promptAnchor('lintel'));
+  const { rows, restRow } = await walkIn(pg, drive, id);
+  const seen = rows.filter((r) => r.row);
+  const dark = seen.filter((r) => !r.row.painted).length;
+  /* the exact negation of PROMPT-2, on the same walk and the same
+     predicate — not a looser one, or this arm would be agreeing with
+     itself rather than contradicting the fix */
+  ok(back === 'lintel' && seen.length >= 6 && !steady(seen),
+    `PROMPT-6 ${who} [REVERT ${id}]: on the OLD anchor the same walk does NOT survive`,
+    `${dark}/${seen.length} steps unpainted — ${rows.map(mark).join(' ')}`);
+  ok(!lit(restRow),
+    `PROMPT-7 ${who} [REVERT ${id}]: ...and standing at the door on the solved azimuth it is not painted at all`,
+    mark(restRow));
+  const lad = await ladder(pg, id, 'behind');
+  ok(!allLit(lad) && lit(lad[0]),
+    `PROMPT-8 ${who} [REVERT ${id}]: ...and the old ladder paints at range and dies close in`,
+    lad.map(mark).join(' '));
+  const now = await pg.evaluate(() => WALLY.debug.promptAnchor('slide'));
+  const back2 = await ladder(pg, id, 'behind');
+  ok(now === 'slide' && allLit(back2),
+    `PROMPT-9 ${who} [${id}]: put the fix back and the same ladder is painted end to end`,
+    back2.map(mark).join(' '));
+};
+await revert(dpage, keyDrive(dpage), 'desktop', WALK_DOORS[0]);
+await revert(wpage, stickDrive(), 'phone', WALK_DOORS[0]);
+await ctxWalk.close();
 
 await browser.close();
 server.close();

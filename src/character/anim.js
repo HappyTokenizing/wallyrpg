@@ -1784,6 +1784,7 @@ export class Animator {
     this._loco = makePose();
     this._bike = makePose();
     this._act = makePose();
+    this._actP = makePose();
     this._w = new Writer();
 
     /* 0 = on foot, 1 = on the bicycle. Damped, never assigned. */
@@ -1814,13 +1815,57 @@ export class Animator {
     this.fadeRate = 5;
     this.onFinish = null;
     this.locoName = 'idle';
+    /* THE OUTGOING ACTION CLIP — see `play`. One slot, not a stack:
+       two crossfades in flight at once is a third pose nobody authored,
+       and a clip swapped again mid-fade should land on what is on
+       screen, which is what `out` already holds. */
+    this.prev = null;           // { clip, name, time, loop, hold, speed }
+    this.prevW = 0;
+    this.prevRate = 1 / 0.22;
 
     /* the locomotion pair and blend factor the last update resolved, so
        `hints` can weight the locomotion layer's declared trunk/ear intent */
     this._hintA = CLIPS.idle; this._hintB = CLIPS.idle; this._hintF = 0;
   }
 
-  /** Start a clip on the action layer. */
+  /**
+   * Start a clip on the action layer.
+   *
+   * ------------------------------------------------------------------
+   * `fade` FADES THE LAYER. IT ALSO NOW FADES BETWEEN TWO CLIPS ON IT.
+   * ------------------------------------------------------------------
+   * `actionW` is the weight of the action layer AGAINST the locomotion
+   * layer, and until this block existed it was the only weight there
+   * was: swapping `this.action` while the layer was already up
+   * SUBSTITUTED one pose curve for another on the next frame, whatever
+   * `fade` said, because `fade` was only ever the rate actionW damps at
+   * and actionW was already 1.
+   *
+   * MEASURED, on the shipped opener, sampling every bone of both arms
+   * every frame through the watched intro (max per-joint change between
+   * two consecutive frames, degrees):
+   *
+   *     t=26.689  ride-bicycle -> cool     42.37 deg in one frame
+   *     t=31.672  cool -> welcome          52.00 deg in one frame
+   *
+   * The first is behind the SEQ C -> D camera cut and is meant to be a
+   * cut. The SECOND IS NOT BEHIND ANYTHING: the hero camera is holding
+   * on him, the title card has been up for half a second, and
+   * `pose('welcome', { fade: 0.55 })` asked for a 0.55 s open and got a
+   * one-frame snap of both arms through 52 degrees. Every caller of
+   * play()/pose() that passes a fade was buying the same nothing.
+   *
+   * So the outgoing clip is KEPT, at its own weight, and the action
+   * layer resolves as a blend of the two before it is blended against
+   * locomotion. The rate is the incoming clip's `fade`, so every
+   * existing call site now gets the fade it always asked for.
+   *
+   * A CUT IS STILL A CUT. `instant: true`, or a fade at or under one
+   * frame, drops the outgoing clip outright — intro.js's C -> D
+   * dismount is `{ fade: 0.001, instant: true }` and is SUPPOSED to
+   * substitute, because the camera cuts on the same frame. Blending
+   * across that would be five frames of a man melting off a bicycle.
+   */
   play(name, opts = {}) {
     const clip = CLIPS[name];
     if (!clip) { console.warn(`[wally] no clip "${name}"`); return this; }
@@ -1829,6 +1874,19 @@ export class Animator {
       this.actionTarget = 1;
       this.fadeRate = 1 / Math.max(fade, 0.016);
       return this;
+    }
+    const cut = !!opts.instant || fade <= 0.016;
+    if (!cut && this.action && this.actionW > 0.004) {
+      /* Swapped again mid-fade: the outgoing source is what is ON
+         SCREEN, which is already the blend in `_act`, so the slot is
+         reused rather than stacked. Its `time` keeps running so a
+         looping clip does not restart under the blend. */
+      this.prev = this.action;
+      this.prevW = 1;
+      this.prevRate = 1 / Math.max(fade, 0.016);
+    } else {
+      this.prev = null;
+      this.prevW = 0;
     }
     this.action = {
       clip, name, time: 0,
@@ -1930,7 +1988,16 @@ export class Animator {
     take(this._hintB, fw * this._hintF);
     take(this._bkA, bw * (1 - this._bkF));
     take(this._bkB, bw * this._bkF);
-    if (this.action) take(this.action.clip, aw);
+    /* The action layer's share is split between the incoming clip and
+       the outgoing one on exactly the weight `update` blends their
+       POSES on — otherwise the trunk curl and the ear set snap on the
+       frame the clip is swapped while the arms fade over half a second,
+       and the two halves of one gesture arrive at different times. */
+    if (this.action) {
+      const pw = this.prev ? smoothstep(0, 1, this.prevW) : 0;
+      take(this.action.clip, aw * (1 - pw));
+      if (this.prev) take(this.prev.clip, aw * pw);
+    }
     if (cw <= 1e-4 && ew <= 1e-4) return null;
     /* Each group is normalised by its OWN accumulated weight and carries
        its OWN blend weight, because trunk cover and ear cover come apart
@@ -2075,10 +2142,38 @@ export class Animator {
         : a.loop ? (a.time / dur) % 1
           : clamp(a.time / dur, 0, 1);
       this._eval(a.clip, ph, this._act, st);
+
+      /* ---- the OUTGOING action clip, blended under the incoming one.
+         See `play`. It is advanced as well as evaluated: a looping clip
+         frozen on its swap frame would stop breathing halfway through
+         its own fade, which the eye reads as the pose "sticking" before
+         it moves. */
+      const p = this.prev;
+      if (p) {
+        this.prevW = damp(this.prevW, 0, this.prevRate, dt);
+        if (this.prevW < 0.004) { this.prevW = 0; this.prev = null; }
+        else {
+          p.time += dt * p.speed;
+          const pdur = p.clip.duration || 1;
+          const pph = (p.hold || p.loop) ? (p.time / pdur) % 1
+            : clamp(p.time / pdur, 0, 1);
+          this._eval(p.clip, pph, this._actP, st);
+          /* smoothstep on the OUTGOING weight, so the pair joins with
+             zero velocity at both ends exactly the way the layer blend
+             below does. */
+          blendPose(this._act, this._act, this._actP, smoothstep(0, 1, this.prevW));
+        }
+      }
     }
 
     this.actionW = damp(this.actionW, this.actionTarget, this.fadeRate, dt);
-    if (this.actionTarget === 0 && this.actionW < 0.004) { this.actionW = 0; this.action = null; }
+    if (this.actionTarget === 0 && this.actionW < 0.004) {
+      this.actionW = 0; this.action = null;
+      /* the layer is gone; the thing that was fading INSIDE it goes
+         with it, or the next play() blends out of a clip that has not
+         been on screen since */
+      this.prev = null; this.prevW = 0;
+    }
 
     const w = smoothstep(0, 1, this.actionW);
     if (a && w > 0) blendPose(this.out, this._loco, this._act, w);
