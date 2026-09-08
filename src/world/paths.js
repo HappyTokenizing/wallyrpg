@@ -211,7 +211,44 @@ export function createPaths(ctx, terrain) {
     return h;
   }
 
-  function carve(pts, h, width) {
+  /* ALL THE CARVES AT ONCE, NOT ONE AFTER ANOTHER — WHICH IS WHY THERE
+     WAS A CLIFF IN A ROAD JUNCTION.
+
+     Each segment used to pull the grid straight at its own profile:
+       H[o] = lerp(H[o], mine, m * 0.92)
+     applied in edge order. On a single road that converges on the
+     profile and is fine. WHERE TWO ROUTES MEET IT IS LAST-WRITER-WINS,
+     and the last writer is a different edge at one grid node than it is
+     at the node 2 m away. Two profiles that differ by 0.8 m at a
+     junction therefore land on adjacent nodes of a 2 m heightfield, and
+     what the player gets is a 48-degree face with a road drawn down it.
+
+     Measured at the Iron Hills / Green Edge junction (-24, -200): the
+     collision normal is n.y 0.671, which is 48 degrees — the exact
+     slope limit controller.js will let him stand on — inside a graded
+     road corridor, on both this build and a clean HEAD archive. It is
+     also the whole of what tools/surfacetest.mjs had left to report
+     there once the ribbon stopped bridging: raw error 0.001 m, and a
+     capsule-lift term of 0.152 m that is not a defect in the ground so
+     much as the ground being too steep to be a road at all.
+
+     So the segments ACCUMULATE and the grid is written once. Three
+     fields, all in the terrain's own indexing:
+       CT/CW  a weighted mean of every profile that reaches this node,
+              weighted m*m so the flat centre of a road outvotes the
+              feathered skirt of the one crossing it;
+       CS     the blend strength the sequential version would have
+              reached, built up the same way it was — 1-prod(1-0.92m) —
+              so a node covered by four segments is still pulled 99 %
+              of the way onto the road and the roads do not go soft.
+     Coverage (PATH) and strength are therefore unchanged and only the
+     TARGET is different: a junction ramps between the two roads that
+     make it instead of stepping between them. */
+  const CT = new Float64Array(H.length);
+  const CW = new Float64Array(H.length);
+  const CS = new Float32Array(H.length);
+
+  function carve(pts, h, width, prio) {
     const half = width * 0.5;
     const reach = half + FEATHER;
     for (let i = 0; i < pts.length - 1; i++) {
@@ -234,21 +271,72 @@ export function createPaths(ctx, terrain) {
           const d = Math.hypot(x - (p0.x + ex * t), z - (p0.z + ez * t));
           if (d > reach) continue;
           const m = smoothstep(reach, half, d);
+          if (m <= 0) continue;
           const o = IX(i2, j);
           if (m > PATH[o]) PATH[o] = m;
-          H[o] = lerp(H[o], lerp(h0, h1, t), m * 0.92);
+          const w = m * m * prio;
+          CT[o] += w * lerp(h0, h1, t);
+          CW[o] += w;
+          CS[o] += 0.92 * m * (1 - CS[o]);
         }
       }
     }
   }
 
+/* THE ROAD NETWORK'S OWN NUMBERS, PUBLISHED.
+
+   `quads`/`fanned`/`worstSag` are filled by buildRibbons() and one of
+   them is already cited by name eighty lines below ("Count:
+   ctx.world.paths.stats.fanned") — a citation that has never been
+   readable, because world.js republishes this module as
+   `{nodes, edges, at}` and drops the stats. tools/_pa-census.mjs
+   section D printed `paths: undefined` for exactly that reason.
+
+   The three below are the ones a floor census wants and nothing else
+   knows: how much road there is to kerb, how it splits between trunk
+   roads and lanes, and how many junctions there are — the junction
+   count being the ceiling on how many desire paths ground.js can cut
+   at corners, which is what sent it looking for destinations instead.
+   They are filled at route time, not at draw time, so they are right
+   even if buildRibbons() has not run. */
+  const stats = {
+    quads: 0, fanned: 0, refined: 0, edges: 0, worstSag: 0, verts: 0, tris: 0,
+    roadMetres: 0, laneMetres: 0, junctions: 0,
+  };
+
   for (const e of edges) {
     e.points = routePoints(e);
     e.height = profile(e.points);
+    /* measured along the ROUTED polyline, not end to end: these roads
+       bend round contours and the straight-line figure is 15 % short */
+    let m = 0;
+    for (let i = 1; i < e.points.length; i++) {
+      m += Math.hypot(e.points[i].x - e.points[i - 1].x, e.points[i].z - e.points[i - 1].z);
+    }
+    e.metres = m;
+    if (e.kind === 'road') stats.roadMetres += m; else stats.laneMetres += m;
   }
-  /* trunk roads first so lanes tie into an already-graded surface */
-  for (const e of edges) if (e.kind === 'road') carve(e.points, e.height, e.width);
-  for (const e of edges) if (e.kind === 'lane') carve(e.points, e.height, e.width);
+  /* a junction is a node more than two edges meet at */
+  {
+    const deg = new Map();
+    for (const e of edges) {
+      deg.set(e.a.key, (deg.get(e.a.key) || 0) + 1);
+      deg.set(e.b.key, (deg.get(e.b.key) || 0) + 1);
+    }
+    for (const d of deg.values()) if (d > 2) stats.junctions++;
+  }
+  stats.roadMetres = Math.round(stats.roadMetres);
+  stats.laneMetres = Math.round(stats.laneMetres);
+  stats.edges = edges.length;
+  /* A TRUNK ROAD STILL OUTRANKS A LANE. The old ordering said so by
+     carving roads first and letting the lanes overwrite them, which
+     gave the lane the last word — the opposite of what the comment
+     claimed. Said as a weight it means what it says: at a junction the
+     graded surface leans 2:1 toward the through road. */
+  for (const e of edges) carve(e.points, e.height, e.width, e.kind === 'road' ? 2 : 1);
+  for (let o = 0; o < H.length; o++) {
+    if (CW[o] > 0) H[o] = lerp(H[o], CT[o] / CW[o], CS[o]);
+  }
 
   /* ------------------------------------------------------------
      Ribbons. Built after the terrain is final so they sit on the
@@ -319,6 +407,7 @@ export function createPaths(ctx, terrain) {
     /* One merged mesh per district keeps the draw calls in single
        figures while still letting the frustum throw most of them
        away. */
+    let quads = 0, fanned = 0, worstSag = 0, refined = 0;
     const buckets = new Map();
     for (const e of edges) {
       const key = e.a.kind === 'zone' ? e.a.key : e.b.key;
@@ -368,8 +457,64 @@ export function createPaths(ctx, terrain) {
            the tail belongs to whichever lane crosses the bank
            sideways. Cutting the ribbon at the boundary, or letting one
            lane win a junction, is the fix; it is not this one. */
-        const pts = densify(e.points, 0.75);
         const half = e.width * 0.38;   // the ribbon rides INSIDE the carve
+        /* THE CHORD IS CHOSEN PER ROUTE, BY MEASURING IT, NOT SET ONCE
+           FOR THE ISLAND.
+
+           0.75 m below is the number the two notes above paid for, and
+           on the 130-odd routes that cross open ground it is more than
+           enough. It is not enough on the handful cut into a hillside,
+           for the reason set out at the bottom of this function: the
+           sag of a flat quad over a corner in the ground falls only as
+           the SQUARE of the chord, so a route that is 0.25 m out at
+           0.75 m is still 0.06 m out at 0.375 m and no single global
+           number is right for both kinds of ground.
+
+           So each route is DRY-RUN first — the lattice is walked with
+           nothing but heightAt, no rng drawn and no vertex emitted —
+           and the chord is halved until the worst quad in it stops
+           bridging or the floor is reached. A route that was already
+           fine is built at exactly 0.75 m from exactly the same rng
+           stream as before, so its geometry is unchanged to the bit.
+           Only the rough ones pay, and they pay four times the
+           vertices for the stretch that needs it. */
+        const STEP0 = 0.75, STEP_MIN = 0.1875;
+        const sagOf = (step) => {
+          const q = densify(e.points, step);
+          const ns = Math.max(1, Math.ceil(half / step));
+          let w = 0;
+          for (let i = 0; i < q.length - 1; i++) {
+            const a0 = q[Math.max(0, i - 1)], a1 = q[Math.min(q.length - 1, i + 1)];
+            const b0 = q[i], b1 = q[Math.min(q.length - 1, i + 2)];
+            let tx = a1.x - a0.x, tz = a1.z - a0.z; let tl = Math.hypot(tx, tz) || 1;
+            const pax = -tz / tl, paz = tx / tl;
+            tx = b1.x - b0.x; tz = b1.z - b0.z; tl = Math.hypot(tx, tz) || 1;
+            const pbx = -tz / tl, pbz = tx / tl;
+            for (let s = -ns; s < ns; s++) {
+              const u0 = (half * s) / ns, u1 = (half * (s + 1)) / ns;
+              const P = [[q[i].x + pax * u0, q[i].z + paz * u0], [q[i].x + pax * u1, q[i].z + paz * u1],
+                [q[i + 1].x + pbx * u1, q[i + 1].z + pbz * u1], [q[i + 1].x + pbx * u0, q[i + 1].z + pbz * u0]];
+              let mx = 0, mz = 0, mh = 0;
+              for (const [px2, pz2] of P) { mx += px2 * 0.25; mz += pz2 * 0.25; mh += terrain.heightAt(px2, pz2) * 0.25; }
+              /* the four edge midpoints matter as much as the middle:
+                 a quad's edges are shared with its neighbours and a
+                 centre vertex cannot move them */
+              let sag = mh - terrain.heightAt(mx, mz);
+              for (let k = 0; k < 4; k++) {
+                const A = P[k], B = P[(k + 1) % 4];
+                const ex2 = (A[0] + B[0]) * 0.5, ez2 = (A[1] + B[1]) * 0.5;
+                const es = (terrain.heightAt(A[0], A[1]) + terrain.heightAt(B[0], B[1])) * 0.5 - terrain.heightAt(ex2, ez2);
+                if (es > sag) sag = es;
+              }
+              if (sag > w) w = sag;
+            }
+          }
+          return w;
+        };
+        let STEP = STEP0;
+        while (STEP > STEP_MIN && sagOf(STEP) > 0.045) STEP *= 0.5;
+        if (STEP < STEP0) refined++;
+        const pts = densify(e.points, STEP);
         /* ...AND ACROSS IT, FOR THE SAME REASON.
 
            The paragraph above densified the ribbon ALONG the centreline
@@ -384,7 +529,7 @@ export function createPaths(ctx, terrain) {
            the tarmac is drawn above his feet — worst walk sample
            -0.139 m at (-314.2, 166) on Rusty Row. Same cure as along:
            no chord, either way, longer than 0.75 m. */
-        const NS = Math.max(1, Math.ceil(half / 0.75));   // columns per side
+        const NS = Math.max(1, Math.ceil(half / STEP));   // columns per side
         const COLS = NS * 2 + 1;
         const ring = [];
         for (let i = 0; i < pts.length; i++) {
@@ -413,7 +558,7 @@ export function createPaths(ctx, terrain) {
                and an index-based u would have run the road texture
                twice as fast for a change that is supposed to be
                geometry only. */
-            uv.push(i * 0.75 * 0.12, t * 0.5 + 0.5);
+            uv.push(i * STEP * 0.12, t * 0.5 + 0.5);
             /* SAMPLED, NOT INTERPOLATED. Three vertices across gave the
                quad a linear crown-to-verge ramp between C_ROAD and
                C_WORN; mixing on |t| is that same ramp evaluated at every
@@ -424,14 +569,72 @@ export function createPaths(ctx, terrain) {
             col.push(_cc.r * k, _cc.g * k, _cc.b * k);
           }
         }
+        /* AND THE LAST PLACE IT STILL BRIDGES IS THE TOE OF A CUT BANK,
+           WHERE NO CHORD LENGTH FIXES IT BECAUSE THE GROUND IS A CORNER.
+
+           The two notes above shortened the chord until the tail
+           collapsed, then said the remainder was the two district
+           ribbons overlapping at (-24, -200). Re-measured, that is not
+           what it is. Every ribbon vertex on the island sits at exactly
+           heightAt + 0.030 — 27 greenedge and 64 ironhills vertices
+           within 3 m of that point, mean 0.0300, worst 0.0300 — so no
+           vertex is wrong. What is wrong is the QUAD BETWEEN them. The
+           road is cut into a hillside, `half` is 2.43 m so the ribbon's
+           outer columns run up the bank, and at the toe the terrain
+           turns a corner: heightAt is 40.374 at (-24, -200) and 40.674
+           half a metre away. A flat quad laid over a corner stands
+           above it in the middle however short its sides are — halving
+           the chord only QUARTERS the sag, which is exactly why 1.5 m
+           to 0.75 m moved the worst point by two centimetres, and why
+           halving again would have moved it by half of nothing. The
+           overlap was a red herring: the higher of the two ribbons was
+           simply whichever one's quad happened to span the corner.
+           Drawn, it is a 0.25 m lip you can see daylight under.
+
+           So the quads that bridge are found and BROKEN, and only
+           those. A quad's bilinear centre is the mean of its four
+           corners; the ground under that centre is one heightAt call.
+           Where the first stands more than SAG over the second the quad
+           gets a centre vertex ON the ground and four triangles instead
+           of two, which puts a real sample in the middle of the corner.
+           The centre vertex interpolates its neighbours' attributes and
+           draws nothing from the wear rng, so every quad that was
+           already right is byte-identical to before this paragraph,
+           colour included — which is what keeps screenshots comparable.
+           It is watertight without neighbour bookkeeping because the
+           new vertex is interior: no edge of any quad moves, so no
+           T-junction can appear against a quad that was left alone.
+
+           SAG is 0.045 and not 0.12. It is not a tolerance being met,
+           it is the size of defect worth two triangles, set at a third
+           of surfacetest's SINK_TOL so the fix has headroom rather than
+           landing on the line. Count: ctx.world.paths.stats.fanned. */
+        const SAG = 0.045;
         for (let i = 0; i < ring.length - 1; i++) {
           const a0 = base + i * COLS, b0 = a0 + COLS;
           for (let s = 0; s < COLS - 1; s++) {
             const a = a0 + s, b = a0 + s + 1, c = b0 + s + 1, d = b0 + s;
-            idx.push(a, b, c, a, c, d);
+            quads++;
+            const cx = (pos[a * 3] + pos[b * 3] + pos[c * 3] + pos[d * 3]) * 0.25;
+            const cz = (pos[a * 3 + 2] + pos[b * 3 + 2] + pos[c * 3 + 2] + pos[d * 3 + 2]) * 0.25;
+            const chord = (pos[a * 3 + 1] + pos[b * 3 + 1] + pos[c * 3 + 1] + pos[d * 3 + 1]) * 0.25;
+            const gy = terrain.heightAt(cx, cz) + 0.03;
+            const sag = chord - gy;
+            if (sag <= SAG) { idx.push(a, b, c, a, c, d); continue; }
+            if (sag > worstSag) worstSag = sag;
+            const m = pos.length / 3;
+            const nn = terrain.normalAt(cx, cz);
+            pos.push(cx, gy, cz);
+            nrm.push(nn.x, nn.y, nn.z);
+            uv.push((uv[a * 2] + uv[c * 2]) * 0.5, (uv[a * 2 + 1] + uv[c * 2 + 1]) * 0.5);
+            for (let k = 0; k < 3; k++) {
+              col.push((col[a * 3 + k] + col[b * 3 + k] + col[c * 3 + k] + col[d * 3 + k]) * 0.25);
+            }
+            fanned++;
+            idx.push(a, b, m, b, c, m, c, d, m, d, a, m);
           }
         }
-        base += ring.length * COLS;
+        base = pos.length / 3;
       }
       if (!idx.length) continue;
       const geo = new THREE.BufferGeometry();
@@ -449,7 +652,12 @@ export function createPaths(ctx, terrain) {
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       group.add(mesh);
+      stats.verts += pos.length / 3;
+      stats.tris += idx.length / 3;
     }
+    stats.quads = quads; stats.fanned = fanned; stats.refined = refined;
+    stats.edges = edges.length;
+    stats.worstSag = +worstSag.toFixed(4);
   }
 
   /** Distance from (x,z) to the nearest road centreline, in metres. */
@@ -470,7 +678,7 @@ export function createPaths(ctx, terrain) {
   }
 
   return {
-    group, material, nodes, edges,
+    group, material, nodes, edges, stats,
     buildRibbons, distanceToRoad,
     dispose() {
       group.traverse((o) => { if (o.isMesh) o.geometry.dispose(); });

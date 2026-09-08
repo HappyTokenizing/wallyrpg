@@ -36,6 +36,7 @@ import { createSign } from './signs.js';
 import { createProps, PROP_FOOTPRINT, FLAP_HANG } from './props.js';
 import { dressLife, createWindInstruments } from './life.js';
 import { createFireworks } from './fireworks.js';
+import { createGround, findSeams } from './ground.js';
 import { HOME_TIERS, homeTierIndex, buildHomeTier } from './home.js';
 
 const PI = Math.PI;
@@ -549,6 +550,49 @@ function groundBerm(K, world, loc, groundY, o) {
     { e: R * 0.76,  dy: -0.34, n: 0.11 },
     { e: R,         dy: -1.05, n: 0.06 },
   ];
+  /* AND THE PROFILE IS PUBLISHED, BECAUSE THINGS STAND ON IT.
+
+     bermBand() below puts every vertex at heightAt + ring.dy, so the
+     earth is 0.44 m PROUD of the terrain where it meets the plinth and
+     crosses back to grade around e = R*0.46. floorY() knew nothing
+     about that — it is topAt() (the footway) falling back to
+     heightAt() — so every prop placed against a wall was placed at
+     terrain level and then had a bank of earth drawn over it.
+
+     Censused across the island: 180 of the 1,587 prop instances stood
+     on a berm skirt and EVERY ONE of them was sunk into it, from
+     0.06 m to 0.44 m — the 0.44 being the inner ring exactly. Sixteen
+     of the eighteen brooms in the game, all leaning on walls, were
+     buried a median 0.27 m; barrels, crates, hedges, lamps and plants
+     the same. It is one rule, wrong once, repeated 180 times, and it
+     is the single biggest placement fault the census found.
+
+     So the sampler is handed back with the mesh, from the same rings
+     table, and floorY() takes the higher of the two surfaces. The
+     wobble and the height noise are deliberately NOT reproduced here:
+     they are zero on the inner ring and ±0.075 m on the second, which
+     is where anything leaning on a wall stands, and reproducing a
+     noise field in two places is how the two drift apart. */
+  if (o.tops) {
+    const cs = Math.cos(loc.yaw), sn = Math.sin(loc.yaw);
+    const wx = loc.world.x, wz = loc.world.z;
+    o.tops.push({
+      wx, wz, cs, sn, hw, hd, R,
+      /* metres above heightAt at offset e outside the inner rectangle,
+         or null past the last ring */
+      dyAt(e) {
+        if (e >= R) return null;
+        if (e <= rings[0].e) return rings[0].dy;
+        for (let i = 1; i < rings.length; i++) {
+          if (e > rings[i].e) continue;
+          const a = rings[i - 1], b = rings[i];
+          const t = (e - a.e) / ((b.e - a.e) || 1);
+          return a.dy + (b.dy - a.dy) * t;
+        }
+        return null;
+      },
+    });
+  }
   /* THE BERM MUST BE DARKER THAN THE GRASS. A ring of pale sand round a
      building is the exact inverse of a contact shadow and reads as a
      placemat: the building becomes a sticker pasted on a lawn. */
@@ -680,6 +724,60 @@ export async function init(ctx) {
   const clothQueue = [];
   const collideQueue = [];
   const bermQueue = [];
+  /* the founding berms' height profiles, for floorY() — see the
+     "AND THE PROFILE IS PUBLISHED" note in groundBerm() */
+  const bermTops = [];
+
+  const _bray = new THREE.Raycaster();
+  const _bdown = new THREE.Vector3(0, -1, 0), _borig = new THREE.Vector3();
+  let _skirts = null, _skirtsN = -1;
+  function bermY(x, z) {
+    /* the cheap reject first: is this point inside ANY berm's reach,
+       and is the profile above grade there */
+    let dy = null;
+    for (const b of bermTops) {
+      const dx = x - b.wx, dz = z - b.wz;
+      const lx = dx * b.cs - dz * b.sn, lz = dx * b.sn + dz * b.cs;
+      const e = Math.hypot(Math.max(Math.abs(lx) - b.hw, 0), Math.max(Math.abs(lz) - b.hd, 0));
+      if (e >= b.R) continue;
+      const v = b.dyAt(e);
+      if (v == null || v <= 0) continue;        // below grade is not a floor
+      if (dy == null || v > dy) dy = v;
+    }
+    if (dy == null) return null;
+    /* THEN THE DRAWN SURFACE ITSELF, because the analytic profile is
+       not the mesh. bermBand() wobbles each ring RADIALLY by up to
+       +/-60 % of its offset and adds a circular height noise of up to
+       +/-0.165 m, both from the building's own rng. Reproducing a noise
+       field in a second place is how two copies of it drift apart, and
+       measured, the analytic profile alone still left 98 of the
+       island's props off their skirt. The skirt is already in the scene
+       by the time anything is placed on it, so it is asked directly and
+       the profile above is only the test for whether to bother. */
+    if (_skirts === null || _skirtsN !== bermTops.length) {
+      _skirtsN = bermTops.length;
+      _skirts = [];
+      root.updateMatrixWorld(true);
+      root.traverse((o) => { if (o.isMesh && o.userData.family === 'skirt' && !o.userData.isOutlineHull) _skirts.push(o); });
+    }
+    const g = world.heightAt(x, z);
+    if (_skirts.length) {
+      _borig.set(x, g + dy + 1.5, z);
+      _bray.set(_borig, _bdown);
+      _bray.far = dy + 3.5;
+      const hit = _bray.intersectObjects(_skirts, false);
+      if (hit.length) return hit[0].point.y;
+    }
+    return g + dy;
+  }
+  /* Every building on the island, named and unnamed, as {x, z, r}.
+     world/ground.js keys its paving on distance to the nearest one of
+     these — see the header there for why the district disc is the
+     wrong measure. */
+  const builtSites = [];
+  /* the unnamed neighbours on their own, because they are the ones
+     that need a path to the street — see the `doors` block in 1c */
+  const infillSites = [];
   const signs = [];
   const ropeKit = new Kit(makeAO({ ground: 1, groundH: 0.01, under: 0.8 }));
   /* what the life pass put where — printed once so the build log says
@@ -760,6 +858,7 @@ export async function init(ctx) {
          bank was still doing after the first pass at this. */
       const spr = SPRAWL[loc.kit] ?? 0.6;
       groundBerm(K, world, loc, groundY, {
+        tops: bermTops,
         w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
         reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
         /* reach back to the plinth face: the ring is nominally at
@@ -897,6 +996,7 @@ export async function init(ctx) {
       visible: true,
     });
     zoneGroups.get(loc.z).add(group);
+    builtSites.push({ id: loc.id, x: loc.world.x, z: loc.world.z, r: Math.max(loc.size.w, loc.size.d) * 0.5 });
   }
 
   /* --- washing lines and bunting cord, one merged mesh --- */
@@ -959,7 +1059,21 @@ export async function init(ctx) {
   for (const q of formProps) {
     const p = q.p;
     if (doorBlocked(q.x, q.z, reachOf(p.type))) { doorVetoed++; continue; }
-    const y = p.y != null ? q.groundY + p.y : world.heightAt(q.x, q.z);
+    /* THE FORM-EMITTED PROPS WERE THE ONE PATH THAT NEVER ASKED.
+       Everything the district scatter places goes through floorY(); the
+       props a BUILDING emits — the crate by its lock-up, the barrel at
+       its corner, the hay by the farm door — were placed at
+       world.heightAt(), which is the one place in the city that is
+       certainly not the floor: they stand against a wall, and a wall
+       has a bank of earth drawn 0.44 m up it. Censused, that is 75 of
+       the island's props, every one of them sunk, hedges and lamps and
+       fences and crates alike. floorY() does not exist yet here — the
+       footway is laid after every building is founded — but the BERMS
+       do, and the berm is what these particular props are standing in.
+       An explicit p.y is still honoured: that is a form saying "on my
+       own step", which is a surface it knows better than this does. */
+    const y = p.y != null ? q.groundY + p.y
+      : Math.max(world.heightAt(q.x, q.z), bermY(q.x, q.z) ?? -Infinity);
     props.add(p.type, new THREE.Matrix4().compose(
       new THREE.Vector3(q.x, y + (p.stack ? p.stack * CONTAINER_H : 0), q.z),
       new THREE.Quaternion().setFromEuler(new THREE.Euler(0, q.yaw + (p.ry || 0), 0)),
@@ -1089,7 +1203,7 @@ export async function init(ctx) {
          and the hard wall/grass line were. They get the full footing
          and apron treatment instead. */
       const gy = settleY(world, fake, w, dd);
-      groundBerm(out.K, world, fake, gy, { w, d: dd, reach: clamp(w * 0.20, 2.4, 4.2), rng: frng2, door: out.meta.door });
+      groundBerm(out.K, world, fake, gy, { tops: bermTops, w, d: dd, reach: clamp(w * 0.20, 2.4, 4.2), rng: frng2, door: out.meta.door });
       footing(out.K, world, fake, S, gy, { w, d: dd, collide: out.meta.collide });
       /* THE UNNAMED NEIGHBOURS GET IT TOO, and they matter more than
          the 28 do: there are 83 of them and they are what a lane is
@@ -1113,12 +1227,16 @@ export async function init(ctx) {
         const wp = new THREE.Vector3(p.x, 0, p.z).applyMatrix4(m);
         if (doorBlocked(wp.x, wp.z, reachOf(p.type))) { doorVetoed++; continue; }
         props.add(p.type, new THREE.Matrix4().compose(
-          new THREE.Vector3(wp.x, world.heightAt(wp.x, wp.z), wp.z),
+          /* same as the named forms above: the shed's own berm is
+             already drawn over the terrain here */
+          new THREE.Vector3(wp.x, Math.max(world.heightAt(wp.x, wp.z), bermY(wp.x, wp.z) ?? -Infinity), wp.z),
           new THREE.Quaternion().setFromEuler(new THREE.Euler(0, fake.yaw + (p.ry || 0), 0)),
           new THREE.Vector3(1, 1, 1),
         ));
       }
       taken.push({ x, z: zz, r: rad });
+      builtSites.push({ x, z: zz, r: rad });
+      infillSites.push({ x, z: zz, r: rad, zone: zid, id });
       fillCount++;
     }
     /* Cluster the district's neighbours before merging: sort along the
@@ -1162,6 +1280,184 @@ export async function init(ctx) {
       });
     }
   }
+
+  /* ================================================================
+     1c. THE FLOOR.
+
+     Everything above this line stands on a meadow. world/ground.js
+     lays the city's ground plane — kerb, gutter, footway, the fall
+     back to grade, a boundary sill on every district seam, a cast
+     gully with the stain fanning out of it, one manhole per street,
+     and the worn chord across the inside of every junction corner.
+     Read its header; it is the argument for all of it.
+
+     IT RUNS HERE, BEFORE THE DRESSING, FOR ONE REASON. Every prop in
+     this city is placed at world.heightAt(), and the footway stands
+     0.10 m proud of that. A lamp post placed before the pavement
+     exists is a lamp post buried to its ankles in the flags — which is
+     precisely the bug tools/surfacetest.mjs was written for, applied
+     to street furniture instead of to Wally. So the floor is laid
+     first and everything below asks `floorY()` where the top of it is.
+
+     The SEAMS are found once, here, and used twice: by the sill and by
+     the fingerpost that stands on it. Two copies of a Voronoi test
+     drift apart the first time either one is touched.
+     ================================================================ */
+  const seams = findSeams(world, ZONES, { eq: 7, gap: 78 });
+
+  /* THE MINE IS FENCED OFF, AND IT WAS NOT.
+
+     A citizen says the Old Bull Bear Mine is fenced off. It was not
+     fenced at all — it was a building on a hillside with a lane to its
+     front door and open grass behind it, and a line of dialogue that
+     describes something the player can walk to and find absent is worse
+     than no line, because it teaches them not to believe the next one.
+
+     THE MINE HEAD IS NOT THE DOOR. Measured: every one of the
+     twenty-eight named doors is within 11.3 m of a carriageway — the
+     mine's is 11.3, the furthest on the island — so the mine already
+     has its lane and ground.js's approach pass is right to leave it
+     alone. The workings are the other thing: the far side of the
+     building from the door, up the hill, where a spoil heap and an adit
+     would be and where there is no road and never was.
+
+     ONE POINT, COMPUTED ONCE, USED TWICE — the same discipline the
+     seams above are held to, and for the same reason. ground.js walks a
+     worn track out to it and the fence below is broken exactly where
+     that track arrives, so the path and the gap cannot drift apart.
+     A fence with a hole trodden through it says both things at once:
+     it is fenced off, and people go anyway. */
+  const mineHead = (() => {
+    const rec = records.get('mine');
+    if (!rec) return null;
+    const ax = rec.center.x - rec.door.x, az = rec.center.z - rec.door.z;
+    const l = Math.hypot(ax, az) || 1;
+    const ux = ax / l, uz = az / l;                 // away from the door
+    /* THE FLATTEST SHELF ON THAT SIDE, NOT THE EXACT OPPOSITE BEARING.
+       Taken dead astern of the door, the head landed on a 30 degree
+       bank and the fence ran along a ridge with the ground falling away
+       under it — photographed, and it read as a fence in mid-air rather
+       than as a boundary round a yard. A working is a flat place: men
+       stood there. So the arc behind the building is searched at two
+       radii and the flattest sample wins, with the slope entering the
+       score hard enough to beat a metre of bearing. */
+    const half = Math.max(rec.loc.size.w, rec.loc.size.d) * 0.5;
+    const bearing0 = Math.atan2(ux, uz);
+    let best = null;
+    for (let k = -6; k <= 6; k++) {
+      const a = bearing0 + k * 0.13;                 // +/- 45 degrees
+      for (const reach of [half + 11, half + 15]) {
+        const x = rec.center.x + Math.sin(a) * reach;
+        const z = rec.center.z + Math.cos(a) * reach;
+        if (world.heightAt(x, z) < WORLD.seaLevel + 1) continue;
+        /* the slope of the SHELF, and of the ground the fence will
+           stand on a few metres further out */
+        const sl = Math.max(world.slopeAt(x, z),
+          world.slopeAt(x + Math.sin(a) * 5, z + Math.cos(a) * 5));
+        const score = sl * 10 + Math.abs(k) * 0.06;
+        if (!best || score < best.score) best = { x, z, a, score, sl };
+      }
+    }
+    if (!best || best.sl > 0.34) return null;
+    const ax2 = Math.sin(best.a), az2 = Math.cos(best.a);
+    return { id: 'minehead', x: best.x, z: best.z, ux: ax2, uz: az2, rec,
+      ring: Math.hypot(best.x - rec.center.x, best.z - rec.center.z) - 2.5 };
+  })();
+
+  const ground = createGround(ctx, world, {
+    sites: builtSites,
+    seams,
+    /* the workings behind the mine, so the track and the gap in the
+       fence are the same bearing. See THE MINE IS FENCED OFF above. */
+    adits: mineHead ? [{ id: 'minehead', x: mineHead.x, z: mineHead.z, kit: ZONE_KIT_NAME(ZONES[records.get('mine').loc.z]), bucket: 'zone:' + records.get('mine').loc.z }] : [],
+    /* every building on the island, offered a path to the street.
+       ground.js decides which of them actually need one — measured,
+       twenty-five of the twenty-eight NAMED doors already have a lane
+       ending within three metres and want nothing. The door point
+       comes from the record's own world-space `door` rather than from
+       data.js, because a building settles onto the terrain and its
+       door goes down with it. */
+    doors: [
+      ...[...records.values()].map((r) => ({
+        id: r.loc.id, x: r.door.x, z: r.door.z,
+        kit: ZONE_KIT_NAME(ZONES[r.loc.z]),
+        bucket: 'zone:' + r.loc.z,
+      })),
+      /* and the eighty-three unnamed neighbours, which is where the
+         "houses standing on a lawn" reading actually comes from: the
+         named twenty-eight all have a lane arriving at the door and
+         the infill has nothing. They are given their centre and their
+         own radius; ground.js starts the track just clear of the
+         footprint. */
+      ...infillSites.map((f) => ({
+        id: f.id, x: f.x, z: f.z, r: f.r,
+        kit: ZONE_KIT_NAME(ZONES[f.zone]),
+        bucket: 'zone:' + f.zone,
+      })),
+    ],
+    zoneKit: (x, z) => ZONE_KIT_NAME(ZONES[nearestZone(x, z)]),
+    rng: ctx.makeRng('wally.city.ground'),
+  });
+  (world.groundGroup || root).add(ground.group);
+  /* A SHEET LYING ON THE TERRAIN TAKES NO OUTLINE. An inverted hull on
+     a two-sided sheet is coplanar with it and renders as a dark slab —
+     the same note registerCityMesh() carries for the building aprons
+     and kits.js carries for cloth. */
+  ctx.mat.register(ground.group, { outline: false, castShadow: false, receiveShadow: true });
+  /** The top of the DRAWN floor at (x, z): the footway where there is
+      one, the terrain where there is not. Everything placed on the
+      ground from here down goes through this. */
+  /* THE BERM IS PART OF THE FLOOR. See groundBerm()'s "AND THE PROFILE
+     IS PUBLISHED": the bank of earth banked against a building stands
+     up to 0.44 m over the terrain, and anything placed at terrain level
+     within a berm's reach is placed INSIDE it. Both surfaces are asked
+     and the higher wins, which is the same rule ground.js's own paving
+     map uses where two kerbs lap at a junction. */
+  /* AND THE FOOTWAY IS ASKED THE SAME WAY THE BERM IS.
+
+     ground.js publishes topAt() from a 0.25 m paving map that records
+     one height per cell for the WALKABLE band and marks the kerb face,
+     the gutter and the fall as covered-without-a-height. That is the
+     right map for suppressing grass and it is the wrong one for
+     standing a lamp post on: on the face itself topAt() is null,
+     floorY() fell back to the terrain, and the post went in up to
+     0.92 m under a drawn kerb. Censused, 94 of the island's props were
+     more than 0.06 m off the drawn footway and 85 of them were sitting
+     exactly where floorY() had put them.
+
+     The map stays the cheap reject — pavedAt() answers "is there
+     anything of mine here" for nothing — and where it says yes the
+     drawn surface itself is asked, which is the same two-step the berm
+     above uses and the same answer surfacetest.mjs raycasts for. */
+  let _gm = null;
+  function groundTop(x, z) {
+    if (!ground.pavedAt(x, z)) return null;
+    if (_gm === null) {
+      _gm = [];
+      ground.group.updateMatrixWorld(true);
+      ground.group.traverse((o) => { if (o.isMesh && !o.userData.isOutlineHull) _gm.push(o); });
+    }
+    if (!_gm.length) return null;
+    const g = world.heightAt(x, z);
+    _borig.set(x, g + 2.2, z);
+    _bray.set(_borig, _bdown);
+    _bray.far = 5.0;
+    const hit = _bray.intersectObjects(_gm, false);
+    return hit.length ? hit[0].point.y : null;
+  }
+  const floorY = (x, z) => {
+    const g = world.heightAt(x, z);
+    const t = groundTop(x, z) ?? ground.topAt(x, z);
+    const b = bermY(x, z);
+    return Math.max(t ?? g, b ?? g, g);
+  };
+  console.log(`[city] ground: ${ground.stats.kerbMetres} m of kerb, ` +
+    `${ground.stats.sills} district sills, ${ground.stats.gullies} gullies, ` +
+    `${ground.stats.manholes} manholes, ${ground.stats.desirePaths} corner desire paths, ` +
+    `${ground.stats.destPaths} tracks to destinations, ${ground.stats.destTris} tris (${(ground.stats.destAt || []).join(', ')}), ` +
+    `${ground.stats.approaches} door approaches, ` +
+    `${Math.round(ground.stats.tris / 1000)}k tris in ${ground.stats.meshes} meshes ` +
+    `(+${Math.round(ground.stats.colTris / 1000)}k collision) in ${ground.stats.ms} ms`);
 
   /* ================================================================
      2. District dressing — props along the lanes between buildings.
@@ -1278,6 +1574,34 @@ export async function init(ctx) {
      A handful of forms sprawl well past their nominal footprint —
      a temple's podium and colonnade, a pier's deck, the stadium bowl —
      and those keep an explicit skirt. */
+  /* ================================================================
+     A LOBSTER POT INLAND.
+
+     The district tables below are keyed on the ZONE, and a zone is a
+     Voronoi disc 112-147 m across. That is the right grain for a bin
+     or a bench and the wrong grain for the four kinds whose whole
+     meaning is the water: censused across the island, the eighteen
+     lobster pots stood a MEDIAN 113 m from the shore and the furthest
+     287 m, in a meadow, up a hill, with the harbour out of sight. The
+     twenty-five rope coils were the same. Nothing was floating and
+     nothing was sunk — they were simply not things that are found
+     where they had been put, which is the other half of "is it in the
+     right place".
+
+     So a maritime kind that lands inland is SUBSTITUTED rather than
+     vetoed: dropping it would thin the waterfront's dressing, and a
+     crate or a barrel behind a harbour warehouse is exactly what is
+     there instead. 60 m is the depth of a working harbour front — one
+     row of buildings and the yard behind them.
+     ================================================================ */
+  const SHOREBOUND = { lobsterpot: 60, ropecoil: 60 };
+  const LANDWARD = ['crate', 'barrel', 'bin'];
+  function kindHere(kind, x, z, r) {
+    const need = SHOREBOUND[kind];
+    if (need == null || world.shoreDistAt(x, z) <= need) return kind;
+    return LANDWARD[Math.floor(r() * LANDWARD.length) % LANDWARD.length];
+  }
+
   const KEEP = LOCATIONS.map((l) => ({
     x: l.world.x, z: l.world.z,
     c: Math.cos(l.yaw), s: Math.sin(l.yaw),
@@ -1315,10 +1639,21 @@ export async function init(ctx) {
       if (world.shoreDistAt(x, zz) < 20) continue;
       if (world.slopeAt(x, zz) > 0.26) continue;
       const road = world.pathAt(x, zz);
-      /* hug the lanes: on the verge, never in the middle of the road */
-      if (road > 0.45 || road < 0.02) { if (srng() < 0.85) continue; }
-      const y = world.heightAt(x, zz);
-      const kind = kinds[Math.floor(srng() * kinds.length) % kinds.length];
+      /* NOT IN THE CARRIAGEWAY, EVER.
+
+         This used to let one placement in six through wherever it
+         landed, road centre included, and on a dirt track that read as
+         clutter beside a lane. With world/ground.js's kerbs in, the
+         same bike is a bike lying in the middle of a made road between
+         two pavements, and it reads as a bug — the floor got better and
+         showed up what was standing on it. Photographed at the Rusty
+         Row seam: a green bicycle, dead centre of the carriageway.
+         Above 0.42 of the carve mask is the tarmac itself. */
+      if (road > 0.42) continue;
+      /* hug the lanes: on the verge, never far from one */
+      if (road < 0.02) { if (srng() < 0.85) continue; }
+      const y = floorY(x, zz);
+      const kind = kindHere(kinds[Math.floor(srng() * kinds.length) % kinds.length], x, zz, srng);
       const m = new THREE.Matrix4().compose(
         new THREE.Vector3(x, y, zz),
         new THREE.Quaternion().setFromEuler(new THREE.Euler(0, srng() * PI * 2, 0)),
@@ -1344,7 +1679,23 @@ export async function init(ctx) {
   for (const e of edges) {
     const pts = e.points;
     if (!pts || pts.length < 3) continue;
-    const off = (e.width || 5) * 0.5 + 1.5;
+    /* ON THE PAVEMENT, NOT BEHIND IT.
+
+       This used to stand every lamp, bench and bin at width/2 + 1.5 m
+       from the centreline — 4.7 m on a main road. The footway world/
+       ground.js now lays runs from 2.65 m to 4.10 m out, so the old
+       offset put the entire verge's furniture in the grass BEHIND the
+       kerb, with a clear metre of pavement in front of it that nobody
+       and nothing stood on. A lamp post belongs at the kerb.
+
+       0.38 is the ribbon's own half-width (paths.js), which is where
+       the tarmac stops. ground.js's walkable top then runs from
+       half + 0.28 (the back of the kerb chamfer) to half + 1.78 (the
+       back of the flags), so half + 1.02 is a hand's breadth in from
+       the middle of the pavement — a lamp standing a little back from
+       the kerb, which is where a real one stands so a cart does not
+       take it off. */
+    const off = (e.width || 5) * 0.38 + 1.02;
     /* One item every 21 m with the side flipping each time put 42 m
        between two things on the same verge — a road ribbon running the
        whole depth of frame carrying two lamps. Six metres, and the side
@@ -1387,7 +1738,7 @@ export async function init(ctx) {
       if (doorBlocked(x, z, reachOf(kind))) { doorVetoed++; continue; }
       const yaw = Math.atan2(-tz * side, tx * side) + (kind === 'bench' ? PI / 2 : 0);
       props.add(kind, new THREE.Matrix4().compose(
-        new THREE.Vector3(x, world.heightAt(x, z), z),
+        new THREE.Vector3(x, floorY(x, z), z),
         new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
         new THREE.Vector3(1, 1, 1).multiplyScalar(0.94 + srng() * 0.14),
       ), { variant: zid === 'goldenheights' && kind === 'lamp' ? 2 : midUse(kind, srng(), zid) });
@@ -1417,55 +1768,36 @@ export async function init(ctx) {
      is untouched: the fingerpost belongs to neither side, which is
      precisely what lets it stand on the line.
      ================================================================ */
-  const SEAM_EQ = 7;
-  const SEAM_GAP = 78;
-  const seams = [];
-  function twoNearest(x, z) {
-    let b0 = Infinity, b1 = Infinity, z0 = null, z1 = null;
-    for (const zid of Object.keys(ZONES)) {
-      const c = ZONES[zid].world;
-      const d = Math.hypot(x - c.x, z - c.z);
-      if (d < b0) { b1 = b0; z1 = z0; b0 = d; z0 = zid; }
-      else if (d < b1) { b1 = d; z1 = zid; }
-    }
-    return { b0, b1, z0, z1 };
-  }
-  for (const e of edges) {
-    const pts = e.points;
-    if (!pts || pts.length < 3) continue;
-    for (let i = 1; i < pts.length; i++) {
-      const p = pts[i], q = pts[i - 1];
-      const n = twoNearest(p.x, p.z);
-      if (!n.z1 || n.b1 - n.b0 > SEAM_EQ) continue;
-      /* both districts have to actually reach this point — two centres
-         can be equidistant from open country a long way from either */
-      if (n.b0 > Math.max(ZONES[n.z0].world.radius, 96)) continue;
-      let near = false;
-      for (const s of seams) if (Math.hypot(s.x - p.x, s.z - p.z) < SEAM_GAP) { near = true; break; }
-      if (near) continue;
-      const seg = Math.hypot(p.x - q.x, p.z - q.z) || 1;
-      const tx = (p.x - q.x) / seg, tz = (p.z - q.z) / seg;
-      const off = (e.width || 5) * 0.5 + 1.6;
-      for (const side of [1, -1]) {
-        const x = p.x - tz * off * side, z = p.z + tx * off * side;
-        if (!clearOf(x, z, 0.8)) continue;
-        if (world.slopeAt(x, z) > 0.26) continue;
-        if (world.shoreDistAt(x, z) < 14) continue;
-        if (doorBlocked(x, z, reachOf('fingerpost'))) { doorVetoed++; continue; }
-        /* square the arms to the lane, so one points each way down it */
-        props.add('fingerpost', new THREE.Matrix4().compose(
-          new THREE.Vector3(x, world.heightAt(x, z), z),
-          new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.atan2(tx, tz) + PI / 2, 0)),
-          new THREE.Vector3(1, 1, 1).multiplyScalar(0.96 + srng() * 0.1),
-        ));
-        seams.push({ x, z, a: n.z0, b: n.z1 });
-        break;
-      }
+  /* THE LIST IS ALREADY MADE. findSeams() ran in 1c above, and the
+     same crossings the boundary sill is laid on are the ones the posts
+     stand at — which is the point: a fingerpost on a stone band you
+     can feel underfoot is a threshold, and a fingerpost in a meadow is
+     a signpost in a meadow. Two copies of the Voronoi test would have
+     drifted apart the first time either was touched, so there is one. */
+  let posts = 0;
+  const posted = [];
+  for (const n of seams) {
+    const off = (n.width || 5) * 0.5 + 1.6;
+    for (const side of [1, -1]) {
+      const x = n.x - n.tz * off * side, z = n.z + n.tx * off * side;
+      if (!clearOf(x, z, 0.8)) continue;
+      if (world.slopeAt(x, z) > 0.26) continue;
+      if (world.shoreDistAt(x, z) < 14) continue;
+      if (doorBlocked(x, z, reachOf('fingerpost'))) { doorVetoed++; continue; }
+      /* square the arms to the lane, so one points each way down it */
+      props.add('fingerpost', new THREE.Matrix4().compose(
+        new THREE.Vector3(x, floorY(x, z), z),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.atan2(n.tx, n.tz) + PI / 2, 0)),
+        new THREE.Vector3(1, 1, 1).multiplyScalar(0.96 + srng() * 0.1),
+      ));
+      posts++;
+      posted.push(`${n.a}|${n.b}`);
+      break;
     }
   }
-  if (seams.length) {
-    console.log(`[city] ${seams.length} fingerposts on district seams: ` +
-      seams.map((s) => `${s.a}|${s.b}`).join(', '));
+  if (posts) {
+    console.log(`[city] ${posts} fingerposts standing on ${seams.length} district sills: ` +
+      posted.join(', '));
   }
 
   /* ================================================================
@@ -1542,10 +1874,12 @@ export async function init(ctx) {
         if (!isPort) {
           /* the residential quay: the same rows, dressed as a place
              people live rather than a place cargo is stacked */
-          const kind = ['ropecoil', 'lobsterpot', 'bollard', 'plant', 'crate', 'bench'][(row * 3 + i) % 6];
+          /* the same shore rule as the district scatter: a residential
+             quay set well back from the water is a yard, not a quay */
+          const kind = kindHere(['ropecoil', 'lobsterpot', 'bollard', 'plant', 'crate', 'bench'][(row * 3 + i) % 6], x, zz, yrng);
           if (doorBlocked(x, zz, reachOf(kind))) { doorVetoed++; continue; }
           props.add(kind, new THREE.Matrix4().compose(
-            new THREE.Vector3(x, world.heightAt(x, zz), zz),
+            new THREE.Vector3(x, floorY(x, zz), zz),
             new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
             new THREE.Vector3(1, 1, 1).multiplyScalar(0.92 + yrng() * 0.16),
           ));
@@ -1600,6 +1934,65 @@ export async function init(ctx) {
   }
   console.log(`[city] ${containers} shipping containers, all of them in a port yard; ` +
     `${quay} quayside pieces at the piers that are not ports`);
+
+  /* ================================================================
+     2b2. THE FENCE ROUND THE MINE HEAD.
+
+     A citizen line says the Old Bull Bear Mine is fenced off. Nothing
+     on the island fenced it. See THE MINE IS FENCED OFF above §1c for
+     where `mineHead` comes from and why the fence and ground.js's worn
+     track are driven by ONE point rather than two.
+
+     THE HOLE IS THE POINT. A fence that runs unbroken says "you cannot
+     go in" and the player, who can walk round it in eight seconds,
+     learns the fence is scenery. A fence with one panel down where the
+     track arrives says the thing that is actually true here: it is
+     fenced off, and people go anyway. So the run is an arc across the
+     workings side, and the two panels either side of the track's
+     bearing are left out — the gap is the width of the track plus a
+     shoulder, which is what a gap people made looks like.
+
+     Every panel is a prop like any other, so it inherits props.js's
+     collider, its wind and its variants for nothing; variant 2 is
+     props.js's mended panel ("a bright new board let into it"), which
+     is exactly the right note beside a hole nobody mended, and it goes
+     at the two ends of the run where the fence is still doing its job.
+     ================================================================ */
+  if (mineHead) {
+    const frng = ctx.makeRng('wally.city.minefence');
+    const R = mineHead.ring;
+    const base = Math.atan2(mineHead.ux, mineHead.uz);   // bearing of the track
+    /* panel pitch on the arc: props.js draws a 2.4 m panel, and 2.75 m
+       of arc leaves the posts just clear of each other on the curve */
+    const PITCH = 2.75;
+    const span = 1.15;                                   // radians, either side
+    const n = Math.max(4, Math.round((span * 2 * R) / PITCH));
+    let posts = 0, gap = 0;
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const a = base - span + t * span * 2;
+      /* the gap: the track's own bearing, plus a shoulder */
+      if (Math.abs(a - base) < 0.135) { gap++; continue; }
+      const jr = (frng() - 0.5) * 0.5;
+      const x = mineHead.rec.center.x + Math.sin(a) * (R + jr);
+      const z = mineHead.rec.center.z + Math.cos(a) * (R + jr);
+      if (doorBlocked(x, z, reachOf('fence'))) { doorVetoed++; continue; }
+      /* a fence follows the ground it is nailed into: tangent to the
+         arc, and leaning with the seeded wobble a hillside fence has */
+      const yaw = a + PI / 2 + (frng() - 0.5) * 0.16;
+      const lean = (frng() - 0.5) * 0.09;
+      const end = i === 0 || i === n;
+      props.add('fence', new THREE.Matrix4().compose(
+        new THREE.Vector3(x, floorY(x, z), z),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(lean, yaw, lean * 0.6)),
+        new THREE.Vector3(1, 1, 1),
+      ), { variant: end ? 2 : (frng() < 0.28 ? 1 : 0) });
+      posts++;
+    }
+    console.log(`[city] the mine head is fenced: ${posts} panels on a ${(span * 2 * R).toFixed(0)} m arc ` +
+      `at ${mineHead.x.toFixed(0)},${mineHead.z.toFixed(0)}, ${gap} panel-width${gap === 1 ? '' : 's'} missing ` +
+      `where the worn track comes through`);
+  }
 
   /* ================================================================
      2c. AGAINST THE WALL.
@@ -1674,7 +2067,8 @@ export async function init(ctx) {
            the plinth's 0.17 m projection and a little air. It still
            reads as "against the wall": the closest it can put a bin is
            0.24 m of daylight, which is a bin leaning on a shopfront. */
-        const kind = kinds[Math.floor(hrng() * kinds.length) % kinds.length];
+        const kind = kindHere(kinds[Math.floor(hrng() * kinds.length) % kinds.length],
+          loc.world.x, loc.world.z, hrng);
         /* A BROOM AND AN A-BOARD ARE NOT SCATTER. The random 0-1.7 m of
            extra stand-off is what makes a row of crates read as dropped
            rather than lined up, and it is exactly wrong for the two
@@ -1705,7 +2099,7 @@ export async function init(ctx) {
         const jit = kind === 'broom' || kind === 'sandwich' ? 0.24 : 0.7;
         const yaw = loc.yaw + (face === 0 ? 0 : PI) + lean + (hrng() - 0.5) * jit;
         props.add(kind, new THREE.Matrix4().compose(
-          new THREE.Vector3(_wp.x, world.heightAt(_wp.x, _wp.z) + 0.05, _wp.z),
+          new THREE.Vector3(_wp.x, floorY(_wp.x, _wp.z) + 0.05, _wp.z),
           new THREE.Quaternion().setFromEuler(new THREE.Euler(0, yaw, 0)),
           new THREE.Vector3(1, 1, 1).multiplyScalar(0.86 + hrng() * 0.26),
         ), { variant: midUse(kind, hrng(), loc.z) });
@@ -1841,6 +2235,24 @@ export async function init(ctx) {
        tier is already standing on the plot. See wireHomeBerm(). */
     wireHomeBerm();
 
+    /* --- the footway ---
+       A raised pavement phys has never heard of is 0.10 m of drawn
+       stone standing over the ground his feet are actually on, which is
+       the sink tools/surfacetest.mjs exists to catch with the sign
+       flipped. Registered exactly the way the berms above are: a
+       triangle strip in world space, walkable, sitting ON the
+       heightfield rather than replacing it, so groundAt() takes the
+       kerb top where there is one and the terrain everywhere else. */
+    let footTris = 0;
+    if (ground.collision) {
+      try {
+        ctx.phys.addTriangles(ground.collision.positions, ground.collision.indices, {
+          name: 'city.footway', walkable: true,
+        });
+        footTris = ground.collision.indices.length / 3;
+      } catch (e) { console.warn('[city] footway collision failed', e); }
+    }
+
     /* --- the nameboards ---
        A board hung over a shopfront is a solid object and the collision
        census had none of them. signs.js has already solved each one to
@@ -1877,8 +2289,8 @@ export async function init(ctx) {
     console.log(`[city] wired ${collideQueue.length} collision volumes, ` +
       `${propCols}/${props.colliders.length} prop colliders ` +
       `(${props.colliders.length - propCols} vetoed at doorways), ` +
-      `${bermQueue.length} berms (${bermTris} tris), ${signCols}/${signs.length} sign boards, ` +
-      `${cloths.length} cloths`);
+      `${bermQueue.length} berms (${bermTris} tris), ${footTris} footway tris, ` +
+      `${signCols}/${signs.length} sign boards, ${cloths.length} cloths`);
   }
 
   /* ONE CLOTH. Lifted out of wirePhysics because the player's home is
@@ -2002,6 +2414,7 @@ export async function init(ctx) {
     const spr = SPRAWL[loc.kit] ?? 0.6;
     const bermCol = [];
     groundBerm(K, world, loc, groundY, {
+      tops: bermTops,
       w: loc.size.w + spr * 2, d: loc.size.d + spr * 2,
       reach: clamp(loc.size.w * 0.20, 2.6, 4.6), rng,
       inner: Math.min(0, 0.32 - spr),
@@ -2386,6 +2799,61 @@ export async function init(ctx) {
     },
     zoneGroup(id) { return zoneGroups.get(id) || null; },
     get locations() { return records; },
+
+    /* --- THE FLOOR, for anything placed on it ---
+       pavedAt(x, z)  1 where world/ground.js laid stone. world/
+                      foliage.js reads this so a blade of grass inside
+                      a footway is never BUILT rather than built and
+                      then hidden under it — see turf() there. That is
+                      where the triangles the kerb costs come back
+                      from, and then some.
+       floorY(x, z)   the top of the drawn floor: the footway where
+                      there is one, the terrain where there is not.
+                      Anything standing something on the ground in this
+                      city has to ask, or it stands 0.10 m inside the
+                      pavement. */
+    pavedAt: ground.pavedAt,
+    floorY,
+    get groundStats() { return ground.stats; },
+
+    /* THE ROAD NETWORK'S NUMBERS, ON A ROUTE THAT EXISTS TODAY.
+
+       paths.js fills a `stats` object and world.js republishes the
+       module as `{nodes, edges, at}`, so `ctx.world.paths.stats` is
+       undefined and has been since it was first cited by name. That
+       one-line fix belongs to world.js's owner and is in this round's
+       handover; until it lands, everything a floor census actually
+       needs is derivable from `edges`, which IS published, and the
+       derivation lives here rather than in the census so that the
+       census is not quietly measuring a different network from the
+       one the city paved. When world.js does publish, the real stats
+       win and the derived ones stop being used — `src` says which
+       you are reading, so nobody has to guess. */
+    get roadStats() {
+      const P = ctx.world.paths;
+      if (!P) return null;
+      if (P.stats) return { src: 'paths.js', ...P.stats };
+      let roadMetres = 0, laneMetres = 0;
+      const deg = new Map();
+      for (const e of P.edges || []) {
+        let m = e.metres;
+        if (m == null) {
+          m = 0;
+          const pts = e.points || [];
+          for (let i = 1; i < pts.length; i++) m += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+        }
+        if (e.kind === 'road') roadMetres += m; else laneMetres += m;
+        deg.set(e.a.key, (deg.get(e.a.key) || 0) + 1);
+        deg.set(e.b.key, (deg.get(e.b.key) || 0) + 1);
+      }
+      let junctions = 0;
+      for (const d of deg.values()) if (d > 2) junctions++;
+      return {
+        src: 'derived in city.js — world.js does not publish paths.stats',
+        edges: (P.edges || []).length, nodes: (P.nodes || []).length,
+        roadMetres: Math.round(roadMetres), laneMetres: Math.round(laneMetres), junctions,
+      };
+    },
 
     /* THE PART CENSUS — see the block in kits.js. Null unless the page
        was loaded with ?partcensus.

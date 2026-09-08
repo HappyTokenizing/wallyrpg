@@ -17,6 +17,28 @@
      spec.blocking  false to allow movement while it is open
 
    Resolves with the chosen `value` (or null when dismissed).
+
+   ------------------------------------------------------------
+   AND IT LISTENS FOR ONE THING: 'encounter'.
+
+   src/game/events.js raises the mid-game encounters — somebody
+   stopping Wally in a room with an offer — and a speaker card with
+   choices is exactly what one of those IS, so the card subscribes to
+   them itself rather than asking ui.js to grow a case.
+
+   THE EMITTER IS REAL AND IT IS ONE FUNCTION. events.js offer()
+   emits {kind:'offer', …} and nothing else in the codebase emits
+   'encounter'. This project has shipped listeners with no emitters
+   before — twenty-two of the audio layer's twenty-eight — so this
+   one is asserted from both ends in tools/test-encounters.mjs: that
+   the emit happens from the condition that is supposed to cause it,
+   and that this subscription is what answers it.
+
+   BUSY IS A DECLINE. If a card is already open — a shopkeeper, the
+   Mayor, a quest beat — the encounter is declined on the spot
+   instead of stomping the conversation the player is having.
+   Declining costs nothing (events.decline()), so being interrupted
+   while busy takes nothing away from anybody.
    ============================================================ */
 
 import { mulberry32 } from '../core/contracts.js';
@@ -44,6 +66,29 @@ export function createDialogue(ctx, ui) {
      change repaints the card the player is reading right now */
   let repaintMore = null;
   const offInputMode = onInputMode(() => { repaintMore?.(); });
+
+  /* ---- THE ENCOUNTER CHANNEL — see the header ---- */
+  const offEncounter = ctx.bus?.on?.('encounter', (e) => {
+    if (!e || e.kind !== 'offer') return;
+    const answer = (v) => { try { ctx.game?.events?.answer?.(e.id, v); } catch (err) { console.error('[ui] encounter answer threw', err); } };
+    /* already mid-conversation: walk away, at no cost */
+    if (live) { answer(null); return; }
+    const choices = (e.choices || []).map((c) => ({ ...c }));
+    /* THE COST IS ON THE BUTTON. "Take the other end · 15 min" is the
+       difference between a choice and a guess, and it is the same
+       courtesy the fare board pays: this game never asks the player
+       to spend the clock without saying how much. */
+    if (e.cost && choices.length) {
+      const bits = [];
+      if (e.cost.mins) bits.push(e.cost.mins + ' min');
+      if (e.cost.energy) bits.push(e.cost.energy + ' energy');
+      if (bits.length) choices[0].label = choices[0].label + ' · ' + bits.join(' · ');
+    }
+    open({
+      speaker: e.speaker, role: e.role, portrait: e.portrait,
+      text: e.text, choices,
+    }).then((v) => answer(v));
+  }) || (() => {});
 
   function close(value) {
     if (!live) return;
@@ -229,7 +274,7 @@ export function createDialogue(ctx, ui) {
         ui.interact() is the one door both go through. */
     advance() { live?.advance(); },
     update(dt) { live?.tick(dt); },
-    dispose() { offInputMode(); root.remove(); },
+    dispose() { offInputMode(); offEncounter(); root.remove(); },
   };
 }
 

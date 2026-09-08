@@ -35,7 +35,7 @@
    approach to its door — a lamp post dropped in the wrong place blocks
    a shop for the rest of the game and nothing else in the suite notices.
 
-     node tools/cliptest.mjs [--verbose] [--revert]
+     node tools/cliptest.mjs [--verbose] [--revert] [--wallraw]
 
    ------------------------------------------------------------------
    WHAT A REVERT CHECK IS, AND WHAT THIS FILE'S USED TO BE.
@@ -77,6 +77,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const VERBOSE = process.argv.includes('--verbose');
 /* see WHAT A REVERT CHECK IS at the top of this file */
 const REVERT = process.argv.includes('--revert');
+/* section 1b's switch: run the door face with the body filter off too */
+const WALLRAW = process.argv.includes('--wallraw');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8' };
 
 const server = createServer(async (rq, rs) => {
@@ -121,6 +123,14 @@ await page.evaluate(() => {
     const tick = () => (++k >= n ? res() : requestAnimationFrame(tick));
     requestAnimationFrame(tick);
   });
+
+  /** The name a raycast hit belongs to. A plane distance is only
+      evidence about a wall if the plane came off the wall, so every row
+      that reports one reports this beside it. */
+  function nameOfBody(bid) {
+    const rec = world.bodies.get(bid);
+    return (rec && rec.opts && rec.opts.name) || (bid ? `#${bid}` : 'terrain');
+  }
 
   /** Every registered body, with its name and world AABB. */
   function bodies(prefix) {
@@ -185,8 +195,15 @@ await page.evaluate(() => {
    * the plane is only sampled while he is still in front of the object
    * (within 1.2 m of the approach line); the through-test proper is the
    * convex box distance, which has no such hole in it.
+   *
+   * AND THE SECOND ONE WAS WRONG THE SAME WAY, ONE LEVEL DOWN. In plane
+   * mode this took the first vertical face on the approach ray WHATEVER
+   * BODY IT BELONGED TO. `onlyBody` is the fix; the long note above
+   * section 1b's four-face loop is the measurement that forced it.
+   * Pass the body the plane is allowed to come from and the ray steps
+   * past everything in front of it, reporting what it stepped past.
    */
-  window.__clip = async function clip(target, angle, dist = 4.0, secs = 2.6, mode = 'box') {
+  window.__clip = async function clip(target, angle, dist = 4.0, secs = 2.6, mode = 'box', onlyBody = null) {
     const p = c.phys.player;
     const cen = new T.Vector3(target.c.x, target.c.y, target.c.z);
     const dir = new T.Vector3(Math.sin(angle), 0, Math.cos(angle));
@@ -201,13 +218,38 @@ await page.evaluate(() => {
        0.9 m bin is under the chest ray and over the ankle one. */
     const start = p.simPosition.clone();
     const toward = new T.Vector3(-dir.x, 0, -dir.z);
-    let hp = null, hn = null;
+    let hp = null, hn = null, hy0 = null, planeBody = -1;
+    const passed = [];              // bodies stepped past, named, in order
     if (mode === 'plane') {
       for (const hy of [0.95, 0.55, 1.4, 0.3]) {
-        const hit = phys.raycast(new T.Vector3(start.x, start.y + hy, start.z), toward, dist + 3);
-        if (hit && hit.normal.y < 0.8) { hp = hit.point.clone(); hn = hit.normal.clone(); break; }
+        const o = new T.Vector3(start.x, start.y + hy, start.z);
+        let travelled = 0;
+        /* step past up to eight foreground surfaces. Eight because the
+           budget has to be bigger than the number of things that can
+           plausibly stand between a pavement and a shop front — board,
+           bin, bench, planter — and small enough to terminate. */
+        for (let k = 0; k < 8; k++) {
+          const hit = phys.raycast(o, toward, dist + 3 - travelled);
+          if (!hit) break;
+          const ok = hit.normal.y < 0.8;
+          if (ok && (onlyBody === null || hit.body === onlyBody)) {
+            hp = hit.point.clone(); hn = hit.normal.clone(); hy0 = hy; planeBody = hit.body; break;
+          }
+          if (ok) passed.push({ name: nameOfBody(hit.body), at: +(travelled + hit.distance).toFixed(3) });
+          /* 2 cm past the face, so the next cast starts on the far side
+             of it rather than re-finding the same triangle */
+          travelled += hit.distance + 0.02;
+          o.addScaledVector(toward, hit.distance + 0.02);
+          if (travelled > dist + 3) break;
+        }
+        if (hp) break;
       }
-      if (!hp) return { skip: 'no vertical face on the approach ray' };
+      if (!hp) {
+        return { skip: onlyBody === null ? 'no vertical face on the approach ray'
+          : `no vertical face of the target body on the approach ray${passed.length ? ` (stepped past ${passed.map((q) => `${q.name}@${q.at}m`).join(', ')})` : ''}`,
+        eye: [+start.x.toFixed(1), +start.y.toFixed(1), +start.z.toFixed(1)],
+        ground: +phys.groundAt(start.x, start.z).y.toFixed(2) };
+      }
     }
 
     let minPlane = Infinity;       // only while in front of it
@@ -235,6 +277,11 @@ await page.evaluate(() => {
       minPlane: Number.isFinite(minPlane) ? +minPlane.toFixed(3) : null,
       minBox: Number.isFinite(minBox) ? +minBox.toFixed(3) : null,
       radius: p.radius,
+      /* WHAT THE PLANE WAS, beside the number it produced. Rule 5: print
+         where the rig actually ended up, not where it was aimed. */
+      face: hp ? { body: nameOfBody(planeBody), hy: hy0, at: +start.distanceTo(hp).toFixed(3) } : null,
+      passed,
+      eye: [+start.x.toFixed(1), +start.y.toFixed(1), +start.z.toFixed(1)],
       end: p.simPosition.toArray().map((v) => +v.toFixed(2)),
     };
   };
@@ -517,15 +564,40 @@ results.push(['no nameboard can be walked through',
    there is no convex box to test against — the face plane, gated to
    the frames where he is still in front of it, is the measurement.
    ------------------------------------------------------------------ */
-const wall = await page.evaluate(() => {
+/* A WALL TEST HAS TO BE POINTED AT A WALL.
+
+   This used to take "the nearest named building 8 to 140 m from
+   wherever the previous section left him", which makes the object
+   under test a function of every walk above it. Run after a pass that
+   moved the street furniture by a metre, it picked the BANK — a temple
+   kit, whose podium and colonnade stand three metres proud of any
+   vertical face — and __clip() answered "no vertical face on the
+   approach ray" on all four sides. Both rows then went red having
+   measured nothing at all, which is this file's own complaint about a
+   suite that cannot see the object it was written to cover, in the
+   mirror.
+
+   Pinned, and parked at first so the terrain collision window covers
+   it. The Property Office is a `shop`: four plain rendered faces, no
+   podium, no colonnade, and a building the player walks up to on the
+   first day. */
+const wall = await page.evaluate(async () => {
   const c = window.WALLY.ctx;
-  const p = c.phys.player.simPosition;
+  const WALL_TARGET = 'propertyoffice';
   let best = null;
-  for (const [id, rec] of c.city.locations) {
-    const d = Math.hypot(rec.center.x - p.x, rec.center.z - p.z);
-    if (d > 8 && d < 140 && (!best || d < best.d)) best = { id, d, rec };
+  const pick = c.city.locations.get(WALL_TARGET);
+  if (pick) best = { id: WALL_TARGET, d: 0, rec: pick };
+  else {
+    const p = c.phys.player.simPosition;
+    for (const [id, rec] of c.city.locations) {
+      const d = Math.hypot(rec.center.x - p.x, rec.center.z - p.z);
+      if (d > 8 && d < 140 && (!best || d < best.d)) best = { id, d, rec };
+    }
   }
   if (!best) return null;
+  await window.__park(best.rec.center.x, best.rec.center.z + best.rec.loc.size.d * 0.5 + 8);
+  best.d = Math.hypot(best.rec.center.x - c.phys.player.simPosition.x,
+    best.rec.center.z - c.phys.player.simPosition.z);
   const cityId = [...c.phys.world.bodies].find(([, r]) => r.opts?.name === 'city')?.[0];
   return {
     id: cityId, loc: best.id,
@@ -533,24 +605,81 @@ const wall = await page.evaluate(() => {
     yaw: best.rec.loc.yaw, d: +best.d.toFixed(1),
   };
 });
+/* AND THE PLANE HAS TO COME OFF THE WALL, NOT OFF WHATEVER IS PARKED
+   IN FRONT OF IT.
+
+   Pinning the building was half the job. This loop then took the first
+   VERTICAL face on the approach ray and called it the wall, and on the
+   door face of the Property Office that face is `prop.sandwich` — a
+   shopfront A-board, 0.9 m wide, standing on the berm 0.95 m proud of
+   the masonry. Wally walks up, the board stops him, he slides round it
+   the way __clip's own header says a tree makes him, and the row read
+
+     face 0  closest approach: face -0.537 m  WENT THROUGH
+
+   for a wall he never touched. It went red the round the placement pass
+   lifted 320 props out of the ground they were buried in: measured with
+   this same probe, prop.sandwich sits at the identical (x, z) in both
+   trees, -219.06 / 73.74, and its collision box rose from +0.118..1.188
+   to +0.447..1.517 above the Property Office's floor. The 0.95 m ray
+   used to clear its sunken top by 28 cm and reach the city wall at
+   1.266 m; it now stops on the board at 0.316 m. The wall did not move
+   and neither did he: his closest approach to the building's own face
+   plane is +0.255 / +0.128 / +0.373 m on faces 0/1/2 in BOTH trees, to
+   the millimetre. Note that at HEAD the 0.55 m ray would have found the
+   board too — the green was one entry in a four-element list away from
+   being this same red, which is rule 3 in the mirror.
+
+   So the ray is filtered to the body under test and steps past
+   everything else, and every row prints WHICH BODY its plane came off.
+   `--wallraw` re-runs the door face with the filter off, on the same
+   page load, so the shipping rule and the prior rule are one
+   measurement apart and not one commit apart. */
 if (wall) {
-  console.log(`--- building wall (${wall.loc}, ${wall.d} m away) ---`);
+  console.log(`--- building wall (${wall.loc}, ${wall.d} m away, body #${wall.id}) ---`);
   let clipped = 0, tried = 0, closest = Infinity;
   /* approach each of the four faces square on */
   for (const k of [0, 1, 2, 3]) {
     const a = wall.yaw + k * Math.PI / 2;
-    const r = await page.evaluate(([tt, aa]) => window.__clip(tt, aa, 6.5, 3.0, 'plane'), [wall, a]);
-    if (r.skip) { console.log(`   face ${k}  skip: ${r.skip}`); continue; }
+    const r = await page.evaluate(([tt, aa]) => window.__clip(tt, aa, 6.5, 3.0, 'plane', tt.id), [wall, a]);
+    if (r.skip) {
+      console.log(`   face ${k}  skip: ${r.skip}` +
+        (r.eye ? `  (eye ${r.eye.join(', ')}, ground ${r.ground})` : ''));
+      continue;
+    }
     tried++;
     const through = r.minPlane !== null && r.minPlane < -0.01;
     if (through) clipped++;
     if (r.minPlane !== null) closest = Math.min(closest, r.minPlane);
     console.log(`   face ${k}  closest approach: face ${r.minPlane?.toFixed(3)} m  ` +
-      `${through ? '\x1b[31mWENT THROUGH\x1b[0m' : 'stopped outside'}`);
+      `${through ? '\x1b[31mWENT THROUGH\x1b[0m' : 'stopped outside'}` +
+      `   [plane off ${r.face.body} @${r.face.at} m, ray ${r.face.hy} m` +
+      `${r.passed.length ? `; stepped past ${r.passed.map((q) => `${q.name}@${q.at}m`).join(', ')}` : ''}]`);
   }
+  /* THREE OF THE FOUR, NOT ONE OF THE FOUR. `tried > 0` let this row go
+     green on a single face, which is how a wall test survives losing
+     three quarters of its subject without saying so. Face 3 of the
+     Property Office legitimately skips — the terrain 6.5 m out on that
+     side is five metres up, level with the roof, and there is no wall
+     on the ray at all — so the floor is three. */
+  results.push(['building wall: measured on at least 3 of its 4 faces', tried >= 3, `${tried}/4 faces measured`]);
   results.push(['building wall: never passes through', tried > 0 && clipped === 0, `${clipped}/${tried} faces clipped`]);
   results.push(['building wall: gets close enough to touch', closest < 0.34 + 0.14,
     `closest axis-to-wall ${closest === Infinity ? 'n/a' : closest.toFixed(3)} m`]);
+
+  /* THE SWITCH. Same page load, same walk, same instrument; the only
+     difference is whether the plane is required to belong to the wall.
+     Predicted, and asserted, so it cannot rot into a citation: with the
+     filter off the door face reports a breach that is a sandwich board. */
+  if (WALLRAW) {
+    const a0 = wall.yaw;
+    const raw = await page.evaluate(([tt, aa]) => window.__clip(tt, aa, 6.5, 3.0, 'plane', null), [wall, a0]);
+    console.log(`   face 0 PRIOR RULE (no body filter): face ${raw.minPlane?.toFixed(3)} m ` +
+      `off ${raw.face?.body} @${raw.face?.at} m`);
+    results.push(['prior rule measured a prop, not the wall',
+      raw.face != null && raw.face.body !== 'city',
+      `unfiltered plane came off ${raw.face?.body}, giving ${raw.minPlane} m`]);
+  }
 }
 
 /* ------------------------------------------------------------------
@@ -696,6 +825,155 @@ results.push(['no part of a building floats clear of the rest of it',
   floats.missing ? 'not measured'
     : floats.iso.length ? `${floats.iso.length} isolated, worst gap ${Math.max(...floats.iso.map((f) => f.gap)).toFixed(3)} m`
       : 'every part touches another part of its own building']);
+
+/* ------------------------------------------------------------------
+   3b. NOR DOES ANY GROUP OF PARTS, WHICH IS NOT THE SAME QUESTION.
+
+   THE REPORT THIS EXISTS FOR: a screenshot of a plank and a cat
+   hanging in the air outside the noodle cart. Section 3 above was
+   green for it. A shelf on two brackets with a cat on it is EIGHT
+   parts that all touch EACH OTHER, so "every part touches another
+   part" is satisfied by an island floating two and a half metres out
+   in the street — pairwise touching is not connectedness, and the
+   thing a player sees floating is always a cluster, because anything
+   worth drawing is more than one box.
+
+   So the same boxes, in the same local frame, with the same 0.02 m
+   tolerance, are unioned into components and every component that is
+   not the building's main mass is reported. That is a strict
+   generalisation: anything section 3 catches is a component of size
+   one and is caught here too, and it costs one union-find over a list
+   that has already been built.
+
+   IT IS STILL BLUNT IN THE SAFE DIRECTION. An AABB is a superset, so
+   an island reported here certainly does not touch the mass. It can
+   still MISS one (two boxes can overlap while the shapes inside them
+   do not), which is the direction an assertion may be wrong in.
+
+   FOUND, the round this was written: 70 islands, 811 parts, across
+   111 buildings. The largest by far is the market form's shelf — the
+   one in the screenshot — at a 2.663 m gap; the rest are chimney
+   caps, monitor glazing and lantern housings sitting a few
+   centimetres clear of the roofs they belong to.
+   ------------------------------------------------------------------ */
+console.log('--- groups of parts that do not reach their building ---');
+const isles = floats.missing ? { missing: true } : await page.evaluate((TOL) => {
+  const c = window.WALLY.ctx, T = window.WALLY.THREE;
+  const cen = c.city.partCensus();
+  const out = [];
+  const m = new T.Matrix4(), v = new T.Vector3();
+  let total = 0, parts = 0;
+  for (const b of cen) {
+    const p = b.parts; total += p.length;
+    const par = p.map((_, i) => i);
+    const find = (i) => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+    for (let i = 0; i < p.length; i++) {
+      for (let j = i + 1; j < p.length; j++) {
+        const a = p[i], o = p[j];
+        const gx = Math.max(a.min[0] - o.max[0], o.min[0] - a.max[0], 0);
+        const gy = Math.max(a.min[1] - o.max[1], o.min[1] - a.max[1], 0);
+        const gz = Math.max(a.min[2] - o.max[2], o.min[2] - a.max[2], 0);
+        if (Math.hypot(gx, gy, gz) <= TOL) { const x = find(i), y = find(j); if (x !== y) par[x] = y; }
+      }
+    }
+    const size = new Map();
+    for (let i = 0; i < p.length; i++) { const r = find(i); size.set(r, (size.get(r) || 0) + 1); }
+    let main = -1, best = -1;
+    for (const [r, n] of size) if (n > best) { best = n; main = r; }
+    const groups = new Map();
+    for (let i = 0; i < p.length; i++) { const r = find(i); if (r === main) continue; (groups.get(r) || groups.set(r, []).get(r)).push(i); }
+    m.fromArray(b.matrix);
+    for (const [, idxs] of groups) {
+      const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+      for (const i of idxs) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[i].min[k]); hi[k] = Math.max(hi[k], p[i].max[k]); }
+      let gap = Infinity;
+      for (let j = 0; j < p.length; j++) {
+        if (find(j) !== main) continue;
+        const o = p[j];
+        const gx = Math.max(lo[0] - o.max[0], o.min[0] - hi[0], 0);
+        const gy = Math.max(lo[1] - o.max[1], o.min[1] - hi[1], 0);
+        const gz = Math.max(lo[2] - o.max[2], o.min[2] - hi[2], 0);
+        gap = Math.min(gap, Math.hypot(gx, gy, gz));
+      }
+      parts += idxs.length;
+      v.set((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2).applyMatrix4(m);
+      out.push({
+        id: b.id, kind: b.kind, n: idxs.length, gap: +gap.toFixed(3),
+        what: [...new Set(idxs.map((i) => p[i].part))].join('+'),
+        at: [+v.x.toFixed(1), +v.y.toFixed(2), +v.z.toFixed(1)],
+      });
+    }
+  }
+  out.sort((a, b2) => b2.gap - a.gap);
+  return { total, parts, out };
+}, TOUCH_TOL);
+/* THE BAR IS NOT ZERO, AND SAYING SO IS THE POINT. Half a metre is
+   the distance at which a group stops reading as detail set proud of a
+   roof and starts reading as an object that is not attached to
+   anything — the cat's shelf was at 2.663 m and the market hall's
+   pigeons were on the same plane. Everything found is printed either
+   way; only the far ones are listed against the ledger below.
+
+   THE LEDGER, AND WHY IT IS A LEDGER AND NOT A ZERO.
+   Fixing the facade plane took this from 15 groups past 0.5 m to
+   three, and the three left are not one cause — they are three
+   separate forms, each wanting its own change in a file this round did
+   not open:
+
+     0.701  stadium (x2)   13 parts, wall+hedge, the terrace planters
+     0.526  learning.fill3  4 parts, wall+stone+metal
+
+   AND HERE IS WHAT EACH ONE ACTUALLY IS, measured part by part in the
+   building's own frame, so the next person spends the twenty minutes
+   fixing them rather than the twenty minutes I spent finding them:
+
+     STADIUM. A planter 1.36 x 0.66 x 0.39 m, local (+/-16.10, 5.40,
+     26.15) — five metres up the front of the bowl and 0.701 m proud of
+     it. The gap is entirely in Z. The nearest piece of the mass is the
+     outer wall panel spanning z 19.79..25.25, and the planter sits at
+     z 25.95..26.34. THE CAUSE IS A RECTANGLE ON AN ELLIPSE: the pair is
+     placed on a frontage line at a fixed z, and formStadium's frontage
+     is an ellipse (rx 31, rz 26, `mx = sin(a)*rx, mz = cos(a)*rz`), so
+     at x = +/-16 the wall has already curved 0.7 m away from the line
+     and the planter is hanging over the concourse. Both copies are the
+     same distance out because both are the same |x|. Whatever places
+     them has to solve for the ellipse the way the pilasters above it
+     do, not for d/2.
+
+     LEARNING.FILL3. A chimney: wall stack 12.76..14.96, stone cap,
+     two metal pots, local x -4.67..-3.77. The roof it should stand on
+     spans x -3.24..3.24, and the gap is 0.526 m in X alone. It is
+     placed against the BUILDING's half-width and the roof is narrower
+     than the building, so on this infill it oversails the eaves and
+     stands on air. Clamping the stack's x to the roof's own half-width
+     rather than the wall's is the whole fix.
+
+   Neither emitter is in a file this round opened, so both stay on the
+   ledger with their diagnosis attached.
+
+   So the assertion is a RATCHET, stated as such: no fourth island, and
+   nothing worse than the worst one on the list. That is a real
+   assertion — it goes red the moment anything new comes unstuck, which
+   is the whole job — and it does not pretend the three are fixed. Take
+   one off the list when you fix it, and tighten LEDGER_N. */
+const ISLE_GAP = 0.5;
+const LEDGER_N = 3, LEDGER_WORST = 0.71;
+if (!isles.missing) {
+  const bad = isles.out.filter((i) => i.gap > ISLE_GAP);
+  for (const i of isles.out.slice(0, 6)) {
+    const red = i.gap > ISLE_GAP;
+    console.log(`   ${red ? '\x1b[31m' : '\x1b[90m'}${i.kind.padEnd(8)}\x1b[0m ${i.id.padEnd(20)} ` +
+      `${String(i.n).padStart(3)} parts (${i.what}) ${i.gap} m from the mass, at ${i.at.join(',')}`);
+  }
+  console.log(`   \x1b[90m${isles.out.length} islands / ${isles.parts} parts of ${isles.total}; ` +
+    `${bad.length} further than ${ISLE_GAP} m\x1b[0m`);
+  results.push([`no NEW group of parts hangs more than ${ISLE_GAP} m clear of its building`,
+    bad.length <= LEDGER_N && (bad.length === 0 || bad[0].gap <= LEDGER_WORST),
+    bad.length ? `${bad.length} of ${LEDGER_N} on the ledger, worst ${bad[0].id} at ${bad[0].gap} m (ledger ${LEDGER_WORST} m)`
+      : `${isles.out.length} islands, all within ${ISLE_GAP} m of the mass`]);
+} else {
+  console.log('   \x1b[90mnot measured — no part census\x1b[0m');
+}
 
 /* ------------------------------------------------------------------
    4. SHIPPING CONTAINERS ARE PORT FURNITURE.
@@ -971,6 +1249,181 @@ results.push(['wind-driven runs are strung, and there are some', runs.n > 0, `${
 results.push([`every strung run clears ${HEADROOM} m of headroom`,
   runs.n > 0 && runs.clear >= HEADROOM,
   runs.n ? `lowest ${runs.clear.toFixed(2)} m at ${runs.at}` : 'none drawn']);
+
+/* ------------------------------------------------------------------
+   5c. THE KERB — A SURFACE HE IS SUPPOSED TO GET ONTO.
+
+   Every other section in this file asks the same question: does a
+   solid thing STOP him. world/ground.js adds an object of the opposite
+   kind — a raised footway, 0.10 m of stone the length of every street
+   in the city, which he is meant to step up onto without noticing. It
+   has exactly two ways to be wrong and this file already has a name
+   for both of them:
+
+     A GHOST   the pavement is drawn and phys never heard of it, so the
+               ground under his feet is the terrain and he walks along
+               a street with his ankles inside the flags. Same defect
+               as the bins and benches the header describes, with the
+               sign flipped.
+     A WALL    the collider is there but he cannot mount it, so a kerb
+               is an invisible fence down both sides of every road and
+               the pavement is scenery. That is precisely the failure
+               mode section 1's CLOSE half exists to catch: a
+               well-meant collider that makes the game feel worse than
+               having none.
+
+   THE PAVEMENT IS FOUND, NOT ASSUMED. Nothing here knows ground.js's
+   section geometry: it steps outward from a road centreline in 5 cm
+   increments until the DRAWN floor (ctx.city.floorY) stands proud of
+   the terrain, which is the kerb wherever ground.js decided to put
+   one. Then he is stood in the carriageway and run at it.
+
+   REVERT CHECK, EXECUTED — NOT A RECIPE. This file was run against a
+   clean `git archive HEAD` of src/, today's test over yesterday's
+   code, with node_modules symlinked in and nothing else changed:
+
+     working tree   34 rows, all green
+     HEAD archive   1 failed — "the footway is a surface phys knows
+                    about: ctx.city.floorY is not published"
+
+   One row, and it is this section's. Every other row in the file
+   passes on both, which is what makes the green above mean something:
+   the suite did not get easier, it got one new thing to see.
+
+   The finer-grained recipe, for anyone changing the wiring rather than
+   removing it: delete the ctx.phys.addTriangles call for
+   `city.footway` in world/city.js's wirePhysics() and floorY still
+   answers, so the section runs and TWO rows go red instead — the
+   triangle count, and "he stands ON the flags", because he ends up
+   0.10 m inside them.
+   ------------------------------------------------------------------ */
+console.log('--- the kerb ---');
+const kerbs = await page.evaluate(async () => {
+  const c = window.WALLY.ctx, T = window.WALLY.THREE;
+  const frames = (n) => new Promise((res) => {
+    let k = 0; const t = () => (++k >= n ? res() : requestAnimationFrame(t)); requestAnimationFrame(t);
+  });
+  if (!c.city?.floorY) return { none: 'ctx.city.floorY is not published' };
+  const out = [];
+  const edges = c.world.paths?.edges || [];
+  for (const e of edges) {
+    if (out.length >= 6) break;
+    const pts = e.points;
+    if (!pts || pts.length < 8) continue;
+    const i = Math.floor(pts.length / 2);
+    const p = pts[i], q = pts[i - 1];
+    const seg = Math.hypot(p.x - q.x, p.z - q.z) || 1;
+    const px = -(p.z - q.z) / seg, pz = (p.x - q.x) / seg;
+    for (const sgn of [1, -1]) {
+      /* step out until the drawn floor stands proud of the terrain */
+      let found = null;
+      for (let u = 0.6; u < 8; u += 0.05) {
+        const x = p.x + px * sgn * u, z = p.z + pz * sgn * u;
+        const up = c.city.floorY(x, z) - c.world.heightAt(x, z);
+        if (up > 0.05) { found = { x, z, u, up }; break; }
+      }
+      if (!found) continue;
+      /* aim a metre past the kerb line, which is the middle of the
+         flags — the kerbstone course is 0.20 m and the footway 1.30 */
+      const tx = p.x + px * sgn * (found.u + 1.0);
+      const tz = p.z + pz * sgn * (found.u + 1.0);
+      /* stand him in the carriageway, 2.6 m short of the kerb */
+      const sx = p.x + px * sgn * Math.max(0, found.u - 2.6);
+      const sz = p.z + pz * sgn * Math.max(0, found.u - 2.6);
+      const pl = c.phys.player;
+      pl.teleport(new T.Vector3(sx, c.phys.groundAt(sx, sz).y + 0.2, sz));
+      await frames(30);
+      pl.teleport(new T.Vector3(sx, c.phys.groundAt(sx, sz).y + 0.2, sz));
+      await frames(30);
+      /* STOP AT THE TARGET, NOT AFTER A FIXED NUMBER OF FRAMES.
+         Held for 150 frames at running speed he covers twelve metres,
+         which is straight over the pavement, off the far side and into
+         a field — two of the four probes ended ten metres past the
+         kerb standing on terrain, and the row then measured a lawn. */
+      const dir = new T.Vector3(tx - sx, 0, tz - sz).normalize();
+      const reach = Math.hypot(tx - sx, tz - sz);
+      pl.setInputFn(() => ({ x: dir.x, z: dir.z, run: false }));
+      for (let f = 0; f < 200; f++) {
+        await frames(1);
+        if (Math.hypot(pl.simPosition.x - sx, pl.simPosition.z - sz) >= reach) break;
+      }
+      pl.setInputFn(null);
+      pl.setInput({ x: 0, z: 0 });
+      await frames(30);
+      const fx = pl.simPosition.x, fz = pl.simPosition.z;
+      const drawn = c.city.floorY(fx, fz);
+      const g = c.phys.groundAt(fx, fz);
+      /* WHAT STOPPED HIM, IF ANYTHING DID.
+
+         A lamp post standing on the pavement is a lamp post standing
+         on the pavement, and being stopped by one is correct — it is
+         what every other section of this file asserts. Without asking,
+         this row read a bollard two metres up the road as "the kerb is
+         an invisible fence": one probe of four stopped 0.06 m short of
+         the kerb line and the row went red on a collider that is doing
+         its job. Same classifier surfacetest.mjs uses on a stalled
+         leg: a near-vertical contact opposing the way he is going is a
+         WALL, whatever the ray under his feet says. */
+      const A = new T.Vector3(fx, pl.simPosition.y + pl.radius, fz);
+      const B = new T.Vector3(fx, pl.simPosition.y + pl.height - pl.radius, fz);
+      const COS_LIMIT = Math.cos(48 * Math.PI / 180);
+      let blockedBy = '', deepest = 0;
+      for (const ct of c.phys.capsuleCast(A, B, pl.radius + 0.10, [])) {
+        if (ct.normal.y >= COS_LIMIT) continue;                        // floor
+        if (ct.normal.x * dir.x + ct.normal.z * dir.z > -0.20) continue; // not in his way
+        if (ct.depth > deepest) {
+          deepest = ct.depth;
+          blockedBy = c.phys.world.bodies.get(ct.body)?.opts?.name || `body${ct.body}`;
+        }
+      }
+      out.push({
+        kerbAt: +found.u.toFixed(2),
+        upstand: +found.up.toFixed(3),
+        /* how far past the kerb line he got */
+        past: +(Math.hypot(fx - p.x, fz - p.z) - found.u).toFixed(2),
+        /* feet vs the floor you can SEE under them */
+        err: +(pl.simPosition.y - drawn).toFixed(3),
+        on: c.phys.world.bodies.get(g.body)?.opts?.name || 'plane',
+        blockedBy,
+      });
+      if (out.length >= 6) break;
+    }
+  }
+  return { out };
+});
+if (kerbs.none) {
+  results.push(['the footway is a surface phys knows about', false, kerbs.none]);
+} else {
+  const K = kerbs.out;
+  for (const k of K) {
+    console.log(`   kerb ${k.kerbAt} m off the centreline, ${k.upstand} m upstand: ` +
+      `he ended ${k.past >= 0 ? '+' : ''}${k.past} m past it, feet ${k.err >= 0 ? '+' : ''}${k.err} m ` +
+      `off the drawn floor, standing on ${k.on}` +
+      `${k.blockedBy ? `  \x1b[90m(walled off by ${k.blockedBy})\x1b[0m` : ''}`);
+  }
+  const bodyTris = await page.evaluate(() => {
+    let n = 0;
+    for (const rec of window.WALLY.ctx.phys.world.bodies.values()) {
+      if (rec.opts?.name === 'city.footway') n += rec.count;
+    }
+    return n;
+  });
+  console.log(`   city.footway: ${bodyTris} triangles in the collision world`);
+  results.push(['the footway is registered with phys at all', bodyTris > 4000, `${bodyTris} triangles`]);
+  /* the ones where nothing was in his way — those are the only ones
+     that say anything about the kerb */
+  const clear = K.filter((k) => !k.blockedBy);
+  results.push(['at least three unobstructed kerbs to walk at', clear.length >= 3,
+    `${clear.length}/${K.length} clear, ${K.length - clear.length} walled off by street furniture`]);
+  results.push(['he can mount every kerb — it is not an invisible fence',
+    clear.length > 0 && clear.every((k) => k.past > 0.35),
+    clear.length ? clear.map((k) => `${k.past} m past`).join(', ') : 'no unobstructed kerb found']);
+  /* 0.06 m: half the SINK_TOL surfacetest.mjs walks the island with,
+     because this one is standing still on a level flag. */
+  results.push(['and he stands ON the flags, not 0.10 m inside them',
+    K.length > 0 && K.every((k) => Math.abs(k.err) < 0.06),
+    K.length ? K.map((k) => `${k.err} m`).join(', ') : 'no kerb found to walk at']);
+}
 
 /* ------------------------------------------------------------------
    THE REVERT ARM — TODAY'S TEST AGAINST YESTERDAY'S CODE.

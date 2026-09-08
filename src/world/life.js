@@ -273,15 +273,56 @@ const ONCE = {
     /* ON THE STREET SIDE OF THE COUNTER, not behind it. The stall form
        is an open veranda and a shelf set inside it is a shelf the
        player walks past without ever seeing — which for the only cat
-       in the game is the same as not having one. */
-    const x = loc.size.w * 0.32, z = loc.size.d / 2 + 0.34, y = 1.06 + lift;
-    K.add(fw, boxRound(0.80, 0.10, 0.56, 0.03, 1), TRS(x, y, z), mixHex(BUILD.wood, BUILD.woodDark, 0.4));
-    for (const sx of [-1, 1]) {
-      K.add(fw, boxRound(0.09, 0.24, 0.09, 0.02, 1), TRS(x + sx * 0.30, y - 0.16, z, 0, 1, 1, 1, 0, sx * 0.35), mixHex(BUILD.wood, BUILD.woodDark, 0.55));
+       in the game is the same as not having one.
+
+       AND A SHELF HANGS OFF SOMETHING. The intent above was right and
+       the arithmetic under it was not: the shelf was put at
+       loc.size.d/2 + 0.34, and on this form loc.size.d/2 is the PLOT
+       edge — the solid front wall is 1.8 m behind it and even the
+       veranda posts are 0.3 m behind it. So the plank stood in the
+       open street on two 0.24 m stubs with nothing behind them, and
+       the cat rode on it. That is the object the user photographed.
+
+       It now hangs off the trestle counter, which is the one surface
+       on this form that is BOTH structural and on the street side of
+       everything: the counter's own outward face. buildings.js
+       publishes that face (meta.stall) rather than this file
+       re-deriving porchD, so the two cannot drift apart. Back edge
+       0.04 m into the counter body, a cleat pinned across the face
+       under it, and two knee braces running down and back to the same
+       face — which is what makes it read as HUNG rather than as
+       hovering. No `lift`: the counter is drawn in the building's own
+       frame at a fixed local height, not on the founding line, so a
+       shelf bolted to it must be too. */
+    const st = meta.stall;
+    if (!st) return null;
+    /* clear of the four counter legs and of the middle veranda post */
+    const gaps = [];
+    for (let i = 0; i < st.legs.length - 1; i++) {
+      const mid = (st.legs[i] + st.legs[i + 1]) * 0.5;
+      if (Math.abs(mid) > 0.9) gaps.push(mid);
     }
-    /* a warm ginger-and-cream, so it is not the same grey as Wally */
-    cat(K, f, x, y + 0.05, z, 1.4, mixHex(BRAND.paper, BUILD.awning, 0.26));
-    return 'a cat asleep on the counter shelf';
+    const x = gaps.length ? gaps[gaps.length - 1] : st.counterHalfW * 0.62;
+    const zf = st.counterFace;                       // the face it is bolted to
+    const D = 0.52, y = st.counterTop - 0.32;        // a hand's width below the plank
+    const z = zf + D * 0.5 - 0.04;                   // back edge inside the face
+    const wood = mixHex(BUILD.wood, BUILD.woodDark, 0.4);
+    K.add(fw, boxRound(0.84, 0.09, D, 0.03, 1), TRS(x, y, z), wood);
+    /* the cleat: the batten the shelf is screwed to, on the face */
+    K.add(fw, boxRound(0.88, 0.10, 0.07, 0.02, 1), TRS(x, y - 0.09, zf + 0.025), shadeHex(wood, 0.88));
+    /* two knee braces, face to shelf front. THIN_MIN in every axis. */
+    for (const sx of [-1, 1]) {
+      K.add(fw, boxRound(0.07, 0.08, 0.47, 0.02, 1),
+        TRS(x + sx * 0.30, y - 0.20, zf + 0.19, 0, 1, 1, 1, -0.70), shadeHex(wood, 0.80));
+    }
+    /* A WARM GINGER, AND FACING THE STREET. Photographed on the new
+       shelf, `mixHex(BRAND.paper, ...)` came back as a pale pink lump:
+       the note in cat() about the head being the read only works if the
+       head is pointed at the player, and ry = 1.4 turned it into the
+       porch. C.hay toward dirt is a marmalade cat; -1.25 brings the
+       head and the ears round to the side you walk past. */
+    cat(K, f, x, y + 0.045, z, -1.25, mixHex(C.hay, LAND.dirt, 0.28));
+    return 'a cat asleep on the shelf hung off the counter';
   },
 
   /* MAIN STREET — the half-finished paint job. Somebody started on the
@@ -342,7 +383,16 @@ const ONCE = {
  */
 export function dressLife(ctx, K, loc, S, meta, rng, opts = {}) {
   const zid = loc.z;
-  const w = loc.size.w, d = loc.size.d, dz = d / 2;
+  const w = loc.size.w, d = loc.size.d;
+  /* THE FACADE, NOT THE PLOT EDGE. Everything below fixes itself to a
+     wall, and this file assumed the wall was at loc.size.d/2. On the
+     stall form it is not: that plane is the front of an open veranda
+     and the wall is 1.8-3.4 m behind it, so four pigeons, a nest and a
+     window box were nailed to fresh air over the market hall's forecourt
+     — 2.663 m clear of the building, which is what the part census in
+     cliptest.mjs reports. buildings.js publishes the plane it actually
+     built; the default is still d/2, so no other form moves. */
+  const dz = meta.faceZ != null ? meta.faceZ : d / 2;
   const eave = meta.eaveY || 0;
   const doorU = meta.door ? meta.door.x : 0;
   const fw = famOf(K, 'wood'), fh = famOf(K, 'hedge'), f = famOf(K, 'wall');

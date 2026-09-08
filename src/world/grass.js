@@ -663,6 +663,15 @@ export function createGrassLayer(ctx, env) {
          growing through it — 0.24 m of setback nobody will ever see. */
       const cl = env.clearance(cx, cz);
       if (cl < 0.35 + spread) continue;
+      /* NOT THROUGH THE PAVEMENT. world/ground.js's footway is 1.50 m
+         wide (kerbstone plus flags) and the turf lattice above is
+         sampled at 2 m, so the
+         interpolated mask thins the grass around a kerb without ever
+         clearing the flags themselves. Asked point-blank here it is a
+         hash get on a sparse 0.25 m map, next door to the clearance
+         query that is already being made, and it is where the
+         triangles the floor costs come back from. */
+      if (env.paved && env.paved(cx, cz)) continue;
       /* CONTACT. Grass does not meet a wall at full brightness — the
          wall occludes half its sky and the turf under it is in
          permanent shade. At 0.66..1.0 over five metres this was a 13 %

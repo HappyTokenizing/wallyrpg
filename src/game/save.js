@@ -39,7 +39,7 @@
    before discovery and access were separate ideas.
    ============================================================ */
 
-import { CONFIG, ASSETS, CLIENTS, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID, OFFICE_STAGES } from './data.js';
+import { CONFIG, ASSETS, CLIENTS, CLIENT_BY_ID, LOC_BY_ID, ASSET_BY_ID, TRAVEL, RIDES, SIDE_QUEST_BY_ID, OFFICE_STAGES, DAY_EVENT_BY_ID, NEWS_POOL } from './data.js';
 import { newState, clamp, round2, DEFAULT_SETTINGS } from './state.js';
 
 /* ---------- storage driver ---------- */
@@ -155,6 +155,72 @@ export function createSave(env) {
     if (m.race.status === 'running') { m.race.status = m.race.wins > 0 ? 'won' : 'offered'; m.race.cp = 0; }
     if (m.race.wins > 0) m.race.status = 'won';
     m.slateDay = Number.isFinite(+m.slateDay) ? Math.max(0, Math.floor(+m.slateDay)) : 0;
+    return m;
+  }
+
+  /* ---------- WHAT THE CITY IS DOING, AND WHO WAS RIGHT ----------
+     state.city and state.tips arrived after v7 shipped, so a save
+     written by an earlier v7 build has neither and migrate()'s
+     forward-fill will not run for it (the version has not moved).
+     Repaired on EVERY load, exactly like the rides, the race and the
+     discovery maps above.
+
+     THE TWO THINGS THAT MATTER HERE.
+       * A condition is dropped if its id is no longer in the content
+         table, or if it ran out before the day the save is being
+         resumed on. A shut door that outlives its reason is a
+         building the player can never get into again.
+       * A pending rumour is dropped if it was for a day that has
+         already gone. events.claimTip() only ever claims a tip told
+         BEFORE today, so a stale one would sit in the record
+         forever, never claimed and never settled.
+     ------------------------------------------------------------ */
+  function migrateEvents(m) {
+    if (!m.city || typeof m.city !== 'object' || Array.isArray(m.city)) {
+      m.city = { today: null, log: [], encDay: 0, encMin: -1e9, encCount: 0, encArmed: false, live: null };
+    }
+    m.city.encArmed = m.city.encArmed === true;
+    if (!Array.isArray(m.city.log)) m.city.log = [];
+    m.city.log = m.city.log.filter((r) => r && DAY_EVENT_BY_ID[r.id] && Number.isFinite(+r.day))
+      .map((r) => ({ id: r.id, day: Math.max(1, Math.floor(+r.day)) }));
+    for (const k of ['encDay', 'encCount']) m.city[k] = Number.isFinite(+m.city[k]) ? Math.max(0, Math.floor(+m.city[k])) : 0;
+    m.city.encMin = Number.isFinite(+m.city.encMin) ? +m.city.encMin : -1e9;
+    /* A CARD IS NEVER RESUMED. It was a conversation in a room, on a
+       day, with somebody standing in front of you; a save reloaded
+       three days later must not reopen it. Dropping it is a DECLINE
+       in every sense that matters, and declining costs nothing. */
+    m.city.live = null;
+    const t = m.city.today;
+    if (!t || typeof t !== 'object' || !DAY_EVENT_BY_ID[t.id]
+      || !Number.isFinite(+t.until) || +t.until < m.day) {
+      m.city.today = null;
+    } else {
+      t.shut = Array.isArray(t.shut) ? t.shut.filter((id) => LOC_BY_ID[id]) : [];
+      t.spared = Array.isArray(t.spared) ? t.spared.filter((id) => LOC_BY_ID[id]) : [];
+      t.open = Array.isArray(t.open) ? t.open.filter((o) => o && LOC_BY_ID[o.loc]) : [];
+      t.from = Number.isFinite(+t.from) ? +t.from : 0;
+      t.until = Math.floor(+t.until);
+    }
+
+    if (!m.tips || typeof m.tips !== 'object' || Array.isArray(m.tips)) m.tips = { pending: null, rec: {} };
+    if (!m.tips.rec || typeof m.tips.rec !== 'object') m.tips.rec = {};
+    for (const k of Object.keys(m.tips.rec)) {
+      if (!CLIENT_BY_ID[k]) { delete m.tips.rec[k]; continue; }
+      const r = m.tips.rec[k];
+      m.tips.rec[k] = {
+        right: Number.isFinite(+r?.right) ? Math.max(0, Math.floor(+r.right)) : 0,
+        wrong: Number.isFinite(+r?.wrong) ? Math.max(0, Math.floor(+r.wrong)) : 0,
+        last: Number.isFinite(+r?.last) ? Math.max(0, Math.floor(+r.last)) : 0,
+      };
+    }
+    const pt = m.tips.pending;
+    if (!pt || !CLIENT_BY_ID[pt.who] || !Number.isFinite(+pt.day) || +pt.day >= m.day
+      || !Number.isFinite(+pt.news) || !NEWS_POOL[+pt.news]) m.tips.pending = null;
+    /* the in-flight claim is a transient inside events.js, never a
+       save field — a key added here would break the byte-identical
+       save/load round trip. Scrubbed in case an older build wrote
+       one. */
+    delete m.tips.claimed;
     return m;
   }
 
@@ -277,6 +343,7 @@ export function createSave(env) {
     if (!m.known) m.known = {};
     if (!m.visited) m.visited = {};
     migrateDiscovery(m);
+    migrateEvents(m);
     if (!m.flags) m.flags = {};
     if (!m.skills) m.skills = {};
     if (!m.unlocks) m.unlocks = {};
@@ -354,5 +421,5 @@ export function createSave(env) {
     return migrate(data);
   }
 
-  return { save, load, has, wipe, migrate, sanitize, migrateRides, migrateRace, migrateDiscovery, exportJSON, importJSON, download, filename, driver: store.kind };
+  return { save, load, has, wipe, migrate, sanitize, migrateRides, migrateRace, migrateDiscovery, migrateEvents, exportJSON, importJSON, download, filename, driver: store.kind };
 }

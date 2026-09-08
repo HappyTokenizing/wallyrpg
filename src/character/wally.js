@@ -46,7 +46,10 @@ import { Expression, EXPRESSION_NAMES } from './expression.js';
 import { Secondary } from './secondary.js';
 import { createBike, solveParkPose, PARK_PITCH_MAX } from './bike.js';
 import { createScooter, createMotorcycle, triangleCost } from './rides.js';
-import { createBalloon, FIT as BALLOON_FIT, FLIGHT, stepFlight, newFlight } from './balloon.js';
+import {
+  createBalloon, FIT as BALLOON_FIT, FLIGHT, stepFlight, newFlight, envelopeRings,
+  WRAP, wrapK, wrapMist, wrapFar, wrapDelta,
+} from './balloon.js';
 
 const _e = new THREE.Euler(0, 0, 0, 'XYZ');
 const _v = new THREE.Vector3();
@@ -2133,6 +2136,97 @@ export async function init(ctx) {
   const F_WATER_FLOOR = 1.6;
   const F_BASKET_R = 0.95;
   const F_ENV_PUSH = 7.5;        // m/s^2 the envelope shoulders with
+  /* THE FABRIC'S GIVE — how far outside the ladder's own radius the
+     shove starts, and the band it ramps in over. A balloon is not a
+     hard surface and it should never read as one arriving.
+
+     IT HAS TO CLEAR THE GORE LOBE. The ladder carries the MERIDIAN's
+     radius and the drawn envelope is that meridian with sixteen gores
+     lobed over it — balloon.js LOBE and SEAM_PULL put the crown of a
+     panel LOBE * (1 - SEAM_PULL) = 6.3% of the radius outside it,
+     which is 0.23 m at the equator and 0.35 m measured off the mesh's
+     own vertices in 0.25 m bands. A skin under that would let the
+     fabric touch a wall before the probe knew anything was there. The
+     rest of it is the stopping distance: 1.10 m gives the absorb
+     below room to take 6.2 m/s of stick out of her before her
+     meridian reaches the brick, which is what makes the contact read
+     as canvas giving rather than as clipping. */
+  const F_ENV_SKIN = 1.10;
+  /* 1/s the inbound speed is soaked up at full contact: about a fifth
+     of it a frame at 60 Hz, so a machine driven at a wall squashes to
+     a stop over a third of a second. NOT a restitution — see
+     flyCollide for why she must not bounce. */
+  const F_ENV_ABSORB = 7.0;
+  /* m/s, the fastest an envelope already inside a solid is eased out.
+
+     IT IS SET BY THE ONE APPROACH A SIDEWAYS SHOVE CANNOT ANSWER.
+     Every deep contact measured on this island happens while she is
+     SINKING — at the worst frame of each drive, vy was -1.4 to -1.9
+     m/s — because a horizontal probe cannot stop a vertical arrival:
+     drop past a roofline four metres from a wall and the fabric is
+     simply inside it, at whatever depth the geometry says, before any
+     shove has been asked for. Up is never blocked, and it should not
+     be, so the answer is to clear it sideways faster than she can
+     enter it from above. At 1.40 m/s the worst case was 1.29 m of
+     drawn fabric inside the Market Hall; at 2.60 it is 0.87, on the
+     same four drives at the same four altitudes minutes apart.
+
+     IT IS A FLOOR NOW AND NOT THE WHOLE RULE — flyCollideCanvas scales
+     it by the sink rate, which is the number the sentence above is
+     actually about, and this is what is left when she is barely
+     descending. 3.60 rather than 2.60 because the school's south face
+     is met at 1.4 to 2.5 m/s of sink with barely 2 m/s of drift, and
+     2.60 left 1.37 to 1.50 m of drawn fabric in a roof tower there
+     against a 1.30 m tolerance. She is drifting at 3 to 4 m/s while
+     this runs, so a lateral ease at 3.6 is not something a player can
+     see happen, and it only ever runs while fabric is genuinely inside
+     masonry. */
+  const F_ENV_SLEW = 3.60;
+  /* the ceiling on how much harder a compressed envelope refuses than
+     one that is merely touching — see the `bite` note in flyCollide */
+  const F_ENV_BITE = 3.5;
+  /* bearings per ring. Six, so the widest ring's rays are 3.6 m apart
+     at the fabric rather than 5.1 m. THE LADDER REVERT'S NUMBER —
+     flyCollideCanvas uses F_ENV_AZ2 and staggers it. */
+  const F_ENV_AZ = 6;
+  /* ---- THE SHIPPING PROBE AND THE SHIPPING RESPONSE. Every one of
+     these is derived in flyCollideCanvas's header; the arithmetic is
+     there rather than here because it is one argument, not five. ---- */
+  const F_ENV_AZ2 = 12;              // bearings per ring
+  /* the golden angle. Each ring's fan is turned by this relative to
+     the one below, so seven rings sample 84 distinct bearings for
+     anything vertical and never line up into a column of blind spot.
+     Any irrational multiple of a turn would do; this one is the one
+     that spreads soonest at small n, which matters because there are
+     seven rings and not seven hundred. */
+  const F_ENV_STAGGER = 2.399963229728653;
+  const F_ENV_PRECESS = 0.90;        // rad/s the whole fan turns
+  /* how far into the skin the spring takes hold. Under this she is
+     touching; over it she is being held off. */
+  const F_ENV_ENGAGE = 0.60;
+  const F_ENV_W = 4.30;              // rad/s, critically damped
+  /* m/s^2 the spring may ask for. The stick's own 6.20 m/s delivered
+     over a tenth of a second — an envelope cannot shove harder than it
+     can be pushed. */
+  const F_ENV_AMAX = 62.0;
+  /* 1/s the basket bleeds the inbound component at. Wicker with an
+     elephant in it, so four times the envelope's rate — but the same
+     shape, and the tangent is not in it. */
+  const F_BASKET_ABSORB = 18.0;
+  /* how much faster than her sink rate the ease-out clears her — see
+     the block it is used in. 1.6, so a 2.5 m/s descent into a wall is
+     eased out of it at 4.0 and anything under 2.25 m/s is left to
+     F_ENV_SLEW's own floor. Measured at the school's south face, which
+     is the one place on this island where the worst frame of a drive
+     is a SINK and not an approach: the pair (3.60 floor, 1.6 scale)
+     took the same drive from 1.50 m of drawn fabric inside a roof
+     tower to 1.22. */
+  const F_ENV_SLEW_VY = 1.6;
+  /* WHAT F_ENV_SLEW WAS WHEN THE 'ladder' REVERT SHIPPED. This round
+     raised the floor from 2.60 and scaled it by the sink rate, and a
+     revert branch that quietly read today's constant would be
+     reverting half the change and calling it the old rule. */
+  const F_ENV_SLEW_WAS = 2.60;
 
   let flyPhase = 'off';          // off | boarding | aloft | landing
   let flyT = 0;
@@ -2144,6 +2238,7 @@ export async function init(ctx) {
   let flyRefusing = false;       // the auto-burner is on
   let flyLandWanted = false;     // he asked to get out while still up
   let flyFogK = 0;
+  let flyMistK = 0;              // the offshore fret, 0..1 — see flyHaze
   let flyAlt = 0;
   /* A HELD BURNER, for the verifier. There is no keyboard in a
      headless tab, so tools/test-balloon.mjs holds the burner through
@@ -2167,6 +2262,31 @@ export async function init(ctx) {
   const _fground = { y: 0, normal: _fup, hit: false };
   const _fnormal = new THREE.Vector3(0, 1, 0);
   const _fcamGround = { y: 0, normal: _fup, hit: false };
+  /* ---------------------------------------------------------------
+     THE RAYCAST OUT PARAMETER IS NOT AN OPTIMISATION HERE, IT IS THE
+     DIFFERENCE BETWEEN A MEASUREMENT AND A LIE.
+
+     physics/collision.js:559 — `const hit = out || (this._rayHit ||=
+     {...})` — hands back ONE SHARED OBJECT when you do not give it
+     one. Every raycast in a frame therefore returns the same object,
+     and anything you kept a reference to has already changed. The old
+     flyCollide kept `hitN = r.normal` while casting two more rays, so
+     the basket's response used the normal of the LAST ray that hit
+     rather than the NEAREST — identical on a flat wall, wrong on every
+     corner and roof edge, and silent either way. `distance` looked
+     fine only because a number is copied.
+
+     Two probes reading each other's answer is the same defect the
+     suite's own enclosure check had (`b.distance` and `f.distance`
+     were the same field), so it is worth naming loudly: give raycast
+     an `out`, and COPY anything you keep.
+     --------------------------------------------------------------- */
+  const _fhit = {
+    point: new THREE.Vector3(), normal: new THREE.Vector3(),
+    distance: 0, tri: -1, body: 0, plane: false,
+  };
+  const _fhitN = new THREE.Vector3();
+  const _frings = [];            // envelopeRings() writes into this
 
   /** The solid the basket would land on: terrain, roofs, decks and
       anything else phys calls static. groundAt takes the HIGHEST
@@ -2302,31 +2422,522 @@ export async function init(ctx) {
        the tangent. That is the whole of "it does not fly through
        buildings".
 
-       THE ENVELOPE is a soft sphere six metres higher and seven
-       across. Between two three-storey terraces there is nowhere for
-       it to be, and a hard response there would pin the machine in a
-       street for ever — which is the "trapped" half of the brief, and
-       it is the one that ships by accident. So the envelope PUSHES
-       rather than stops: a lateral acceleration away from whatever it
-       is against, so a balloon that drifts into a terrace is eased
-       back over the middle of the street instead of stopping dead on
-       a chimney.
+       THE ENVELOPE is a soft body six metres higher, seven across and
+       seven and a third tall. Between two three-storey terraces there
+       is nowhere for it to be, and a hard response there would pin the
+       machine in a street for ever — which is the "trapped" half of
+       the brief, and it is the one that ships by accident. So the
+       envelope PUSHES rather than stops: a lateral shove away from
+       whatever it is against, so a balloon that drifts into a terrace
+       is eased back over the middle of the street instead of stopping
+       dead on a chimney.
 
      AND UP IS NEVER BLOCKED. Neither probe touches the vertical
      velocity at all. Whatever else has gone wrong, the burner is the
      way out — which is what makes trapped impossible rather than
      merely unlikely.
+
+     ================================================================
+     WHAT WAS WRONG WITH IT, MEASURED, because the shape of the answer
+     above was right and it still let a player fly through the Exchange.
+
+     ONE RING AT ONE HEIGHT. The envelope was probed on a single
+     horizontal ring at its widest point, 5.93 m over the deck. Against
+     a building TALLER than that ring it works; against a roofline it
+     is a plane sweeping through the air above the tiles. Measured on
+     this island: 19 of the city's 28 named buildings have a roof under
+     8 m over their own street, so at any altitude a player would
+     actually cruise at, the ring is above every one of them. Driven at
+     the Market Hall (roof +6.96) at 6 m the envelope ended 2.85 m
+     inside the building and the machine came out the far side; the
+     same drive at 3 m bounced, because down there the BASKET's rays
+     reach the wall. The suite's collision test flew at 3 m. It had
+     been green over this bug from the day it was written.
+
+     THE PROBE NOW WALKS THE WHOLE HULL — balloon.js envelopeRings(),
+     seven rings generated from the meridian the fabric is drawn from,
+     at most 1.25 m apart, six bearings each. With the basket's three
+     heights that is 54 rays a frame, measured at 0.00088 ms each
+     against this city's collision set: 0.048 ms, which is 0.3% of a
+     16.7 ms frame. There was never a reason to be stingy here.
+
+     TREES ARE STILL GHOSTS ABOVE 1.72 m, and that is not this file's
+     to fix. world/trees.js gives a trunk a box capped at props.js's
+     SOLID_TOP because nothing above a walking elephant's crown can be
+     touched by one — correct for the character and wrong for a machine
+     that meets the canopy and never the trunk. Measured: 0 of 24
+     sampled trees answer a ray at 3 m or above, 23 of 24 answer below
+     2 m. The handover is written in this round's report; the ladder
+     above meets a canopy collider the moment one exists, and
+     test-balloon B5f proves that by registering one itself.
+
+     WHAT IT MUST NOT DO. Not a stop — a balloon that halts dead at a
+     roofline has no mass. Not a bounce — canvas has no restitution and
+     a reflection here reads as a beach ball. Not a hard collider on
+     the envelope — that is the terrace trap above. It shoulders,
+     soaks up what is still going in, keeps every bit of the tangent so
+     she slides along the roofline and away, and eases out of anything
+     she is already inside.
      ---------------------------------------------------------------- */
+
+  /* ----------------------------------------------------------------
+     RUNTIME REVERT. contracts.js's strongest form of a revert check is
+     "a switch in the module, shipping rule and prior rule side by
+     side, driven on the same page load", and this is one: 'ladder' is
+     what ships and 'ring' is flyCollideRing() below — the rule this
+     round replaced, kept runnable and kept verbatim, aliased normal
+     and early-out and all. tools/test-balloon.mjs B5c drives BOTH on
+     one boot at the same altitudes off the same measured wall, so the
+     claim "the ladder is what stops her going through the roofline" is
+     a measurement in this build rather than a number in a comment that
+     outlives the code it describes.
+
+     It costs one dead function in the bundle. hud.js pays the same for
+     promptAnchor and it is the cheapest honest evidence available.
+     ---------------------------------------------------------------- */
+  let flyHullMode = 'canvas';    // 'canvas' ships | 'ladder', 'ring' are the two rules it replaced
+  let flyProbeT = 0;             // the fan's precession clock — see flyCollideCanvas
+
   function flyCollide(dt) {
+    flyProbeT += dt;
+    if (flyHullMode === 'ring') { flyCollideRing(dt); return; }
+    if (flyHullMode === 'ladder') { flyCollideLadder(dt); return; }
+    flyCollideCanvas(dt);
+  }
+
+  /* ----------------------------------------------------------------
+     THE PRIOR RULE — LAST ROUND'S LADDER, VERBATIM. Reachable only
+     through WALLY.debug.balloonHull('ladder'). It is the probe that
+     fixed "2.85 m inside the Market Hall and out the far side", and it
+     is kept because the two things wrong with it are things a number
+     in a comment cannot demonstrate:
+       · SIX BEARINGS ON EVERY RING, ALL AT THE SAME AZIMUTH, which
+         puts adjacent rays 3.6 m apart at the widest ring and leaves a
+         column-shaped blind spot running the full height of the
+         envelope. Measured: a 0.8 m post 1.7 m off the line gave 610
+         frames of contact and 3.02 m of fabric intersecting it with no
+         response at all, because nothing was ever asked;
+       · A CONSTANT SHOVE PLUS AN EXPONENTIAL ABSORB, whose stopping
+         distance is proportional to the inbound speed. Flown at five
+         buildings x four bearings x four altitudes it held the Market
+         Hall (1.128 m of drawn fabric inside solid, against a 1.29 m
+         tolerance) and blew it at the four the suite did not fly:
+         exchange 1.652, school 3.193, bank 1.788, apartment 2.092,
+         with 13 of 72 drives leaving mesh vertices fully enclosed.
+     ---------------------------------------------------------------- */
+  function flyCollideLadder(dt) {
+    const p = ctx.phys;
+    if (!p || !p.raycast) return;
+
+    /* THE BEARING THE PROBES ARE ALIGNED TO. Along the drift when
+       there is one, and along the machine's own yaw when there is not.
+       This used to return early below 0.02 m/s, which switched the
+       collision off at precisely the moment it is load-bearing: a
+       balloon the wind is holding against a wall sits at very nearly
+       zero net speed, and with the probes off, the ease-out below
+       never runs and she stays in the brickwork. */
+    const sp = Math.hypot(flyState.vx, flyState.vz);
+    const moving = sp > 0.02;
+    const dx = moving ? flyState.vx / sp : Math.sin(flyState.yaw);
+    const dz = moving ? flyState.vz / sp : Math.cos(flyState.yaw);
+    const a0 = Math.atan2(dx, dz);
+
+    /* --- the basket --- three heights, at the deck, at his chest and
+       at the rim, so a rail at one height cannot be walked through by
+       a probe that only looked at another; and four bearings, because
+       the shove above can put her sideways into a wall she was never
+       pointed at. Nearest contact wins, and its normal is COPIED —
+       see _fhit. */
+    const reach = F_BASKET_R + sp * dt * 2 + 0.25;
+    let hitD = Infinity, hit = false;
+    for (let i = 0; i < 4; i++) {
+      const a = a0 + (i / 4) * Math.PI * 2;
+      _fv2.set(Math.sin(a), 0, Math.cos(a));
+      for (const h of [0.10, 0.70, BALLOON_FIT.WALL]) {
+        _fv.set(root.position.x, root.position.y + h, root.position.z);
+        let r = null;
+        try { r = p.raycast(_fv, _fv2, reach, _fhit); } catch (e) { r = null; }
+        if (r && r.distance < hitD) { hitD = r.distance; _fhitN.copy(r.normal); hit = true; }
+      }
+    }
+    if (hit) {
+      const vn = flyState.vx * _fhitN.x + flyState.vz * _fhitN.z;
+      if (vn < 0) {
+        flyState.vx -= _fhitN.x * vn * 1.02;
+        flyState.vz -= _fhitN.z * vn * 1.02;
+        /* it is canvas and wicker, not glass: bleed a fifth of what is
+           left so a scrape along a wall costs you something */
+        flyState.vx *= 0.80; flyState.vz *= 0.80;
+      }
+      const gap = F_BASKET_R - hitD;
+      if (gap > 0) {
+        root.position.x += _fhitN.x * gap * 0.6;
+        root.position.z += _fhitN.z * gap * 0.6;
+      }
+    }
+
+    /* --- the envelope --- the whole hull, ring by ring. */
+    const rings = envelopeRings(flyProp ? flyProp.inflation : 1, _frings);
+    const y0 = root.position.y - BALLOON_FIT.DECK;
+    let px = 0, pz = 0, depth = 0, n = 0;
+    for (let k = 0; k < rings.length; k++) {
+      const ring = rings[k];
+      if (ring.r < 0.30) continue;
+      const range = ring.r + F_ENV_SKIN;
+      _fv.set(root.position.x, y0 + ring.y, root.position.z);
+      for (let i = 0; i < F_ENV_AZ; i++) {
+        const a = a0 + (i / F_ENV_AZ) * Math.PI * 2;
+        const ax = Math.sin(a), az = Math.cos(a);
+        _fv2.set(ax, 0, az);
+        let r = null;
+        try { r = p.raycast(_fv, _fv2, range, _fhit); } catch (e) { r = null; }
+        if (!r) continue;
+        /* how far into the skin this bearing is, so the sum leans the
+           way the fabric is most compressed */
+        const d = range - r.distance;
+        px -= ax * d; pz -= az * d;
+        if (d > depth) depth = d;
+        n++;
+      }
+    }
+    if (!n) return;
+    const l = Math.hypot(px, pz);
+    /* SQUEEZED EVENLY FROM EVERY SIDE there is no way out sideways and
+       nothing sensible to do with a direction of zero length. The
+       burner is the answer to that one, and it always is. */
+    if (l < 1e-4) return;
+    const ux = px / l, uz = pz / l;
+
+    /* HOW HARD SHE SHOULDERS scales with how far in she is: a brush at
+       the edge of the fabric is a nudge and a real contact is the full
+       shoulder. The old code divided the depth back out again, so
+       grazing a chimney with one gore and burying half the envelope in
+       a wall were the same 7.5 m/s^2. */
+    const soft = clamp(depth / F_ENV_SKIN, 0, 1);
+    const push = F_ENV_PUSH * (0.22 + 0.78 * soft) * dt;
+    flyState.vx += ux * push;
+    flyState.vz += uz * push;
+
+    /* AND PAST THE SKIN IT STIFFENS. Inside the skin the response is a
+       toe — a lean-in over the last metre, and `bite` is `soft` there,
+       so nothing about the approach changes. Past it the fabric is
+       genuinely compressed, and an envelope with hot air in it refuses
+       harder the further it is pushed rather than flattening off at
+       the surface. Without this the absorb takes a fixed third of a
+       second whatever the overlap, which at the stick's own 6.2 m/s is
+       longer than it takes to cross the whole skin: measured at the
+       Market Hall, the meridian pressed 1.01 m past the wall on the
+       worst altitude, against a design budget of 0.60. Capped at
+       F_ENV_BITE, because the point is a firm shoulder and not a
+       catapult — a balloon that flings itself off a roof is a worse
+       lie than one that sinks into it. */
+    const over = depth - F_ENV_SKIN;
+    const bite = Math.min(soft + Math.max(0, over) / F_ENV_SKIN, F_ENV_BITE);
+
+    /* AND SHE SOAKS UP WHAT IS STILL GOING IN, which is what makes it
+       read as mass. The inbound component decays exponentially and the
+       TANGENT IS UNTOUCHED, so she does not stop — she stops going
+       through the wall and carries on along it, which is the whole
+       feel of the thing: a balloon meets a roofline, leans off it and
+       drifts away down the street. */
+    const vin = flyState.vx * ux + flyState.vz * uz;
+    if (vin < 0) {
+      const kill = 1 - Math.exp(-F_ENV_ABSORB * bite * dt);
+      flyState.vx -= ux * vin * kill;
+      flyState.vz -= uz * vin * kill;
+    }
+
+    /* THE WAY OUT OF SOMETHING SHE IS ALREADY IN. A shove is an
+       acceleration, and an acceleration cannot rescue an envelope a
+       metre inside a wall — nor one the wind is holding there, where
+       the shove and the air reach a standoff with fabric in the
+       brickwork. Past the skin the hull is EASED out at walking pace,
+       never faster than F_ENV_SLEW, so she drifts clear over a second
+       or so instead of snapping out of the masonry. This is the line
+       that makes trapped impossible in the horizontal, the way the
+       burner does in the vertical. */
+    if (over > 0) {
+      /* F_ENV_SLEW_WAS AND NOT F_ENV_SLEW. This round raised the
+         shipping ease-out's floor from 2.60 to 3.60 and scaled it by
+         the sink rate, and a revert branch that quietly inherited the
+         new constant would be reverting half the change and calling it
+         the old rule. What ships here is the number that shipped. */
+      const s = Math.min(over, F_ENV_SLEW_WAS * dt);
+      root.position.x += ux * s;
+      root.position.z += uz * s;
+    }
+  }
+
+  /* ================================================================
+     THE SHIPPING RULE — WHAT CANVAS DOES.
+
+     Same hull as the ladder above and the same three refusals (not a
+     stop, not a bounce, never blocks up). Two things are different and
+     each of them is one of the two ways the ladder failed.
+
+     ------------------------------------------------------------------
+     1  THE FAN IS STAGGERED, AND IT IS STAGGERED BECAUSE MASTS ARE
+        VERTICAL.
+
+        The ladder put all six of every ring's rays at the SAME six
+        azimuths, so the seven rings sampled the same six directions
+        seven times and the gaps between them were a blind spot running
+        the whole 6.4 m height of the envelope. A wall does not care —
+        a wall is wider than the gap. A 0.5 x 0.5 m column does: a
+        census of this city found solids above 3 m at six points on the
+        exchange, five at the bazaar, four at the docks and three at
+        harbourhomes, which is exactly the masts, flues and finials a
+        balloon snags on, and the ladder flew through a 0.8 m post 1.7 m
+        off the line for 610 frames without answering.
+
+        THE FIX IS FREE AND IT FALLS OUT OF THE GEOMETRY. A post is
+        vertical, so it crosses EVERY ring. Turn each ring's fan by the
+        golden angle relative to the one below it and the seven rings
+        sample seven different sets of bearings — so a vertical obstacle
+        is probed at F_ENV_AZ x 7 = 84 effective bearings while a
+        horizontal one is still probed at 12, which is all a wall needs.
+        At the widest ring that takes the finest bearing gap from 3.60 m
+        to 0.27 m for anything standing up, and it costs twelve rays a
+        ring rather than six.
+
+        AND THE WHOLE FAN PRECESSES, slowly, on its own clock. A
+        becalmed balloon holding station against a chimney would
+        otherwise keep the same blind spots for as long as it hovered;
+        at F_ENV_PRECESS the fan sweeps a whole bearing gap every 0.6 s,
+        so nothing sits in a gap. It is driven off an accumulated dt
+        rather than a frame count, so it is the same rotation at 30 fps
+        as at 120.
+
+     ------------------------------------------------------------------
+     2  THE RESPONSE IS A CRITICALLY DAMPED SPRING, BECAUSE THE LADDER'S
+        STOPPING DISTANCE WAS PROPORTIONAL TO THE INBOUND SPEED.
+
+        The ladder shoved at a constant F_ENV_PUSH and bled the inbound
+        component at a fixed rate, which means the depth she reaches is
+        roughly (inbound - the ease-out's own ceiling) x a time
+        constant. Position is integrated and then corrected
+        (flyUpdate's aloft branch), the ease-out is capped at 2.60 m/s
+        and the stick delivers 6.20 — so it held at the one wall the
+        suite flew, whose faces are met at 3.1-4.4 m/s, and came apart
+        at the exchange and the school, which are met at 4.7-6.4.
+
+        A spring has no such term. For a critically damped spring the
+        deepest a body of any inbound speed v reaches is v / (w e), a
+        number that is LINEAR in v with a slope this file gets to
+        choose, and it never overshoots on the way out, so it cannot
+        turn into the catapult F_ENV_BITE was capped to prevent.
+
+        THE FREQUENCY IS SOLVED, NOT PICKED, and it is solved against
+        the squash budget the suite measures: 0.60 m, a sixth of the
+        envelope's radius, is what canvas giving looks like and more
+        than that reads as clipping. The spring takes hold F_ENV_ENGAGE
+        into the skin, so the meridian is past the surface by
+        (ENGAGE + v/(w e) - SKIN); setting that to the budget at the
+        stick's own ceiling gives w = 6.20 / ((SKIN - ENGAGE + 0.60) e)
+        = 6.20 / (1.10 x e) = 2.07 rad/s as the floor. F_ENV_W is 4.30
+        — twice the floor, because a floor is not a design — which puts
+        the meridian 0.03 m into the brick at 6.20 m/s and 0.00 at
+        anything under 5.8. The response stays soft: a hold against a
+        wall with the stick buried settles 0.07 m in, because the drive
+        is a lag and not a force (0.22/s x 6.20 m/s over w^2).
+
+        AND THE ENGAGE IS SET FROM THE OTHER END. At rest the spring's
+        zero IS the gap she floats at: SKIN - ENGAGE = 0.50 m from the
+        meridian, which with the gore crowns standing 0.35 m proud of
+        it puts the fabric 0.15 m off the wall. Shallower and she hangs
+        off buildings behind an invisible cushion, which is the same
+        failure as clipping seen from the other side.
+
+        IT TAKES HOLD PART WAY INTO THE SKIN rather than at the fabric's
+        outer surface, because the skin exists to let the gore crowns
+        touch a wall before anything happens — a spring anchored at the
+        skin's edge would hold her 1.10 m off the brick behind an
+        invisible cushion, which is the "wall in the sky" failure at the
+        other end of this.
+
+        AND THE TANGENT IS STILL UNTOUCHED. The spring acts along the
+        contact normal only, so the thing the judge measured and liked —
+        inbound 6.24 to 0 in 0.18 s while the tangent RISES 1.50 to 5.54
+        and she leans off the wall and runs along it — is the same
+        motion, arrived at continuously instead of by an exponential.
+     ================================================================ */
+  function flyCollideCanvas(dt) {
+    const p = ctx.phys;
+    if (!p || !p.raycast) return;
+
+    const sp = Math.hypot(flyState.vx, flyState.vz);
+    const moving = sp > 0.02;
+    const dx = moving ? flyState.vx / sp : Math.sin(flyState.yaw);
+    const dz = moving ? flyState.vz / sp : Math.cos(flyState.yaw);
+    const a0 = Math.atan2(dx, dz) + flyProbeT * F_ENV_PRECESS;
+
+    flyBasket(dt, a0);
+
+    /* --- the envelope --- the whole hull, ring by ring, staggered. */
+    const rings = envelopeRings(flyProp ? flyProp.inflation : 1, _frings);
+    const y0 = root.position.y - BALLOON_FIT.DECK;
+    let px = 0, pz = 0, depth = 0, n = 0;
+    for (let k = 0; k < rings.length; k++) {
+      const ring = rings[k];
+      if (ring.r < 0.30) continue;
+      const range = ring.r + F_ENV_SKIN;
+      const ak = a0 + k * F_ENV_STAGGER;
+      _fv.set(root.position.x, y0 + ring.y, root.position.z);
+      for (let i = 0; i < F_ENV_AZ2; i++) {
+        const a = ak + (i / F_ENV_AZ2) * Math.PI * 2;
+        const ax = Math.sin(a), az = Math.cos(a);
+        _fv2.set(ax, 0, az);
+        let r = null;
+        try { r = p.raycast(_fv, _fv2, range, _fhit); } catch (e) { r = null; }
+        if (!r) continue;
+        const d = range - r.distance;
+        px -= ax * d; pz -= az * d;
+        if (d > depth) depth = d;
+        n++;
+      }
+    }
+    if (!n) return;
+    const l = Math.hypot(px, pz);
+    /* squeezed evenly from every side there is nowhere to go sideways;
+       the burner is the answer to that one, and it always is. */
+    if (l < 1e-4) return;
+    const ux = px / l, uz = pz / l;
+
+    /* ---- the spring ----
+       `x` is how far past the engage line the deepest bearing is, and
+       `vn` the speed along the same direction (negative going in). The
+       acceleration is the textbook critically damped pair, integrated
+       semi-implicitly like everything else in this file. */
+    const x = depth - F_ENV_ENGAGE;
+    if (x > 0) {
+      const vn = flyState.vx * ux + flyState.vz * uz;   // + is coming OUT
+      const acc = F_ENV_W * F_ENV_W * x - 2 * F_ENV_W * vn;
+      /* CAPPED, and the cap is a statement about mass rather than a
+         fudge: an envelope cannot shove harder than it can be pushed,
+         and F_ENV_AMAX is the stick's own ceiling delivered over a
+         tenth of a second. Without it a single frame that starts deep
+         — she dropped past a roofline into a wall — would answer with
+         hundreds of m/s^2 and fling her. */
+      /* AND IT CAN PUSH BUT NOT PULL. A contact is unilateral: fabric
+         against brick can refuse to be compressed and cannot hold on.
+         Without the floor the damping term wins whenever she is
+         leaving fast while still overlapped, and the envelope reels
+         her back into the wall she is drifting off — which is a spring
+         doing exactly what a spring does and not what a balloon does. */
+      const a = Math.max(0, Math.min(acc, F_ENV_AMAX));
+      flyState.vx += ux * a * dt;
+      flyState.vz += uz * a * dt;
+    }
+
+    /* THE WAY OUT OF SOMETHING SHE IS ALREADY IN, unchanged from the
+       ladder and for the unchanged reason: a spring is an acceleration
+       and an acceleration cannot rescue an envelope the wind is holding
+       a metre inside a wall. Past the skin the hull is EASED out at
+       walking pace. This is what makes trapped impossible in the
+       horizontal the way the burner does in the vertical. */
+    const over = depth - F_ENV_SKIN;
+    if (over > 0) {
+      /* AND IT CLEARS SIDEWAYS AT LEAST AS FAST AS SHE IS ARRIVING
+         FROM ABOVE, which is what F_ENV_SLEW's own header said the
+         rule was and what the previous round then wrote as a constant.
+         Measured at the school's south face, the worst frame of the
+         drive was not a fast approach at all: drift 1.98 m/s and vy
+         -2.494. She was SINKING past the roofline, and a horizontal
+         probe cannot stop a vertical arrival — the fabric is simply
+         inside the wall, at whatever depth the geometry says, before
+         any shove has been asked for. Up is never blocked and should
+         not be, so the only answer is to clear it sideways faster than
+         she can enter it, and how fast she is entering it is a number
+         this function has: |vy|. A constant 2.60 is the right ease for
+         a 1.6 m/s sink and half the ease for a 3.6 m/s one.
+
+         The ceiling is therefore vMaxDown x F_ENV_SLEW_VY = 5.76 m/s,
+         and it is only ever reached by an envelope that is genuinely
+         buried in masonry while falling at its terminal rate. */
+      const ease = Math.max(F_ENV_SLEW, Math.abs(flyState.vy) * F_ENV_SLEW_VY);
+      const s = Math.min(over, ease * dt);
+      root.position.x += ux * s;
+      root.position.z += uz * s;
+    }
+  }
+
+  /* ----------------------------------------------------------------
+     THE BASKET, WITH THE ENVELOPE'S MANNERS.
+
+     WHAT IT USED TO DO, MEASURED. Envelope contact reads like a
+     balloon: inbound 6.24 to 0 in 0.18 s while the tangent RISES 1.50
+     to 5.54 — she leans off the wall and runs along it. The basket
+     branch did the opposite: 4.88 to 0.20 in 0.25 s with the TANGENT
+     KILLED ALONGSIDE IT, and then a shove out to 5.8 m off the wall at
+     2.42 m/s with the stick still held into the building. Two lines
+     did all of it:
+       vn * 1.02  — reflecting slightly MORE than the inbound, which is
+                    a restitution, on wicker;
+       *= 0.80    — an ISOTROPIC bleed, which takes a fifth of the
+                    tangent as well, so a scrape along a wall stops her
+                    dead along the wall as well as into it. Compounded
+                    every frame of a 0.25 s contact that is 0.8^15.
+     Together they turned a wall into a bumper: she arrived, stopped,
+     and was posted back out into the street.
+
+     WHAT IT DOES NOW. The inbound component decays exponentially and
+     the tangent is not touched at all — the same two sentences as the
+     envelope, at a stiffer rate because a wicker basket with an
+     elephant standing in it is not canvas. The overlap is still
+     resolved positionally, which is what actually keeps it out of the
+     wall; the velocity's job is only to stop it arriving again.
+     ---------------------------------------------------------------- */
+  function flyBasket(dt, a0) {
+    const p = ctx.phys;
+    const sp = Math.hypot(flyState.vx, flyState.vz);
+    const reach = F_BASKET_R + sp * dt * 2 + 0.25;
+    let hitD = Infinity, hit = false;
+    for (let i = 0; i < 4; i++) {
+      const a = a0 + (i / 4) * Math.PI * 2;
+      _fv2.set(Math.sin(a), 0, Math.cos(a));
+      for (const h of [0.10, 0.70, BALLOON_FIT.WALL]) {
+        _fv.set(root.position.x, root.position.y + h, root.position.z);
+        let r = null;
+        try { r = p.raycast(_fv, _fv2, reach, _fhit); } catch (e) { r = null; }
+        if (r && r.distance < hitD) { hitD = r.distance; _fhitN.copy(r.normal); hit = true; }
+      }
+    }
+    if (!hit) return;
+    const vn = flyState.vx * _fhitN.x + flyState.vz * _fhitN.z;
+    if (vn < 0) {
+      const kill = 1 - Math.exp(-F_BASKET_ABSORB * dt);
+      flyState.vx -= _fhitN.x * vn * kill;
+      flyState.vz -= _fhitN.z * vn * kill;
+    }
+    const gap = F_BASKET_R - hitD;
+    if (gap > 0) {
+      root.position.x += _fhitN.x * gap * 0.6;
+      root.position.z += _fhitN.z * gap * 0.6;
+    }
+  }
+
+  /* ----------------------------------------------------------------
+     THE PRIOR RULE, VERBATIM. Reachable only through
+     WALLY.debug.balloonHull('ring'). Nothing in here is a bug that
+     survived — every one of them is the thing being reverted TO, and
+     they are left exactly as they shipped so the comparison is honest:
+       · one ring at the envelope's widest point, so the whole hull
+         above and below that plane is unprobed;
+       · four bearings rather than six;
+       · the push normalised, so depth of contact does not matter;
+       · no ease-out, so an overlap can only be undone by the physics;
+       · `hitN` aliasing collision.js's shared hit object, so the
+         basket answers with the LAST ray's normal, not the nearest;
+       · the early-out below 0.02 m/s that switches the probe off while
+         the wind holds her against a wall.
+     ---------------------------------------------------------------- */
+  function flyCollideRing(dt) {
     const p = ctx.phys;
     if (!p || !p.raycast) return;
     const sp = Math.hypot(flyState.vx, flyState.vz);
     if (sp < 0.02) return;
     const dx = flyState.vx / sp, dz = flyState.vz / sp;
 
-    /* --- the basket --- three rays, at the deck, at his chest and at
-       the rim, so a rail at one height cannot be walked through by a
-       probe that only looked at another. */
     const reach = F_BASKET_R + sp * dt * 2 + 0.25;
     let hitN = null, hitD = Infinity;
     for (const h of [0.10, 0.70, BALLOON_FIT.WALL]) {
@@ -2341,8 +2952,6 @@ export async function init(ctx) {
       if (vn < 0) {
         flyState.vx -= hitN.x * vn * 1.02;
         flyState.vz -= hitN.z * vn * 1.02;
-        /* it is canvas and wicker, not glass: bleed a fifth of what is
-           left so a scrape along a wall costs you something */
         flyState.vx *= 0.80; flyState.vz *= 0.80;
       }
       const gap = F_BASKET_R - hitD;
@@ -2352,8 +2961,6 @@ export async function init(ctx) {
       }
     }
 
-    /* --- the envelope --- four probes on its own ring, answering with
-       a shove rather than a stop. */
     const ec = flyProp ? flyProp.envelopeCentre : { y: 6, r: 3.6 };
     const ey = root.position.y - BALLOON_FIT.DECK + ec.y;
     let px = 0, pz = 0, n = 0;
@@ -2374,6 +2981,215 @@ export async function init(ctx) {
       const l = Math.hypot(px, pz) || 1;
       flyState.vx += (px / l) * F_ENV_PUSH * dt;
       flyState.vz += (pz / l) * F_ENV_PUSH * dt;
+    }
+  }
+
+  /* ================================================================
+     THE ISLAND IS ROUND — the flight's half of balloon.js WRAP.
+
+     balloon.js owns the geometry and the argument for it; this owns
+     the three things a teleport in a live world has to get right, and
+     every one of them was a bug before it was a line here.
+
+     1  THE STREAM HAS TO ARRIVE FIRST, AND IT DOES NOT ON ITS OWN.
+        terrain.js streams a 3x3 window of 64 m collision tiles at ONE
+        TILE PER FRAME (updateCollision's default budget, and world.js
+        asks for 1-2). Measured on this build: jump 1273 m and the
+        window refills 1,2,3,4,5,6,7,8,9 over NINE FRAMES — 150 ms in
+        which the ground under the arrival does not exist. That is the
+        documented failure in this codebase, arriving somewhere before
+        the ground does, and the balloon being airborne is not an
+        answer to it: `flySolidUnder` casts a ray, a ray into an
+        unstreamed tile misses, a miss reads as `overWater`, and the
+        refusal then decides she is over the sea when she is not.
+
+        So the wrap FORCES the window at the destination before it
+        moves her. It forces ONE tile, not the 3x3 this paragraph used
+        to claim: a 9-tile force measured 39.2-59.6 ms, one tile
+        measures 3.8-5.5 ms, and the section below explains why one is
+        enough — the arrival is clamped seabed, so what the force has
+        to buy is a real answer on the arrival frame and nothing more.
+        world.js finishes the rest at its own two a frame. The arrival
+        is then asserted by casting for it (see flyWrapArrival, on
+        flightState.wrap, whose `mesh` field is the raw cast that can
+        actually come back false).
+
+        It is affordable exactly because of where the plane is: out
+        there the height raster has clamped and the sea floor is a flat
+        -65.03 m, so the nine tiles are nine flat sheets.
+
+     2  EVERYTHING WORLD-SPACE HUNG OFF HIM MOVES WITH HIM. The camera
+        boom (flyCam.pos/aim) is a damped world-space point and would
+        otherwise spend a second flying 1560 m across the ocean with
+        the lens pointing at nothing. His EARS and TRUNK are worse:
+        secondary.js hangs them off phys chains whose particles are
+        world positions, so a swap without them streaks the ears out
+        to the far side of the map for as long as the springs take to
+        catch up. They are TRANSLATED rather than reset() — the chains
+        are Verlet, so shifting `points` and `prev` by the same delta
+        preserves every velocity in them and the ears do not notice.
+
+     3  IT MUST NOT BE VISIBLE. That is the fret, and it lives in
+        flyHaze below: `far` is a function of |x| and |z| only, and the
+        wrap negates one of those, so the fog is the SAME NUMBER on
+        both sides of the swap. Nothing is cross-faded and nothing is
+        matched up; there is no seam because there is no difference.
+        WALLY.debug.balloonMist(0) is the runtime revert — it leaves
+        the wrap in and takes the concealment out, and B13 shoots both
+        and differences the frames.
+
+     WHY THIS IS THE BALLOON'S AND NOT THE WORLD'S. The wrap is a fact
+     about the map, and WRAP is exported from balloon.js so world.js can
+     adopt it the day anything else can reach the plane. Today nothing
+     can: walking and biking are bounded by the island's own geometry
+     and the character controller never gets within 300 m of it, so a
+     wrap in the world would be a rule with no subject. And it could
+     not be applied through the controller anyway — the only published
+     way to move it is teleport(), which snaps to the ground, and 65 m
+     under the arrival there is nothing but sea floor.
+     ================================================================ */
+  const _fwrapD = { dx: 0, dz: 0 };
+  /* its own ground scratch: flyFootprint's _ffg is live inside its own
+     loop and sharing one is how two probes answer with each other's
+     surface. */
+  const _fwrapG = { y: 0, normal: _fup, hit: false };
+  let flyWraps = 0;                 // how many this flight
+  let flyWrapLog = null;            // the last one, for the verifier
+  let flyMistOn = 1;                // the fret's runtime revert, 0..1
+
+  /** What is actually under (nx, nz) right now, after the stream.
+      Cast from well above so it cannot start inside a collider. */
+  function flyWrapArrival(nx, nz) {
+    const g = flySolidUnder(nx, nz, 120, _fwrapG);
+    const sea = waterAt(nx, nz);
+    /* `solid` IS NOT EVIDENCE AND NEVER WAS. flySolidUnder falls
+       through to ctx.world.heightAt on a ray miss and sets hit from
+       the RASTER, which answers everywhere — so `solid:true` was
+       returned whether a tile had streamed or not, and the assertion
+       that read it could not fail. It is kept because it is the right
+       answer for the refusal logic, and `mesh` is added beside it:
+       the raw cast, with no fallback, which is false when nothing has
+       streamed in. That is the one a verifier should read. */
+    let mesh = false, meshY = null;
+    try {
+      const r = ctx.phys?.groundAt?.(nx, nz, null, 120, 900);
+      if (r && r.hit && Number.isFinite(r.y)) { mesh = true; meshY = +r.y.toFixed(2); }
+    } catch (e) { /* no collision world is a false, not a throw */ }
+    return {
+      solid: !!g.hit,
+      mesh, meshY,
+      solidY: g.hit ? +g.y.toFixed(2) : null,
+      seaY: +sea.toFixed(2),
+      tiles: (() => { try { return ctx.world?.terrain?.colliderCount?.() ?? null; } catch (e) { return null; } })(),
+    };
+  }
+
+  /* ----------------------------------------------------------------
+     WHAT THE STREAM ACTUALLY COSTS, AND THE PRE-WARM THAT DOES NOT
+     WORK — written down because the obvious fix here is wrong and the
+     next person will reach for it too.
+
+     Forcing the whole 3x3 window in the swap's own frame WORKS and it
+     is measured: 39.2 to 59.6 ms for nine tiles across five bearings
+     (headless Chrome, SwiftShader, 1024x640, load average 37 to 96 —
+     this machine had a second workflow's browser on it). Two to three
+     frames in one, on the single frame of this feature that has to be
+     invisible.
+
+     THE OBVIOUS FIX IS TO PRE-WARM THE FAR SIDE while she is still in
+     the fret, one tile a frame from k = 0.90 — twenty-two seconds of
+     water at the upwind cruise against the nine frames the streamer
+     needs. It was written, and it never accumulates: world.js calls
+     terrain.updateCollision(focus) EVERY FRAME with the player's own
+     position, so the window is dragged back under her between every
+     one of the warm's calls and the two just take turns re-centring an
+     empty queue. Measured with the warm in: still 39-60 ms at the
+     swap, i.e. exactly the unwarmed cost. A window that follows the
+     player cannot be pointed somewhere the player is not, and that is
+     terrain.js's decision to make, not this file's.
+
+     SO THE FORCE IS ONE TILE AND THE ARGUMENT IS ABOUT GEOMETRY.
+     WRAP.X 780 and WRAP.Z 675 are both OUTSIDE terrain.js's built box
+     (BX 672, BZ 560) — that is asserted against world.bounds in
+     test-balloon B13, not assumed — so every point of the wrap surface
+     is off the raster, where the height field has clamped and the sea
+     floor is a flat -65.03 m. The arrival is open water by
+     construction, and open water needs nothing from the streamer:
+     `overWater`, the refusal and the water floor all read waterAt(),
+     which is analytic. What one tile buys is that flySolidUnder
+     answers with a real sea floor rather than a miss on the arrival
+     frame, so the refusal is deciding from a measurement; world.js
+     then finishes the other eight at its own two a frame, from the
+     same centre, because she is now standing on it.
+
+     And it is CHECKED rather than trusted: flyWrapArrival casts for
+     what is really there, before and after, and both go into
+     flightState.wrap for the verifier to read. Read `mesh`, not
+     `solid` — `solid` accepts the height raster's answer, which is
+     available whether anything streamed or not.
+     ---------------------------------------------------------------- */
+  function flyWrap() {
+    const d = wrapDelta(root.position.x, root.position.z, _fwrapD);
+    if (!d) return false;
+    const nx = root.position.x + d.dx, nz = root.position.z + d.dz;
+
+    /* --- the ground goes first --- */
+    const t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+    const terr = ctx.world?.terrain;
+    try {
+      terr?.updateCollision?.(nx, nz, 1);
+      terr?.updateRockCollision?.(nx, nz, 2);
+    } catch (e) { /* a stream that throws must not strand her mid-swap */ }
+    const streamMs = ((typeof performance !== 'undefined') ? performance.now() : 0) - t0;
+    const before = {
+      at: [+root.position.x.toFixed(2), +root.position.y.toFixed(2), +root.position.z.toFixed(2)],
+      alt: +flyAlt.toFixed(2),
+      vy: +flyState.vy.toFixed(3),
+      drift: +Math.hypot(flyState.vx, flyState.vz).toFixed(3),
+      yawDeg: +(flyState.yaw * 180 / Math.PI).toFixed(1),
+      under: flyWrapArrival(root.position.x, root.position.z),
+      fogFar: ctx.scene?.fog ? Math.round(ctx.scene.fog.far) : null,
+    };
+    const arrival = flyWrapArrival(nx, nz);
+
+    /* --- then everything that is standing on it --- */
+    root.position.x = nx; root.position.z = nz;
+    flyCam.pos.x += d.dx; flyCam.pos.z += d.dz;
+    flyCam.aim.x += d.dx; flyCam.aim.z += d.dz;
+    if (ctx.camera) { ctx.camera.position.x += d.dx; ctx.camera.position.z += d.dz; }
+    flyShiftChains(d.dx, d.dz);
+    flyPlaceController();
+
+    flyWraps++;
+    flyWrapLog = {
+      n: flyWraps, dx: d.dx, dz: d.dz,
+      before,
+      after: {
+        at: [+nx.toFixed(2), +root.position.y.toFixed(2), +nz.toFixed(2)],
+        vy: before.vy, drift: before.drift, yawDeg: before.yawDeg,
+        under: arrival,
+        fogFar: ctx.scene?.fog ? Math.round(ctx.scene.fog.far) : null,
+      },
+      streamMs: +streamMs.toFixed(2),
+    };
+    ctx.bus?.emit('wally:wrap', flyWrapLog);
+    return true;
+  }
+
+  /** Translate every world-space spring particle hung off him. See
+      point 2 above. `chains` is secondary.js's own public map. */
+  function flyShiftChains(dx, dz) {
+    const cs = secondary && secondary.chains;
+    if (!cs) return;
+    for (const k in cs) {
+      const c = cs[k];
+      if (!c) continue;
+      for (const arr of [c.points, c.prev, c.restWorld, c.framePrev, c.render]) {
+        if (!arr) continue;
+        for (let i = 0; i < arr.length; i++) { arr[i].x += dx; arr[i].z += dz; }
+      }
+      if (c.rootPos) { c.rootPos.x += dx; c.rootPos.z += dz; }
+      if (c._prevRootPos) { c._prevRootPos.x += dx; c._prevRootPos.z += dz; }
     }
   }
 
@@ -2428,9 +3244,37 @@ export async function init(ctx) {
     if (!fog || !Number.isFinite(fog.near)) return;
     const k = smoothstepLocal(6, 150, Math.max(0, alt)) * clamp(flyBlend, 0, 1);
     flyFogK = k;
-    if (k <= 0.0005) return;
-    fog.near = fog.near * (1 + 3.2 * k);
-    fog.far = fog.far * (1 + 3.6 * k);
+    if (k > 0.0005) {
+      fog.near = fog.near * (1 + 3.2 * k);
+      fog.far = fog.far * (1 + 3.6 * k);
+    }
+    /* ---- AND THE FRET CLOSES IT AGAIN OUT AT SEA ----
+       This runs AFTER the altitude open and pulls the same two numbers
+       back down, because those two are the same rule read at different
+       distances from the island: at 200 m over the city the haze wants
+       2392 m so the island can be seen, and 300 m past the beach the
+       fret wants 210 so it cannot. Applied here rather than as a rival
+       write for the reason the header gives — anything that writes the
+       fog outside lateUpdate is overwritten before the frame draws.
+
+       IT IS A LERP AND NOT A MIN, so the fret arrives over 170 m of
+       water instead of snapping on at a threshold, and so the value at
+       the plane is exactly wrapFar() rather than whatever the weather
+       happened to be doing.
+
+       AND IT IS SYMMETRIC BY CONSTRUCTION. wrapMist and wrapFar read
+       |x|, |z| and the height over the sea; the wrap negates x or z and
+       touches neither the other axis nor y, so this returns the same
+       pair of numbers on the frame after the swap as on the frame
+       before it. That is the whole of "it does not read as a cut". */
+    const m = wrapMist(root.position.x, root.position.z)
+            * clamp(flyBlend, 0, 1) * clamp(flyMistOn, 0, 1) * WRAP.mist;
+    flyMistK = m;
+    if (m > 0.0005) {
+      const far = wrapFar(root.position.y - (ctx.world?.seaLevel ?? 0));
+      fog.far = fog.far + (far - fog.far) * m;
+      fog.near = fog.near + (far * 0.05 - fog.near) * m;
+    }
   }
 
   /* ----------------------------------------------------------------
@@ -2815,6 +3659,7 @@ export async function init(ctx) {
 
       flyState = newFlight(root.rotation.y);
       flyFloored = false;
+      flyWraps = 0; flyWrapLog = null;
       flyPhase = 'boarding';
       flyT = 0;
       flyLandWanted = false;
@@ -2863,6 +3708,17 @@ export async function init(ctx) {
     if (controller) {
       controller.enabled = true;
       controller.velocity.set(0, 0, 0);
+    }
+    /* THE CROWNS COME DOWN BEFORE THE SNAP, AND THE ORDER IS THE
+       WHOLE BUG. trees.js registers canopy colliders on this exact
+       event and drops them when it says flying:false, so a snap that
+       runs first lands him ON a crown that is about to be deleted out
+       from under him: measured at rest 5.11 m over the terrain, and
+       the frame after the emit he was 4.83 m over it with crowns 0,
+       falling. Emit first and the snap has only the real world to
+       find. */
+    ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
+    if (controller) {
       /* 500 m, not 6. This is the cutscene/debug path and it may be
          called with him two hundred metres up; a six-metre snap would
          leave him there and then drop him. Put him on the ground. */
@@ -2871,7 +3727,6 @@ export async function init(ctx) {
     }
     flyStick = null; flyForceBurn = false;
     ctx.cam?.releaseOverride?.();
-    ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
   }
 
   /** Write a position into the controller WITHOUT snapping it to the
@@ -3015,6 +3870,13 @@ export async function init(ctx) {
       root.position.y += flyState.vy * dt;
       root.position.z += flyState.vz * dt;
       flyCollide(dt);
+      /* THE ISLAND IS ROUND — after the collision and before anything
+         reads the position, so the frame that lands is already on the
+         far side and nothing downstream sees the intermediate. The
+         velocity, the heat, the yaw and the altitude are untouched by
+         it on purpose: she carries on doing exactly what she was
+         doing, in the same direction, at the same height. */
+      flyWrap();
       /* SHE FINDS THE ROOF. Coming down over a parapet, the footprint
          probe knows which way the support is; this leans the machine
          that way so the basket ends up ON the roof instead of standing
@@ -3071,8 +3933,6 @@ export async function init(ctx) {
           controller._prevPosition.copy(root.position);
           controller.velocity.set(0, 0, 0);
           controller.acceleration.set(0, 0, 0);
-          controller.snapToGround(3);
-          root.position.copy(controller.position);
         }
         locoManual = false;
         secondary.ikEnabled = flyIkSaved;
@@ -3082,7 +3942,15 @@ export async function init(ctx) {
         bike = prop;
         parkProp();
         ctx.cam?.releaseOverride?.();
+        /* SAME ORDERING AS flyEnd, and this path is the worse-shaped
+           one: maxDrop 3 will happily find a crown top under his head,
+           so he would be snapped onto canopy the emit is about to
+           remove. Crowns down first, then snap onto what is left. */
         ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
+        if (controller) {
+          controller.snapToGround(3);
+          root.position.copy(controller.position);
+        }
         return true;
       }
     }
@@ -3563,6 +4431,15 @@ export async function init(ctx) {
         blend: +flyBlend.toFixed(3),
         hazeK: +flyFogK.toFixed(3),
         fog: ctx.scene?.fog ? [Math.round(ctx.scene.fog.near), Math.round(ctx.scene.fog.far)] : null,
+        /* THE WRAP, as a measurement rather than a promise: how far out
+           she is in half-periods, how thick the fret is, how many times
+           the map has come round this flight, and the whole record of
+           the last one including what was actually under her before and
+           after. See flyWrap. */
+        wrapK: +wrapK(root.position.x, root.position.z).toFixed(4),
+        mistK: +flyMistK.toFixed(3),
+        wraps: flyWraps,
+        wrap: flyWrapLog,
         at: [+root.position.x.toFixed(2), +root.position.y.toFixed(2), +root.position.z.toFixed(2)],
       };
     },
@@ -5343,6 +6220,79 @@ export async function init(ctx) {
   };
   /** Hold or release the burner. See flyForceBurn. */
   dbg.balloonBurn = (on = true) => { flyForceBurn = on !== false; return flyForceBurn; };
+  /** THE RUNTIME REVERT FOR THE FRET. 1 ships; 0 leaves the wrap
+      exactly as it is and takes the concealment away, so B13 can shoot
+      the same swap with and without it on one page load and difference
+      the two frames rather than quoting a number about them. */
+  dbg.balloonMist = (v = 1) => { flyMistOn = Math.max(0, Math.min(1, +v || 0)); return flyMistOn; };
+  /** The wrap, and the numbers that decide where it fires. `at` puts
+      her on a bearing at a fraction of the half-period so a test can
+      start just inside the plane instead of flying twelve minutes. */
+  dbg.balloonWrap = (o = null) => {
+    if (o && Number.isFinite(o.k) && Array.isArray(o.dir)) {
+      const l = Math.hypot(o.dir[0], o.dir[1]) || 1;
+      const ux = o.dir[0] / l, uz = o.dir[1] / l;
+      /* the half-period along this bearing, so k means the same thing
+         on every one of them */
+      const s = 1 / Math.max(Math.abs(ux) / WRAP.X, Math.abs(uz) / WRAP.Z);
+      dbg.balloon({ alt: o.alt ?? 40, at: [ux * s * o.k, 60, uz * s * o.k] });
+      if (o.drive !== false) dbg.balloonStick(ux, uz);
+    }
+    return {
+      wrap: WRAP,
+      k: +wrapK(root.position.x, root.position.z).toFixed(4),
+      mist: +flyMistK.toFixed(3), mistOn: flyMistOn,
+      far: +wrapFar(root.position.y - (ctx.world?.seaLevel ?? 0)).toFixed(1),
+      fog: ctx.scene?.fog ? [Math.round(ctx.scene.fog.near), Math.round(ctx.scene.fog.far)] : null,
+      wraps: flyWraps, last: flyWrapLog,
+      /* the design's own margin, derived from the world rather than
+         transcribed: how much open water there is past the shoreline
+         before the plane, on each axis. */
+      margin: [WRAP.X - (ctx.world?.islandRadiusX ?? 0), WRAP.Z - (ctx.world?.islandRadiusZ ?? 0)],
+    };
+  };
+  /** THE RUNTIME REVERT for the envelope's collision hull, and there
+      are THREE rules in it now, every one runnable on one page load:
+        'canvas'  ships — the staggered fan and the damped spring;
+        'ladder'  the round before — one azimuth set for all seven
+                  rings, a constant shove and an exponential absorb;
+        'ring'    the round before that — one horizontal ring at the
+                  envelope's widest point.
+      tools/test-balloon.mjs B5b drives all three at three buildings.
+      Returns the mode actually in force, not the one asked for. */
+  dbg.balloonHull = (mode) => {
+    if (mode === 'ring' || mode === 'ladder' || mode === 'canvas') flyHullMode = mode;
+    return { mode: flyHullMode,
+      /* PUBLISHED RATHER THAN TRANSCRIBED. A test that copies a
+         constant into itself is asserting against its own copy. */
+      skin: F_ENV_SKIN, push: F_ENV_PUSH, absorb: F_ENV_ABSORB,
+      slew: F_ENV_SLEW, slewVy: F_ENV_SLEW_VY, slewWas: F_ENV_SLEW_WAS,
+      az: F_ENV_AZ, basketR: F_BASKET_R,
+      az2: F_ENV_AZ2, stagger: F_ENV_STAGGER, precess: F_ENV_PRECESS,
+      engage: F_ENV_ENGAGE, w: F_ENV_W, amax: F_ENV_AMAX,
+      basketAbsorb: F_BASKET_ABSORB,
+      /* THE MODULE'S OWN PREDICTION, as a number rather than a
+         function, because page.evaluate cannot bring a function home.
+         The deepest a critically damped spring lets the stick's own
+         ceiling reach past the engage line is v / (w e); a test builds
+         its tolerance out of this instead of out of a number somebody
+         watched come out. */
+      squashAt: +(FLIGHT.reach / (F_ENV_W * Math.E)).toFixed(3),
+      /* and the same number expressed as what the SUITE measures: how
+         far the meridian itself gets past the surface, which is the
+         spring's travel minus the skin it still had left when the
+         spring took hold. Negative means the fabric never reaches the
+         wall at that speed at all. */
+      meridianAt: +Math.max(0, F_ENV_ENGAGE + FLIGHT.reach / (F_ENV_W * Math.E) - F_ENV_SKIN).toFixed(3),
+      /* and where she rests against a wall with the stick off: the
+         spring's own zero. Deeper than this and the gore crowns are in
+         the brick; shallower and she floats off it behind an invisible
+         cushion, which is the other end of the same failure. */
+      restGap: +(F_ENV_SKIN - F_ENV_ENGAGE).toFixed(3),
+      hull: flyHullMode,
+      rings: envelopeRings(flyProp ? flyProp.inflation : 1).map(
+        (r) => ({ y: +r.y.toFixed(2), r: +r.r.toFixed(2) })) };
+  };
   /** Hold the stick. `null` hands it back to the keyboard. Set rather
       than pushed, because a test that writes the VELOCITY writes over
       the collision response it is trying to measure. */

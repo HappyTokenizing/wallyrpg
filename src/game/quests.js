@@ -240,16 +240,45 @@ export function createQuests(env) {
      nothing, and is loud about it in a small way — a place found by
      walking is the reward for walking. Returns the location record if
      this call is what found it, else null. */
-  function discover(locId, how = 'proximity') {
+  /* `opts.quiet` suppresses the toast and the phone message and
+     NOTHING ELSE — the 'discover' and 'unlock' events still go out
+     per place, because the world module lights each building up
+     individually and a batched event would leave twenty-three of
+     them dark.
+
+     It exists for the balloon. One hover at two hundred metres
+     resolves most of the island at once, and twenty-four toasts
+     queued three at a time behind a fourteen-deep buffer is not a
+     view, it is a punishment. game.sense() batches the words into
+     one line and one message; see the air branch there. */
+  function discover(locId, how = 'proximity', opts = {}) {
     const st = S();
     const l = LOC_BY_ID[locId];
     if (!l || st.known[l.id]) return null;
     st.known[l.id] = true;
     st.found[l.id] = true;
     const acc = accessInfo(l.id);
-    M().note('token', 'Discovered ' + l.n);
-    M().msg('City Guide', 'You found ' + l.n + ' in ' + ZONES[l.z].n + ' by walking past it. '
-      + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why)));
+    /* HOW YOU FOUND IT IS PART OF FINDING IT. 'by walking past it' is
+       the only sentence this ever said, and from a balloon at two
+       hundred metres it was simply untrue — the Assessor's whole
+       point is that you have not walked anywhere. See AIRVIEW in
+       data.js and game.sense(). */
+    const air = how === 'air';
+    if (opts.quiet) {
+      bus.emit('sfx', { name: 'discover' });
+      bus.emit('discover', {
+        location: l.id, name: l.n, zone: l.z, zoneName: ZONES[l.z].n,
+        how, access: acc.ok, why: acc.ok ? null : acc.why, need: acc.need,
+      });
+      bus.emit('unlock', { key: 'location', location: l.id, zone: l.z, how, quiet: true });
+      return l;
+    }
+    M().note('token', (air ? 'Spotted ' : 'Discovered ') + l.n);
+    M().msg('City Guide', air
+      ? 'You picked ' + l.n + ' out of ' + ZONES[l.z].n + ' from the basket, by its roof. '
+        + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why))
+      : 'You found ' + l.n + ' in ' + ZONES[l.z].n + ' by walking past it. '
+        + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why)));
     /* THE SMALL REWARD. Its own sound and its own sting rather than
        the generic 'unlock' chime, so finding a place on foot does not
        sound like buying a wallet upgrade. The unlock event still goes

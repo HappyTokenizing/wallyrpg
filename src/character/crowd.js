@@ -75,12 +75,18 @@ export class HumanAnim {
     this.walkPhase = rng() * Math.PI * 2;
 
     this.mode = 'idle';
-    this.w = { walk: 0, run: 0, talk: 0, sit: 0, work: 0, wave: 0 };
+    this.w = { walk: 0, run: 0, talk: 0, sit: 0, work: 0, wave: 0, point: 0 };
     this.speed = 0;
     this.turn = 0;
     this.rootY = 0;
     this.lookTarget = null;
     this.lookW = 0;
+    /* 0..1, written from outside (npc.js's balloon pass). A separate
+       field rather than a `mode`, because pointing at something is
+       done WHILE walking, standing, working or talking — it is a limb,
+       not a state, and routing it through `mode` would have cost the
+       crowd its walk cycle for the duration. */
+    this.pointW = 0;
     this.headYaw = 0;
     this.headPitch = 0;
     /* idle "life": a slow random walk of glance targets so a standing
@@ -127,6 +133,7 @@ export class HumanAnim {
     W.sit = damp(W.sit, m === 'sit' ? 1 : 0, 4.5, dt);
     W.work = damp(W.work, m === 'work' ? 1 : 0, 4.5, dt);
     W.wave = damp(W.wave, m === 'wave' ? 1 : 0, 7, dt);
+    W.point = damp(W.point, this.pointW, 4.2, dt);
 
     this.speed = damp(this.speed, loco?.speed || 0, 8, dt);
     this.turn = damp(this.turn, loco?.turn || 0, 6, dt);
@@ -162,16 +169,30 @@ export class HumanAnim {
       const yaw = Math.atan2(Math.sin(local), Math.cos(local));
       const pitch = -Math.atan2(_v2.y, Math.hypot(_v2.x, _v2.z));
       wantYaw = lerp(wantYaw, clamp(yaw, -1.15, 1.15), this.lookW);
-      wantPitch = lerp(wantPitch, clamp(pitch, -0.45, 0.45), this.lookW);
+      /* THE UP CLAMP IS NOT THE DOWN CLAMP. ±0.45 rad was enough for
+         everything the crowd was ever asked to look at — another
+         person, at eye height, a few metres away — and it is nowhere
+         near enough for the one thing worth craning at, which is a hot
+         air balloon sixty metres over the roofs. A head that stops at
+         26° reads as a person glancing at a first-floor window. Down
+         is left where it was: nothing in this city is worth stooping
+         at, and a deep downward look on a walking figure reads as
+         somebody being sick. */
+      wantPitch = lerp(wantPitch, clamp(pitch, -0.70, 0.45), this.lookW);
     }
     this.headYaw = damp(this.headYaw, wantYaw, 6, dt);
     this.headPitch = damp(this.headPitch, wantPitch, 6, dt);
+    if (W.point > 0.002) this.point(e, W.point);
     /* the chest takes a third of a big turn — a head that swivels alone
-       on a fixed body is the single most robotic thing an NPC can do */
+       on a fixed body is the single most robotic thing an NPC can do —
+       and, for the same reason, a share of the pitch: you do not look
+       at the sky with your neck, you lean back into it. */
     e[B.head * 3 + 1] += this.headYaw * 0.72;
     e[B.head * 3 + 0] += this.headPitch;
     e[B.chest * 3 + 1] += this.headYaw * 0.20;
+    e[B.chest * 3 + 0] += this.headPitch * 0.26;
     e[B.spine * 3 + 1] += this.headYaw * 0.08;
+    e[B.spine * 3 + 0] += this.headPitch * 0.12;
 
     this.apply();
   }
@@ -322,6 +343,46 @@ export class HumanAnim {
     e[f * 3 + 0] = lerp(e[f * 3 + 0], -0.22, w);
     e[B.chest * 3 + 2] += -0.07 * s * w;
     e[B.chest * 3 + 1] += 0.06 * s * w;
+  }
+
+  /**
+   * Pointing at whatever the head is already looking at.
+   *
+   * THIS EXISTS BECAUSE A NECK IS NOT VISIBLE FROM A BALLOON. The
+   * craning look-at below is the right gesture and it is the read at
+   * six metres; at the distance the flight camera actually frames the
+   * street — measured, 60 to 160 m, where a person is 9 to 15 pixels
+   * tall — a forty-degree head tilt moves the top of a two-pixel skull
+   * by a fraction of a pixel and is, correctly, invisible. An arm
+   * raised above the shoulder line changes the SILHOUETTE, and the
+   * silhouette is all there is left at fifteen pixels.
+   *
+   * So it is aimed off the head's own solved angles rather than
+   * re-solving the target: the arm goes where the face goes, which is
+   * the only version of this that cannot disagree with itself.
+   */
+  point(e, w) {
+    const a = this.handed > 0 ? B.armR0 : B.armL0;
+    const f = this.handed > 0 ? B.armR1 : B.armL1;
+    const s = this.handed;
+    /* headPitch is NEGATIVE looking up (it is added straight onto the
+       head's X euler), so this is 0 at the horizon and ~0.70 at the
+       clamp. A point at the horizon is a point at a person; a point at
+       0.70 is an arm past vertical. */
+    const up = clamp(-this.headPitch, 0, 0.75);
+    e[a * 3 + 0] = lerp(e[a * 3 + 0], -(1.02 + up * 1.15), w);
+    /* clear of the head, and swinging with it — an arm that points
+       dead ahead while the face is 60 degrees off is a shop dummy */
+    e[a * 3 + 2] = lerp(e[a * 3 + 2], -0.34 * s, w);
+    e[a * 3 + 1] = lerp(e[a * 3 + 1], this.headYaw * 0.55, w);
+    /* nearly straight: a bent elbow reads as a shrug at this size */
+    e[f * 3 + 0] = lerp(e[f * 3 + 0], -0.12, w);
+    e[f * 3 + 2] = lerp(e[f * 3 + 2], 0, w);
+    /* the shoulder follows the arm up, and the far one drops back —
+       both of them are half a pixel each and together they are the
+       difference between a raised arm and a stuck-on stick */
+    e[B.chest * 3 + 2] += 0.10 * s * w * (0.4 + up);
+    e[B.chest * 3 + 1] += this.headYaw * 0.10 * w;
   }
 
   sit(e, w, t) {
@@ -655,6 +716,10 @@ export function createCrowd(ctx, host) {
          eviction force stays raised after one fires */
       doorDwell: 0, parkDwell: 0, doorAt: null, probe: null,
       dk: 0, dkx: 0, dkz: 0, evict: 0, noPause: 0,
+      /* seconds left of "stopped in the street to look at something",
+         and the world point being looked at. Written from outside —
+         npc.js's balloon pass is the only caller. See stare() below. */
+      stare: 0, stareX: 0, stareZ: 0,
       active: true,
       lift: 0, liftT: rng() * 0.5,
     };
@@ -677,6 +742,33 @@ export function createCrowd(ctx, host) {
 
   /** Wander target, path following, separation, grounding. */
   function steer(a, dt, wally) {
+    /* ---- STOPPED IN THE STREET TO LOOK AT SOMETHING ----
+       Three or four seconds, not a mode: people stop, look, and walk
+       on. A crowd frozen for the length of a balloon flight is not a
+       city noticing a balloon, it is a city with its update loop
+       switched off — and the flight lasts minutes.
+
+       IT IS NOT A LICENCE TO STAND IN A DOORWAY. `dk` is this frame's
+       own keep-clear sample, taken at the top of update() before
+       anything moves, so somebody who stops and then drifts into a
+       threshold gives up the stare rather than the door. Everything
+       the eviction pass was built to prevent still holds; this cannot
+       manufacture a new blocker. */
+    if (a.stare > 0) {
+      a.stare -= dt;
+      if (a.dk > 0.15) { a.stare = 0; }
+      else {
+        a.speed = damp(a.speed, 0, 6, dt);
+        const sx = a.stareX - a.pos.x, sz = a.stareZ - a.pos.z;
+        if (sx || sz) {
+          const want = Math.atan2(sx, sz);
+          const dy = Math.atan2(Math.sin(want - a.yaw), Math.cos(want - a.yaw));
+          a.yaw += dy * (1 - Math.exp(-2.6 * dt));
+        }
+        a.vel.set(0, 0, 0);
+        return;
+      }
+    }
     if (a.pause > 0) {
       a.pause -= dt;
       a.speed = damp(a.speed, 0, 8, dt);
@@ -846,7 +938,12 @@ export function createCrowd(ctx, host) {
     steer(a, dt, wally);
     place(a, dt);
     const h = a.human;
-    if (a.speed > 0.15) {
+    /* `a.stare` steers the yaw itself, at the thing being looked at.
+       Without the second clause this block re-derives it from a
+       velocity the stare has just zeroed — atan2(0, 0) is 0 — and
+       everybody who stopped to watch the balloon snapped round to due
+       north over the following third of a second. */
+    if (a.speed > 0.15 && a.stare <= 0) {
       const want = Math.atan2(a.vel.x, a.vel.z);
       const dyaw = Math.atan2(Math.sin(want - a.yaw), Math.cos(want - a.yaw));
       a.turn = dyaw / Math.max(dt, 1e-3);

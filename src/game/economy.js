@@ -12,6 +12,7 @@
    Plus the two recurring drains: weekly rent and daily salaries.
    ============================================================ */
 
+import { baseWeather } from './events.js';
 import {
   CONFIG, ASSETS, ASSET_BY_ID, ASSET_BY_TICK, VENUES, VENUE_LOC, CLIENT_BY_ID, OFFICE_STAGES,
   HOME_BY_ID, EMPLOYEE_BY_ID, NEWS_POOL, WALLYNET_GOOD, WALLYNET_BAD, LOC_BY_ID,
@@ -442,16 +443,38 @@ export function createEconomy(env) {
     }
   }
 
+  /* ------------------------------------------------------------
+     TWO HEADLINES A MORNING, AND ONE OF THEM MAY HAVE BEEN TOLD TO
+     YOU YESTERDAY.
+
+     events.claimTip() returns an index into NEWS_POOL when somebody
+     stopped Wally in the street last night and turned out to be
+     worth listening to, or null when they did not. It is claimed
+     ONCE and it clears itself, so a reload cannot bank the same
+     rumour twice; settleTip() then scores the tipster against what
+     actually printed, which means a chancer who happens to be right
+     is scored right. See the block above makeTip() in events.js.
+
+     The forced item goes in FIRST and the second is rolled normally,
+     so a tip never costs the morning its other headline.
+     ------------------------------------------------------------ */
   function rollNews() {
     const st = S();
     st.news = [];
-    for (let i = 0; i < 2; i++) {
-      const n = NEWS_POOL[Math.floor(env.rng() * NEWS_POOL.length)];
-      if (st.news.some((x) => x.h === n.h)) continue;
+    const forced = env.events ? env.events.claimTip() : null;
+    const push = (n) => {
+      if (!n || st.news.some((x) => x.h === n.h)) return;
       st.news.push({ h: n.h, t: n.t, a: n.a, e: n.e });
       st.trend[n.a] = (st.trend[n.a] || 0) + n.e * 0.5;
       st.prices[n.a] = clampPrice(n.a, price(n.a) * (1 + n.e * 0.4));
+    };
+    if (forced != null && NEWS_POOL[forced]) push(NEWS_POOL[forced]);
+    while (st.news.length < 2) {
+      const before = st.news.length;
+      push(NEWS_POOL[Math.floor(env.rng() * NEWS_POOL.length)]);
+      if (st.news.length === before) break;          // duplicate; do not spin
     }
+    env.events?.settleTip(st.news);
     bus.emit('news', st.news);
   }
 
@@ -483,7 +506,15 @@ export function createEconomy(env) {
     st.day++;
     st.stats.daysPlayed++;
     st.time = CONFIG.dayStartMin;
-    st.weather = env.rng() < 0.22 ? 'rain' : 'clear';
+    /* THE ORDINARY MORNING'S SKY. One draw, here, where it has always
+       been — but it used to produce 'rain' or 'clear', two names in a
+       vocabulary nothing in the codebase could read, while
+       src/world/weather.js sat there with clear/cloudy/rain/storm, a
+       wet-surface signal, gusting wind and lightning whose only caller
+       was a debug hook. events.js names the draw now (baseWeather),
+       a day condition may override it with its own weather, and
+       game.js hands the result to ctx.sky.setWeather(). */
+    st.weather = baseWeather(env.rng());
 
     rollPrices();
     rollNews();

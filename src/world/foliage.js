@@ -342,10 +342,29 @@ export async function init(ctx) {
   const noise = makeNoise(0x0f01a6e);
   const BEACH = W.beachWidth ?? 26;
 
-  /** 0..1 "this is planted turf". Sea, sand, cliff and road are 0. */
+  /* AND THE PAVEMENT IS 0 TOO.
+
+     world/ground.js lays a kerb, a gutter and a footway along every
+     street in the built-up part of the island, and a desire path across
+     every junction corner. Grass grew there because nothing had ever
+     told it not to; after that pass it grows there and is then hidden
+     under stone, which is the most expensive way to draw nothing.
+
+     This is the saving that pays for the floor. It is looked up in a
+     sparse 0.25 m map (see ground.js) — a hash get, once per TUFT, in a
+     function that already costs several heightfield taps.
+
+     ctx.city boots before ctx.foliage (main.js's order) so this is
+     always there; the guard is for the scene-lab pages that build a
+     foliage layer with no city under it. */
+  const cityPaved = ctx.city?.pavedAt || null;
+
+  /** 0..1 "this is planted turf". Sea, sand, cliff, road and pavement
+      are 0. */
   function turf(x, z) {
     const h = W.heightAt(x, z);
     if (h < 0.85) return 0;
+    if (cityPaved && cityPaved(x, z)) return 0;
     let a = smoothstep(BEACH * 0.42, BEACH * 1.05, W.shoreDistAt(x, z));
     if (a <= 0.001) return 0;
     a *= 1 - smoothstep(0.26, 0.58, W.slopeAt(x, z));
@@ -435,6 +454,12 @@ export async function init(ctx) {
     ctx, world: W, quality: q,
     CHUNK, GRASS_DIST, DENS, BEACH,
     turf, clump, blocked, clearance, groundColorAt, noise,
+    /* exact, per-tuft. turf() feeds a 2 m lattice that grass.js
+       interpolates, and a 1.5 m footway on a 2 m lattice is a smear
+       rather than an edge: it thins the grass either side of the kerb
+       and still lets blades through the flags. This is the same map
+       asked point-blank, once per tuft. */
+    paved: cityPaved,
     patch, noBackflip, folUniforms, allowedAt, lin, mixHex,
     uPlayer, uWindK,
     rngFor: (name) => ctx.makeRng('wally.foliage.' + name),

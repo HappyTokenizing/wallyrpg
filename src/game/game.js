@@ -174,13 +174,16 @@ import DATA, {
   HOME_BY_ID, HOMES, EMPLOYEE_BY_ID, EMPLOYEE_POOL, IPOS, IPO_STEPS, STADIUM_STEPS,
   ASSETS, ASSET_BY_ID, CLIENT_BY_ID, MORNING_NOTES, fare, worldDistance,
   RACE, PRODUCERS, SLATE_MEAL, repProgress, hops as hopsBetween,
-  DISCOVER, FIRST_ORDER, isFastTravel, strideCost,
+  DISCOVER, FIRST_ORDER, isFastTravel, strideCost, AIRVIEW,
 } from './data.js';
 import { newState, createState, mulberry32, hashStr, clamp, round2 } from './state.js';
 import { createEconomy } from './economy.js';
 import { createClients } from './clients.js';
 import { createQuests } from './quests.js';
 import { createSave } from './save.js';
+/* THE CITY DOING SOMETHING TO YOU — day conditions, encounters, the
+   rumour ledger and the view from the balloon. See events.js. */
+import { createEvents } from './events.js';
 
 /* Walking used to be computed here from the real 3D distance at 1.55 m/s,
    which made crossing the whole island a nine-minute stroll: the island is
@@ -215,6 +218,15 @@ export function createGame(opts = {}) {
   const env = {
     data: DATA,
     bus, rng, makeRng,
+    /* THE WORLD SEED, by name, so a submodule can open its own
+       deterministic stream that still differs between playthroughs.
+       makeRng() hashes a string and knows nothing about opts.seed, so
+       makeRng('events') alone would hand every save in existence the
+       same weather and the same encounters in the same order — which
+       is exactly what it did until tools/test-encounters.mjs ran forty
+       seeded games and got forty identical mornings. See
+       createEvents(). */
+    seed: opts.seed ?? 0x5eed1e,
     state: null,
     setState(s) { env.state = s; },
     officeLoc: () => (env.state && env.state.office >= 1 ? 'office' : 'apartment'),
@@ -226,6 +238,7 @@ export function createGame(opts = {}) {
   env.clients = createClients(env);
   env.quests = createQuests(env);
   env.save = createSave(env);
+  env.events = createEvents(env);
 
   const S = () => env.state;
   const M = env.mutate;
@@ -233,6 +246,7 @@ export function createGame(opts = {}) {
   const clients = env.clients;
   const quests = env.quests;
   const saveSys = env.save;
+  const events = env.events;
 
   let autosaveAt = 0;
   let lastHour = -1;
@@ -385,6 +399,13 @@ export function createGame(opts = {}) {
        hold in your head, and he slept. */
     clearRoute(collapsed ? 'he fell asleep at the desk' : 'a new day');
     const income = econ.newDay();
+    /* WHAT THE CITY IS DOING TODAY — weather, a strike, a festival, a
+       power cut, or nothing at all, which is most mornings. It runs
+       AFTER econ.newDay() because it needs the new day number and the
+       expired-order sweep (a condition may not shut a door an order
+       due now is filled at), and BEFORE the 'day' event so anybody
+       listening for the morning already has the morning's facts. */
+    const cond = events.rollDay();
     M.addHunger(collapsed ? 24 : 11);
     if (st.loan > 0) M.pay(-Math.max(4, Math.round(st.loan * 0.02)), 'loan interest');
     /* The desk is cleared every morning — yesterday's walk-ins have
@@ -415,7 +436,7 @@ export function createGame(opts = {}) {
     quests.milestones();
     quests.check();
     lastHour = -1;
-    bus.emit('day', { day: st.day, weather: st.weather, income });
+    bus.emit('day', { day: st.day, weather: st.weather, income, today: cond ? cond.id : null });
     return income;
   }
 
@@ -425,11 +446,27 @@ export function createGame(opts = {}) {
   const here = () => LOC_BY_ID[S().loc];
   const officeLoc = env.officeLoc;
 
+  /* ------------------------------------------------------------
+     …AND WHAT THE CITY IS DOING TODAY.
+
+     This is the ONE place a day condition (events.js) reaches the
+     rest of the game. isOpen() is already the single authority that
+     travel(), enter(), gate(), gateAct() and economy.tradeGate()
+     all consult, so a shut dock is shut to the fare board, to the
+     door in the 3D world, to the job counter and to the Places app
+     without another line anywhere. A condition may push a closing
+     hour OUT as well (the festival keeps the farm open until 23:00),
+     and it may never touch a trading venue — see canRun() in
+     events.js for that rule and the two guards beside it.
+     ------------------------------------------------------------ */
   function isOpen(locId, atMin) {
     const l = LOC_BY_ID[locId];
     if (!l) return false;
     const hour = Math.floor((atMin == null ? S().time : atMin) / 60) % 24;
-    return hour >= l.hours[0] && hour < l.hours[1];
+    if (events.shut(locId, atMin).shut) return false;
+    const until = events.openUntil(locId);
+    const close = until != null ? Math.max(l.hours[1], until) : l.hours[1];
+    return hour >= l.hours[0] && hour < close;
   }
   const known = (locId) => quests.knows(locId);
   const visibleLocations = () => DATA.locations.filter((l) => quests.knows(l.id));
@@ -465,15 +502,28 @@ export function createGame(opts = {}) {
     const hour = Math.floor((atMin == null ? S().time : atMin) / 60) % 24;
     let opensIn = 0;
     if (!open) opensIn = (l.hours[0] - hour + 24) % 24;
+    /* WHAT THE CITY IS DOING TO THIS DOOR TODAY. The Places app draws
+       `label` beside every building, and on a strike day "closed ·
+       opens at 05:00" is true of the timetable and a lie about the
+       morning — the player walks across the island to a gate nobody
+       is opening. A condition that shuts a door says so here, and one
+       that holds a door open late says that too. */
+    const cond = events.shut(locId, atMin);
+    const late = events.openUntil(locId);
+    const closes = late != null ? Math.max(l.hours[1], late) : l.hours[1];
     return {
-      id: l.id, n: l.n, open, always,
+      id: l.id, n: l.n, open, always: always && !cond.shut,
       hours: l.hours.slice(),
-      opens: hhmm(l.hours[0]), closes: hhmm(l.hours[1]),
-      span: hhmm(l.hours[0]) + '–' + hhmm(l.hours[1]),
+      opens: hhmm(l.hours[0]), closes: hhmm(closes),
+      span: hhmm(l.hours[0]) + '–' + hhmm(closes),
       opensInHours: opensIn,
-      label: always ? 'always open'
-        : open ? 'open until ' + hhmm(l.hours[1])
-          : 'closed · opens at ' + hhmm(l.hours[0]),
+      /* the condition, for a UI that wants to say more than a label */
+      today: cond.shut ? { shut: true, id: cond.id, why: cond.why }
+        : late != null ? { shut: false, lateUntil: hhmm(closes) } : null,
+      label: cond.shut ? 'shut today · ' + cond.why
+        : always ? 'always open'
+          : open ? 'open until ' + hhmm(closes) + (late != null ? ' · late today' : '')
+            : 'closed · opens at ' + hhmm(l.hours[0]),
     };
   }
   const opensAt = (locId) => (LOC_BY_ID[locId] ? hhmm(LOC_BY_ID[locId].hours[0]) : null);
@@ -481,6 +531,13 @@ export function createGame(opts = {}) {
   function closedLine(locId) {
     const l = LOC_BY_ID[locId];
     if (!l) return 'That place does not exist.';
+    /* A DOOR SHUT BY THE CITY SAYS SO. 'closed — opens at 05:00' is
+       true and useless on a strike day; the player has to be able to
+       tell the difference between a shop that is not open yet and a
+       yard nobody is opening at all. events.js hands over the reason
+       in the condition's own words. */
+    const c = events.shut(locId);
+    if (c.shut) return l.n + ' is shut today — ' + c.why;
     return l.n + ' is closed — it opens at ' + hhmm(l.hours[0]) + ' (' + openInfo(locId).span + ').';
   }
 
@@ -646,6 +703,9 @@ export function createGame(opts = {}) {
   env.hungerLine = hungerLine;
   env.isOpenLoc = isOpen;
   env.closedLine = closedLine;
+  /* events.js spends the clock through the same door every other
+     action in this file uses. */
+  env.advance = advance;
 
   /* May he go in? The one answer travel(), enter() and the HUD door
      prompt all share.
@@ -1066,6 +1126,21 @@ export function createGame(opts = {}) {
     quests.check();
     storyBeats();
     if (first) M.note('token', 'Discovered ' + LOC_BY_ID[locId].n);
+    /* AND NOBODY STOPS YOU WHEN YOU GET OFF THE METRO.
+
+       events.onPlace() is deliberately NOT called here. This is the
+       fast-travel branch: ui.js answers the 'travel' event two lines
+       up by dropping a black curtain, holding it, and landing Wally
+       at the door — so a card raised on this line would open, type
+       itself out and be answered behind a fade. It is also the wrong
+       fiction. An encounter is somebody catching you in the street,
+       and you were not in the street; you paid a fare and stepped out
+       of a station.
+
+       The ambient roll is a DAY flag (city.encArmed), not a
+       per-arrival one, so this costs a fast-travelling player nothing
+       — the same encounter is still waiting the first time he walks
+       through a door under his own steam. See enter(), below. */
     return { ok: true, moved: true, fast: !!fast, first, cost: opt.cost, mins: opt.mins, trudge: !!opt.trudge };
   }
 
@@ -1384,6 +1459,15 @@ export function createGame(opts = {}) {
     quests.check();
     storyBeats();
     if (first) M.note('token', 'Discovered ' + LOC_BY_ID[locId].n);
+    /* …AND SOMEBODY MAY BE IN THAT ROOM. This is the on-foot door —
+       he walked or rode here, ui.js raises no curtain for it (see
+       arrive(): a Wally already standing at the door returns early) —
+       and it is the ONLY thing in the codebase that calls onPlace().
+       An encounter that opened itself on a timer while the player was
+       standing still would be an interruption; one that is waiting
+       when you push a door open is an encounter. Every guard is
+       inside — see encReady() in events.js. */
+    events.onPlace(locId);
     return { ok: true, moved: true, first, routed: arrived };
   }
 
@@ -1480,8 +1564,32 @@ export function createGame(opts = {}) {
   /* THE FEED. Called with Wally's world position every frame (see
      init() below), or once with a big dt from a test. Returns the
      array of locations discovered by THIS call — usually empty. */
-  function sense(x, z, dt = 1) {
+  /* ------------------------------------------------------------
+     …AND DISCOVERY BY LOOKING, WHICH IS WHAT THE BALLOON IS FOR.
+
+     `opts.alt` is metres of clear air under the basket, fed from the
+     same 8 Hz position sample in init() below. Below AIRVIEW.min
+     (90 m) events.airRadius() returns 0 and every line here behaves
+     exactly as it did on foot. Above it the radius stops being the
+     width of a doorway and becomes the horizon — 2.6 m of island per
+     metre of altitude, capped at 560 — which is the one thing the
+     Assessor's own description has always promised, "you can see the
+     whole island at once", and never once delivered.
+
+     IT PUTS PLACES ON THE MAP AND NOTHING ELSE. quests.discover()
+     sets known/found; quests.access() is untouched, so flying over
+     the Stock Exchange leaves every one of its gates standing,
+     exactly as walking past it does.
+
+     THE WARP GUARD IS SKIPPED ALOFT, and it has to be: the guard
+     measures the ground track against a MOTORCYCLE's ceiling, and a
+     balloon launching off a rooftop reads to it as a teleport.
+     Aloft, the dwell IS the guard — AIRVIEW.dwell seconds holding
+     the same patch of island in view.
+     ------------------------------------------------------------ */
+  function sense(x, z, dt = 1, opts = {}) {
     if (!Number.isFinite(x) || !Number.isFinite(z)) return [];
+    const air = events.airRadius(opts && opts.alt);
     /* A TELEPORT IS NOT A WALK. If the position jumped further than a
        motorcycle could have travelled in this frame, the player was
        moved by fast travel or by a debug hook — drop every dwell timer
@@ -1489,24 +1597,53 @@ export function createGame(opts = {}) {
        discover what he is standing next to; he just cannot bank the
        journey he did not make. */
     const step = lastSense.has ? Math.hypot(x - lastSense.x, z - lastSense.z) : 0;
-    if (lastSense.has && step > Math.max(40, dt * 120)) dwell.clear();
+    if (!air && lastSense.has && step > Math.max(40, dt * 120)) dwell.clear();
     lastSense = { x, z, has: true };
 
     const found = [];
     for (const l of DATA.locations) {
       if (quests.knows(l.id)) { if (dwell.has(l.id)) dwell.delete(l.id); continue; }
       const d = Math.hypot(l.world.x - x, l.world.z - z);
-      const r = findRadius(l);
+      const r = air || findRadius(l);
       if (d > r + DISCOVER.hysteresis) { if (dwell.has(l.id)) dwell.delete(l.id); continue; }
       if (d > r) continue;                              // in the slack band: hold, do not count
       const t = (dwell.get(l.id) || 0) + Math.max(0, dt);
-      if (t < DISCOVER.dwell) { dwell.set(l.id, t); continue; }
+      if (t < (air ? AIRVIEW.dwell : DISCOVER.dwell)) { dwell.set(l.id, t); continue; }
       dwell.delete(l.id);
-      const hit = quests.discover(l.id, 'proximity');
+      /* ALOFT THE WORDS ARE BATCHED. Twenty-four separate "Discovered
+         X" toasts and twenty-four separate phone messages is what a
+         hover at two hundred metres produced before this line, and
+         ui/notify.js presents three at a time from a fourteen-deep
+         queue — so the reward for the most expensive machine in the
+         game was half a minute of drip. One sweep, one sentence; see
+         the air branch below and quests.discover()'s `quiet`. */
+      const hit = quests.discover(l.id, air ? 'air' : 'proximity', { quiet: !!air });
       if (hit) found.push(hit);
     }
-    if (found.length) { quests.check(); storyBeats(); }
+    if (found.length) {
+      if (air) {
+        events.firstFlightBanner();
+        /* ONE SENTENCE FOR THE WHOLE SWEEP, and it names them, because
+           "you found 24 places" is a number and the point of the
+           basket is the island. */
+        const names = found.map((l) => l.n);
+        M.note('token', names.length === 1
+          ? 'Spotted ' + names[0] + ' from the basket'
+          : names.length + ' places resolve out of the haze below you');
+        M.msg('City Guide', 'From ' + Math.round(Math.max(0, opts.alt || 0)) + ' metres you can pick out '
+          + list(names) + '. They are on your map now. Whether they will let you in is a separate question.');
+      }
+      quests.check();
+      storyBeats();
+    }
     return found;
+  }
+
+  /* 'a, b and c' — the Oxford-less serial list every batched line uses */
+  function list(a) {
+    if (!a.length) return 'nothing';
+    if (a.length === 1) return a[0];
+    return a.slice(0, -1).join(', ') + ' and ' + a[a.length - 1];
   }
   /* the world/UI may want to reset the timers (respawn, new game) */
   function resetSense() { dwell.clear(); lastSense = { x: 0, z: 0, has: false }; }
@@ -3070,6 +3207,17 @@ export function createGame(opts = {}) {
     race,
 
     /* ------------------------------------------------------------
+       THINGS THAT HAPPEN TO YOU — see src/game/events.js.
+         events.today()        the condition the city is under today
+         events.view()         all of it, for the HUD and the phone
+         events.shut(id)       is that door shut today, and why
+         events.live()         the encounter card on screen, or null
+         events.answer(id,v)   ui/dialogue.js answers through this
+         events.tipRecord()    whose word has been worth having
+       ------------------------------------------------------------ */
+    events,
+
+    /* ------------------------------------------------------------
        THE OFFICE, AS ONE OBJECT.
        What the current stage grants, what is in use, and — the point
        of the whole thing — whether it can run every upgrade at once.
@@ -3146,6 +3294,13 @@ export function createGame(opts = {}) {
         hours: openInfo(st.loc),
         /* the race, small enough to read every frame */
         race: { status: raceState(st).status, won: raceState(st).status === 'won' },
+        /* WHAT THE CITY IS DOING TODAY, small enough to read every
+           frame. `today` is null on most mornings and that is the
+           design — see EVENT_TUNING in data.js. */
+        today: events.today()
+          ? { id: events.today().id, n: events.today().n, zone: events.today().zone }
+          : null,
+        encounter: events.live() ? events.live().id : null,
         /* LEGACY: the bicycle specifically, {owned, equipped}. */
         bike: { ...st.bike },
         /* THE RIDE HE IS ON, or null if he is on his own feet. */
@@ -3273,7 +3428,13 @@ export async function init(ctx) {
        rather than once at boot so a build that never produces a
        position never claims to have a walker. */
     game.setWalker(true);
-    game.sense(p.x, p.z, step);
+    /* ALTITUDE RIDES WITH THE POSITION. ctx.wally.flightState is
+       published by character/wally.js and `alt` there is metres over
+       the SOLID under the basket (a roof counts), which is exactly
+       the number AIRVIEW wants. On foot flying is false, alt is 0,
+       and sense() takes its ordinary doorway-width radius. */
+    const fs_ = ctx.wally && ctx.wally.flying ? ctx.wally.flightState : null;
+    game.sense(p.x, p.z, step, { alt: fs_ ? fs_.alt : 0 });
     /* …and the same sample pays the road tax. Both are fed from here
        because this is the only place in the codebase that knows where
        Wally actually is — and `step` goes with the position, because
@@ -3283,6 +3444,61 @@ export async function init(ctx) {
        free. See stride(). */
     game.stride(p.x, p.z, step);
   };
+
+  /* ------------------------------------------------------------
+     THE ROPE BETWEEN THE RULES AND THE SKY.
+
+     src/world/weather.js has had clear / cloudy / rain / storm, a
+     wet-surface signal, gusting wind and lightning since the sky
+     shipped, and in this whole codebase the only caller of
+     ctx.sky.setWeather() was a debug hook. Meanwhile state.weather
+     rolled every single morning and NOTHING read it. Two working
+     halves of one feature, never introduced. This is the
+     introduction, and it is four lines.
+
+     THE RETURN VALUE IS CHECKED, and that is not defensive padding.
+     weather.js refuses an unknown name, warns, and returns FALSE —
+     and its own header records that the last rig to ignore that
+     false spent its life screenshotting a clear sky under an
+     "overcast" heading. events.js keeps state.weather inside
+     weather.js's four names (WX_NAMES) precisely so this cannot
+     drift, and if it ever does, this says so out loud rather than
+     leaving the sky quietly one storm behind the rules.
+     ------------------------------------------------------------ */
+  let skySaid = null;
+  function publishWeather(fade) {
+    const sky = ctx.sky;
+    if (!sky || typeof sky.setWeather !== 'function') return false;   // headless
+    const want = game.state.weather;
+    if (want === skySaid) return true;
+    const ok = sky.setWeather(want, fade);
+    if (!ok) {
+      console.warn('[game] the sky refused weather "' + want + '" — state.weather and '
+        + 'world/weather.js WEATHER_NAMES have drifted apart. The sky is still showing '
+        + (skySaid || 'whatever it had'));
+      return false;
+    }
+    skySaid = want;
+    return true;
+  }
+  /* A NEW DAY BRINGS ITS OWN WEATHER, over a couple of minutes rather
+     than as a cut — weather.js damps everything and "transitions take
+     minutes, never snap" is its first rule. A loaded save gets the
+     sky it saved with, immediately, because there is nothing to
+     transition from. */
+  ctx.bus.on('day', () => publishWeather(150));
+  ctx.bus.on('state', () => { skySaid = null; publishWeather(0); });
+  ctx.bus.on('ready:game', () => publishWeather(0));
+  /* …AND ONCE, NOW, WITHOUT WAITING FOR AN EVENT.
+
+     'ready:game' has already fired by this line on a cold boot —
+     bootState(true) runs inside createGame(), three lines above the
+     subscription that would have caught it. It is still worth
+     listening for (newGame() and load() both re-fire it later), but a
+     feature whose first frame depends on an event that has already
+     been and gone is exactly the class of bug this project keeps
+     shipping, so the first publish is a call and not a hope. */
+  publishWeather(0);
 
   /* Continue an existing run when there is one, unless we are taking
      a screenshot — shots must be reproducible from a fresh state. */
@@ -3347,6 +3563,40 @@ export async function init(ctx) {
     d.clearRoute = () => game.clearRoute('debug');
     d.fast = (id) => game.fares(id || game.state.loc)
       .map((f) => f.mode + (f.fast ? ' · carries you' : ' · points you') + (f.ok ? '' : ' · ' + f.why));
+    /* ---- THINGS THAT HAPPEN TO YOU (src/game/events.js) ----
+       today()        what the city is doing, or null
+       force(id)      make it do that instead, right now
+       encounter(id)  raise one by hand, wherever he is standing
+       answer(v)      answer the live card ('yes' declines nothing)
+       tips()         the rumour ledger — who has been worth having
+       air(alt)       how far you can see from that altitude          */
+    d.today = () => game.events.view().today;
+    d.forceToday = (id) => {
+      const c = game.events.city();
+      const spec = game.data.dayEventById[id];
+      if (!spec) return null;
+      c.today = {
+        id: spec.id, n: spec.n, day: game.state.day, until: game.state.day,
+        zone: spec.zone || null, wx: spec.wx || null,
+        from: Number.isFinite(spec.from) ? spec.from : 0,
+        shut: (spec.shut || []).slice(),
+        open: (spec.open || []).map((o) => ({ ...o })),
+        spared: [], line: spec.line, closed: spec.closed || null,
+        title: spec.title, sub: spec.sub, first: true,
+      };
+      game.events.applyWeather(c.today);
+      /* …and tell the sky, which in play happens on the 'day' event.
+         A debug hook that changed the rules and left the sky on
+         yesterday's weather would be the exact bug this whole wiring
+         exists to close, one level up. */
+      publishWeather(0);
+      return game.events.view().today;
+    };
+    d.encounter = (id) => game.events.offer(id);
+    d.answer = (v) => game.events.answer(null, v);
+    d.tips = () => game.events.view().tips;
+    d.air = (alt) => game.events.airRadius(alt);
+
     /* THE MAYOR'S DASH, for anyone posing or testing it. */
     d.race = () => game.race.view();
     d.raceOffer = () => game.race.offer();

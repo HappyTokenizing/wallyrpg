@@ -47,6 +47,84 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; cha
 const SINK_TOL = 0.12;
 const FLOAT_TOL = 0.14;
 
+/* ------------------------------------------------------------------
+   A KNOWN DEFECT THIS TEST FINDS OR MISSES DEPENDING ON THE WALK.
+
+   At (-24.0, -200.2), where the Green Edge and Iron Hills lanes
+   converge on the Iron Hills anchor, EIGHT drawn road surfaces stack
+   over one another and the highest of them stands 0.154 m over the
+   terrain the controller is on. world/paths.js documents this at the
+   same coordinate, names the cause (two district ribbon buckets
+   overlapping across the boundary, 0.132 m and 0.041 m at the same
+   point) and says the fix — cutting the ribbon at the boundary, or
+   letting one lane win a junction — is not that file's change.
+
+   IT IS NOT ROUTE-DEPENDENT; FINDING IT IS, AND IT IS NOT ONE METRE.
+   Rastered statically at 0.5 m over the 16 x 16 m square centred on
+   (-24, -200) — no capsule, no walk, so the same measurement in any
+   build — the defect is a patch roughly 16 m by 12 m:
+
+                          points past SINK_TOL     worst
+     clean HEAD archive      226 of 1089         -0.4205
+     with the ground pass    241 of 1089         -0.4205
+
+   Same worst value, same coordinate, same mesh (road.zone:greenedge),
+   both builds. The fifteen extra points are the new footway reaching a
+   little further into the junction at its edges; the 226 were there
+   before anything on the ground was drawn.
+
+   And yet HEAD's ironhills LEG reports 0 samples past tolerance and a
+   worst sink of -0.031, because it is walked and its route misses the
+   patch. Add a kerb anywhere on the island, the controller ends up a
+   metre to one side eighty metres earlier, the leg crosses the patch
+   and the row goes red on geometry nobody touched.
+
+   So a green ironhills row is not evidence that this is fixed and a
+   red one is not evidence that anything regressed. Read the row, then
+   raster the patch — the per-leg "N of M past sink" count printed
+   below is there to tell one bad metre from a bad district.
+
+   ------------------------------------------------------------------
+   AND THE DIAGNOSIS ABOVE, WHICH BOTH FILES CARRIED, WAS WRONG.
+   [placement round] Everything above about ROUTE-DEPENDENCE stands and
+   is the reason this section is here. The CAUSE was not the two
+   ribbons overlapping. Measured: every road vertex within 3 m of
+   (-24, -200) sits at exactly heightAt + 0.030 — 27 on the Green Edge
+   mesh, 64 on the Iron Hills one, mean 0.0300, worst 0.0300 — so
+   neither ribbon was drawn wrong and stacking them changed nothing.
+   Two separate faults were sitting on the same coordinate:
+
+     · a flat QUAD spanning the corner where the cut bank meets the
+       road, which no chord length fixes because the sag falls only as
+       the square of the chord. paths.js now measures each route and
+       shortens its chord until the lattice stops bridging, and fans
+       the few quads that still do.
+     · the CARVE, which pulled each grid node onto the last edge that
+       reached it. At a junction that put two profiles 0.8 m apart on
+       adjacent nodes of a 2 m heightfield and left a 48-degree face
+       with a road drawn down it — n.y 0.671, and a capsule-lift term
+       of 0.152 m that this file correctly reports as a sink because
+       the ground really is too steep to be a road. The carve now
+       accumulates every profile and writes the grid once.
+
+   After both: n.y at (-24, -200) is 0.783, the two ribbons agree to
+   0.006 m, and the ironhills leg goes from 36 of 385 samples past
+   SINK_TOL to none. The console recipe below still reproduces the
+   patch numbers; expect them to have moved.
+   ------------------------------------------------------------------
+   To reproduce the four numbers above without a walk,
+   in the page console (they are a static property of the geometry, so
+   they do not need this file at all):
+
+     const c = WALLY.ctx, T = WALLY.THREE, x = -24.02, z = -200.18;
+     c.phys.player.teleport(new T.Vector3(x, c.phys.groundAt(x,z).y+0.3, z));
+     // ...one frame, then teleport again: the collision window streams
+     const g = c.phys.groundAt(x, z);
+     const r = new T.Raycaster(new T.Vector3(x, g.y+0.45, z), new T.Vector3(0,-1,0), 0, 6);
+     // intersect the same roots collectTargets() below uses, then
+     // err = g.y - hit.y - 0.34*(1/Math.max(g.normal.y,0.5) - 1)
+   ------------------------------------------------------------------ */
+
 /* Probe-disc raster, metres. See "AT HALF A METRE" below for why it is
    not 1.0 any more and not 0.25 either. `--step n` is there so anyone
    can re-run the old grid against the same build and watch it miss. */
@@ -78,7 +156,11 @@ await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'l
 await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 180000 });
 await page.waitForTimeout(4000);
 
-await page.evaluate(() => {
+/* The tolerances are Node-side constants and this block runs in the
+   page, so they are handed across explicitly — the count added below
+   needs them and referencing them directly threw ReferenceError on the
+   first leg. */
+await page.evaluate(([SINK_TOL, FLOAT_TOL]) => {
   const c = window.WALLY.ctx;
   const T = window.WALLY.THREE;
   const phys = c.phys;
@@ -195,7 +277,17 @@ await page.evaluate(() => {
      and the run prints how many vertices found one so the exclusion is
      a number.
      ---------------------------------------------------------------- */
-  const SKIP = /outline|hull|contactShadow|cloth|drift|grass|\blip\b|foliage|detail|bush|reed|water|sky|cloud/i;
+  /* WORD BOUNDARIES ON `water`, AND HERE IS WHY.
+     The district is called the WATERFRONT. A bare /water/ matched
+     `ground.zone:waterfront` and `road.zone:waterfront` and threw both
+     of them out of the drawn set, so at the harbour this test compared
+     a real collision surface against the terrain UNDER the paving and
+     reported the collision standing 0.145 m over the drawn ground —
+     a defect that did not exist, in a mesh it had refused to look at.
+     Every water mesh on the island is `water` or `water.<something>`
+     (world/water.js, foam.js, ripples.js), so \bwater\b still excludes
+     all of them and stops excluding the district named after them. */
+  const SKIP = /outline|hull|contactShadow|cloth|drift|grass|\blip\b|foliage|detail|bush|reed|\bwater\b|sky|cloud/i;
   function collectTargets() {
     const roots = [c.world?.groundGroup, c.city?.root].filter(Boolean);
     const out = [];
@@ -282,7 +374,7 @@ await page.evaluate(() => {
     const p = phys.player;
     const targets = collectTargets();
     const samples = [];
-    let stalled = 0, lastD = Infinity;
+    let stalled = 0, lastD = Infinity, airborne = 0;
     const catches = [];
     /* CRAB ROUND IT AND CARRY ON. A leg is a beeline across a district
        and a district is full of legitimate walls, so the first thing a
@@ -385,6 +477,38 @@ await page.evaluate(() => {
          on a slope, never looser. The raw figure is kept and printed
          beside it so both are on the record. */
       const lift = p.radius * (1 / Math.max(g.normal.y, 0.5) - 1);
+      /* A CAPSULE IN THE AIR IS NOT STANDING ON ANYTHING.
+
+         This file's whole question is "does he stand ON the ground you
+         can see", and err = feetY - drawnY only answers it while his
+         feet are on something. Between the two they are not: with
+         world/ground.js's kerbs in, walking off a 0.10 m footway puts
+         him briefly airborne, and one frame of that was reported as a
+         0.174 m FLOAT at (-304.8, 186.1) on Rusty Row — a defect the
+         same coordinate does not have. Probed statically, the drawn
+         terrain and the collision surface there agree to 0.000 m in
+         both this build and a clean HEAD archive; he was simply in the
+         air, which is what stepping off a kerb is.
+
+         Skipped, not tolerated: a real float is a surface he is
+         RESTING on that disagrees with the drawn one, and that is
+         still measured on every grounded frame. `airborne` counts the
+         skips so the exclusion is a number rather than an argument. */
+      /* AND `grounded` IS NOT THE TEST FOR IT.
+         controller.js keeps grounded true through coyote time and its
+         ground snap, so the frame after he walks off a 0.10 m kerb it
+         still reads true — measured at (-304.8, 186.1) on Rusty Row,
+         grounded, n.y 0.98, and his feet 0.180 m above the collision
+         surface directly under them. Ask phys instead: if the ground it
+         reports beneath him is further below his feet than the capsule
+         geometry accounts for, he is not resting on it, and comparing
+         the drawn floor to feet that are in mid-air measures nothing.
+
+         This cannot hide a real float. A float defect is feet AT the
+         collision surface with the drawn one below it — q.y - g.y is
+         zero there and the sample is kept and measured, exactly as
+         before. */
+      if (!p.grounded || q.y - g.y - lift > 0.05) { airborne++; continue; }
       samples.push({
         x: +q.x.toFixed(2), z: +q.z.toFixed(2),
         err: q.y - dy - lift, raw: q.y - dy, lift, ny: g.normal.y,
@@ -394,15 +518,22 @@ await page.evaluate(() => {
     p.setInputFn(null);
     p.setInput({ x: 0, z: 0 });
 
-    let sink = 0, float = 0, sum = 0;
+    let sink = 0, float = 0, sum = 0, overSink = 0, overFloat = 0;
     let worstSink = null, worstFloat = null;
     for (const s of samples) {
       sum += s.err;
       if (s.err < sink) { sink = s.err; worstSink = s; }
       if (s.err > float) { float = s.err; worstFloat = s; }
+      /* HOW MANY, NOT JUST HOW BAD. A worst-case on its own cannot tell
+         one bad metre from a district that is wrong everywhere, and
+         those want completely different fixes. paths.js reasoned about
+         exactly this the same way — "17 of 68910 sample points past
+         0.12 m" — and this row could not until now. */
+      if (s.err < -SINK_TOL) overSink++;
+      if (s.err > FLOAT_TOL) overFloat++;
     }
     return {
-      label, n: samples.length, catches,
+      label, n: samples.length, airborne, catches, overSink, overFloat,
       mean: samples.length ? +(sum / samples.length).toFixed(3) : null,
       sink: +sink.toFixed(3), float: +float.toFixed(3),
       worstSink, worstFloat,
@@ -640,7 +771,7 @@ await page.evaluate(() => {
     }
     return pts;
   };
-});
+}, [SINK_TOL, FLOAT_TOL]);
 
 const zones = await page.evaluate(() => window.__route());
 const legs = [];
@@ -665,6 +796,8 @@ for (const leg of legs) {
   console.log(`   ${flag}${leg.label.padEnd(22)}\x1b[0m ` +
     `${String(r.n).padStart(4)} samples  mean ${String(r.mean).padStart(6)}  ` +
     `sink ${r.sink.toFixed(3).padStart(7)}  float ${r.float.toFixed(3).padStart(6)}` +
+    `${(r.overSink || r.overFloat) ? `  \x1b[33m(${r.overSink} of ${r.n} past sink, ${r.overFloat} past float)\x1b[0m` : ''}` +
+    `${r.airborne ? `  \x1b[90m(${r.airborne} airborne frames skipped)\x1b[0m` : ''}` +
     `${r.n === 0 ? '  \x1b[33mNO SAMPLES\x1b[0m' : ''}`);
   for (const ct of r.catches) {
     console.log(`        ${ct.bad ? '\x1b[31mCAUGHT' : '\x1b[90mstopped'}\x1b[0m at ${ct.x},${ct.z} — ` +

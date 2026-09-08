@@ -1225,12 +1225,36 @@ function formStall(ctx, K, loc, S, rng, meta) {
   K.add('wood', boxRound(w + 0.52, 0.20, 0.18, 0.06, 1), TRS(0, porchH + 0.04, pz + 0.30), shadeHex(S.trim, 0.86));
   K.add('metal', cyl(0.09, 0.09, w + 0.5, 7, false), TRS(0, porchH - 0.10, pz + 0.38, 0, 1, 1, 1, 0, PI / 2), S.roofAlt);
 
-  /* the canvas valance hung off the porch beam — the wind carrier */
+  /* the canvas valance hung off the porch beam — the wind carrier.
+
+     IT HANGS. IT IS NOT STRETCHED, AND IT WAS PINNED TO NOTHING.
+     city.js's makeCloth treats kind 'awning' as a panel stretched over
+     a frame and pins its BOTTOM row as well as its top (`stretched`,
+     city.js). Every other awning in this file earns that: their `down`
+     is (0, -0.34, 1), they lean out over the pavement, and each one
+     draws a real front rail for the canvas to reach — see the shopfront
+     awning and the brise-soleil sunshade. This one has `down` almost
+     straight at the floor and there is no rail under it, so its lower
+     edge was pinned in mid-air. Photographed from the street at the
+     noodle cart it is not a valance at all: it is a flat, taut sheet of
+     canvas 1.25 m deep hanging from 2.16 m to 0.95 m across the entire
+     frontage — below the top of a barrel — and behind it the trestle
+     counter, the serving hatches, the goods and (this round) the cat
+     are all simply not visible from the street. Every stall in the game
+     was shut.
+
+     So it hangs from its top edge like the bunting under it, and it is
+     a VALANCE: deep enough to read as canvas and to move, short enough
+     that the shopfront it is nailed above is the thing you look at.
+     0.52 m puts its hem at 1.70 m on the noodle cart and 2.70 m on the
+     market hall, which is the height a real one is cut to — above the
+     head of the person being served. Three rows instead of six, which
+     is also three fewer solver rows on every stall in the city. */
   meta.cloths.push({
-    kind: 'awning',
+    kind: 'valance',
     origin: new THREE.Vector3(-w * 0.42, porchH - 0.34, pz + 0.20),
     right: new THREE.Vector3(1, 0, 0), down: new THREE.Vector3(0, -1, 0.26).normalize(),
-    width: w * 0.84, height: 1.25, cols: 12, rows: 6, pin: 'top',
+    width: w * 0.84, height: 0.52, cols: 12, rows: 3, pin: 'top',
     color: pick(rng, S.fabric),
   });
   if (S.feat.bunting) {
@@ -1259,6 +1283,28 @@ function formStall(ctx, K, loc, S, rng, meta) {
   for (let i = 0; i < 4; i++) {
     K.add('wood', boxRound(0.10, 0.84, 0.10, 0.03, 1), TRS(-w * 0.32 + (w * 0.64 * i) / 3, 0.44, cz + 0.46), shadeHex(S.trim, 0.85));
   }
+  /* PUBLISHED, BECAUSE SOMETHING ELSE HANGS OFF IT.
+     life.js's one cat sat on a shelf it worked out from loc.size.d/2 —
+     the PLOT edge — which on this form is 1.8 m of open veranda in
+     front of the wall and 0.3 m in front of the post line, so the
+     shelf and the cat stood in the street on two stub legs with
+     nothing behind them. That was the floating object in the user's
+     screenshot. Nothing in `meta` described any of the surfaces this
+     form actually builds, so there was nothing else it could have
+     been measured from. These are the four lines a shelf can be hung
+     on; anything that wants one takes them from here rather than
+     re-deriving porchD from loc.size and going quietly stale the next
+     time this function changes. Face = the outward (+z) face. */
+  meta.faceZ = frontZ;
+  meta.stall = {
+    wallZ: frontZ,                 // the solid front wall of the body
+    postZ: pz, postH: porchH,      // the veranda post line and its head
+    counterZ: cz,                  // centre of the trestle counter
+    counterFace: cz + 0.43,        // its street-facing body face
+    counterTop: 1.12,              // top of the counter plank
+    counterHalfW: w * 0.35,        // its half-width, plank included
+    legs: [0, 1, 2, 3].map((i) => -w * 0.32 + (w * 0.64 * i) / 3),
+  };
 
   for (let i = 0; i < (big ? 7 : 4); i++) {
     meta.props.push({
@@ -2216,6 +2262,16 @@ export function buildLocation(ctx, loc, S, rng) {
        solve falls back to the eaves, which is right for every form
        whose whole frontage is fair game. */
     signBase: 0, signCeil: null,
+    /* THE FRONT WALL PLANE, in the building's local frame.
+       loc.size.d/2 is the PLOT edge and on most forms the facade is on
+       it, so that is the default — but formStall keeps 1.8-3.4 m of
+       open veranda in front of its wall, and world/life.js was hanging
+       pigeons, nests, window boxes and a cat's shelf on the plot edge.
+       Measured with the island-wide part census (cliptest section 3b),
+       that was 15 groups of parts standing up to 2.663 m clear of the
+       building they belong to, every one of them on a stall. Anything
+       that fixes itself TO a facade takes the line from here. */
+    faceZ: loc.size.d / 2,
     interior: new THREE.Vector3(0, 1.5, 0),
     collide: [], cloths: [], props: [], top: loc.size.h, ground: 0,
   };

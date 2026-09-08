@@ -535,7 +535,7 @@ export async function init(ctx) {
     zones: ZONES,
     locations: LOCATIONS,
     locationById: LOC_BY_ID,
-    paths: { nodes: paths.nodes, edges: paths.edges, at: terrain.pathAt },
+    paths: { nodes: paths.nodes, edges: paths.edges, at: terrain.pathAt, stats: paths.stats },
     terrain,
 
     /* phys ingests `collider` at its own init; ours is streamed

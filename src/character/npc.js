@@ -34,10 +34,10 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { clamp, damp, smoothstep } from '../core/contracts.js';
-import { CLIENTS, CLIENT_BY_ID, LOCATIONS, ZONES, RACE } from '../game/data.js';
+import { CLIENTS, CLIENT_BY_ID, LOCATIONS, ZONES, RACE, AIRVIEW } from '../game/data.js';
 import { createHumans, randomSpec, H as HUMAN_H } from './humans.js';
 import { HumanAnim, createCrowd } from './crowd.js';
-import { createBubbles, BULL_LINES, BEAR_LINES, STREET_LINES } from './bubbles.js';
+import { createBubbles, createLinePicker, ALL_LINES } from './bubbles.js';
 
 /* Hidden past this. 150 m emptied a district the moment the camera
    pulled back to look at it — §2.4 hazes everything past 120 m, so a
@@ -54,9 +54,99 @@ const ANIM_FAR = 62;          // skeleton frozen past this
    RECEIVE (which is what keeps them sitting in the world) and stop
    casting, which is where most of the crowd's cost goes. */
 const SHADOW_FAR = 24;
+/* How far the skeleton reach may be stretched while the balloon is up.
+   190 m is FAR minus the ten metres the thinning band needs: a person
+   animated past the distance at which he is culled is a skeleton
+   solved for a mesh nobody draws. The GAIN that gets there (3.4 m of
+   reach per metre of lens height) is measured, not guessed: over Main
+   Street the people actually inside the flight frame sit 105-140 m
+   from the lens at every altitude from 12 m up, because the boom's
+   pitch barely changes and the bottom edge of the picture walks
+   outward with the camera. A gain of 1.9 reaches 104 m at 12 m of
+   altitude and animated nobody at all. See the block above the LOD
+   loop in update(). */
+const ANIM_FLY_MAX = 190;
 const THIN0 = 110;            // distance thinning starts
 const THIN_MAX = 0.55;        // fraction dropped by FAR
 const TALK_RANGE = 3.4;       // the approach prompt
+
+/* ============================================================
+   THE SKY CROWD — the draw cull, which is the actual bug.
+
+   TWO ROUNDS RAISED THE WRONG NUMBERS. Round one aimed the look-at at
+   the basket; round two made the ANIMATION reach follow the lens. Both
+   were real, and neither could ever have worked, because ANIM_FLY_MAX
+   (190) and the notice radius cap (190) are both UNDER `FAR` (200) —
+   the draw cull. Measured over Market Hall at 13:00 on the real flight
+   camera, at 80 m of altitude the six nearest people to the lens sit at
+   NDC y = -3.65 to -5.04, four to five screen-heights below the bottom
+   of the frame, and every person actually INSIDE the picture is past
+   200 m. `h.root.visible = false` had already run. There was nobody to
+   animate and nobody to notice with, and shots/judge2/fix-alt80-basket
+   .png is a full city of streets and houses with not one human in it.
+   The ladder said so in a column nobody assertted about: at 90 m,
+   48 people project inside the frame and 0 are drawn.
+
+   YOU CANNOT FIX IT BY RAISING FAR. AIRVIEW.max is 560 m; at cruise the
+   player is looking at most of an island. Four hundred skinned meshes
+   at 560 m of range is a diorama rendered as a city and it would cost
+   what a city costs.
+
+   SO ASK WHAT THE PLAYER CAN RESOLVE. Measured: a person is 75 px tall
+   at 20 m of altitude, 21 px at 40 m, ~9 px at 90 m and 3-5 px past
+   200 m. Nobody can see a head tilt at nine pixels. What a person CAN
+   see at three pixels is a field of specks that MOVES — and then stops
+   moving, all over the street, in a wave, because something is
+   overhead. That is a much cheaper thing to draw than a face.
+
+   So past AIR_NEAR the person stops being a skeleton and becomes one
+   instance in a single billboard draw call: a silhouette in his own
+   shirt colour, with the one cue that survives three pixels — the pale
+   upturned face when he notices. The MOTION is free and already
+   correct: crowd.js has always kept far agents walking (the `!a.active`
+   branch steers and places them without touching a bone), and its
+   `stare` makes an agent stop dead and turn, at zero skeleton cost.
+   Nothing was ever wrong with the simulation. It was never drawn.
+
+   NONE OF THIS TOUCHES THE GAME ON FOOT. Every number below is read
+   only while ctx.wally.flying is true; on the ground the LOD loop takes
+   the identical branches it always has and the sky crowd is not even
+   built. It is built on the first lift-off and never at boot.
+   ============================================================ */
+/* Where a skinned pedestrian becomes an instanced silhouette. 150 m,
+   because at 150 m from the flight lens a person is 11-12 px — under
+   the size at which a body and a silhouette differ — and because it is
+   inside `THIN0`'s band, so the people THINNING throws away come back
+   as specks instead of as nothing. */
+const AIR_NEAR = 150;
+/* …and where he stops being drawn at all. AIRVIEW.max (560) is the
+   game's own statement of how far you can see from up here; the boom
+   sits 20-31 m behind the basket at every measured altitude, so the
+   lens needs that much more than the basket does. */
+const AIR_FAR = AIRVIEW.max + 60;          // 620
+/* THE FLOOR UNDER A SPECK. A 1.68 m figure at 560 m is 1.9 px at this
+   fov, and a sub-pixel quad does not dim, it FLICKERS — the crowd
+   would boil. Below this the billboard is grown in world units to hold
+   the floor, which trades a hair of scale error at the horizon (where
+   a person is a dot either way) for a stable field.
+
+   IT IS 4.2 PX AND NOT 2.6, AND THAT WAS MEASURED, NOT PREFERRED. At
+   2.6 the crowd rendered and could not be FOUND: cropped at the exact
+   pixel coordinates the ladder reported, a 5.8 px pedestrian on the
+   Market Hall road read as dust on the lens — a soft alpha silhouette
+   covering about 40 % of its own box, half-dissolved into a bright
+   green ground by the blend. A person at 250 m of altitude is 2.5-3.4
+   px, so the floor is what decides whether the top of the ladder has a
+   crowd in it at all. Raising it costs a scale error only where a
+   person is a dot either way. */
+const AIR_MIN_PX = 5.0;
+/* Aerial perspective, capped. wally.js's flyHaze already opens
+   scene.fog to about 420/2392 at altitude, so at 600 m the honest
+   linear fog factor is only ~0.24 and this cap almost never binds —
+   but a three-pixel figure that is 95% haze is not a figure, and the
+   one thing this feature may not do is dissolve the crowd it exists to
+   draw. It binds only on a weather day with the fog shut down. */
+const AIR_FOG_CAP = 0.86;
 
 /* THE ROAD IS NOT THE TERRAIN. paths.js lays its ribbons at
    terrain.heightAt(x, z) + 0.09 so they read as a made surface rather
@@ -667,6 +757,237 @@ export async function init(ctx) {
   let repopT = 0;
 
   /* ------------------------------------------------------------
+     THE SKY CROWD, built. See the block above AIR_NEAR for why.
+
+     ONE DRAW CALL, whatever the population. An InstancedBufferGeometry
+     of one quad, four instance streams (foot position, shirt, skin,
+     state), and a shader that builds the billboard and the silhouette
+     itself — no texture, because §"no external assets" and because a
+     procedural silhouette can change shape when he looks up and a
+     sprite sheet cannot.
+
+     THE BILLBOARD IS CYLINDRICAL, not spherical: the quad's up is
+     WORLD up and only its right is the camera's. A view-aligned quad
+     rolls with the boom and a street of them shears together, which
+     reads as a bug at any size. Standing them upright costs one row of
+     the view matrix.
+     ------------------------------------------------------------ */
+  let sky = null;                 // built on the first lift-off, never at boot
+  let skyMode = 'on';             // the runtime revert — dbg.skyCrowd()
+  let skyDrawn = 0, skyCand = 0, skyNotice = 0;
+
+  function buildSky() {
+    const cap = all.length + 96;
+    const g = new THREE.InstancedBufferGeometry();
+    /* x in [-0.5, 0.5], y in [0, 1] — feet at y = 0, so the instance
+       position is the ground point and needs no half-height offset. */
+    g.setAttribute('position', new THREE.Float32BufferAttribute(
+      [-0.5, 0, 0, 0.5, 0, 0, 0.5, 1, 0, -0.5, 1, 0], 3));
+    g.setIndex([0, 1, 2, 0, 2, 3]);
+    const mk = (n) => {
+      const a = new THREE.InstancedBufferAttribute(new Float32Array(cap * n), n);
+      a.setUsage(THREE.DynamicDrawUsage);
+      return a;
+    };
+    const iPos = mk(3), iCol = mk(3), iSkin = mk(3), iState = mk(3);
+    g.setAttribute('iPos', iPos);
+    g.setAttribute('iCol', iCol);
+    g.setAttribute('iSkin', iSkin);
+    g.setAttribute('iState', iState);
+    g.instanceCount = 0;
+
+    const uni = {
+      /* x: pixels per metre at one metre of depth — (h/2)/tan(fov/2),
+         refreshed on resize and whenever the lens changes fov (the
+         flight camera does, per altitude). y: AIR_MIN_PX. */
+      uPx: { value: new THREE.Vector2(900 * 0.5 / Math.tan(30 * Math.PI / 360), AIR_MIN_PX) },
+      uFog: { value: new THREE.Vector2(100, 520) },
+      uFogCol: { value: new THREE.Color(0xb8def0) },
+      uFogCap: { value: AIR_FOG_CAP },
+      uFade: { value: 0 },        // the whole field ramps in with the flight
+    };
+
+    const mat = new THREE.ShaderMaterial({
+      name: 'npc.skycrowd',
+      uniforms: uni,
+      transparent: true,
+      depthWrite: false,          // alpha-blended specks; they must not punch the depth buffer
+      depthTest: true,            // …but a person behind Market Hall is behind Market Hall
+      side: THREE.DoubleSide,
+      vertexShader: /* glsl */`
+        attribute vec3 iPos;
+        attribute vec3 iCol;
+        attribute vec3 iSkin;
+        attribute vec3 iState;      // x: notice 0..1  y: body height m  z: unused
+        uniform vec2 uPx;
+        uniform vec2 uFog;
+        varying vec2  vUv;
+        varying vec3  vCol;
+        varying vec3  vSkin;
+        varying float vNotice;
+        varying float vFog;
+        varying float vSoft;
+        varying float vTiny;
+        void main() {
+          /* row 0 of the view matrix IS the camera's right in world
+             space (the rotation block of a rigid inverse is its
+             transpose), and mat4 indexing is column-major. */
+          vec3 right = vec3( viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0] );
+          float depth = max( -( viewMatrix * vec4( iPos, 1.0 ) ).z, 0.001 );
+          float h  = iState.y;
+          float px = ( h * uPx.x ) / depth;
+          /* hold the floor: grow the figure in world units until it is
+             uPx.y pixels tall, never shrink it */
+          h *= max( 1.0, uPx.y / max( px, 0.0001 ) );
+          /* how far past "has a shape" he is — 0 while the silhouette
+             can be resolved, 1 once he is a handful of pixels.
+
+             WRITTEN AS 1 - smoothstep, NOT AS A REVERSED EDGE PAIR.
+             smoothstep(edge0, edge1, x) is UNDEFINED in GLSL when
+             edge0 >= edge1 — not clamped, not mirrored, undefined —
+             and it does not fail loudly, it returns whatever that
+             driver's polynomial happens to give. Written the wrong way
+             round, this term came back zero here: the solid mark in the
+             fragment stage never engaged at any distance, and a crowd
+             whose size I had verified as 6.7 px against the uniforms
+             rendered as one-pixel flecks I could not find in the frame
+             holding their own screen coordinates. Both descending
+             smoothsteps in this shader are written this way now. */
+          float tiny = 1.0 - smoothstep( 4.5, 9.0, max( px, uPx.y ) );
+          /* AND HE BROADENS AS HE SHRINKS. 0.42 of his height is the
+             true width of a person and it is 2.5 px at 240 m — a
+             needle, which is not what a person looks like from the
+             air. A shoulder-width mark is both more honest at this
+             range (arms, bag, coat) and the difference between a
+             crowd and a scatter of noise. */
+          float w = h * mix( 0.42, 0.66, tiny );
+          vec3 wp = iPos + right * ( position.x * w ) + vec3( 0.0, position.y * h, 0.0 );
+          gl_Position = projectionMatrix * viewMatrix * vec4( wp, 1.0 );
+          vUv     = vec2( position.x + 0.5, position.y );
+          vCol    = iCol;
+          vSkin   = iSkin;
+          vNotice = iState.x;
+          vTiny   = tiny;
+          /* the silhouette's edge, in UV, sized to ~1.3 screen pixels —
+             derivatives would do this too, but this is one multiply and
+             it is correct on every driver.
+
+             THE CEILING OF 0.12 IS LOAD-BEARING. It was 0.34, which is
+             a THIRD of the quad of feather on every edge: the three
+             smoothsteps that build the body then multiply to a peak
+             alpha near 0.3 and a six-pixel pedestrian renders as a
+             one-pixel smear you cannot find in the frame with its own
+             coordinates in your hand. Feathering is for antialiasing a
+             shape; when there is no shape left to antialias the answer
+             is the solid mark below, not more feather. */
+          vSoft   = clamp( 1.3 / max( px, uPx.y ), 0.015, 0.12 );
+          vFog    = clamp( ( depth - uFog.x ) / max( uFog.y - uFog.x, 1.0 ), 0.0, 1.0 );
+        }`,
+      fragmentShader: /* glsl */`
+        uniform vec3  uFogCol;
+        uniform float uFogCap;
+        uniform float uFade;
+        varying vec2  vUv;
+        varying vec3  vCol;
+        varying vec3  vSkin;
+        varying float vNotice;
+        varying float vFog;
+        varying float vSoft;
+        varying float vTiny;
+        void main() {
+          float y = vUv.y, x = abs( vUv.x - 0.5 );
+          /* THE FIGURE, as a half-width profile: legs narrow, torso
+             wide at the shoulder, and the head a disc on top. Three
+             smoothsteps; at a dozen pixels it is a person-shaped
+             smudge, which is exactly what a person that size is. */
+          float hw   = mix( 0.115, 0.215, smoothstep( 0.34, 0.54, y ) )
+                     * ( 1.0 - smoothstep( 0.70, 0.79, y ) );
+          float body = ( 1.0 - smoothstep( hw - vSoft, hw + vSoft, x ) )
+                     * smoothstep( -vSoft, vSoft, y )
+                     * ( 1.0 - smoothstep( 0.74 - vSoft, 0.80, y ) );
+          /* THE HEAD IS THE ONLY THING THAT CHANGES WHEN HE NOTICES,
+             and it is the right thing: a face tipped back at a balloon
+             turns its lit side toward a camera that is ABOVE it, so the
+             speck grows a pale cap. It is the one cue that reads at
+             three pixels — a head tilt does not, an arm does not. */
+          float hr   = 0.100 + 0.024 * vNotice;
+          float hd   = length( vec2( ( vUv.x - 0.5 ) * 1.06, y - 0.876 ) );
+          float head = 1.0 - smoothstep( hr - vSoft, hr + vSoft, hd );
+          /* AND WHEN THERE IS NO SHAPE LEFT, A SOLID MARK.
+
+             THE MEASUREMENT THIS EXISTS FOR. At six pixels the profile
+             above covers about a third of its own box at partial alpha,
+             and cropped at the exact screen coordinates the ladder
+             printed, a pedestrian on the Market Hall road was a
+             one-pixel teal fleck — rendered, counted, and impossible to
+             find in the frame. Below about nine pixels a waist and a
+             pair of legs are not information anybody receives, so spend
+             the box on COVERAGE instead: one opaque lozenge, his own
+             shirt colour, inked. The crossfade is over 9 to 4.5 px, so
+             nothing swaps representation while it is big enough to see
+             it swap. */
+          float e    = length( vec2( ( vUv.x - 0.5 ) / 0.42, ( y - 0.52 ) / 0.50 ) );
+          float blob = 1.0 - smoothstep( 1.0 - vSoft * 2.4, 1.0, e );
+          float a    = mix( max( body, head ), max( blob, head * 0.9 ), vTiny );
+          if ( a < 0.004 ) discard;
+          /* trousers are the shirt's own dark; one mix, no second
+             attribute stream for a colour nobody can resolve */
+          vec3 col = mix( vCol * 0.58, vCol, smoothstep( 0.38, 0.52, y ) );
+          vec3 face = mix( vSkin, vSkin * 1.28 + 0.20, vNotice );
+          col = mix( col, face, clamp( head, 0.0, 1.0 ) );
+          col *= 1.0 + 0.10 * vNotice;
+          /* THE INK, which is the same answer toon.js gives everywhere
+             else in this game and the reason a Wind-Waker frame stays
+             legible when it is busy. Coverage falls off across the soft
+             boundary, so this darkens exactly the rim — and on a figure
+             only a few pixels tall the whole figure IS rim, which is
+             precisely the size at which he needs to be a dark mark on a
+             bright ground rather than a tint of it. It is applied
+             BEFORE the haze so the outline recedes with the person
+             instead of sitting on top of the aerial perspective. */
+          float ink = 1.0 - smoothstep( 0.22, 0.88, a );
+          col = mix( col, col * 0.30, ink * 0.80 );
+          col = mix( col, uFogCol, min( vFog, uFogCap ) );
+          gl_FragColor = vec4( col, a * uFade );
+          #include <colorspace_fragment>
+        }`,
+    });
+
+    const mesh = new THREE.Mesh(g, mat);
+    mesh.name = 'npc.skycrowd';
+    mesh.frustumCulled = false;   // culled per instance on the CPU, below
+    mesh.renderOrder = 3;
+    mesh.visible = false;
+    root.add(mesh);
+    return { mesh, geo: g, mat, uni, iPos, iCol, iSkin, iState, cap };
+  }
+
+  /** Refill the instance streams from whoever the LOD loop tagged.
+      Called once a frame while flying, never otherwise. */
+  function skyUpdate(dt) {
+    if (!sky) return;
+    sky.uni.uFade.value = damp(sky.uni.uFade.value, skyDrawn > 0 ? 1 : 0, 4.5, dt);
+    sky.mesh.visible = sky.uni.uFade.value > 0.01 && skyDrawn > 0;
+    sky.geo.instanceCount = skyDrawn;
+    if (!skyDrawn) return;
+    const cam = ctx.camera;
+    /* pixels per metre at one metre of depth, off the LENS — the
+       flight camera changes its fov with altitude, so a constant here
+       would put the AIR_MIN_PX floor in the wrong place at cruise */
+    const ph = ctx.renderer?.domElement?.height || 900;
+    sky.uni.uPx.value.set(ph * 0.5 / Math.tan(cam.fov * Math.PI / 360), AIR_MIN_PX);
+    const fog = ctx.scene.fog;
+    if (fog && Number.isFinite(fog.near)) {
+      sky.uni.uFog.value.set(fog.near, fog.far);
+      sky.uni.uFogCol.value.copy(fog.color);
+    }
+    sky.iPos.needsUpdate = true;
+    sky.iCol.needsUpdate = true;
+    sky.iSkin.needsUpdate = true;
+    sky.iState.needsUpdate = true;
+  }
+
+  /* ------------------------------------------------------------
      THE STREAMER — the rest of the island arriving.
 
      Everything boot did not mesh is turned into a person here, a few
@@ -750,12 +1071,105 @@ export async function init(ctx) {
       }
     }
 
+    /* ------------------------------------------------------------
+       HOW FAR A SKELETON IS WORTH RUNNING IS A QUESTION ABOUT PIXELS,
+       AND ANIM_FAR ANSWERS IT IN METRES.
+
+       62 m is the right answer for the gameplay camera, which sits
+       two metres off the ground: a pedestrian at 62 m is about 25 px
+       tall at 1600x900 and freezing him there costs nothing anybody
+       can see. From the balloon it is not a threshold at all, it is a
+       refusal. Measured over Main Street at 13:00 with the REAL
+       flight camera (tools/gawkladder.mjs), the nearest person to the
+       LENS is 17.5 m at 12 m of altitude, 25.9 m at 19 m, 47.5 m at
+       34 m and 62.1 m at 45 m — and the people in the FRAME are
+       further still, because the boom sits 20-30 m back and pitches
+       down only 18-26 degrees, so the ground under the basket is
+       below the bottom edge of the picture and what is on screen is
+       60-160 m out. The count of animated people went to ZERO at 19 m
+       and stayed there at every altitude above it. That is the whole
+       of "nobody notices the balloon above nineteen metres": there
+       was nobody left running a skeleton to notice with.
+
+       So the reach follows the lens up. Everything else about the
+       gate is untouched — frustum first, same head-count budget — and
+       on the ground `flying` is false and every number below is the
+       one the crowd has always used, to the digit. It is also not a
+       cost: measured, the flight spends FEWER skeletons than walking
+       does, because there is less on screen.
+       ------------------------------------------------------------ */
+    const flyingNow = !!(ctx.wally && ctx.wally.flying) && gawkReach === 'lens';
+    const camUp = flyingNow ? Math.max(0, _v.y - groundY(_v.x, _v.z)) : 0;
+    const animFar = flyingNow
+      ? clamp(ANIM_FAR + camUp * 3.4, ANIM_FAR, ANIM_FLY_MAX) : ANIM_FAR;
+
+    /* ------------------------------------------------------------
+       AND THE DRAW CULL, WHICH IS THE ONE THAT MATTERED.
+
+       `airOn` is the ONLY gate on everything below. On foot it is
+       false, `drawMax` is FAR to the digit, the sky crowd is never
+       built, and the loop under this takes the branches it has always
+       taken. That is the guard rail: the on-foot game's culling is not
+       touched by any of this.
+
+       THE NOTICE RADIUS IS NOW THE DRAW RADIUS. IF YOU CAN SEE HIM, HE
+       CAN SEE YOU — one law, one constant, and no third number to get
+       wrong. It used to be max(70, animFar), capped at 190, under FAR,
+       which is why it could never reach anybody in the picture.
+
+       THE FIRST VERSION OF THIS FIX TIED IT TO ALTITUDE INSTEAD —
+       camUp * AIRVIEW.gain, the sight radius events.js already uses —
+       and it was elegant and it was wrong, because the boom pitches
+       down only 16 to 30 degrees at every altitude, so the ground
+       under the basket is BELOW the bottom of the frame and what is in
+       the picture is always further out than the altitude implies.
+       Measured on the pinned ladder: at 20 m of altitude the nearest
+       person in frame is past 150 m while camUp * gain is 52, floored
+       to 70 — reach 70, notice 0, a rung that drew 35 people and had
+       none of them look up. The altitude is not what decides who can
+       see a twenty-metre envelope; the horizon is.
+
+       IT IS STILL AIRVIEW'S NUMBER, one step removed: AIR_FAR is
+       AIRVIEW.max plus the boom's standoff, so "how far the crowd can
+       be and still notice" and "how far you can see from up here" are
+       the same statement measured from the two ends. And it costs a
+       distance test and a damp per person — the expensive thing was
+       always the skeleton, which is a different gate (below).
+
+       IT IS NOT THE ANIMATION REACH. Those are now separate numbers and
+       that separation IS the fix: noticing costs a distance test and a
+       damp, per person, and it is what puts the pale faces and the
+       stopped feet in the picture. A skeleton costs a skeleton, so
+       `animFar` stays where round two left it and is additionally
+       capped at the skinned band — solving bones for a mesh that is
+       being drawn as a billboard is the same waste as before, wearing
+       a different hat.
+       ------------------------------------------------------------ */
+    const airOn = flyingNow && skyMode === 'on';
+    const drawMax = airOn ? AIR_FAR : FAR;
+    /* ONE REPRESENTATION PER PERSON, AND ONE LINE BETWEEN THEM. Inside
+       `skinFar` everybody is a full skinned body — airborne the
+       thinning band is pushed out to the same line, so nothing is
+       dropped from the near half at all — and outside it everybody is
+       an instance. Mixing the two in one distance band is the only way
+       this reads as a seam, so there is no band where both occur.
+       Airborne this is a NET SAVING even before the billboards are
+       counted: it retires every skinned draw between 150 and 200 m and
+       buys back the quarter of 110-150 m that thinning used to throw
+       away, which is the half of the band the player can still see. */
+    const skinFar = airOn ? AIR_NEAR : FAR;
+    const thin0 = airOn ? AIR_NEAR : THIN0;
+    noticeR = airOn ? AIR_FAR : Math.max(GAWK_R, animFar);
+    if (airOn && !sky) sky = buildSky();
+    skyDrawn = 0; skyCand = 0; skyNotice = 0;
+
     /* --- level of detail ---
        Sorted by nothing: the frustum test throws away most of them and
        the budget takes the rest in scene order, which is stable frame
        to frame and therefore never flickers. */
     let live = 0;
     for (const h of all) {
+      h.airOn = false;
       if (h.asleep) { h.root.visible = false; h.active = false; continue; }
       const d = h.root.position.distanceTo(_v);
       h.dist = d;
@@ -766,15 +1180,49 @@ export async function init(ctx) {
          rival. He keeps his skeleton too: he is the only figure on the
          island whose gait is the point. */
       if (h.exempt) { h.root.visible = true; h.active = true; live++; continue; }
-      if (d > FAR) { h.root.visible = false; h.active = false; continue; }
+      if (d > drawMax) { h.root.visible = false; h.active = false; continue; }
+      /* --- THE INSTANCED BAND. Unreachable on foot: skinFar is FAR
+         and drawMax is FAR, so `d > skinFar` implies the line above
+         already took him. --- */
+      if (d > skinFar) {
+        h.root.visible = false; h.active = false;
+        skyCand++;
+        _sphere.center.copy(h.root.position);
+        _sphere.center.y += h.height * 0.55;
+        /* a generous radius: the shader may GROW the billboard to hold
+           AIR_MIN_PX, so a figure whose true sphere misses the edge of
+           the frame can still have pixels inside it */
+        _sphere.radius = h.height * 1.15;
+        if (!_frustum.intersectsSphere(_sphere)) continue;
+        if (skyDrawn >= sky.cap) continue;
+        const i3 = skyDrawn * 3;
+        const p = h.root.position, pal = h.pal;
+        sky.iPos.array[i3] = p.x; sky.iPos.array[i3 + 1] = p.y; sky.iPos.array[i3 + 2] = p.z;
+        sky.iCol.array[i3] = pal.shirt.r; sky.iCol.array[i3 + 1] = pal.shirt.g;
+        sky.iCol.array[i3 + 2] = pal.shirt.b;
+        sky.iSkin.array[i3] = pal.skin.r; sky.iSkin.array[i3 + 1] = pal.skin.g;
+        sky.iSkin.array[i3 + 2] = pal.skin.b;
+        /* the notice weight is LAST FRAME'S — gawkUpdate runs after
+           this loop, by one frame at 60 Hz, which is 16 ms of lag on a
+           gesture that ramps over two seconds */
+        const nw = h.gawkOn ? h.lookW : 0;
+        sky.iState.array[i3] = nw;
+        sky.iState.array[i3 + 1] = h.height;
+        sky.iState.array[i3 + 2] = 0;
+        if (nw > 0.3) skyNotice++;
+        h.airOn = true;
+        skyDrawn++;
+        continue;
+      }
       /* THINNING, not culling. Quadrupling the population to make a
          square look inhabited also quadruples what a vista has to draw,
          and a figure past 110 m is a dozen pixels of colour that §2.4
          has already hazed toward #B8DEF0. So beyond THIN0 a stable,
          per-person fraction drops out — deterministic, so it never
          flickers, and graded, so the district in front of you keeps
-         every one of its people. */
-      if (d > THIN0 && h.lodKey > 1 - smoothstep(THIN0, FAR, d) * THIN_MAX) {
+         every one of its people. (Airborne `thin0` is `skinFar`, so
+         this never fires: see the note on skinFar.) */
+      if (d > thin0 && h.lodKey > 1 - smoothstep(THIN0, FAR, d) * THIN_MAX) {
         h.root.visible = false; h.active = false; continue;
       }
       _sphere.center.copy(h.root.position);
@@ -784,18 +1232,28 @@ export async function init(ctx) {
       h.root.visible = vis;
       const cast = vis && d < SHADOW_FAR;
       if (cast !== h._cast) { h._cast = cast; h.body.castShadow = cast; h.head.castShadow = cast; }
-      h.active = vis && d < ANIM_FAR && live < budget;
+      h.active = vis && d < animFar && live < budget;
       if (h.active) live++;
     }
 
-    /* --- standers: named clients, and anyone the debug lineup froze.
-       They notice Wally, turn toward him and hold his eye. --- */
+    /* --- the balloon, if it is up. BEFORE both loops below: it decides
+       who is looking at the sky, and each loop then runs that person's
+       animator once with the answer already written. --- */
     const wp = ctx.wally ? ctx.wally.position : null;
+    gawkUpdate(dt, wp);
+    /* the sky crowd's upload, after the pass that decides who is
+       looking up — the instance streams were filled in the LOD loop
+       above, this is the one place that hands them to the driver */
+    if (sky) skyUpdate(dt);
+
+    /* --- standers: named clients, residents outside their shops, and
+       anyone the debug lineup froze. They notice Wally, turn toward
+       him and hold his eye. --- */
     for (const h of all) {
       if (h.agent && !h.agent.frozen) continue;      // the crowd owns them
       if (!h.active) continue;
       if (h.mayorDriven) continue;                   // the dash owns him
-      if (wp) {
+      if (wp && !h.gawkOn) {
         const d = h.root.position.distanceTo(wp);
         h.lookW = damp(h.lookW, d < 8 ? 1 : 0, 3.2, dt);
         h.lookVec.set(wp.x, wp.y + 1.18, wp.z);
@@ -1826,14 +2284,63 @@ export async function init(ctx) {
   const bubbleRng = ctx.makeRng('npc.bubbles.v1');
   let bubbleT = 3.0;
   let hintPokeT = 20;
-  const LINE_POOLS = [BULL_LINES, BEAR_LINES, STREET_LINES];
+  /* THE PICKER GETS ITS OWN STREAM. It draws a variable number of
+     values per line (the recency scan is a reservoir sample), and
+     bubbleRng also scores the candidate crowd — sharing one stream
+     would make WHO speaks depend on how full the line memory happened
+     to be, which is exactly the kind of coupling that makes a
+     screenshot stop reproducing. */
+  const linePicker = createLinePicker(ctx.makeRng('npc.bubbles.lines.v2'));
 
-  function pickLine() {
-    /* Bull, bear and street in roughly equal measure — this is a market
-       town, so half of what you overhear is a position and half of it is
-       the rent. */
-    const pool = LINE_POOLS[Math.floor(bubbleRng() * 3) % 3];
-    return pool[Math.floor(bubbleRng() * pool.length) % pool.length];
+  /* ------------------------------------------------------------
+     THE SCENE — everything the picker is allowed to know.
+
+     Built from the SPEAKER, not from the player: the district is the
+     one that person is standing in. Everything is read through
+     optional chaining and defaulted, because npc.js boots before
+     game.js and the first few frames have no rules layer at all.
+
+     The sky is read as `rainfall`/`storminess` and never as
+     `weatherName` — see sky.js: the name is what was ASKED for and a
+     transition takes 150 seconds, so a citizen keyed off the name
+     complains about rain two minutes before the first drop lands.
+     ------------------------------------------------------------ */
+  function sightingNow() {
+    const w = ctx.wally;
+    if (!w) return null;
+    if (w.flying) return 'balloon';
+    if (w.riding) {
+      const id = w.rideId;
+      return id === 'motorcycle' || id === 'scooter' ? id : 'bike';
+    }
+    return null;
+  }
+
+  const _scene = {};
+  function sceneFor(h) {
+    const p = h?.root?.position;
+    let zone = null;
+    if (p && ctx.world?.zoneAt) {
+      try { zone = ctx.world.zoneAt(p.x, p.z)?.id ?? null; } catch (e) { zone = null; }
+    }
+    _scene.zone = zone;
+    _scene.hour = ctx.game?.time?.hour ?? 12;
+    _scene.rainfall = ctx.sky?.rainfall ?? 0;
+    _scene.storminess = ctx.sky?.storminess ?? 0;
+    let pct = 0, rep = 0;
+    try { pct = ctx.game?.economy?.cityPct?.() ?? 0; } catch (e) { pct = 0; }
+    try { rep = ctx.game?.rep?.()?.rep ?? 0; } catch (e) { rep = 0; }
+    _scene.pct = pct;
+    _scene.rep = rep;
+    _scene.seeing = sightingNow();
+    /* THE FIRST TIME THE BALLOON GOES UP, the city is not asked to
+       roll for it. After that it is one remark among many. */
+    _scene.forceSeeing = balloonBurst > 0 && _scene.seeing === 'balloon';
+    return _scene;
+  }
+
+  function pickLine(h) {
+    return linePicker.pick(sceneFor(h));
   }
 
   /* `loose` skips the ANIMATED test. h.active is written by the LOD
@@ -1894,6 +2401,196 @@ export async function init(ctx) {
     }
   }
 
+  /* ============================================================
+     THE CITY LOOKS UP.
+
+     The remark is only half of noticing. A speech bubble is a
+     gameplay-distance object by construction — nothing speaks past
+     thirty metres and no line is granted to anyone more than
+     twenty-two metres from the lens — so once the balloon is properly
+     up, TEXT CANNOT REACH IT. Two lines at the moment he leaves the
+     ground, and then, correctly, silence.
+
+     What carries at sixty metres is posture. So the street tilts its
+     head back instead: HumanAnim already has a look-at with a chest
+     follow-through, nothing in the crowd was ever using it, and one
+     Vector3 per active pedestrian per frame buys the whole city
+     watching him go. THE SPLIT IS THE DESIGN — text near the ground,
+     posture at altitude — and it is the reason the balloon lines are
+     worth writing at all when a player only hears them for a few
+     seconds of a flight.
+
+     AND THEN IT WAS MEASURED FROM THE WRONG CAMERA, WHICH IS WORSE
+     THAN NOT MEASURING IT.
+
+     "Head pitch 26 to 40 degrees, 15 or 16 of about 25 people looking
+     up, at 34 m altitude" is a real reading and it is reproducible —
+     from a STREET camera with the balloon parked overhead, which is
+     what bubbleCam({keepWally:true}) leaves you holding and what that
+     figure was taken through. A player is never in that configuration:
+     the flight rig claims the lens the moment he lifts off. Driven
+     through the real flight camera instead (tools/gawkladder.mjs,
+     Market Hall and Main Street, 13:00, arrive() asserted):
+
+       alt      6 m   12 m   19 m   26 m   34 m   45 m   60 m
+       looking   13      6      0      0      0      0      0
+       animated  18      8      0      0      0      0      0
+
+     Both readings are of the same code and neither is wrong. What
+     they disagree about is the LENS, and the lens is what h.active is
+     computed against — it is a render-LOD flag (frustum AND within
+     ANIM_FAR of the camera AND under the head-count budget), and the
+     gawk pass was gated on it. From the basket the near crowd is
+     under the bottom edge of the frame and the far crowd is past
+     62 m, so `active` is zero and there is nobody to ask. Two things
+     had to change and neither of them is in this file's design: the
+     reach (see the LOD block in update()) and the notice radius,
+     which was a flat 70 m — the distance from which somebody notices
+     a balloon cannot be smaller than the distance at which the game
+     is willing to animate him.
+
+     AND POSTURE IS NOT A NECK, AT THE SIZE THIS IS SEEN AT. At 6 m
+     the craning head is the whole gesture and it is lovely. At the
+     range the flight camera actually frames — 60 to 160 m, a person
+     9 to 15 px tall — a 40-degree head tilt is a fraction of a pixel
+     on a two-pixel skull. What survives is the silhouette and the
+     motion field: so somebody who notices STOPS for three or four
+     seconds, TURNS, and about a third of them POINT. Fifteen figures
+     that were sliding along a street all stopping is legible at nine
+     pixels; a raised arm is legible at fifteen. The craning stays
+     exactly as it was, because it is still the read close up.
+
+     NOT EVERYBODY AND NOT AT ONCE. A little over a quarter never look
+     up (they have things to do), and the rest turn over a staggered
+     two seconds, because a crowd that snaps its heads in unison is a
+     Mexican wave, not a city. The bias is drawn once per person from a
+     seeded stream, so the same people look up in the same order every
+     run and a screenshot reproduces.
+
+     IT TOUCHES ONLY CROWD WALKERS. Named clients, and anyone the debug
+     lineup froze, are driven by the standers pass above, which owns
+     their look-at. Two writers on one field is how a head ends up
+     vibrating between two targets.
+     ============================================================ */
+  const gawkRng = ctx.makeRng('npc.gawk.v1');
+  const _gawkTo = new THREE.Vector3();
+  let balloonBurst = 0;
+  let flyWas = false, gawk = 0, gawkT = 0, gawkLive = false, gawkers = 0;
+  let pointers = 0, stoppers = 0;
+  /** The old flat gate, kept as the FLOOR. On the ground `noticeR` is
+      exactly this and nothing about the crowd changes. */
+  const GAWK_R = 70;
+  /** Rewritten every frame by update(), before this pass runs. */
+  let noticeR = GAWK_R;
+  /* THE RUNTIME REVERT (contracts.js rule 1). 'flat' is the rule that
+     shipped before this round — ANIM_FAR is 62 m and the notice radius
+     is 70 m at every altitude — and 'lens' is the one that ships now.
+     Both are driven on ONE page load by tools/voicetest.mjs, because a
+     quoted before-number is a citation and not a check. */
+  let gawkReach = 'lens';
+
+  /** Give one person's head back to whoever normally owns it. */
+  function release(h) {
+    if (!h.gawkOn) return;
+    h.gawkOn = false;
+    h.lookW = 0;
+    if (h.anim) { h.anim.lookW = 0; h.anim.lookTarget = null; h.anim.pointW = 0; }
+    /* the stare is seconds, not a latch, so it expires on its own —
+       but a person released mid-stare must walk on now, not in three
+       seconds' time */
+    if (h.agent) h.agent.stare = 0;
+  }
+
+  function gawkUpdate(dt, wp) {
+    const flying = !!(ctx.wally && ctx.wally.flying);
+    if (flying && !flyWas) {
+      /* HE HAS JUST LEFT THE GROUND. The next remark comes early, and
+         the two after it are balloon lines rather than a roll for one. */
+      balloonBurst = 2;
+      bubbleT = Math.min(bubbleT, 1.4);
+      gawkT = 0;
+      gawkLive = true;
+    }
+    flyWas = flying;
+    if (!gawkLive || !wp) return;
+    gawkT += dt;
+    gawk = damp(gawk, flying ? 1 : 0, 2.0, dt);
+    if (!flying && gawk < 0.005) gawk = 0;
+    _gawkTo.set(wp.x, wp.y + 1.1, wp.z);   // the basket, not his feet
+    gawkers = 0; pointers = 0; stoppers = 0;
+    for (const h of all) {
+      /* `h.active` MEANS "HIS SKELETON IS BEING SOLVED", AND THAT IS
+         NOT THE SAME QUESTION AS "CAN HE SEE THE BALLOON". Gating the
+         notice on it is what tied noticing to the animation budget —
+         46 people, nearest first, none of them in the picture from a
+         balloon — and it is the second half of why the city never
+         looked up. `h.airOn` is the other way a person is on screen:
+         drawn as an instance, no bones, and every visible cue he has
+         (stopping, turning, the pale upturned face) is one this pass
+         writes. Both are "he is in the picture"; only one costs a
+         skeleton. */
+      const eligible = (h.active || h.airOn) && !h.mayorDriven && h !== happy && !h.asleep;
+      if (eligible && h.gawkBias === undefined) h.gawkBias = gawkRng();
+      let want = 0;
+      if (eligible && h.gawkBias <= 0.72) {
+        const d = h.root.position.distanceTo(_gawkTo);
+        if (gawk > 0.01 && d < noticeR && gawkT > 0.35 + h.gawkBias * 2.1) want = gawk;
+      }
+      /* NEVER CLAIM SOMEBODY WE DO NOT ALREADY OWN. A person the
+         standers pass has looking at Wally still carries look weight
+         when he lifts off; without this test one of the people who
+         DOES NOT look up (bias > 0.72) would be claimed on that
+         leftover weight and quietly aimed at the balloon anyway. */
+      if (want <= 0 && !h.gawkOn) continue;
+      if (want <= 0 && h.lookW <= 0.002) { release(h); continue; }
+      /* ---- THE MOMENT HE NOTICES, and it happens exactly once ----
+         Three to six and a half seconds of standing still and turning
+         to face it, drawn off the same per-person bias that staggered
+         the head turn, so the stopping is staggered by construction
+         and the street empties of motion over two seconds rather than
+         on one frame. crowd.js declines the stop outright if he is
+         standing in a doorway keep-clear, so this cannot manufacture
+         a blocker the eviction pass then has to remove. */
+      const first = !h.gawkOn;
+      h.gawkOn = true;
+      if (first && h.agent) {
+        /* THE EAGER ONES WATCH LONGEST, which is the same fact as
+           noticing first and is drawn off the same number. Tying the
+           duration to the bias the other way round — which is the way
+           it was first written — gave the shortest stop to the people
+           who look up first, so the pointers (also the low bias, see
+           below) had their arms down again before anybody else had
+           got theirs up. Measured, that was 0 pointers in every row of
+           the altitude ladder. */
+        h.agent.stare = 3.4 + (0.72 - h.gawkBias) * 4.4;
+        h.agent.stareX = _gawkTo.x; h.agent.stareZ = _gawkTo.z;
+      }
+      h.lookW = damp(h.lookW, want, 2.6, dt);
+      h.lookVec.copy(_gawkTo);
+      h.anim.lookTarget = h.lookVec;
+      h.anim.lookW = h.lookW;
+      /* ---- and about a third of them point ----
+         The bias is already a uniform draw over [0, 0.72] for everyone
+         who looks up at all, so its bottom third IS a third of them,
+         with no second stream and no second field on the record. The
+         arm goes up with the stop and comes down with it: an arm held
+         out for the whole flight is a statue, and the flight is
+         minutes long. */
+      const pointing = h.gawkBias < 0.24 && h.agent && h.agent.stare > 0.4;
+      h.anim.pointW = pointing ? h.lookW : 0;
+      if (h.lookW > 0.3) gawkers++;
+      if (pointing && h.lookW > 0.3) pointers++;
+      if (h.agent && h.agent.stare > 0) stoppers++;
+    }
+    /* AND HAND EVERYBODY BACK WHEN IT IS OVER, on the same frame the
+       ramp closes. `gawkOn` is what tells the standers pass to keep its
+       hands off a head; a crowd walker has no other writer, so one left
+       set with a stale target is a pedestrian who stares at an empty
+       patch of sky for the rest of the session. It cost a rewrite of
+       this loop to make every exit path go through release(). */
+    if (gawk === 0) { gawkLive = false; for (const h of all) release(h); }
+  }
+
   function bubbleUpdate(dt, t, camPos) {
     bubbles.update(dt, t);
     hintUpdate(dt, camPos);
@@ -1918,7 +2615,7 @@ export async function init(ctx) {
     bubbleT = 4.5 + bubbleRng() * 4.5;
     const h = bubbleCandidate(camPos);
     if (!h) return;
-    if (bubbles.show(h, pickLine(), {})) h.bubbleAt = elapsed;
+    if (bubbles.show(h, pickLine(h), {})) { h.bubbleAt = elapsed; if (balloonBurst > 0) balloonBurst--; }
   }
 
   /* ------------------------------------------------------------
@@ -2580,6 +3277,113 @@ export async function init(ctx) {
      the picture. `WALLY.debug.bubbleHint()` fires the scooter line
      through the same path the rules layer uses.
      ================================================================ */
+  /* ================================================================
+     WHAT THE STREET CAN CURRENTLY SAY — WALLY.debug.bubbleScene()
+
+     The scene as the picker sees it right now, plus every group that
+     scene opens and how big each one is. This is the hook to reach for
+     when a line reads wrong in place: it says whether the world is
+     publishing what you assumed, before you go looking at the words.
+     `zoneAt` is sampled at the camera, which is where the player is.
+     ================================================================ */
+  /** THE RUNTIME REVERT for the balloon's reach — see `gawkReach`.
+      Returns the mode ACTUALLY in force and the radius the last frame
+      actually produced, never the one asked for. */
+  dbg.gawkReach = (mode) => {
+    if (mode === 'flat' || mode === 'lens') gawkReach = mode;
+    return { mode: gawkReach, reach: +noticeR.toFixed(1) };
+  };
+
+  /** THE RUNTIME REVERT for the draw cull (contracts.js rule 1).
+      'off' is the rule that shipped before this round to the digit —
+      FAR = 200 for the skinned crowd, thinning from 110, no instanced
+      band and no sky crowd drawn — and 'on' is the one that ships now.
+      Both branches on ONE page load, which is what makes a before-and
+      -after a measurement instead of a citation. Returns what the last
+      frame ACTUALLY produced, never what was asked for. */
+  dbg.skyCrowd = (mode) => {
+    if (mode === 'on' || mode === 'off') skyMode = mode;
+    return { mode: skyMode, drawn: skyDrawn, candidates: skyCand,
+      noticing: skyNotice, built: !!sky, reach: +noticeR.toFixed(1) };
+  };
+
+  dbg.bubbleScene = () => {
+    ctx.camera.getWorldPosition(_v);
+    const at = ctx.wally?.position || _v;
+    const s = sceneFor({ root: { position: at } });
+    return {
+      scene: { ...s },
+      groups: linePicker.groupsFor(s).map((g) => ({ g: g.name, w: g.w, n: g.lines.length })),
+      used: linePicker.stats(),
+      gawk: { live: gawkLive, w: +gawk.toFixed(3), looking: gawkers, burst: balloonBurst,
+        /* THE THREE READS, IN THE ORDER THEY SURVIVE DISTANCE.
+           `pointing` and `stopped` are the ones that carry from the
+           basket; `looking` is the one that carries from the pavement.
+           `reach` is the number that was silently 62 m for every
+           altitude before this and is why the other three were zero. */
+        pointing: pointers, stopped: stoppers, reach: +noticeR.toFixed(1),
+        /* AND THE ONE THE OTHER FOUR DEPEND ON. `sky` is how many of
+           the people in the picture are drawn at all past 150 m; it
+           was structurally zero before this round, and a `looking`
+           count taken while it is zero is a count of people nobody
+           can see. `skyMode` says which branch produced it. */
+        sky: skyDrawn, skyCand, skyNotice, skyMode,
+        t: +gawkT.toFixed(2), flying: !!ctx.wally?.flying,
+        all: all.length, active: all.filter((h) => h.active).length,
+        biased: all.filter((h) => h.gawkBias !== undefined).length,
+        on: all.filter((h) => h.gawkOn).length,
+        /* the craning, in degrees off level, most-tilted first. Negative
+           is UP. This is the number the ±0.45 rad clamp used to cap at
+           26° and now stops at 40° of head plus the chest's share. */
+        craneDeg: all.filter((h) => h.gawkOn && h.anim)
+          .map((h) => +(-h.anim.headPitch * 180 / Math.PI).toFixed(1))
+          .sort((a, b) => b - a).slice(0, 5) },
+    };
+  };
+
+  /* ================================================================
+     DOES IT REPEAT? — WALLY.debug.bubbleAudit({picks, ...scene})
+
+     Runs the real picker, on a fresh stream, over a FIXED scene, and
+     reports the smallest number of picks between two occurrences of
+     the same line. This is the assertion the old picker could not have
+     passed: uniform choice over one flat pool of forty-four repeats
+     inside seven picks about half the time, which at one line every
+     four to nine seconds is the same sentence twice in a minute.
+
+     `minGap` is the number that matters. Anything under about twenty
+     in a normal street scene means a player on a walk hears a repeat.
+     ================================================================ */
+  dbg.bubbleAudit = (o = {}) => {
+    const picks = o.picks ?? 400;
+    const scene = {
+      zone: o.zone ?? null, hour: o.hour ?? 12,
+      rainfall: o.rainfall ?? 0, storminess: o.storminess ?? 0,
+      pct: o.pct ?? 0, rep: o.rep ?? 0, seeing: o.seeing ?? null,
+    };
+    const p = createLinePicker(ctx.makeRng(o.seed || 'npc.bubbles.audit'));
+    const seen = new Map(), distinct = new Set(), byGroup = {};
+    let minGap = Infinity, worst = null;
+    for (let i = 0; i < picks; i++) {
+      const r = p.pick(scene, { detail: true });
+      byGroup[r.group] = (byGroup[r.group] || 0) + 1;
+      distinct.add(r.line);
+      if (seen.has(r.line)) {
+        const g = i - seen.get(r.line);
+        if (g < minGap) { minGap = g; worst = r.line; }
+      }
+      seen.set(r.line, i);
+    }
+    return {
+      scene, picks, distinct: distinct.size, ring: p.ring, desperate: p.desperate,
+      minGap: minGap === Infinity ? null : minGap, worst, byGroup,
+    };
+  };
+
+  /** Every line in the file, laid out with the real font and the real
+      wrap. `rows3` and `elided` must both be empty. */
+  dbg.bubbleFit = () => bubbles.measure(ALL_LINES);
+
   dbg.bubbles = (n = 3) => {
     api.drain();
     ctx.camera.updateMatrixWorld();
@@ -2588,7 +3392,7 @@ export async function init(ctx) {
     for (let i = 0; i < n; i++) {
       const h = bubbleCandidate(_v, true);
       if (!h) break;
-      const line = pickLine();
+      const line = pickLine(h);
       if (bubbles.show(h, line, { ttl: 240 })) {
         h.bubbleAt = elapsed;
         h.anim.setMode('talk');
@@ -2626,11 +3430,33 @@ export async function init(ctx) {
     const built = buildMayorPath(ctx.game?.race?.route?.());
     if (!built.pts.length) return 'no roads';
     mayorPath = built.pts; mayorLen = built.len;
+    /* THE ARGUMENT USED TO BE A LIE. `locId` was named, defaulted and
+       documented, and then never read — every call walked the whole
+       route and stopped at the same busiest corner, so
+       bubbleCam('waterfront') photographed Main Street. That did not
+       matter while every person in the city drew from one flat list.
+       It matters now: a shot of the docks has to BE at the docks or it
+       is not a shot of the feature. Takes a zone id or a location id,
+       and holds the walk inside that district. */
+    let wantZone = null;
+    if (locId) {
+      if (ctx.world?.zones?.[locId]) wantZone = locId;
+      else {
+        const locs = ctx.world?.locations;
+        const arr = Array.isArray(locs) ? locs : Object.values(locs || {});
+        wantZone = arr.find((x) => x && x.id === locId)?.z ?? null;
+      }
+    }
     const look = new THREE.Vector3(), eye = new THREE.Vector3();
     let bestD = -1, bestN = -1;
     for (let d = 12; d < mayorLen - 12; d += 4) {
       mayorAt(d, eye);
       mayorAt(d + 10, look);
+      if (wantZone) {
+        let z = null;
+        try { z = ctx.world.zoneAt(eye.x, eye.z)?.id ?? null; } catch (e) { z = null; }
+        if (z !== wantZone) continue;
+      }
       const fx = look.x - eye.x, fz = look.z - eye.z;
       const fl = Math.hypot(fx, fz) || 1;
       /* THE WHOLE SHOT HAS TO BE OUTDOORS, not just the lens. Checking
@@ -2655,21 +3481,37 @@ export async function init(ctx) {
       }
       if (n > bestN) { bestN = n; bestD = d; }
     }
-    if (bestD < 0) return 'nowhere open';
+    if (bestD < 0) return wantZone ? 'no open road in ' + wantZone : 'nowhere open';
     mayorAt(bestD, eye);
     mayorAt(bestD + 10, look);
     const a0 = Math.atan2(look.x - eye.x, look.z - eye.z);
     /* Wally in the frame, walking the same street — this is a shot of
        the city he is standing in, not a survey of it */
     const wx = eye.x + Math.sin(a0) * 4.4, wz = eye.z + Math.cos(a0) * 4.4;
-    ctx.wally?.setBike?.(false, { instant: true });
-    ctx.wally?.setPosition?.(wx, groundY(wx, wz), wz);
-    ctx.wally?.setYaw?.(a0);
+    /* `keepWally` leaves him exactly where he is and only re-takes the
+       camera. It is what makes a BALLOON shot possible at all: the
+       flight camera claims the lens the moment he lifts off, so the
+       street view has to be taken back after he is already up — and
+       moving him at that point would drop the basket on the road. The
+       spot search above is deterministic, so the second call frames the
+       identical street. */
+    if (!opts.keepWally) {
+      ctx.wally?.setBike?.(false, { instant: true });
+      ctx.wally?.setPosition?.(wx, groundY(wx, wz), wz);
+      ctx.wally?.setYaw?.(a0);
+    }
     takeCamera(eye.x, groundY(eye.x, eye.z) + 2.25, eye.z,
       look.x, groundY(look.x, look.z) + 1.45, look.z, opts.fov ?? 50);
     ctx.camera.updateMatrixWorld();
     ctx.camera.matrixWorldInverse.copy(ctx.camera.matrixWorld).invert();
-    return { ahead: bestN, ...dbg.bubbles(opts.n ?? 3) };
+    /* WARM THE STREAM. The picker is seeded, so every fresh page load
+       overhears the city in the same order and the first two lines of
+       a shot are always the same two lines — which is exactly what
+       reproducible screenshots are for, and exactly wrong when what
+       you want to photograph is the fifth thing the docks say. `warm`
+       burns N picks against the live scene and throws them away. */
+    for (let i = 0; i < (opts.warm | 0); i++) linePicker.pick(sceneFor(all[0]));
+    return { zone: wantZone, ahead: bestN, ...dbg.bubbles(opts.n ?? 3) };
   };
 
   dbg.bubbleHint = () => {

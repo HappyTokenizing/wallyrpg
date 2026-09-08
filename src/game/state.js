@@ -75,7 +75,11 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     version: CONFIG.version,
     day: 1,
     time: CONFIG.dayStartMin,
-    weather: 'rain',
+    /* ONE OF world/weather.js's FOUR NAMES — clear|cloudy|rain|storm.
+       It used to be 'rain' or 'clear' and nothing in the codebase
+       read it; game.js hands it to ctx.sky.setWeather() now, which
+       refuses anything else. src/game/events.js is the only writer. */
+    weather: 'clear',
     money: CONFIG.startMoney,
     energy: 100,
     hunger: 16,
@@ -143,6 +147,35 @@ export function newState(rng = mulberry32(0x5eed1e)) {
     },
     /* the day the noodle cart last fed him on the slate (SLATE_MEAL) */
     slateDay: 0,
+
+    /* ------------------------------------------------------------
+       WHAT THE CITY IS DOING TO YOU. Two records, both owned by
+       src/game/events.js, both repaired by save.js (migrateEvents)
+       on every load.
+
+       city.today   the day condition standing right now, or null —
+                    which it is on most mornings, deliberately. It
+                    carries its own `until` day so a two-day strike
+                    survives a night's sleep, and `spared`, the list
+                    of doors the player personally held open against
+                    it.
+       city.log     what has run and when, so the same condition
+                    cannot come round twice in a week.
+       city.live    the encounter card on screen. NEVER persisted
+                    across a load — see migrateEvents().
+       tips.pending tomorrow's headline, as somebody told it to you
+                    tonight. Claimed exactly once, by
+                    economy.rollNews().
+       tips.rec     …and whether they turned out to be right. This is
+                    the only thing in the save that is a fact about
+                    ANOTHER PERSON'S judgement rather than about
+                    Wally, and it is the whole point of the rumour:
+                    the game never says whose word is good, it keeps
+                    the score where a player who was paying attention
+                    can read it.
+       ------------------------------------------------------------ */
+    city: { today: null, log: [], encDay: 0, encMin: -1e9, encCount: 0, encArmed: false, live: null },
+    tips: { pending: null, rec: {} },
 
     pawnDay: 0, pawnStock: [],
     /* Otto's welcome is on the phone before the player touches

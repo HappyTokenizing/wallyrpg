@@ -1979,6 +1979,525 @@ export const MORNING_NOTES = [
   { day: 15, from: 'Fenn',          msg: 'Is the Exchange hard to get into? Asking for a friend. It is me.', when: (S) => !S.unlocks.exchange },
 ];
 
+
+/* ============================================================
+   THE CITY DOING SOMETHING TO YOU — day conditions + encounters.
+
+   WHY THIS TABLE EXISTS. Until now the middle of this game offered
+   three things: NEWS, which happens to the market and which you READ;
+   CLIENT ORDERS, which tell you where to go; and the Mayor's Dash,
+   which is the only thing in the whole build that interrupts you.
+   Everything else was a number going up.
+
+   Two layers here, and they are deliberately different shapes.
+
+   DAY_EVENTS — what the CITY is doing today. Not addressed to Wally,
+   not declinable, because weather and industrial relations are not
+   offers. A condition changes what a PLACE IS for a day: it shuts a
+   door, or it holds one open late. It bites through game.isOpen(),
+   which travel(), enter() and every gate() already obey, so a shut
+   dock is shut to the fare board, to the door in the 3D world and to
+   the job counter without one extra line anywhere else.
+
+     shut     locations that close today (never a trading venue —
+              VENUES carries its own hours table and a location whose
+              hours moved would disagree with it; see events.js)
+     from     the hour it starts biting. 0 means all day.
+     open     locations whose closing hour is pushed out today
+     wx       the weather this condition brings, in weather.js's own
+              four names, so ctx.sky.setWeather() can be handed it
+              directly and never has to guess
+     after    this condition can only land the day after that one
+     never    …and never on the same day as these
+
+   ENCOUNTERS — what a PERSON is doing to you. One of these stops you
+   in a room, says something, and offers a choice you can walk away
+   from at no cost. See events.js for the frequency rule and for the
+   two guards that make them company rather than noise: nothing fires
+   on a day an order is due, and nothing fires twice inside 90 in-game
+   minutes.
+   ============================================================ */
+
+export const DAY_EVENTS = [
+  /* ------------------------------------------------------------
+     THE WEATHER FINALLY DOES SOMETHING. src/world/weather.js has
+     had clear / cloudy / rain / storm, a wet-surface signal and
+     lightning since the sky shipped, and the only caller of
+     ctx.sky.setWeather() in the entire codebase was a debug hook.
+     state.weather has meanwhile rolled 'rain' at 22% every morning
+     since the 2D original and nothing has ever read it. This is the
+     rope between the two, and it is tied in events.js.
+     ------------------------------------------------------------ */
+  {
+    id: 'storm', n: 'Weather off the water', zone: 'waterfront',
+    wx: 'storm', from: 15,
+    shut: ['docks', 'noodlecart'],
+    title: 'WEATHER OFF THE WATER',
+    sub: 'The harbour goes early',
+    line: 'It came in off the water before breakfast and it has not moved since. The cranes are down and the carts will not last the afternoon.',
+    closed: 'the weather has taken the afternoon off it',
+    from_: null,
+  },
+  {
+    /* THE DAY WHERE THE ONLY THING THAT HAPPENS IS THE SKY. It shuts
+       nothing and offers nothing, and it earns its place because
+       world/weather.js has a wet-surface signal, a rain shader, gusting
+       wind and lightning that this game has never once shown a player.
+       `quiet` keeps it off the banner — see announce() in events.js. */
+    id: 'squall', n: 'Rain all day', zone: null,
+    wx: 'rain', from: 0, quiet: true, cooldown: 11,
+    shut: [],
+    title: 'RAIN, ALL DAY',
+    sub: 'Bring the good coat',
+    line: 'Rain from first light. The gutters in Rusty Row are doing the thing they do.',
+    closed: null,
+  },
+  /* ------------------------------------------------------------
+     THE CRANE THAT WAS ALWAYS ABOUT TO STRIKE. src/character/
+     bubbles.js has the city muttering about the crane crews in its
+     ambient lines and they have never once put the tools down.
+     ------------------------------------------------------------ */
+  {
+    id: 'strike', n: 'The crane crews are out', zone: 'waterfront',
+    wx: 'cloudy', from: 0, days: [1, 2],
+    shut: ['docks'],
+    never: ['storm'],
+    title: 'THE CRANES ARE DOWN',
+    sub: 'Waterfront · the crews are out',
+    line: 'Nothing is moving at the Waterfront. Forty people, one brazier, and a hand-painted sign about the third shift.',
+    closed: 'the crews are out and nobody is opening the gate',
+  },
+  /* ------------------------------------------------------------
+     A DISTRICT BEING A DIFFERENT PLACE FOR A DAY, in the nicer
+     direction. NEWS_POOL has announced this festival for the whole
+     life of the game without it ever arriving.
+     ------------------------------------------------------------ */
+  {
+    id: 'festival', n: 'Strawberry festival', zone: 'greenedge',
+    wx: 'clear', from: 0,
+    shut: [],
+    open: [{ loc: 'farm', until: 23 }],
+    never: ['storm', 'strike'],
+    title: 'STRAWBERRY FESTIVAL',
+    sub: 'Green Edge · all day and half the night',
+    line: 'Bunting the whole way up the farm track. Auntie Maple has been up since four and is not going to bed.',
+    closed: null,
+  },
+  /* ------------------------------------------------------------
+     A CONSEQUENCE, WHICH IS THE POINT. The power cut is the only
+     condition with an `after`: it never happens on its own, only
+     the morning after weather. NEWS_POOL already jokes about the
+     fibre ring going down in a storm; now the joke has a cause.
+     ------------------------------------------------------------ */
+  {
+    id: 'powercut', n: 'The fibre ring is down', zone: 'innovation',
+    wx: null, from: 0, chance: 0.45,
+    after: ['storm'],
+    shut: ['devlab', 'ipooffice'],
+    title: 'INNOVATION DISTRICT IS DARK',
+    sub: 'The fibre ring went down in the weather',
+    line: 'Half the Innovation District is running on a generator the size of a fridge, and it is running the coffee machine.',
+    closed: 'there is no power in that building today',
+  },
+];
+
+export const DAY_EVENT_BY_ID = {};
+for (const d of DAY_EVENTS) DAY_EVENT_BY_ID[d.id] = d;
+
+/* ============================================================
+   ENCOUNTERS.
+
+   Each one is a card with choices. `accept` is what the first
+   choice does, and EVERY encounter's last choice is a decline that
+   costs nothing at all — no time, no energy, no reputation, no
+   memory of it. See events.js decline(); the test rig asserts the
+   whole state is byte-identical across a decline.
+
+     when(S, ctx)  may this fire right now
+     at            locations it can happen at (null = anywhere known)
+     cast          location -> client id, so the person who stops you
+                   is somebody who plausibly works there
+   ============================================================ */
+export const ENCOUNTERS = [
+  /* ------------------------------------------------------------
+     1. THE OTHER END OF THE AWNING.
+     The storm is going to shut this place at three whatever happens
+     — that is weather, and weather is not an offer. What is on
+     offer is whether ONE door on the island stays open through it,
+     and it costs a quarter of an hour and a wet back. Declining
+     leaves the city exactly where the storm left it.
+     ------------------------------------------------------------ */
+  {
+    id: 'shutters', kind: 'help', cond: 'storm',
+    /* EVERY ONE OF THESE IS IN storm.shut, AND THAT IS THE RULE, not
+       a coincidence: the offer is "help me keep this door open" and
+       at a door the weather was never going to close there is
+       nothing to offer. tools/test-encounters.mjs asserts the two
+       lists against each other so a fifth location added here
+       without a matching one up there fails the test rather than
+       raising a card with no consequence. */
+    at: ['noodlecart', 'docks'],
+    cast: { noodlecart: 'mabel', docks: 'pearl' },
+    mins: 15, energy: 5, rep: 1, trust: 1,
+    title: 'Take the other end of this',
+    text: [
+      '{who} is up a stepladder in the rain with one hand on an awning that has already decided which way it is going.',
+      '"Do not just stand there being an elephant about it. Take the other end and I can get the pins in before it goes over the road."',
+    ],
+    again: [
+      '{who} is up the same stepladder. The awning has not improved its opinion overnight.',
+      '"You again. Well. The offer stands and so, barely, does this." She nods at the loose corner.',
+    ],
+    yes: 'Take the other end',
+    no: 'Leave them to it',
+    done: 'Pinned, strapped and roped. {here} is staying open today, weather or no weather.',
+    passed: '"Fair enough." They get it down on their own, eventually, and get wet doing it.',
+  },
+  /* ------------------------------------------------------------
+     2. THE PICKET.
+     Not a morality test and not a delivery. Barnaby wants the one
+     person on the island who reads contracts for a living to say
+     out loud what the harbour authority has actually offered. Say
+     yes and the crews go back tomorrow. Say no and the strike runs
+     exactly as long as it was always going to — declining does not
+     extend it by an hour. See events.js: the duration is rolled
+     when the strike starts, not when you walk away from it.
+     ------------------------------------------------------------ */
+  {
+    id: 'picket', kind: 'read', cond: 'strike',
+    /* AND NOT ONE OF THESE IS IN strike.shut, WHICH IS ALSO A RULE.
+       The obvious place to meet a picket line is the gate it is
+       standing at — and the gate is the one door on the island the
+       strike has closed, so an encounter sited there could never
+       fire: onPlace() only runs when you get INTO a room. Asserted
+       the other way round from the awning above. */
+    at: ['harbourhomes', 'trunkdepot'],
+    cast: { harbourhomes: 'barnaby', trunkdepot: 'barnaby' },
+    mins: 20, energy: 0, rep: 2, trust: 1,
+    title: 'Somebody who reads these',
+    text: [
+      'Barnaby is on the brazier end of the line with a folded document he has clearly read eleven times.',
+      '"Thirty years I drove route 6 past this gate. Nobody here can tell me if this offer is generous or an insult dressed up in a font. You do numbers for a living. Read it and say which."',
+    ],
+    /* DAY TWO. He asked yesterday and you walked past; he is not
+       going to perform the whole speech again, and a strike that
+       repeated itself verbatim was the thing a play-through caught.
+       See offeredOn in events.js. */
+    again: [
+      'Barnaby is still on the brazier end of the line. The document has been folded and unfolded so many times it is starting to come apart along the crease.',
+      '"Second day. Offer has not improved and neither has the coffee." He holds it out again, without much hope. "You still do numbers for a living."',
+    ],
+    yes: 'Read it properly',
+    no: 'Not my argument',
+    done: 'You read it twice and say the second number out loud. It is an insult in a font, and once forty people know that, the authority finds a better one. The gates open tomorrow.',
+    passed: '"No, you are right, it is not your argument." He folds it up again and goes back to the brazier.',
+  },
+  /* ------------------------------------------------------------
+     3. A STRANGER WITH A TIP, WHICH MAY BE WRONG.
+     The news in this game moves a price and prints a headline and
+     you read it on a screen. This puts tomorrow's headline in
+     somebody's mouth today — and then makes whether they were RIGHT
+     a fact about that person that the game remembers. Barnaby has
+     driven the same route for thirty years. Fenn has ninety dollars
+     and unlimited confidence. Both of them will tell you what the
+     market is going to do, and only one of them is usually correct,
+     and the game never says which: it keeps the score and shows you
+     the score, and a player who was paying attention already knows.
+     ------------------------------------------------------------ */
+  {
+    id: 'wire', kind: 'tip', cond: null,
+    at: ['cafe', 'markethall', 'noodlecart', 'bazaar', 'trunkdepot', 'library', 'docks', 'stadium'],
+    mins: 10, energy: 0, rep: 0, trust: 0,
+    minDay: 6,
+    title: 'A word, before you go',
+    yes: 'Go on then',
+    no: 'I have somewhere to be',
+    passed: 'They shrug and let you past. Whatever it was, it stays theirs.',
+  },
+];
+
+export const ENCOUNTER_BY_ID = {};
+for (const e of ENCOUNTERS) ENCOUNTER_BY_ID[e.id] = e;
+
+/* ------------------------------------------------------------
+   WHOSE WORD IS GOOD.
+
+   The number is the chance that a tip from that person turns out to
+   be tomorrow's news. It is never shown as a number — state.tips
+   keeps the tally and the phone shows "right 4, wrong 1", which is
+   the same information arrived at honestly. Barnaby drove route 6
+   for thirty years; Fenn has unlimited confidence and ninety
+   dollars. Anyone not in this table does not deal in rumours.
+   ------------------------------------------------------------ */
+export const TIPSTERS = Object.freeze({
+  barnaby: 0.78, hazel: 0.74, mabel: 0.71, wendell: 0.68, goldie: 0.62,
+  otto: 0.58, dot: 0.55, sunny: 0.52, maple: 0.62, pearl: 0.60,
+  penny: 0.44, bex: 0.44, fenn: 0.32,
+});
+
+/* ============================================================
+   HOW A RUMOUR SOUNDS COMING OUT OF A PARTICULAR MOUTH.
+
+   THE FAULT THIS REPLACES. The tip encounter fires thirteen times in
+   thirty days — more than the other two encounters put together — and
+   its middle sentence was one fixed string with two substitutions:
+
+     'They are saying <headline>, and it is not in the paper yet.
+      If that lands, <TICK> has a good morning coming.'
+
+   Thirteen hearings of one sentence, sitting immediately after four
+   openers that are the best writing in the game ("taps the side of
+   their nose, which nobody has ever done sincerely"), and the
+   template read worse for the company it kept. Its closing clause
+   also did the player's reacting for him: "a good morning coming" is
+   the game saying this is good news, in a mechanic whose entire
+   subject is that you do not know yet.
+
+   THREE PARTS, AND EACH ONE VARIES INDEPENDENTLY.
+
+   OPENER — how they get you alone. Eight of them, and the pronoun in
+   one is now the person's own: `pr` below is the character's, and
+   only the POSSESSIVE and OBJECT forms are ever substituted, so no
+   line has to agree a verb with a pronoun it does not know. ("the
+   voice people use for a secret they are enjoying" keeps its `they`:
+   that one refers to `people` and was always correct.)
+
+   FRAME — how they say they came by it. Eight, shared, because this
+   half is the same act whoever performs it: somebody passing on a
+   thing they were told. Several of them carry the doubt — "Talk,
+   mind", "The same two people, probably" — which is the job the old
+   aside was doing by announcing it.
+
+   VERDICT — what they make of it for the one ticker it touches. Two
+   up and two down PER PERSON, because this is the half that is
+   theirs: Penny hears a rise and thinks about the asking price, Fenn
+   hears anything at all and remembers that he called it. It has to
+   carry the DIRECTION, because a tip with no direction is not a tip
+   — but it carries it the way a person would, and it does not tell
+   the player how to feel about it.
+
+   That is 8 x 8 x 2 = 128 sentences per tipster per direction against
+   thirteen fires a month, and the record aside is now a record and
+   nothing else: what they have been right and wrong about, which is
+   the only honest thing to say about a rumour you have not slept on.
+   ============================================================ */
+export const TIP_VOICE = Object.freeze({
+  /* Only ever used possessively or as an object — never as a subject,
+     so nothing here has to conjugate. Fenn is `they` on purpose: a
+     student with a mohawk and ninety dollars, and it makes the word a
+     decision rather than the oversight it used to be everywhere. */
+  pr: Object.freeze({
+    barnaby: 'his', hazel: 'her', mabel: 'her', wendell: 'his', goldie: 'his',
+    otto: 'his', dot: 'her', sunny: 'her', maple: 'her', pearl: 'her',
+    penny: 'her', bex: 'her', fenn: 'their',
+  }),
+
+  openers: Object.freeze([
+    '{who} steps out of a doorway you did not know was a doorway and matches your pace.',
+    '{who} waits until the person behind you has gone past, which takes a while.',
+    '{who} taps the side of {their} nose, which nobody has ever done sincerely.',
+    '{who} says your name in the voice people use for a secret they are enjoying.',
+    '{who} looks both ways down a street with nobody in it.',
+    '{who} falls in beside you and drops {their} voice about a foot.',
+    '{who} checks who is behind you, and then checks again.',
+    '{who} hands it over the way people hand over a parcel they were given.',
+  ]),
+
+  /* {heard} is the NEWS_POOL headline, lowercased at the front. */
+  frames: Object.freeze([
+    'They are saying {heard}. It is not in the paper yet.',
+    'Word is {heard}. You did not get that here.',
+    'I heard {heard}. Whether it is true is a different question.',
+    'There is talk that {heard}. Talk, mind.',
+    'Somebody who would know says {heard}.',
+    'It is going round that {heard}. Nobody has printed it.',
+    'Two people told me {heard}. The same two people, probably.',
+    'You will read {heard} tomorrow. I am telling you today.',
+  ]),
+
+  /* {tick} is the ticker. Two each way, per person. */
+  verdict: Object.freeze({
+    barnaby: { up: ['That is {tick} going up. I have driven past worse.',
+                    '{tick} climbs on that. Thirty years, same route, same pattern.'],
+               down: ['{tick} takes that on the chin. It usually does.',
+                      'Down for {tick}. I would not be standing near it.'] },
+    hazel:   { up: ['{tick} rises on that. It is in the record, if you look.',
+                    'That is {tick} up. I could show you the last three times.'],
+               down: ['{tick} falls on that. It has happened twice before.',
+                      'Down for {tick}. Look it up. It is not a secret.'] },
+    mabel:   { up: ['{tick} goes up on that. Slowly, if there is any sense in it.',
+                    'That is {tick} up. Which is not the same as up for long.'],
+               down: ['{tick} comes down on that. They always come down faster.',
+                      'Down for {tick}. That part I would put money on.'] },
+    wendell: { up: ['Puts {tick} up. Signals are green on that one.',
+                    '{tick} runs up on that. On time, for once.'],
+               down: ['{tick} down. That is a red board if I ever saw one.',
+                      'Down for {tick}. Delayed, and then cancelled.'] },
+    goldie:  { up: ['{tick} up. Something down there is worth having after all.',
+                    'Up for {tick}. About time somebody hit a seam.'],
+               down: ['{tick} down. That is a shaft with nothing in it.',
+                      'Down for {tick}. I have been in richer holes.'] },
+    otto:    { up: ['{tick} up. Everybody will want a go at that one.',
+                    'That is {tick} up. Queue round the block by Thursday.'],
+               down: ['{tick} down. Nobody is putting a coin in that.',
+                      'Down for {tick}. Out of order, that one.'] },
+    dot:     { up: ['{tick} up. Three people said so before nine this morning.',
+                    'That is {tick} up. You heard it over a flat white.'],
+               down: ['{tick} down. Nobody in here is happy about it.',
+                      'Down for {tick}. The man who owns some was in at seven.'] },
+    sunny:   { up: ['{tick} up. Good week for somebody.',
+                    'That is {tick} up. I would take it, if I had any.'],
+               down: ['{tick} down. Somebody is having a worse week than me.',
+                      'Down for {tick}. One of my irons is out again anyway.'] },
+    maple:   { up: ['{tick} up. Things grow if you leave them alone.',
+                    'That is {tick} up. Good soil under that one.'],
+               down: ['{tick} down. August was wet, and it always tells.',
+                      'Down for {tick}. Nothing has come off that field in years.'] },
+    pearl:   { up: ['{tick} up. I would have bought it on Tuesday.',
+                    'That is {tick} up. There is a crane on it already.'],
+               down: ['{tick} down. The survey came back and so did the price.',
+                      'Down for {tick}. I looked at it once. Once.'] },
+    penny:   { up: ['{tick} up. And the asking price with it, obviously.',
+                    'That is {tick} up. Somebody will want too much for it now.'],
+               down: ['{tick} down. Which is when I start looking.',
+                      'Down for {tick}. It was never worth the ask.'] },
+    bex:     { up: ['{tick} up. Deadstock, and everybody knows it now.',
+                    'That is {tick} up. Three people have asked me this week.'],
+               down: ['{tick} down. Nobody wants a pair off that shelf.',
+                      'Down for {tick}. It has been sitting there since spring.'] },
+    fenn:    { up: ['{tick} up. I have got ninety dollars and a feeling.',
+                    'That is {tick} up. I called it. Remember that I called it.'],
+               down: ['{tick} down. Obviously. Anyone could see it.',
+                      'Down for {tick}. I am not saying I told you.'] },
+  }),
+
+  /* THE ASIDE IS A RECORD NOW, NOT AN INSTRUCTION. It used to read
+     "You have no idea yet whether to believe them", which announces
+     the uncertainty the whole mechanic exists to make the player sit
+     with. What a person can actually be told is what has happened so
+     far, and nothing else. */
+  aside(name, right, wrong) {
+    const seen = right + wrong;
+    if (seen === 0) return 'This is the first thing ' + name + ' has ever told you.';
+    if (seen === 1) return 'One before this one. It was ' + (right ? 'right' : 'wrong') + '.';
+    return 'Right ' + right + ', wrong ' + wrong + ', since you started counting.';
+  },
+});
+
+/* A HEADLINE DROPPED INTO THE MIDDLE OF A SENTENCE LOSES ITS CAPITAL
+   — unless the capital was never sentence case in the first place. The
+   old code lowercased character zero unconditionally and turned
+   "CloudTusk data centre hums louder" into "cloudTusk", which is the
+   kind of thing that is invisible in a diff and unmissable on a phone
+   screen. Two tests, and between them they cover every headline in
+   NEWS_POOL: a second capital anywhere in the first word means it is a
+   brand (CloudTusk, WaffleWorks), and the short list is the ordinary
+   looking words that are nevertheless somebody's name. */
+const HEADLINE_PROPER = new Set(['Mayor', 'Stampede', 'Trunk', 'Orchard', 'City', 'Gold']);
+function lowerHeadline(h) {
+  const first = String(h).split(' ')[0];
+  if (HEADLINE_PROPER.has(first) || /[A-Z]/.test(first.slice(1))) return h;
+  return h.charAt(0).toLowerCase() + h.slice(1);
+}
+
+/**
+ * The whole spoken half of one tip, composed.
+ *
+ * @param {string} who     tipster id (a key of TIPSTERS)
+ * @param {object} news    the NEWS_POOL entry
+ * @param {object} asset   the ASSETS entry it touches
+ * @param {{right:number, wrong:number}} rec  what they have been so far
+ * @param {() => number} rng  the caller's seeded stream
+ * @returns {{opener:string, line:string, aside:string}}
+ */
+export function tipVoice(who, news, asset, rec, rng = Math.random) {
+  const V = TIP_VOICE;
+  const c = CLIENT_BY_ID[who];
+  const name = c ? c.n : who;
+  const pick = (arr) => arr[Math.floor(rng() * arr.length) % arr.length];
+  const heard = lowerHeadline(news.h);
+  const up = news.e > 0;
+  const v = V.verdict[who] || V.verdict.dot;
+  return {
+    /* {who} IS LEFT FOR THE CALLER. events.js runs every card line
+       through its own fill(), which substitutes {who}, {role} and
+       {here}; resolving {who} here as well would work but it would
+       quietly take one of those three tokens out of that helper's
+       hands. {their} is this table's own and nothing else knows it,
+       so it is resolved here and only here. */
+    opener: pick(V.openers).replace(/\{their\}/g, V.pr[who] || 'their'),
+    line: pick(V.frames).replace('{heard}', heard) + ' '
+      + pick(up ? v.up : v.down).replace(/\{tick\}/g, asset.tick),
+    aside: V.aside(name, rec ? rec.right | 0 : 0, rec ? rec.wrong | 0 : 0),
+  };
+}
+
+/* ------------------------------------------------------------
+   THE VIEW FROM THE BASKET — the one encounter that is not a card.
+
+   The Assessor's own description promises "you can see the whole
+   island at once", the Treasury clerk hands over a logbook with
+   forty years of the island's shape in it, and until now the
+   balloon's altitude bought exactly nothing that standing in the
+   road did not. From `min` metres up, the discovery radius stops
+   being the width of a doorway and becomes the horizon: places you
+   have never walked past resolve out of the haze and go onto your
+   map. The MAP, and not the keys — a `see` rule is a door and
+   flying over a door does not open it (quests.access is untouched).
+
+   gain is metres of sight per metre of altitude. At the 90 m floor
+   that is 234 m of island; at 200 m it is 520 m, which is most of
+   it, which is the shot the whole machine exists for.
+
+   DECLINING THIS IS NOT FLYING. It is the most opt-in thing in the
+   game: a $24,000 machine, gated behind rep 75 and forty tokenized
+   assets, that has to be deliberately taken to ninety metres.
+   ------------------------------------------------------------ */
+export const AIRVIEW = Object.freeze({
+  min: 90,          // metres over the solid below the basket
+  gain: 2.6,        // sight radius per metre of altitude
+  max: 560,         // …and the horizon stops there
+  dwell: 1.6,       // seconds over a place before it resolves
+  banner: ['THE WHOLE ISLAND AT ONCE', 'Forty years of its shape, and now yours'],
+});
+
+/* ------------------------------------------------------------
+   THE FREQUENCY RULE, IN ONE OBJECT, because "how often" is a
+   design decision and it should be legible as one.
+
+   A condition lands on about a third of days from day 5, never two
+   running (the power cut is the single exception and it can ONLY be
+   the day after weather), and never the same one inside six days.
+   An encounter is rolled when Wally walks into a room, at most one
+   a day, at most one per 90 in-game minutes, never in the first or
+   last hour of the day, and NEVER on a day an order is due.
+
+   That is roughly two city-wide events and five conversations in a
+   week of play. Fewer and it is a rumour that the city does
+   anything; more and every corner has somebody standing on it with
+   a quest marker.
+   ------------------------------------------------------------ */
+export const EVENT_TUNING = Object.freeze({
+  firstDay: 5,
+  dayChance: 0.34,
+  cooldownDays: 6,
+  encFirstDay: 4,
+  /* HOW OFTEN SOMEBODY STOPS YOU, and it is rolled ONCE A MORNING
+     rather than once a doorway — see onPlace() in events.js for the
+     play-through that made that difference matter. Condition-born
+     encounters ignore it: if the storm has put a person on a ladder
+     outside the door you just opened, they are on the ladder. */
+  dayEncChance: 0.45,
+  encGapMins: 90,
+  encPerDay: 1,
+  encHours: Object.freeze([8, 21]),
+  /* The hours across which a day condition may never remove the last
+     open kitchen. Outside them the escape is the bed — see
+     foodSurvives() in events.js, and game.js's hunger-lock header. */
+  kitchenHours: Object.freeze([8, 21]),
+  tipHonourFloor: 0.30,
+});
+
 /* ---------------- freeze ---------------- */
 function deepFreeze(o) {
   if (o && (typeof o === 'object' || typeof o === 'function') && !Object.isFrozen(o)) {
@@ -2024,6 +2543,10 @@ export const DATA = deepFreeze({
   happyEnding: HAPPY_ENDING,
   tips: TIPS,
   morningNotes: MORNING_NOTES,
+  /* THE CITY DOING SOMETHING — see the block above DAY_EVENTS */
+  dayEvents: DAY_EVENTS, dayEventById: DAY_EVENT_BY_ID,
+  encounters: ENCOUNTERS, encounterById: ENCOUNTER_BY_ID,
+  tipsters: TIPSTERS, airview: AIRVIEW, eventTuning: EVENT_TUNING,
   hops, fare, rideFare, worldDistance, strideCost, isFastTravel,
 });
 

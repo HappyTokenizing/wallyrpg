@@ -411,12 +411,35 @@ function buildSpecies(kind, variant, hi, rng) {
     height = h + 3.1;
   }
 
+  /* THE CROWN IS MEASURED OFF THE MERGED CANOPY, never typed in — the
+     rule props.js solidFor() already follows, so it cannot drift away
+     from the art when a species is resculpted. Per axis rather than one
+     radius: a palm's fronds are 5 m across and 2 m deep, and a single
+     square box round that is mostly air. 0.90 inscribes the box in the
+     round mass exactly as props.js does for barrels and bins. */
+  const canopyGeo = canopyParts.length ? bakeAO(mergeGeos(canopyParts), 0.56) : null;
+  let crown = null;
+  if (canopyGeo) {
+    canopyGeo.computeBoundingBox();
+    const bb = canopyGeo.boundingBox;
+    if (bb && Number.isFinite(bb.min.y)) {
+      crown = {
+        rx: (bb.max.x - bb.min.x) * 0.5 * 0.90,
+        rz: (bb.max.z - bb.min.z) * 0.5 * 0.90,
+        cx: (bb.max.x + bb.min.x) * 0.5,
+        cz: (bb.max.z + bb.min.z) * 0.5,
+        base: bb.min.y, top: bb.max.y,
+      };
+    }
+  }
+
   return {
     trunk: trunkParts.length ? mergeGeos(trunkParts) : null,
-    canopy: canopyParts.length ? bakeAO(mergeGeos(canopyParts), 0.56) : null,
+    canopy: canopyGeo,
     extra: extraParts.length ? mergeGeos(extraParts) : null,
     height,
     solid: TRUNK_SOLID[kind],
+    crown,
   };
 }
 
@@ -447,6 +470,65 @@ const TRUNK_SOLID = {
 };
 /* below the ground line, so a trunk on a hillside never floats its box */
 const TRUNK_BASE = -0.9;
+
+/* ------------------------------------------------------------------
+   AND WHAT A TREE STOPS A BALLOON WITH.
+
+   The paragraph above is right about the character and wrong about the
+   machine: a hot air balloon meets the canopy and never the trunk, and
+   until this pass it flew through a beech. So the crown gets a box too
+   — but only ever ABOVE CANOPY_BASE, and only ever WHILE SOMETHING
+   THAT CAN REACH IT EXISTS. Both halves of that were paid for.
+
+   CANOPY_BASE is the floor. The walkable circle of grass under a tree
+   is the thing this must not take away, so nothing is registered below
+   2.90 m of the tree's own base: 1.62 m of capsule, 0.35 m of step
+   offset and a metre of daylight over the top of both. Enforced at the
+   BOX'S CORNERS, not at its local floor — see crownFloor() — because
+   the box leans with the tree and a palm's crown sits a metre off its
+   own axis: the naive clamp left a palm at (-458, 38) hanging at
+   2.38 m. With the corner pass all 757 crowns sit at exactly 2.90 m
+   or higher over the terrain under their own trunk.
+
+   AND THE HONEST LIMIT OF THAT RULE, which the gate is what makes
+   harmless: "over the terrain under its own trunk" is not "over the
+   ground". A six-metre crown on a hillside overhangs ground that is
+   metres lower, and 18 of the island's 3 028 bottom corners clear the
+   ground beneath THEM by less than a capsule's 1.97 m — the worst, a
+   pine at (41, -226), is 1.19 m INSIDE the hill. Nothing walks under a
+   registered crown, so nothing meets those. Anyone who ever takes the
+   gate away must fix this first, and the symptom is already on record:
+   a test capsule walked downhill from that pine deviated 2.17 m.
+
+   THE GATE IS THE PART THAT IS NOT OBVIOUS, AND IT IS MEASURED.
+   collision.js groundAt() casts DOWN FROM THE TOP OF THE WORLD and
+   answers the first solid it meets, and three consumers ask it with no
+   fromY: secondary.js's foot IK (twice) and camera.js's lensFloor and
+   skyline. A canopy is the first solid this island would ever have
+   over ground you can walk on, so a permanently-registered crown is
+   not a canopy, it is an edit to somebody else's camera and somebody
+   else's legs. Hung one 2.90–7.20 m crown over Wally's head through
+   phys's own public API, on this build, changing no source:
+
+     ankles   0.10 m over the terrain -> 0.94 m   (legs at full stretch
+              reaching for a target 7 m up; he walks on tiptoe under
+              every tree in the wood)
+     camera   0.91 m over the terrain -> 7.92 m   (the lens floor takes
+              the crown for the ground and the shot leaves for the sky)
+
+   Both recovered the moment the box was removed. props.js says it
+   shorter: a collider taller than the thing that has to walk around it
+   is not describing collision.
+
+   So canopies exist exactly while the balloon does. wally.js already
+   emits 'wally:fly' on both edges of a flight — it is the same event
+   that turns foot IK off for the ride ("his feet are on a deck") — and
+   that is the whole wiring. On foot the collision world is byte for
+   byte what it was before this pass; aloft, every crown is solid.
+   ------------------------------------------------------------------ */
+const CANOPY_BASE = 2.90;
+/* below this a crown box is not worth a body: the clamp has eaten it */
+const CANOPY_MIN_H = 0.40;
 
 /* ------------------------------------------------------------------
    NOTHING GROWS IN THE CARRIAGEWAY.
@@ -659,8 +741,9 @@ export function createTrees(ctx, env) {
     const cv = 0.80 + rng() * 0.40;
     t.c.setRGB(cv * (0.94 + rng() * 0.12), cv, cv * (0.92 + rng() * 0.16));
     t.solid = sh.hi.solid || null;
+    t.crown = sh.hi.crown || null;
     trees.push(t);
-    if (physWired) addTrunkCollider(t);
+    if (physWired) { addTrunkCollider(t); if (canopiesOn) addCanopyCollider(t); }
     const k = skey(x, z);
     let a = cell.get(k);
     if (!a) cell.set(k, a = []);
@@ -682,15 +765,91 @@ export function createTrees(ctx, env) {
     t.colId = ctx.phys.addOBB(s.r * 2, s.top - TRUNK_BASE, s.r * 2, _colM,
       { name: `tree.${t.kind}`, prop: true });
   }
-  function dropTrunkCollider(t) {
+
+  /* THE /sy IS THE WHOLE OF THIS FUNCTION.
+
+     t.m carries each tree's own size — that is why the trunk boxes
+     measure 1.31 to 2.66 m over their terrain rather than a flat
+     SOLID_TOP of 1.72 — and the crown numbers coming out of
+     buildSpecies() are in the species' LOCAL frame, which that scale
+     is about to multiply. CANOPY_BASE is a world height, so it has to
+     be divided by the tree's vertical scale before it can be compared
+     with a local one. Without the division a sapling at s = 0.74 gets
+     its canopy floor at 0.74 x 2.90 = 2.15 m of world height, and the
+     rule this whole design rests on is quietly gone. */
+  const _cv = new THREE.Vector3();
+  /** The local Y this tree's crown box may start at, or null when the
+      clamps have eaten it. One function, so the rig that measures the
+      floor is measuring the rule that ships. */
+  function crownFloor(t) {
+    const c = t.crown;
+    if (!c) return null;
+    const e = t.m.elements;
+    const sy = Math.hypot(e[4], e[5], e[6]) || 1;
+    let base = Math.max(c.base, CANOPY_BASE / sy);
+    if (!(c.top - base > CANOPY_MIN_H)) return null;
+    /* AND THEN THE CORNERS, because the box is TILTED and OFFSET.
+       t.m leans the tree 0.35 of the way onto the terrain normal and a
+       palm's crown sits a metre downwind of its own axis, so a floor
+       2.90 m up the tree's local Y is not 2.90 m of world height at the
+       low corner: measured over the island before this clause, the
+       lowest corner on the island was a palm's at 2.38 m. Raising the
+       local base by d lifts the bottom face by e[5] * d and leaves the
+       top where the leaves are, so one pass is exact. */
+    let low = Infinity;
+    for (let i = 0; i < 4; i++) {
+      _cv.set(c.cx + (i & 1 ? c.rx : -c.rx), base, c.cz + (i & 2 ? c.rz : -c.rz)).applyMatrix4(t.m);
+      if (_cv.y < low) low = _cv.y;
+    }
+    const want = t.y + CANOPY_BASE;
+    if (low < want && e[5] > 1e-3) {
+      base += (want - low) / e[5];
+      if (!(c.top - base > CANOPY_MIN_H)) return null;
+    }
+    return base;
+  }
+  function addCanopyCollider(t) {
+    const c = t.crown;
+    if (!c || t.dead || t.crownId != null || !ctx.phys?.addOBB) return;
+    const base = crownFloor(t);
+    if (base == null) return;
+    const h = c.top - base;
+    _colM.copy(t.m).multiply(_colT.makeTranslation(c.cx, base + h * 0.5, c.cz));
+    t.crownId = ctx.phys.addOBB(c.rx * 2, h, c.rz * 2, _colM,
+      { name: `canopy.${t.kind}`, prop: true });
+  }
+  function dropColliders(t) {
+    if (t.crownId != null) { ctx.phys?.remove(t.crownId); t.crownId = null; }
     if (t.colId == null) return;
     ctx.phys?.remove(t.colId);
     t.colId = null;
   }
+
+  /* THE SWITCH, and it is a revert switch, not a debug hook: on is
+     what a balloon meets, off is the island exactly as it was before
+     canopies existed, and the two run on one page load so the A/B is a
+     measurement rather than a number quoted from a dead build. The
+     game drives it from 'wally:fly' below and never calls it directly;
+     a test drives it to hold the island still on either side. */
+  let canopiesOn = false;
+  function setCanopies(on) {
+    on = on !== false;
+    if (on === canopiesOn) return canopiesOn;
+    canopiesOn = on;
+    if (!physWired) return canopiesOn;
+    for (const t of trees) {
+      if (t.dead) continue;
+      if (on) addCanopyCollider(t);
+      else if (t.crownId != null) { ctx.phys?.remove(t.crownId); t.crownId = null; }
+    }
+    return canopiesOn;
+  }
+  const offFly = ctx.bus?.on?.('wally:fly', (e) => setCanopies(!!e?.flying)) || null;
+
   function wirePhysics() {
     if (physWired || !ctx.phys?.addOBB) return 0;
     physWired = true;
-    for (const t of trees) addTrunkCollider(t);
+    for (const t of trees) { addTrunkCollider(t); if (canopiesOn) addCanopyCollider(t); }
     return trees.length;
   }
 
@@ -913,7 +1072,7 @@ export function createTrees(ctx, env) {
       let n = 0;
       for (const t of trees) {
         if (t.dead) continue;
-        if (Math.hypot(t.x - x, t.z - z) < r + 1.2) { t.dead = true; dropTrunkCollider(t); n++; }
+        if (Math.hypot(t.x - x, t.z - z) < r + 1.2) { t.dead = true; dropColliders(t); n++; }
       }
       if (n) acc = 99;
       return n;
@@ -922,6 +1081,45 @@ export function createTrees(ctx, env) {
     /** Hand every trunk to ctx.phys. Called once, from foliage.update. */
     wirePhysics,
     get solidCount() { let n = 0; for (const t of trees) if (t.colId != null) n++; return n; },
+
+    /** The canopy switch. Driven by 'wally:fly'; exposed so a test can
+        run the island with crowns and without on one page load. */
+    setCanopies,
+    get canopiesOn() { return canopiesOn; },
+    get crownCount() { let n = 0; for (const t of trees) if (t.crownId != null) n++; return n; },
+    /** Every live crown box in world space — what a rig measures the
+        fit of against the drawn canopy. */
+    crownBoxes(limit = 1e9) {
+      const out = [];
+      const p = new THREE.Vector3();
+      for (const t of trees) {
+        if (t.dead || !t.crown || out.length >= limit) continue;
+        const c = t.crown;
+        const base = crownFloor(t);
+        if (base == null) continue;
+        const h = c.top - base;
+        /* the eight world corners, so a rig can ask the question that
+           matters — how low does this box actually reach — instead of
+           re-deriving it and getting the tilt wrong */
+        const corners = [];
+        let low = Infinity, high = -Infinity;
+        for (let i = 0; i < 8; i++) {
+          p.set(c.cx + (i & 1 ? c.rx : -c.rx), i & 4 ? c.top : base, c.cz + (i & 2 ? c.rz : -c.rz)).applyMatrix4(t.m);
+          corners.push([p.x, p.y, p.z]);
+          if (p.y < low) low = p.y;
+          if (p.y > high) high = p.y;
+        }
+        p.set(c.cx, base + h * 0.5, c.cz).applyMatrix4(t.m);
+        out.push({
+          kind: t.kind, v: t.v, x: t.x, y: t.y, z: t.z, s: t.s,
+          live: t.crownId != null,
+          centre: [p.x, p.y, p.z], corners,
+          lowOverBase: low - t.y, highOverBase: high - t.y,
+          local: { rx: c.rx, rz: c.rz, base, top: c.top, h },
+        });
+      }
+      return out;
+    },
 
     setWind(k) {
       for (const [m, base] of windBase) m.uniforms.uWindWeight.value = base * k;
@@ -986,6 +1184,8 @@ export function createTrees(ctx, env) {
     },
 
     dispose() {
+      offFly?.();
+      setCanopies(false);
       for (const parts of buckets.values()) for (const m of parts) { m.geometry.dispose(); m.dispose(); }
       group.parent?.remove(group);
     },

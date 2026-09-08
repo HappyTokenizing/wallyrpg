@@ -88,6 +88,14 @@
               throat, so it leans and breathes with the same gust
               everything else in the frame is riding.
 
+   AND THE ISLAND IS ROUND. The one thing on this island that can
+   reach the edge of the world is this machine, so the one thing on
+   this island that owns the edge of the world is this file: section 2b
+   below is the wrap — fly far enough out to sea in any direction and
+   you come back in on the opposite side — together with the offshore
+   fret that is the reason it does not read as a teleport. wally.js
+   applies both; the geometry, the argument and the numbers are here.
+
    FORWARD IS +Z. Origin on the ground under the basket's centre-line,
    same as the other three.
    ============================================================ */
@@ -342,6 +350,143 @@ export function newFlight(yaw = 0) {
 }
 
 /* ==================================================================
+   2b. THE ISLAND IS ROUND — the wrap, and the fret that hides it.
+
+   THE REQUEST. "If you keep traveling with the hot air balloon off the
+   island into the distant ocean it will eventually just take you to the
+   other side of the map — so if you go north for a while you end up in
+   the south part of the map." So the map is a TORUS, and the whole
+   difficulty is that a torus made by teleporting is a cut.
+
+   WHY THIS IS PER-AXIS AND NOT RADIAL. A radial "you come out the
+   antipode" is not a manifold: fly out at 45 degrees, come out at 225,
+   keep going, and you arrive somewhere that is not where you started.
+   Wrapping x and z INDEPENDENTLY is a flat torus, which is consistent —
+   fly any straight line for long enough and it closes. It also happens
+   to be exactly what the request describes, north to south and west to
+   east, and the diagonal falls out of it for free.
+
+   WHERE IT FIRES, AND THE THREE NUMBERS THAT DECIDE IT.
+     terrain.js publishes BX 672 / BZ 560 as the half-extents of the
+     BUILT box, and data.js puts the shoreline ellipse at 485 x 380.
+     So the built box is only 187 m of open water past the east shore
+     and 180 m past the north one — and a wrap AT the box edge would
+     drop the player 187 m short of the far beach with the whole island
+     filling the frame ahead of them. That is not a round island, that
+     is a cut with the destination in shot.
+
+     So the wrap plane is OUTSIDE the built box, in the open water the
+     ocean disc covers anyway (water.js DISC_MAX is 12 km and the disc
+     follows the camera). Past x ~ 800 / z ~ 600 the height raster has
+     clamped and the sea floor is flat -- -65.03 m on the X planes,
+     -62.87 and -58.78 on the Z ones, measured, so it is level where
+     each plane is and not one number everywhere --
+     and terrain.js will happily stream collision tiles out there — so
+     "past the box" is open sea with a floor, not a void.
+
+     MARGIN is the distance past the shoreline at which it fires, and
+     it is the same 295 m on both axes on purpose: the rule a player
+     infers has to be "a few minutes out in any direction", not "a
+     rectangle". At the delivered cruise speeds (A2's own numbers:
+     9.30 m/s downwind, 6.20 across, 3.10 up) that is 32 / 48 / 95
+     seconds of open water past the beach. Nearer and the far shore is
+     in the frame; further and the player has already decided they are
+     stuck, which is the exact feeling the request is about.
+
+   WHAT THE PLAYER SEES — AND WHY THE FOG IS A FUNCTION OF |x| AND |z|.
+     The wrap negates x (or z). Every quantity that depends only on
+     |x| and |z| is therefore IDENTICAL either side of it, and `far`
+     below is built out of |x| and |z| alone. So the fret does not
+     change across the swap by construction rather than by tuning —
+     there is no value to match up, and no seam to hide. What is left
+     that could move is the ocean's own wave phase, which is measured
+     rather than assumed (test-balloon B13).
+
+     FAR = hypot(altitude, WRAP.far), and both halves of that are
+     load-bearing:
+       · it must be SHORTER than the distance to the far shore, or the
+         island is standing in the frame when the swap lands. At the
+         plane the nearest land is at least MARGIN away horizontally
+         and at sea level, so its distance from a balloon at height h
+         is at least hypot(h, MARGIN); hypot(h, 210) < hypot(h, 295)
+         for every h. The guarantee is therefore altitude-INDEPENDENT,
+         which is the property a haze tuned at one altitude would not
+         have had.
+       · it must be LONGER than the altitude, or a balloon high over
+         the sea is in a featureless void with no water under it.
+         hypot(h, 210) > h for every h. Also by construction.
+     The one thing it does not cover is a 58 m hilltop seen from very
+     high up: solve hypot(h,210) < hypot(295, h - 58) and it holds up
+     to h = 399 m, above which the island's high ground begins to show
+     through. That is stated rather than hidden — it is four times the
+     altitude the water refusal parks a hands-off flight at, and twice
+     B4's haze altitude — and there is no distance fog that hides an
+     island without also hiding the sea directly beneath you, because
+     from far enough up they are the same distance away.
+
+   Exported, and pure numbers with no THREE and no ctx, so
+   tools/test-balloon.mjs asserts the topology and the visibility
+   budget in plain node before any of it is flown.
+   ================================================================== */
+export const WRAP = Object.freeze({
+  X: 780,              // half-period east-west  (period 1560 m)
+  Z: 675,              // half-period north-south (period 1350 m)
+  /* where the fret starts closing, as a fraction of the half-period.
+     0.78 puts it 123 m past the east shore and 147 m past the north
+     one, so the first two minutes of an open-water flight are in clear
+     air and you can still turn round and look at the island. */
+  mist0: 0.78,
+  far: 210,            // metres of level visibility at the wrap plane
+  /* how much of the fog the fret is allowed to own. 1 = the fret's
+     `far` wins outright at the plane. The runtime revert sets it to 0,
+     which leaves the wrap in and takes the concealment out. */
+  mist: 1,
+});
+
+/** How far out she is, 1 at the wrap plane. Chebyshev in half-periods,
+    because the wrap is per-axis and the plane is a box. */
+export function wrapK(x, z) {
+  return Math.max(Math.abs(x) / WRAP.X, Math.abs(z) / WRAP.Z);
+}
+
+/** The fret's strength at (x, z): 0 inside WRAP.mist0, 1 at the plane
+    and beyond. Smooth, so it opens and closes rather than switching. */
+export function wrapMist(x, z) {
+  return smooth(WRAP.mist0, 1, wrapK(x, z));
+}
+
+/** The fog distance the fret asks for at altitude `h` over the sea.
+    See the header: short enough to hide the far shore, long enough to
+    leave the water under her visible. */
+export function wrapFar(h) {
+  return Math.hypot(Math.max(0, h), WRAP.far);
+}
+
+/**
+ * THE WRAP ITSELF. The displacement that puts (x, z) back inside the
+ * box, or null if it is already inside. Both axes are tested, so a
+ * balloon crossing a corner on the diagonal wraps both in one step —
+ * which is what a torus does and what "or if you keep going west
+ * you'll end up east" means when you are going north-west.
+ *
+ * @param {number} x
+ * @param {number} z
+ * @param {object} [out] {dx, dz} to fill, so a frame allocates nothing
+ * @returns {{dx:number, dz:number}|null}
+ */
+export function wrapDelta(x, z, out = null) {
+  let dx = 0, dz = 0;
+  if (x > WRAP.X) dx = -2 * WRAP.X;
+  else if (x < -WRAP.X) dx = 2 * WRAP.X;
+  if (z > WRAP.Z) dz = -2 * WRAP.Z;
+  else if (z < -WRAP.Z) dz = 2 * WRAP.Z;
+  if (!dx && !dz) return null;
+  const o = out || { dx: 0, dz: 0 };
+  o.dx = dx; o.dz = dz;
+  return o;
+}
+
+/* ==================================================================
    3. THE MERIDIAN — the envelope's own profile.
 
    Twelve control points rather than a formula, because the shape of a
@@ -391,6 +536,102 @@ function meridian(v) {
     hd(p0[1], p1[1], p2[1], p3[1]) * inv,
     Math.max(0.05, hd(p0[2], p1[2], p2[2], p3[2]) * inv),
   ];
+}
+
+/* The two numbers the deflation is made of. They live out here rather
+   than inside the envelope part because envelopeRings() below has to
+   describe the SAME shape build() draws, and two copies of a constant
+   is how a collision hull ends up describing last month's balloon. */
+const FOLD = 2.05;          // radians the cold envelope folds through
+const HEAP = 3.90;          // metres of axis a cold envelope occupies
+
+/* ==================================================================
+   THE COLLISION HULL — the drawn envelope, sampled coarsely.
+
+   WHAT WENT WRONG WITH THE OLD ONE. wally.js probed the envelope with
+   FOUR RAYS ON ONE HORIZONTAL RING at `envelopeCentre`, 5.93 m over
+   the deck. That ring is a correct description of exactly one height
+   of a body 7.30 m tall and 7.24 m wide, and it is the height at which
+   the balloon is widest — so against a wall TALLER than the ring it is
+   very nearly right, and against everything else it is a plane sweeping
+   through empty air above the obstacle. Measured on this island: the
+   ring sits at the street plus the flying altitude plus 5.93 m, and 19
+   of the city's 28 named buildings have a roof under 8 m over their own
+   street. Driven at the Market Hall (roof +6.96) at 6 m of altitude the
+   envelope finished 2.85 m INSIDE the building and the machine came out
+   the far side. Three metres lower it bounced — because at 3 m the
+   BASKET's own rays reach the wall, which is the whole reason the
+   suite's collision test was green over this. It flew at one altitude.
+
+   SO THE HULL IS A LADDER, and it is generated from the meridian the
+   envelope is actually built from rather than transcribed: same
+   MERIDIAN table, same per-row fill curve as build(), same axial
+   shortening. Seven rings from the throat to the shoulder, at most
+   1.25 m apart, each carrying the fabric's real radius at that height.
+   The crown (v > 0.88, under 1.2 m across) is left off: it is the one
+   part of the envelope that meets nothing the shoulder under it has
+   not already met.
+
+   IT IS EXACT AT FULL INFLATION, which is the only state that flies —
+   flyCollide runs in the 'aloft' phase and nowhere else. Cold, it
+   ignores the fold, so it describes a heap standing straight up rather
+   than one draped over the frame: conservative in the only direction
+   that matters, and never asked.
+   ================================================================== */
+const ENV_RING_V = Object.freeze([0.00, 0.10, 0.24, 0.40, 0.56, 0.72, 0.88]);
+
+/**
+ * The envelope as a ladder of horizontal rings, prop-local (y = 0 is
+ * the ground the basket stands on), in metres.
+ *
+ * @param {number} fill  the inflation, 0..1
+ * @param {Array}  [out] an array to fill, so a frame allocates nothing
+ * @returns {Array<{y:number, r:number}>}
+ */
+export function envelopeRings(fill = 1, out = null) {
+  const t = clamp01(fill);
+  /* build()'s own two lines, verbatim: the axis shortens as the cloth
+     crumples, and each row swells on its own curve — the throat first
+     and the crown last. */
+  const L = HEAP + (FIT.ENV_H - HEAP) * Math.pow(t, 0.80);
+  const a = out || [];
+  for (let i = 0; i < ENV_RING_V.length; i++) {
+    const v = ENV_RING_V[i];
+    const m = meridian(v);
+    const rf = clamp01((t - v * 0.30) / 0.70);
+    const k = 0.40 + 0.60 * Math.pow(rf, 0.62);
+    const o = a[i] || (a[i] = { y: 0, r: 0 });
+    o.y = FIT.MOUTH + L * v;
+    o.r = m[0] * k;
+  }
+  a.length = ENV_RING_V.length;
+  return a;
+}
+
+/**
+ * THE LADDER READ AS A SOLID, which is the shape the sweep probe in
+ * wally.js tests a contact point against and the shape
+ * tools/test-balloon.mjs measures the drawn mesh against. Both used to
+ * carry their own copy of this interpolation; two copies of a hull is
+ * how a collider ends up describing last month's balloon, and a test
+ * with its own copy is a test asserting against itself.
+ *
+ * @param {Array<{y:number,r:number}>} rings  from envelopeRings()
+ * @param {number} y  prop-local height, metres
+ * @returns {number}  the fabric's radius there, 0 below the throat and
+ *                    above the crown ring
+ */
+export function ringRadiusAt(rings, y) {
+  const n = rings.length;
+  if (!n || y <= rings[0].y || y >= rings[n - 1].y) return 0;
+  for (let i = 1; i < n; i++) {
+    if (y <= rings[i].y) {
+      const span = rings[i].y - rings[i - 1].y;
+      const t = span > 1e-6 ? (y - rings[i - 1].y) / span : 0;
+      return rings[i - 1].r + (rings[i].r - rings[i - 1].r) * t;
+    }
+  }
+  return 0;
 }
 
 /* Gores, columns per gore, rows. 16 x 4 x 18 is 2 304 triangles for
@@ -590,8 +831,8 @@ function makeEnvelope(ctx, K) {
   const AXT = new Float32Array((ROWS + 1) * 3);     // its tangent
   const RAD = new Float32Array(ROWS + 1);           // ring radius
   const DRD = new Float32Array(ROWS + 1);           // dr/ds, for the hull normal
-  const FOLD = 2.05;          // radians the cold envelope folds through
-  const HEAP = 3.90;          // metres of axis a cold envelope occupies
+  /* FOLD and HEAP are at module scope, beside envelopeRings(), which
+     has to describe the same shape this function draws. */
   /* AND THEN IT FALLS. The fold alone put the cold envelope in a neat
      arc that ended a metre and a half off the grass — a balloon doing
      a handstand. Cloth with no air in it has weight and nothing to
@@ -1549,4 +1790,8 @@ function finishBalloon(ctx, group, spec, K) {
   return api;
 }
 
-export default { createBalloon, FIT, FLIGHT, stepFlight, newFlight };
+export default {
+  createBalloon, FIT, FLIGHT, stepFlight, newFlight,
+  WRAP, wrapK, wrapMist, wrapFar, wrapDelta,
+  envelopeRings, ringRadiusAt,
+};
