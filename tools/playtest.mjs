@@ -17,7 +17,7 @@ const errs=[];
 p.on('pageerror',e=>errs.push('PAGEERROR: '+e.message.split('\n')[0]));
 p.on('console',m=>{const t=m.text();if(m.type()==='error'&&!/favicon/.test(t))errs.push('CONSOLE: '+t.slice(0,180));});
 await p.goto(`http://127.0.0.1:${port}/index.html?skipIntro`,{waitUntil:'load',timeout:60000});
-await p.waitForFunction('window.__WALLY_READY__===true',{timeout:60000});
+await p.waitForFunction('window.__WALLY_READY__===true',null, {timeout:60000});
 await p.waitForTimeout(3000);
 const log=[];
 const snap=async(tag)=>{const m=await p.evaluate(()=>({

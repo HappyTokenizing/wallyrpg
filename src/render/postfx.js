@@ -19,7 +19,7 @@ import {
   GLSL_NOISE, GLSL_COLOR, GLSL_POISSON, GLSL_VIEWPOS, GLSL_DEPTH, GLSL_FINITE,
   spiralTaps,
 } from './shaders.js';
-import { damp } from '../core/contracts.js';
+import { damp, tierName } from '../core/contracts.js';
 
 /* ------------------------------------------------------------------
    Grade presets. Lift pushes the toe blue-violet, gain pulls the
@@ -242,7 +242,12 @@ export function createPostFX(ctx, { composer }) {
   /* ================================================================
      1. SSAO — wide radius, soft falloff, warm tint (§3.4)
      ================================================================ */
-  const ssaoTaps = q.name === 'low' ? 8 : (q.name === 'med' ? 10 : 12);
+  /* THROUGH tierName, BECAUSE THE SOFTWARE TIER IS NAMED 'med(sw)'.
+     A raw === 'med' is false for it, so the one tier that exists
+     because a software rasteriser is nothing but pixel cost was
+     falling to the else branch and taking the 12-tap path. */
+  const qn = tierName(q.name);
+  const ssaoTaps = qn === 'low' ? 8 : (qn === 'med' ? 10 : 12);
 
   const ssaoMat = composer.makeMaterial(/* glsl */`
     uniform sampler2D tND;
@@ -498,7 +503,7 @@ export function createPostFX(ctx, { composer }) {
      legible (§2.4). The composite recomputes this CoC for its mix
      gate, so both gain and clamp have to be pushed there too.
      ================================================================ */
-  const dofTaps = q.name === 'low' ? 8 : (q.name === 'med' ? 12 : 20);
+  const dofTaps = tierName(q.name) === 'low' ? 8 : (tierName(q.name) === 'med' ? 12 : 20);
 
   const dofMat = composer.makeMaterial(/* glsl */`
     uniform sampler2D tSrc;
@@ -866,9 +871,27 @@ export function createPostFX(ctx, { composer }) {
   const aoScale = 0.5;
   const dofScale = 0.5;
 
+  /* `post.b` USED TO BE HERE, AND NOTHING EVER TOUCHED IT. It was the
+     back half of a ping-pong pair that no pass in this file ever
+     ponged: the chain runs scene -> a -> mips -> dof -> ldr, and `T.b`
+     had zero readers. It cost no VRAM, which is exactly why it
+     survived — composer.target() only constructs a WebGLRenderTarget,
+     and three does not allocate the GL texture until something binds
+     it. PROVEN, ONE PAGE LOAD, WITH A POSITIVE CONTROL, by asking the
+     renderer whether each target's texture had reached the driver:
+
+       renderer.properties.get(rt.texture).__webglTexture
+         post.a    defined      <- the control: this one IS drawn into
+         post.ldr  defined      <- and so is this one
+         post.b    UNDEFINED    <- never bound, in a settled frame
+
+     A `hasGL: false` on its own would only have meant "the query is
+     wrong"; the two controls beside it are what make it mean "the
+     target is dead". What it did cost was a setSize() on every
+     viewport change and a name in a pool that anyone reading this
+     file had to account for. */
   const T = {
     a: composer.target('post.a', 1, {}),
-    b: composer.target('post.b', 1, {}),
     ao: composer.target('post.ao', aoScale, { type: THREE.HalfFloatType }),
     ao2: composer.target('post.ao2', aoScale, { type: THREE.HalfFloatType }),
     dof: composer.target('post.dof', dofScale, {}),

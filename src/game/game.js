@@ -250,6 +250,9 @@ export function createGame(opts = {}) {
 
   let autosaveAt = 0;
   let lastHour = -1;
+  /* is the elephant in the air right now? pushed in by init(ctx) —
+     see setAloft() and collapse(). false in every headless harness. */
+  let aloft = false;
 
   /* a default minigame score when the UI has no minigame to run */
   const defaultScore = () => 0.46 + rng() * 0.44;
@@ -323,6 +326,36 @@ export function createGame(opts = {}) {
     advance(mins, energy = 0) { return advance(mins, energy); },
   };
 
+  /* ------------------------------------------------------------
+     THE HOUR BELL — the ONE place 'hour' is emitted, and now the one
+     place it can be RUNG.
+
+     Everything downstream of the clock hangs off this event: sky.js
+     adopts the hour from it and eases the whole day-night chain onto
+     it. advance() rings it by crossing an hour boundary, which is
+     right while time is running and WRONG the moment time jumps.
+
+     THE MORNING NOBODY LIT. A night's sleep does not cross an hour
+     boundary — it REPLACES the clock: econ.newDay() assigns
+     st.time = CONFIG.dayStartMin, so the next advance() after waking
+     has beforeHour === afterHour === 7 and the loop below runs zero
+     times. No 'hour' fired at 07:00, so the sky was never told the
+     night had ended and kept last night's stars until the 08:00 bell
+     — roughly two real minutes (60 min / CONFIG.minutesPerSecond
+     0.5 = 120 s) of daylight play under a starfield, every day, with
+     the HUD reading MORNING. rollDay() therefore rings the bell for
+     the hour it just woke into, AFTER the 'day' event, because
+     sky.js's 'day' handler clears the adopted hour and the bell has
+     to be the last word.
+     ------------------------------------------------------------ */
+  function ringHour(hh) {
+    if (!Number.isFinite(hh) || hh === lastHour) return false;
+    lastHour = hh;
+    const st = S();
+    bus.emit('hour', { hour: hh, minutes: st.time, day: st.day });
+    return true;
+  }
+
   function advance(mins, energy = 0) {
     const st = S();
     if (!Number.isFinite(mins) || mins <= 0) mins = 0;
@@ -350,10 +383,7 @@ export function createGame(opts = {}) {
     if (st.energy > 42) st.flags.ewarn = false;
 
     const afterHour = Math.floor(st.time / 60);
-    for (let h = beforeHour + 1; h <= afterHour; h++) {
-      const hh = h % 24;
-      if (hh !== lastHour) { lastHour = hh; bus.emit('hour', { hour: hh, minutes: st.time, day: st.day }); }
-    }
+    for (let h = beforeHour + 1; h <= afterHour; h++) ringHour(h % 24);
 
     clients.tick(mins);
 
@@ -365,10 +395,38 @@ export function createGame(opts = {}) {
     return st.time;
   }
 
+  /* NOBODY FALLS ASLEEP AT A DESK HE IS NOT AT — AND NOBODY SLEEPS
+     THROUGH A FLIGHT. collapse() is the only forced day roll, and it
+     used to fire wherever the player happened to be at
+     CONFIG.forceSleepMin, including 200 m over the harbour with the
+     balloon under him: the day rolled, the banner said he fell asleep
+     at the desk, and character/wally.js kept flying because a flight
+     is only ended by an explicit landing (see flyPhase there). The
+     morning then arrived around an elephant still in the air.
+
+     The rules layer cannot see the balloon — createGame() takes no
+     ctx by design (tools/test-game.mjs runs it headless) — so the
+     fact is PUSHED in by init(ctx) through setAloft(), and defaults
+     to false, which is exactly the old behaviour for any harness that
+     never pushes it. The collapse is deferred, not cancelled: the
+     clock keeps running past forceSleepMin and the next advance()
+     after he puts it down rolls the day for real. */
+  const setAloft = (on) => { aloft = !!on; return aloft; };
+
   function collapse() {
+    const st = S();
+    if (aloft) {
+      /* said once per night, not eight times a second */
+      if (!st.flags.aloftLate) {
+        st.flags.aloftLate = true;
+        M.note('bad', 'It is far too late to be up here. Put the balloon down.');
+      }
+      return false;
+    }
     M.note('bad', 'You fell asleep at the desk.');
     M.addRep(-1);
     rollDay(true);
+    return true;
   }
 
   function sleep() {
@@ -398,6 +456,9 @@ export function createGame(opts = {}) {
        against a fare board he read yesterday. A heading is a thing you
        hold in your head, and he slept. */
     clearRoute(collapsed ? 'he fell asleep at the desk' : 'a new day');
+    /* a night has passed, so the "you are still in the air" warning is
+       spent — see collapse() */
+    st.flags.aloftLate = false;
     const income = econ.newDay();
     /* WHAT THE CITY IS DOING TODAY — weather, a strike, a festival, a
        power cut, or nothing at all, which is most mornings. It runs
@@ -416,6 +477,11 @@ export function createGame(opts = {}) {
     st.arrivals = st.arrivals.filter((o) => o.keep && st.day <= o.deadline);
     clients.resetClock();
     clients.seedArrivals();
+    /* THE MORNING SEED IS THE DAY'S SEED. bootState() may also seed a
+       desk it finds empty, and without a latch that is once per LOAD:
+       clear the desk, reload, and the walk-ins are back. See the
+       matching check there. */
+    st.flags.seedDay = st.day;
     clients.dailyOffers();
     /* A friend nags. If the side quest is open but his order is gone —
        lapsed, or wiped by an older save — put it back with a fresh
@@ -437,6 +503,12 @@ export function createGame(opts = {}) {
     quests.check();
     lastHour = -1;
     bus.emit('day', { day: st.day, weather: st.weather, income, today: cond ? cond.id : null });
+    /* AND NOW LIGHT THE MORNING. Last line of the roll, after 'day',
+       because sky.js clears its adopted hour on 'day' and adopts it
+       again on 'hour' — see ringHour(). Without this the first bell
+       of a new day was 08:00 and the sky held the small hours until
+       it came. */
+    ringHour(Math.floor(st.time / 60) % 24);
     return income;
   }
 
@@ -2358,14 +2430,21 @@ export function createGame(opts = {}) {
     },
 
     /* ---- THE RIDES ----
-       Three vehicles, one table (data.js RIDES), one ownership record
+       FOUR vehicles, one table (data.js RIDES), one ownership record
        (state.rides). Owning and riding stay separate — a thing in the
        shed is not a thing under you — and only one is ever equipped.
+       Every number below is a copy of data.js RIDES and nothing reads
+       it; when they disagree, RIDES is right.
 
-         bicycle     $180, day one, at Dispatch or Vic's
-         scooter     NOT FOR SALE. q_side_scooter hands it over.
-                     1.5x the bicycle.
-         motorcycle  $16,000 and rep 45, at Dispatch. 3x the bicycle.
+         bicycle     $180, day one, at Dispatch or the pawnshop. The
+                     1x every other speed is quoted against.
+         scooter     NOT FOR SALE. q_side_scooter hands it over. 1.5x
+         motorcycle  $3,300 and rep 50, at Dispatch. 3x the bicycle
+         balloon     $24,000, rep 75 and 40% of the city tokenized, at
+                     the Treasury. 2.2x — slower than the motorcycle,
+                     and it goes over the top of everything. It is the
+                     one row whose headline is not its speed; see
+                     RIDES.balloon's `pitch`.
 
        None of it is ever required: walking is free and never refused,
        so a broke, exhausted, ride-less player is slow, not stuck. */
@@ -3111,8 +3190,18 @@ export function createGame(opts = {}) {
        mode that is now fast travel. */
     resetStride();
     syncRoute();
-    if (fresh) clients.seedArrivals();
-    else if (!S().arrivals.length) clients.seedArrivals();
+    /* A DESK IS SEEDED ONCE A DAY, NOT ONCE A LOAD. The empty-desk
+       re-seed exists so a save written before arrivals existed still
+       gets walk-ins — but it keyed on nothing, so it ran on EVERY
+       load: accept the morning's orders, reload, and clients.seedArrivals()
+       handed out one to three more, again, and again. state.flags.seedDay
+       is the latch, written here and by rollDay(); an older save has
+       no seedDay, so it still gets exactly one seed and then latches. */
+    const bs = S();
+    if (fresh || (!bs.arrivals.length && bs.flags.seedDay !== bs.day)) {
+      clients.seedArrivals();
+      bs.flags.seedDay = bs.day;
+    }
     lastHour = -1;
     storyBeats();
     bus.emit('ready:game', { day: S().day, loc: S().loc });
@@ -3174,10 +3263,14 @@ export function createGame(opts = {}) {
                           the guard is a flat 40 m.
          setWalker(on)    is anything in this build actually walking
                           him? Off means travel() resolves a
-                          self-powered leg itself.                   */
+                          self-powered leg itself.
+         setAloft(on)     is he in the balloon RIGHT NOW? The rules
+                          layer has no ctx and cannot see a balloon;
+                          init(ctx) pushes it every sense tick, and
+                          collapse() is the one thing that reads it. */
     get route() { return routeView(); },
     get routeTo() { const r = syncRoute(); return r ? r.to : null; },
-    clearRoute, stride, resetStride, setWalker,
+    clearRoute, stride, resetStride, setWalker, setAloft,
     get hasWalker() { return hasWalker; },
     zoneOf: (locId) => (LOC_BY_ID[locId] ? ZONES[LOC_BY_ID[locId].z] : null),
 
@@ -3420,6 +3513,10 @@ export async function init(ctx) {
     if (senseAcc < 1 / SENSE_HZ) return;
     const step = senseAcc;
     senseAcc = 0;
+    /* IS HE IN THE AIR? Pushed before the position check, because the
+       forced day roll must not fire mid-flight even on a frame the
+       position feed has nothing to say (see collapse()). */
+    game.setAloft(!!(ctx.wally && ctx.wally.flying));
     const p = ctx.wally && ctx.wally.position;
     if (!p) return;
     /* THERE IS AN ELEPHANT AND HE IS MOVING. This one line is what

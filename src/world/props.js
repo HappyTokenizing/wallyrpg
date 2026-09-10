@@ -1293,6 +1293,157 @@ const CELL = 144;
 const cellKey = (m) => `${Math.floor(m.elements[12] / CELL)},${Math.floor(m.elements[14] / CELL)}`;
 const _offM = new THREE.Matrix4();
 
+/* ------------------------------------------------------------------
+   THE LEFTOVERS PUT THE ISLAND-WIDE BOUNDING SPHERE BACK.
+
+   The block above is right and the code that used to sit below it
+   undid it. A cell holding fewer than a dozen instances was swept into
+   ONE '@spare' InstancedMesh per prop type — and the stragglers of a
+   type are, by definition, the ones scattered across the whole island,
+   so `computeBoundingSphere()` on that mesh produced exactly the
+   object the comment says the bucketing removed.
+
+   MEASURED ON THE BUILT CITY (one page load, 1600x900, headless Chrome
+   /ANGLE Metal, load-independent counts only): 97 '@spare' meshes,
+   bounding-sphere radius median 126.5 m, max 473.2 m. Standing at the
+   Market Hall, 69 of the 97 pass three's own frustum test carrying
+   1999 instances and 525 917 triangles, of which 636 instances are
+   within 185 m and 104 within 60 m. `prop.hedge.1.hedge@spare` was
+   drawn with its nearest instance 307.4 m away and NOTHING inside
+   185 m. Across the four places x four azimuths below, '@spare' was
+   44-77 of the 97 every time. That is a quarter of the frame's draw
+   calls that no frustum and no cascade can ever remove.
+
+   RE-BUCKETING THE LEFTOVERS ON THE SAME GRID IS A NET LOSS. Simulated
+   off the live scene: at 144 m the sweep becomes 152 meshes (up from
+   97) and only the triangles fall. This frame is draw-call bound; the
+   file's own price table above says a call costs ~3.0 us and a
+   thousand triangles ~0.064 us, so buying 55 calls to save 200 k
+   triangles loses by an order of magnitude.
+
+   SWEEP ACROSS TYPES INSTEAD OF WITHIN ONE. Every straggler in a
+   SWEEP-metre cell that shares a MATERIAL is baked into a single
+   static BufferGeometry, whatever prop it came from — the barrel, the
+   bollard and the bike frame in the same corner of the port are all
+   `city.metal`, so they are one mesh. Simulated over the live scene at
+   four places x four azimuths, meshes that pass the frustum:
+
+     grid   meshes   Market Hall     Bent Spoon      radius median
+     today     97    66/63/68/68     71/55/53/73     126.5 m
+     144 m    152    65/48/63/45     80/31/45/52      67.5 m
+     216 m     92    49/36/31/32     50/26/32/37     102.9 m
+     288 m     61    37/26/28/22     40/18/28/27     132.6 m
+     432 m     28    27/20/14/20     27/18/14/20     224.5 m
+
+   288 m wins in 16 of 16 configurations and 432 m wins by a little
+   more, but 432 m puts the median cell radius back over the 150 m
+   sphere csm.js fits its cascades to, so every cell lands in every
+   cascade — which is the cost this whole block exists to avoid. 288 m
+   keeps the median under it.
+
+   WHAT IT COSTS. Per-instance frustum culling INSIDE a 288 m cell is
+   gone. Today there is none at all for these instances, so nothing is
+   lost relative to shipping code; the honest statement of the cost is
+   the WORST CASE against a hypothetical perfect culler, and that is
+   measured in the report beside this change.
+
+   `flap` NEVER MERGES. kits.js's mats.flap bends a vertex by
+   `(position.y - windBase) / windHeight` read off the LOCAL attribute,
+   and its own comment says why merged world-space geometry cannot be
+   used: position.y would become metres above sea level and the whole
+   island would saturate at full bend. Those two meshes keep the old
+   per-type sweep. */
+const SWEEP = 288;
+/* The outline hull's position-hash pass (toon.js hullNormals) gives up
+   above 120 000 vertices and falls back to face normals, which on a
+   crate — which is nothing but hard edges — is a visibly different
+   stroke. Split a cell before it can reach that. */
+const SWEEP_MAX_VERTS = 110000;
+const NO_SWEEP = new Set(['flap']);
+
+/* ------------------------------------------------------------------
+   Bake a list of {geo, m} into one indexed BufferGeometry, positions
+   relative to (ox, 0, oz).
+
+   NOT src/character/model.js's mergeGeometries. That one carries
+   position, normal and index and nothing else, and every prop geometry
+   here is VERTEX COLOURED with a four-component colour (kits.js
+   Builder.build) whose alpha is the baked AO that toon.js reads under
+   USE_COLOR_ALPHA, plus a uv the plaster and wood triplanars sample.
+   Merging through it would render the whole sweep flat white with no
+   AO. Importing it and patching the attributes back on afterwards
+   would be more code than this, so this is the local one; see the
+   report's note on the world -> character import.
+
+   CELL-LOCAL, NOT WORLD. toon.js sets `vObjPos = position` and, for an
+   InstancedMesh, adds 0.373 * the instance translation to decorrelate
+   the procedural grain between copies. Baking to cell-local keeps that
+   decorrelation (each prop lands at its own offset inside the cell)
+   and keeps the coordinate bounded, instead of feeding the triplanar a
+   coordinate that grows with distance from the world origin.
+   ------------------------------------------------------------------ */
+const _bakeM = new THREE.Matrix4();
+const _bakeN = new THREE.Matrix3();
+const _bakeV = new THREE.Vector3();
+function bakeMerged(parts, ox, oz) {
+  let vc = 0, ic = 0;
+  for (const p of parts) {
+    vc += p.geo.attributes.position.count;
+    ic += p.geo.index ? p.geo.index.count : p.geo.attributes.position.count;
+  }
+  const pos = new Float32Array(vc * 3);
+  const nor = new Float32Array(vc * 3);
+  const uv = new Float32Array(vc * 2);
+  const col = new Float32Array(vc * 4);
+  const idx = vc > 65535 ? new Uint32Array(ic) : new Uint16Array(ic);
+  let vo = 0, io = 0;
+  for (const p of parts) {
+    const g = p.geo;
+    const P = g.attributes.position, N = g.attributes.normal;
+    const U = g.attributes.uv, C = g.attributes.color;
+    _bakeM.copy(p.m);
+    _bakeM.elements[12] -= ox;
+    _bakeM.elements[14] -= oz;
+    _bakeN.getNormalMatrix(_bakeM);
+    const n = P.count;
+    for (let i = 0; i < n; i++) {
+      const o3 = (vo + i) * 3, o2 = (vo + i) * 2, o4 = (vo + i) * 4;
+      _bakeV.fromBufferAttribute(P, i).applyMatrix4(_bakeM);
+      pos[o3] = _bakeV.x; pos[o3 + 1] = _bakeV.y; pos[o3 + 2] = _bakeV.z;
+      if (N) {
+        _bakeV.fromBufferAttribute(N, i).applyMatrix3(_bakeN).normalize();
+        nor[o3] = _bakeV.x; nor[o3 + 1] = _bakeV.y; nor[o3 + 2] = _bakeV.z;
+      }
+      if (U) { uv[o2] = U.getX(i); uv[o2 + 1] = U.getY(i); }
+      if (C) {
+        col[o4] = C.getX(i); col[o4 + 1] = C.getY(i); col[o4 + 2] = C.getZ(i);
+        /* itemSize 4 either way — the alpha IS the baked AO, and a 3-
+           component colour would drop USE_COLOR_ALPHA and light the
+           whole sweep a shade brighter than the props beside it. */
+        col[o4 + 3] = C.itemSize > 3 ? C.getW(i) : 1;
+      } else { col[o4] = col[o4 + 1] = col[o4 + 2] = col[o4 + 3] = 1; }
+    }
+    if (g.index) {
+      const gi = g.index.array;
+      for (let i = 0; i < gi.length; i++) idx[io + i] = gi[i] + vo;
+      io += gi.length;
+    } else {
+      for (let i = 0; i < n; i++) idx[io + i] = vo + i;
+      io += n;
+    }
+    vo += n;
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  out.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  out.setAttribute('color', new THREE.BufferAttribute(col, 4));
+  out.setIndex(new THREE.BufferAttribute(idx, 1));
+  out.computeBoundingSphere();
+  out.userData.bytes = pos.byteLength + nor.byteLength + uv.byteLength + col.byteLength + idx.byteLength;
+  return out;
+}
+
 export function createProps(ctx, lib, rng) {
   const group = new THREE.Group();
   group.name = 'city.props';
@@ -1304,6 +1455,16 @@ export function createProps(ctx, lib, rng) {
   /* one record per INSTANCE — never one per batch. See registerColliders. */
   const colliders = [];
   const colliderIds = [];
+  /* THE PAIRED A/B, SWITCHED INSIDE ONE PAGE LOAD (contracts.js's
+     preferred form: "a switch in the module, shipping rule and prior
+     rule side by side, driven on the same page load"). With ?propsweep=ab
+     the OLD per-type '@spare' InstancedMeshes are built as well as the
+     merged cells, and sweepMode() flips which set is visible. Off by
+     default: building both doubles this geometry's memory. */
+  const AB = typeof location !== 'undefined' && /[?&]propsweep=ab(&|$)/.test(location.search);
+  const swept = [];                 // the merged cells (shipping)
+  const legacySpare = [];           // the old per-type '@spare' meshes
+  let sweepStats = null;
 
   function add(type, m4, opt = {}) {
     if (!CATALOGUE[type]) return;
@@ -1361,6 +1522,10 @@ export function createProps(ctx, lib, rng) {
 
   function build() {
     const collapsed = collapseVariants();
+    const t0 = (typeof performance !== 'undefined' ? performance.now() : 0);
+    /* `${cx},${cz}|${material.uuid}` -> { mat, fam, ox, oz, parts, verts } */
+    const sweepCells = new Map();
+    let sweepInst = 0;
     for (const [key, list] of requests) {
       const [type, vs] = key.split('#');
       const v = +vs;
@@ -1378,16 +1543,15 @@ export function createProps(ctx, lib, rng) {
         c.push(it);
       }
       /* A cell holding a handful of crates is a draw call that buys
-         nothing, so sweep the stragglers into a single leftover mesh
-         rather than emitting a chunk each. The threshold rose with the
-         cell size for the same reason the cell size did: below about a
-         dozen instances a chunk cannot hold enough triangles to be
-         worth its own submission. */
+         nothing, so the stragglers come out of this type's cell set.
+         They do NOT become one leftover mesh per type — see THE
+         LEFTOVERS PUT THE ISLAND-WIDE BOUNDING SPHERE BACK above. They
+         go into the cross-type sweep below, which groups them by cell
+         and material instead of by cell and type. */
       const spare = [];
       for (const [k, c] of [...cells]) {
         if (c.length < 12) { spare.push(...c); cells.delete(k); }
       }
-      if (spare.length) cells.set('spare', spare);
 
       for (const proto of meshes) {
         for (const [k, c] of cells) {
@@ -1402,6 +1566,45 @@ export function createProps(ctx, lib, rng) {
           built.push(im);
           if (proto.userData.family === 'lamp') lampMeshes.push(im);
           ctx.mat.register(im, { outline: proto.userData.family !== 'lamp' });
+        }
+        if (spare.length) {
+          const fam = proto.userData.family;
+          /* `flap` is world-space-hostile (see NO_SWEEP), and the A/B
+             switch wants the old mesh built alongside the new one. */
+          if (NO_SWEEP.has(fam) || AB) {
+            const im = new THREE.InstancedMesh(proto.geometry, proto.material, spare.length);
+            im.name = `${proto.name}@spare`;
+            im.castShadow = true;
+            im.receiveShadow = true;
+            for (let i = 0; i < spare.length; i++) im.setMatrixAt(i, spare[i].m);
+            im.instanceMatrix.needsUpdate = true;
+            im.computeBoundingSphere();
+            group.add(im);
+            built.push(im);
+            if (fam === 'lamp') lampMeshes.push(im);
+            ctx.mat.register(im, { outline: fam !== 'lamp' });
+            if (!NO_SWEEP.has(fam)) legacySpare.push(im);
+          }
+          if (!NO_SWEEP.has(fam)) {
+            const vpi = proto.geometry.attributes.position.count;
+            for (const it of spare) {
+              const e = it.m.elements;
+              const sx = Math.floor(e[12] / SWEEP), sz = Math.floor(e[14] / SWEEP);
+              const k = `${sx},${sz}|${proto.material.uuid}`;
+              let c = sweepCells.get(k);
+              /* the cell CENTRE, so a baked position is at most half a
+                 cell from the origin the triplanar reads */
+              if (!c) {
+                c = { mat: proto.material, fam, ox: (sx + 0.5) * SWEEP, oz: (sz + 0.5) * SWEEP,
+                      key: `${sx},${sz}`, parts: [] };
+                sweepCells.set(k, c);
+              }
+              c.parts.push({ geo: proto.geometry, m: it.m, v: vpi });
+              /* instance SLOTS, the unit props.count has always summed:
+                 a crate with a wood part and a metal part is two. */
+              sweepInst++;
+            }
+          }
         }
         /* the protos are templates only — the instanced copies own the
            geometry from here on */
@@ -1438,6 +1641,55 @@ export function createProps(ctx, lib, rng) {
         shadowList.push({ x: p.x, y: p.y, z: p.z, r: spec.r * 2.3 * Math.max(s.x, s.z) });
       }
     }
+
+    /* ----------------------------------------------------------------
+       THE CROSS-TYPE SWEEP. One static mesh per (288 m cell, material),
+       whatever prop each piece came from.
+
+       Neither the colliders above nor the contact decals above read
+       `cells` or `spare` — both loop `list`, which is every instance of
+       the type — so nothing here can move a collider or a decal. That
+       is asserted at runtime as well as by reading: the report carries
+       collider and decal counts identical across the A/B.
+       ---------------------------------------------------------------- */
+    let sweptVerts = 0, sweptBytes = 0;
+    for (const [, c] of sweepCells) {
+      /* split before the outline's position-hash pass gives up */
+      const chunks = [];
+      let cur = [], curV = 0;
+      for (const p of c.parts) {
+        if (curV && curV + p.v > SWEEP_MAX_VERTS) { chunks.push(cur); cur = []; curV = 0; }
+        cur.push(p); curV += p.v;
+      }
+      if (cur.length) chunks.push(cur);
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const geo = bakeMerged(chunks[ci], c.ox, c.oz);
+        const mesh = new THREE.Mesh(geo, c.mat);
+        mesh.name = `prop.sweep.${c.fam}@${c.key}${chunks.length > 1 ? `.${ci}` : ''}`;
+        mesh.position.set(c.ox, 0, c.oz);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        /* `count` on an InstancedMesh is what props.count sums; a plain
+           mesh has none, so carry the instance-slots it replaced. */
+        mesh.userData.propInstances = chunks[ci].length;
+        group.add(mesh);
+        built.push(mesh);
+        swept.push(mesh);
+        ctx.mat.register(mesh, { outline: c.fam !== 'lamp' });
+        sweptVerts += geo.attributes.position.count;
+        sweptBytes += geo.userData.bytes;
+      }
+    }
+    /* the A/B opens on the SHIPPING arm, so a page loaded with the flag
+       and never switched draws exactly what a page without it draws */
+    for (const m of legacySpare) m.visible = false;
+    sweepStats = {
+      cells: sweepCells.size, meshes: swept.length, instances: sweepInst,
+      verts: sweptVerts, mb: +(sweptBytes / 1048576).toFixed(2),
+      legacy: legacySpare.length, ab: AB,
+      buildMs: +((typeof performance !== 'undefined' ? performance.now() : 0) - t0).toFixed(1),
+    };
+
     if (shadowList.length) {
       /* A FLAT DECAL 3.5 cm OVER heightAt() IS A DECAL NOBODY SEES.
          terrain.js draws its tiles at four LODs and a coarse tile
@@ -1476,7 +1728,36 @@ export function createProps(ctx, lib, rng) {
     }
     requests.clear();
     if (collapsed) console.log(`[city] ${collapsed} prop variant meshes collapsed (under ${MIN_SPLIT} island-wide)`);
+    console.log(`[city] prop sweep: ${sweepStats.instances} straggler parts -> ` +
+      `${sweepStats.meshes} static meshes across ${sweepStats.cells} ${SWEEP} m cells ` +
+      `(${(sweepStats.verts / 1000) | 0}k verts, ${sweepStats.mb} MB, ${sweepStats.buildMs} ms)` +
+      `${AB ? ` — A/B armed, ${sweepStats.legacy} legacy @spare meshes built and hidden` : ''}`);
+    /* props.build() runs at city.js:2154, BEFORE city.js assembles its
+       own debug table at :2710 from `window.WALLY.debug` and reassigns
+       the SAME object at :2788 — so a key put here survives. Also on
+       the returned API as `sweepMode`, for a caller that would rather
+       not go through window. */
+    if (typeof window !== 'undefined' && window.WALLY) {
+      window.WALLY.debug = window.WALLY.debug || {};
+      window.WALLY.debug.propSweep = sweepMode;
+    }
     return group;
+  }
+
+  /* ----------------------------------------------------------------
+     THE SWITCH. `WALLY.debug.propSweep()` reads; 'merge' | 'spare'
+     writes, and only means anything under ?propsweep=ab, which is the
+     only mode that builds both sets. Anything else returns the reason
+     it cannot switch rather than silently reporting success — a rig
+     that cannot reach its subject must die, not shrug.
+     ---------------------------------------------------------------- */
+  function sweepMode(mode) {
+    if (mode === undefined) return { ...sweepStats, mode: AB ? (swept[0]?.visible ? 'merge' : 'spare') : 'merge' };
+    if (!AB) return `NO A/B ON THIS PAGE LOAD — reload with ?propsweep=ab (${swept.length} merged meshes, 0 legacy)`;
+    if (mode !== 'merge' && mode !== 'spare') return `unknown mode ${mode}`;
+    for (const m of swept) m.visible = mode === 'merge';
+    for (const m of legacySpare) m.visible = mode === 'spare';
+    return { mode, merged: swept.length, legacy: legacySpare.length };
   }
 
   /* ----------------------------------------------------------------
@@ -1491,7 +1772,12 @@ export function createProps(ctx, lib, rng) {
   function cullShadows(camPos, far) {
     const lim = far + 24;                 // slack for a long raking shadow
     for (const m of built) {
-      const bs = m.boundingSphere;
+      /* An InstancedMesh carries the spread of its instances in its own
+         bounding sphere; a swept cell is a plain Mesh whose spread is
+         baked into the geometry, so its sphere is the geometry's. Read
+         `m.boundingSphere` alone and every swept mesh silently kept
+         castShadow = true for ever — which is the whole saving. */
+      const bs = m.boundingSphere || m.geometry.boundingSphere;
       if (!bs) continue;
       _c.copy(bs.center).applyMatrix4(m.matrixWorld);
       m.castShadow = _c.distanceTo(camPos) - bs.radius < lim;
@@ -1517,11 +1803,15 @@ export function createProps(ctx, lib, rng) {
   }
 
   return {
-    group, add, build, cullShadows, registerColliders,
+    group, add, build, cullShadows, registerColliders, sweepMode,
     get colliders() { return colliders; },
     get colliderCount() { return colliderIds.length; },
-    get count() { return built.reduce((a, m) => a + m.count, 0); },
+    /* unchanged in meaning: this counts instance SLOTS, so a crate with
+       a wood part and a metal part has always counted twice. A swept
+       mesh carries the slots it replaced so the number does not move. */
+    get count() { return built.reduce((a, m) => a + (m.isInstancedMesh ? m.count : (m.userData.propInstances || 0)), 0); },
     get meshes() { return built; },
+    get sweep() { return sweepStats; },
     dispose() {
       const geos = new Set();
       for (const m of built) geos.add(m.geometry);

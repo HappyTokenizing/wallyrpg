@@ -1516,10 +1516,41 @@ void main() {
      HULL BUDGET.
 
      An outlined mesh draws its geometry twice — once solid, once as a
-     back-faced shell — and, because the shell has to exist in the
-     depth+normal buffer too (see OUTLINE_ND_FRAG), twice again in the
-     prepass. Four submissions of the same triangles for a stroke that
-     §2.2 fixes at ~1.6 px.
+     back-faced shell — for a stroke that §2.2 fixes at ~1.6 px.
+
+     IT IS TWO SUBMISSIONS IN THE SHIPPING FRAME, NOT FOUR. This block
+     used to say four, on the grounds that the shell has to exist in
+     the depth+normal buffer too (see OUTLINE_ND_FRAG) and so is drawn
+     twice again in the prepass. That prepass is not the shipping path:
+     renderer.js's `geoPrepass` is FALSE by default and main.nd is
+     filled by un-projecting the main pass's own depth texture, the
+     geometry prepass surviving only as a fallback and as
+     WALLY.debug.prepass(true). Measured as a paired A/B switched
+     inside ONE page load, arms alternated three times, boot camera,
+     1600x900 at dpr 1, wind pinned, headless Chrome on a real GPU,
+     quality tier 'high': 499 draw calls with geoPrepass off — which
+     is also exactly what the boot frame draws, so the boot frame IS
+     the off path — against 883 with it forced on. Switching this whole
+     budget off costs 28-31 more calls in the shipping frame and 58-62
+     under the forced prepass, so a shell this budget retires is worth
+     ONE draw call, two with the prepass on. The shell never casts a
+     shadow (`hull.castShadow = false` below), so no cascade is in the
+     count either way. Draw calls are load-independent; there is
+     deliberately no fps figure here.
+
+     THOSE ARE MEDIANS AND THE FRAME IS BIMODAL — read this before you
+     quote one of them anywhere else, because quoting the other
+     statistic of the same frames is what put two wrong numbers into
+     ART_DIRECTION §3. csm.js cadences the last cascade of any tier
+     that has more than one (`farCadence` 3), so two frames in three
+     draw one cascade and the third draws both: the off path reads
+     499 / 499 / 654 and the on path 883 / 883 / 1040, over and over.
+     Attributed rather than assumed — WALLY.debug.shadowCadence(1)
+     flattens the off path to 651 on EVERY frame and shadowCadence(3)
+     puts the pattern straight back, alternated on one page load. The
+     MEAN over the cadence is 551 / 940. This block used to say
+     802 / 1272; those were measured before the prop merge and the
+     cadence landed and no longer exist on any frame.
 
      That is worth paying on the crate in front of you. It is not
      worth paying on the crate that is nine pixels tall on the far side
@@ -1552,8 +1583,71 @@ void main() {
      200 m, 1600x900, load 29.69: 89 of 517 hulls drawn, and the mean
      depth of the surviving stroke was 13.9 codes against 26.2 on the
      ground — while the balloon, 40 m from the lens, kept a full one.
+     (THAT IS THE ORIGINAL DIAGNOSIS, ON THE 517-HULL SCENE THAT NO
+     LONGER EXISTS. The live figures, and a revert that is driven
+     rather than quoted, are at the end of this block.)
      An inked balloon over an un-inked island is exactly the wrong way
      round, and §2.2's outline is the game's signature.
+
+     THAT COUNT IS ONLY A COUNT OF THE PLAIN MESHES, and the sentence
+     above never said so. cullHulls sizes an INSTANCED source by the
+     whole batch's bounding sphere (see the note over it), so an
+     island-wide prop batch is a 300 m sphere the camera is standing
+     inside and neither test can retire it. Re-measured at 200 m,
+     1600x900, tier 'high', camera at (0,200,120), one page load, the
+     same 675-hull scene throughout:
+     under the pre-fix condition — fog left at the ground's 520, hazeK
+     1, cullFarNow 185 — 88 hulls drew, and 57 of those 88 were
+     instanced sources that BOTH tests passed on the batch sphere;
+     the budget only ever reached the plain meshes, of which it drew
+     31 of 552. With the fog pinned open the way the flight opens it
+     (far 2392, hazeK 4.6, cullFarNow 851) the plain meshes come back
+     — 348 of 552 — while the instanced ones go from 57 to 111-114 of
+     123, against 114 that neither test could have failed. So the fix
+     below is real and it is a fix TO THE PLAIN MESHES; on the
+     instanced batches there was never anything to fix, because there
+     was never anything switched off. Counts, not fps: load-independent
+     — reproduced across two separate page loads to the unit except
+     where a frame's race between reading the module's `visible` flags
+     and recomputing the test moved a batch or two (84 vs 82 at the
+     boot camera, 111 vs 114 here).
+
+     THE PARAGRAPH ABOVE IS THE PRE-MERGE SCENE AND IS KEPT AS THE
+     ARGUMENT, NOT AS THE CENSUS. city.js's prop merge has since turned
+     those island-wide instanced batches into plain meshes, which is
+     exactly what that paragraph said would remove the inert branch
+     from underneath rather than repair it — and it did. The scene is
+     now 630 hulls, 599 of them plain and 31 instanced (was 675 with
+     123 instanced), and the budget reaches essentially all of them.
+     Re-measured on the shipping page load, 1600x900, tier 'high',
+     wind pinned, camera held at the flight's own lens:
+
+       ground, five locations   249-352 of 630 drawn   (0.40-0.56)
+       80 / 140 / 200 / 260 m   398 / 423 / 407-420 / 394
+
+     AND THE REVERT IS NOW DRIVABLE RATHER THAN QUOTED (contracts.js
+     rule 1: a before-number left in a comment is a citation, not a
+     revert check). The multiplier's whole effect on this budget is
+     cullFarNow = cullFar * hazeK, so setOutline({ cullFar: 185/hazeK })
+     reproduces "no hazeK in cullHulls" through the public API, live.
+     At 200 m, hazeK 4.6, three alternated pairs on ONE page load:
+     SHIPPING 420, 420, 420 of 630 against PRE-FIX 84, 84, 84 of 630 —
+     identical to the unit, both ways, every time.
+
+     WHAT THE MERGE DID TO THE *SHARE*, AND WHY THAT IS NOT A
+     REGRESSION IN THE INK. It converted ~95 always-drawn instanced
+     hulls into budget-tested plain ones, so the denominator grew while
+     the numerator did not: the fraction drawn at 200 m fell 0.86 to
+     0.66 while the absolute stroke count fell only ~439 to 415-420.
+     Of the 215 hulls retired at 200 m, 209 fail the SIZE test and NONE
+     fails the distance test, and their bounding spheres are a median
+     4.8 px across (p90 8.2) — objects that cannot carry a 1.6 px
+     stroke. Paired inside one page load with the camera held, the wind
+     pinned and the sea hidden, budget on against budget off differ by
+     99 px in 1.44 M (0.007 %), which is a fifth of the frame-to-frame
+     spread of the SAME arm. See ART_DIRECTION §2.2 for the art call
+     that follows from those three numbers and tools/test-balloon.mjs
+     B11 for the assertion that now encodes it.
 
      So the two distances that retire the stroke — this budget and
      uOutlineFade's width ramp — are multiplied by how far the haze
@@ -1901,8 +1995,56 @@ void main() {
   }
 
   /* Switch off the shells that cannot pay for themselves this frame.
-     One sphere transform and one divide each; at ~400 hulls that is
-     noise next to the four draw calls it saves per hull. */
+     One sphere transform and one divide each; at ~675 hulls that is
+     noise next to the draw call it saves per hull — ONE call in the
+     shipping frame, two under WALLY.debug.prepass(true). It used to
+     say four; see HULL BUDGET above for the paired A/B that priced it.
+
+     ----------------------------------------------------------------
+     AND ON AN INSTANCED SOURCE IT IS INERT. READ THIS BEFORE YOU
+     "FIX" IT.
+
+     The branch below sizes an InstancedMesh by the WHOLE BATCH's
+     bounding sphere, because that is the only sphere an InstancedMesh
+     has. city.js merges props island-wide, so those spheres are 80 to
+     300 m and the camera is usually inside them. Measured at the boot
+     camera, 1600x900, 123 instanced sources holding 2352 instances:
+     the median batch reads 1038 screen px against minPx 9, a lamp
+     batch (median radius 86 m) reads 809 px while ONE lamp would read
+     21, and 82 of the 123 sources — every one that was drawing —
+     could not have failed either test. At 200 m it is worse in the way
+     that
+     matters — the median instance falls to 6 px, under the threshold,
+     while its batch still reads 704.
+
+     IT IS BEING LEFT ALONE, DELIBERATELY, FOR TWO REASONS.
+
+     1. It is being removed from underneath rather than repaired:
+        another agent is merging those prop batches into static
+        geometry this round, after which the instanced branch stops
+        reaching props at all and the plain-mesh path — the one the
+        numbers above show actually works — covers them.
+
+        THAT LANDED. Censused on the shipping page load: 630 hulls,
+        599 plain and 31 instanced, against 675 with 123 instanced
+        before it. The 31 that remain are 11 prop batches and 20
+        foliage batches; city.js's island-wide prop batches, which
+        were the whole reason this branch was inert where it mattered,
+        are gone. The paragraph stays as written because the ARGUMENT
+        is still the operative one for those 31 — do not tighten this
+        test on them either.
+
+     2. The obvious repair is WRONG. Sizing by one instance's geometry
+        radius while still measuring distance to the batch CENTRE
+        would switch a whole batch's outlines off while a near instance
+        is still on screen: visible popping, traded for a stroke nobody
+        can see. Doing it properly needs PER-INSTANCE hull culling,
+        and there is no such thing here — the shell is one
+        InstancedMesh sharing the source's instanceMatrix, so its
+        `visible` flag is all-or-nothing for every instance in it.
+
+     So: do not "tighten" this test on instanced sources. Either the
+     batches are gone, or you are writing per-instance culling. */
   function cullHulls(cam, dbH) {
     if (!cam || !cam.isPerspectiveCamera) return;
     const cullFarNow = hullCull.cullFar * hazeK;

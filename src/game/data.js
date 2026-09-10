@@ -2206,7 +2206,17 @@ export const ENCOUNTERS = [
      ------------------------------------------------------------ */
   {
     id: 'wire', kind: 'tip', cond: null,
-    at: ['cafe', 'markethall', 'noodlecart', 'bazaar', 'trunkdepot', 'library', 'docks', 'stadium'],
+    /* NO 'stadium'. A tip is somebody telling you something, and
+       tipster() only offers a person whose home zone is the one you
+       are standing in — so a site with nobody homed in it is a site
+       the encounter can never fire at. Every other id here has one;
+       stampede had none, so this was a dead entry that read as an
+       eighth of the coverage. The siting assertions below hold the
+       rule for every kind:'tip' site, not just this one. Give the
+       stadium a tipster and it can come back — they need an entry in
+       TIP_VOICE too, which carries a per-character verdict pair and
+       a pronoun. */
+    at: ['cafe', 'markethall', 'noodlecart', 'bazaar', 'trunkdepot', 'library', 'docks'],
     mins: 10, energy: 0, rep: 0, trust: 0,
     minDay: 6,
     title: 'A word, before you go',

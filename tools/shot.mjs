@@ -23,6 +23,24 @@
      --eval js     run in page before the shot (after ready)
      --console     print browser console + page errors
      --dpr n       device pixel ratio       (default 1)
+     --ready ms    how long to wait for __WALLY_READY__ (default 30000).
+                   MISSING IT IS FATAL on index.html — see the block at
+                   the wait itself. Raise it on a loaded box.
+     --allow-unready  shoot anyway if the flag never arrives
+     --becalm      hold the wind at ZERO for the shot (wind.pin(0))
+     --wind n      hold the wind at n instead   (e.g. --wind 0.42)
+
+   TWO CAPTURES OF THE SAME FRAME WERE NEVER THE SAME FRAME.
+   Every blade, banner, awning and ear in this world is driven by
+   wind.js's gust machine, which is running the whole time the harness
+   waits, so a before/after pair taken an hour apart differed by
+   whatever gust happened to be blowing — and `setStrength(0)` did not
+   help, because weather.js damps the base back to nominal EVERY FRAME
+   and never touches the gust term at all (see THE PIN in
+   src/core/wind.js). `--becalm` uses the real pin: it holds both
+   terms and the bearing, so the foliage in two captures is in the
+   same place. It runs AFTER --eval, so it wins over any wind an eval
+   set; pick the held value with --wind if you want air in the frame.
    ============================================================ */
 
 import { chromium } from 'playwright-core';
@@ -30,6 +48,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir } from 'node:fs/promises';
 import { extname, join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadavg } from 'node:os';
 
 /* NOTE: do NOT add --disable-frame-rate-limit to the Chrome args below.
    It starves page.screenshot() and every capture times out. Learned
@@ -65,6 +84,10 @@ const DPR = +arg('dpr', 1);
 const SCENE = arg('scene', null);
 const URLPATH = arg('url', 'index.html');
 const EVAL = arg('eval', null);
+const BECALM = flag('becalm');
+const WINDAT = arg('wind', null);
+const READY = +arg('ready', 30000);
+const ALLOW_UNREADY = flag('allow-unready');
 
 /* ---------- static server ---------- */
 const server = createServer(async (req, res) => {
@@ -124,12 +147,53 @@ try {
 
   // Wait for the game to declare itself ready (main.js sets window.__WALLY_READY__).
   // Reference/legacy pages never set it, so fall back to the plain wait.
-  await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 30000 })
-    .catch(() => logs.push('[warn] __WALLY_READY__ never set — falling back to timed wait'));
+  /* THE SECOND ARGUMENT IS `arg`, NOT `options`. `waitForFunction(fn,
+     null, {timeout})` passes the options object as the polyfill's argument
+     and silently uses the DEFAULT 30 s, so raising the number here has
+     no effect at all until the null goes in. It bit this probe on a
+     loaded box; the value below is now the one that applies. */
+  /* A RIG THAT CANNOT REACH ITS SUBJECT MUST DIE, NOT SHRUG.
+     This used to swallow the timeout into a `[warn]` line — and
+     `[warn]` is not in the `errs` filter at the bottom of this file, so
+     a run that never saw __WALLY_READY__ screenshotted whatever was on
+     screen at 30 s and EXITED ZERO. The caller got a PNG of a
+     half-streamed world (no crowns, no props, terrain still paging)
+     that is indistinguishable from a real capture in every way except
+     the console it did not print. Not hypothetical: this box has run
+     at 1-minute load 20 to 298 today, and at 298 a cold boot of this
+     game does not finish inside 30 s.
+
+     So the wait is now `--ready ms` (default 30000 — raise it on a
+     loaded box) and missing it is FATAL. Reference and legacy pages
+     genuinely never set the flag (the header's `--url
+     ref/original-wally.html` case), so the requirement applies only
+     when we actually loaded the game; `--allow-unready` waives it. */
+  const isGame = /(^|\/)index\.html$/.test(URLPATH.split('?')[0]);
+  await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: READY })
+    .catch(() => {
+      const msg = `__WALLY_READY__ never set within ${READY} ms (1-min load ${loadavg()[0].toFixed(2)})`;
+      if (isGame && !ALLOW_UNREADY) {
+        throw new Error(`${msg} — REFUSING to screenshot a half-built world. ` +
+          `Raise it with --ready <ms>, or pass --allow-unready to shoot anyway.`);
+      }
+      logs.push(`[warn] ${msg} — falling back to timed wait`);
+    });
 
   if (EVAL) {
     const r = await page.evaluate(EVAL).catch(e => `[EVAL ERROR] ${e.message}`);
     if (r !== undefined && r !== null) logs.push(`[eval] ${JSON.stringify(r)}`);
+  }
+
+  /* Hold the air. See the header. Reported unconditionally when asked
+     for, including the refusal on a build without the pin, so a shot
+     can never silently be taken in moving air it claimed to becalm. */
+  if (BECALM || WINDAT !== null) {
+    const held = await page.evaluate((s) => {
+      const w = window.WALLY?.ctx?.wind;
+      if (!w || typeof w.pin !== 'function') return 'NO wind.pin ON THIS BUILD — shot taken in moving air';
+      return w.pin(s === null ? 0 : +s);
+    }, WINDAT).catch(e => `PIN FAILED: ${e.message}`);
+    logs.push(`[wind] ${JSON.stringify(held)}`);
   }
 
   await page.waitForTimeout(WAIT);
@@ -145,8 +209,40 @@ try {
   await page.screenshot({ path: resolve(ROOT, out), animations: 'allow', timeout: 20000 });
 
   // Report perf + any GL errors so agents can see them without a second run.
+  /* THE PIXEL COUNT GOES WITH THE NUMBER, ALWAYS (contracts.js rule 4:
+     "state the rig beside the number"). This block used to print
+     fps/cpuMs/calls/tris with nothing saying how big the frame was, so a
+     run at --dpr 2 and a run at the default --dpr 1 produced perf lines
+     that look identical in a report for frames with FOUR TIMES the
+     pixels between them. Report the CSS viewport, the requested dpr, the
+     ratio three.js is actually rendering at (setPixelRatio and the
+     quality tier may both clamp it), the drawing buffer in real pixels,
+     and the product — the only figure a fill-rate claim may be divided
+     by. Printed unconditionally, next to [perf], both to stdout. */
+  const rig = await page.evaluate(() => {
+    const r = window.WALLY?.ctx?.renderer;
+    if (!r) return null;
+    const d = r.domElement;
+    return { pr: +r.getPixelRatio().toFixed(3), bw: d.width, bh: d.height,
+             q: window.WALLY?.ctx?.quality?.name ?? null };
+  }).catch(() => null);
+  const px = rig ? rig.bw * rig.bh : W * DPR * H * DPR;
+  logs.push(`[rig] ${W}x${H} css, dpr ${DPR}` +
+            `${rig && rig.pr !== DPR ? ` (renderer ${rig.pr})` : ''}` +
+            `, buffer ${rig ? `${rig.bw}x${rig.bh}` : `${W * DPR}x${H * DPR}`}` +
+            ` = ${(px / 1e6).toFixed(2)} Mpx${rig?.q ? `, quality ${rig.q}` : ''}`);
+  /* RULE 4: STATE THE RIG BESIDE THE NUMBER — and the box load is part
+     of the rig for anything measured in milliseconds. This line carried
+     fps and cpuMs with nothing saying what else the machine was doing,
+     and the 1-minute load here has been seen at 20 and at 298 inside one
+     hour. Above 10, every millisecond in it is noise and the line says
+     so rather than leaving the reader to know. */
   const perf = await page.evaluate(() => window.__WALLY_PERF__ || null).catch(() => null);
-  if (perf) logs.push(`[perf] ${JSON.stringify(perf)}`);
+  if (perf) {
+    const L = loadavg()[0];
+    logs.push(`[perf] ${JSON.stringify(perf)}  load ${L.toFixed(2)}` +
+              `${L > 10 ? '  <- DISCARD every ms above: load > 10' : ''}`);
+  }
 } catch (e) {
   failed = e;
   logs.push(`[FATAL] ${e.message}`);
@@ -163,6 +259,10 @@ if (flag('console') || errs.length) {
   console.log(logs.join('\n'));
 } else {
   console.log(`wrote ${out}  (${W}x${H})`);
+  const rigLine = logs.find(l => l.startsWith('[rig]'));
+  if (rigLine) console.log(rigLine);
+  const windLine = logs.find(l => l.startsWith('[wind]'));
+  if (windLine) console.log(windLine);
   const perf = logs.find(l => l.startsWith('[perf]'));
   if (perf) console.log(perf);
 }

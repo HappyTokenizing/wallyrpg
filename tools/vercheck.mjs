@@ -19,7 +19,7 @@ const errs=[];
 p.on('pageerror',e=>errs.push(e.message));
 p.on('console',m=>{if(m.type()==='error'&&!/favicon/.test(m.text()))errs.push(m.text());});
 await p.goto(`http://127.0.0.1:${port}/${process.argv[3]||'index.html'}`,{waitUntil:'load',timeout:60000});
-const ready=await p.waitForFunction('window.__WALLY_READY__===true',{timeout:60000}).then(()=>true).catch(()=>false);
+const ready=await p.waitForFunction('window.__WALLY_READY__===true',null, {timeout:60000}).then(()=>true).catch(()=>false);
 await p.waitForTimeout(6000);
 const perf=await p.evaluate(()=>window.__WALLY_PERF__||null).catch(()=>null);
 const stage=await p.evaluate(()=>(document.getElementById('bootStatus')||{}).textContent).catch(()=>null);

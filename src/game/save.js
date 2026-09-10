@@ -213,9 +213,24 @@ export function createSave(env) {
         last: Number.isFinite(+r?.last) ? Math.max(0, Math.floor(+r.last)) : 0,
       };
     }
+    /* `>` NOT `>=`. events.js:676 stamps the tip with TODAY's day and
+       claimTip() will not touch it until the day has turned, so the
+       ENTIRE life of a pending rumour is spent with pt.day === m.day.
+       A `>=` here therefore dropped every tip that has ever been
+       bought, on the one day it could exist: buy it, save, reload,
+       and the thing you were told is gone. What must still die is a
+       day the save can never reach the far side of — a tip dated
+       AFTER the save's own day, which claimTip() refuses to claim
+       (`p.day >= st.day` returns null) and settleTip() never sees.
+       That is the corrupt case, and it is the only one. */
     const pt = m.tips.pending;
-    if (!pt || !CLIENT_BY_ID[pt.who] || !Number.isFinite(+pt.day) || +pt.day >= m.day
+    if (!pt || !CLIENT_BY_ID[pt.who] || !Number.isFinite(+pt.day) || +pt.day > m.day
       || !Number.isFinite(+pt.news) || !NEWS_POOL[+pt.news]) m.tips.pending = null;
+    /* JSON writes a NaN day out as null, which parses back as 0 —
+       finite, so the guard keeps it, and claimTip() then compares it
+       against st.day. Pin it to the integer the rest of the file
+       uses rather than leave a null in the record. */
+    else pt.day = Math.max(0, Math.floor(+pt.day));
     /* the in-flight claim is a transient inside events.js, never a
        save field — a key added here would break the byte-identical
        save/load round trip. Scrubbed in case an older build wrote
@@ -365,25 +380,50 @@ export function createSave(env) {
     return ok;
   }
 
+  /* ---------- REFUSING A SAVE IS NOT DELETING IT ----------
+     Two loads end in a refusal: the text is not JSON, and migrate()
+     turns it down — no version field, or a version from a build
+     NEWER than this one, i.e. the player downgraded and this is the
+     only copy of their game. Neither is a reason for the file to
+     stop existing.
+
+     So the bytes are MOVED, never dropped: written to a rescue key,
+     READ BACK to prove the write took, and only then removed from
+     the key that is in the way. If the rescue write fails — storage
+     full, and the rescue momentarily doubles the bytes, so that is
+     the likely failure — the original is left exactly as it was and
+     the player gets a refused load instead of a deleted save.
+
+     `src` matters: raw may have been adopted from a legacy key, and
+     deleting KEY in that case removes nothing while leaving the bad
+     file to be re-adopted, re-stashed and re-refused on every boot
+     for the rest of the install's life. */
+  function refuse(src, raw, why) {
+    const rk = KEY + '_' + why;
+    const kept = store.set(rk, raw) === true && store.get(rk) === raw;
+    if (kept) store.del(src);
+    bus.emit('save', { ok: false, why, kept, rescueKey: kept ? rk : null });
+    return kept;
+  }
+
   function load() {
     let raw = store.get(KEY);
+    let src = KEY;
     if (!raw) {
       for (const legacy of CONFIG.legacyKeys) {          // adopt a v4 save
         raw = store.get(legacy);
-        if (raw) break;
+        if (raw) { src = legacy; break; }
       }
     }
     if (!raw) return null;
     let data;
     try { data = JSON.parse(raw); }
     catch (e) {
-      store.set(KEY + '_corrupt', raw);
-      store.del(KEY);
-      bus.emit('save', { ok: false, why: 'corrupt' });
+      refuse(src, raw, 'corrupt');
       return null;
     }
     const m = migrate(data);
-    if (!m) { store.del(KEY); return null; }
+    if (!m) { refuse(src, raw, 'refused'); return null; }
     return m;
   }
 

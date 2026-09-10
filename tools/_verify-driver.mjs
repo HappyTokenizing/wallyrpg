@@ -51,7 +51,7 @@ wire(page);
 
 async function boot(qs) {
   await page.goto(`http://127.0.0.1:${PORT}/index.html${qs ?? QS}`, { waitUntil: 'load', timeout: 90000 });
-  await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 90000 }).catch(() => logs.push('[warn] not ready'));
+  await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 90000 }).catch(() => logs.push('[warn] not ready'));
 }
 await boot();
 

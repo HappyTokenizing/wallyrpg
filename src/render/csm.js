@@ -81,6 +81,57 @@ export function createCSM(ctx, opts = {}) {
     softWorld: opts.softWorld ?? 0.055,
     margin: opts.margin ?? 70,
     fadeFrac: opts.fadeFrac ?? 0.82,
+
+    /* ------------------------------------------------------------
+       THE FAR CASCADE'S CADENCE.
+
+       Every cascade above is a real DirectionalLight with castShadow,
+       and three re-rendered EVERY ONE of them EVERY frame:
+       renderer.js sets `renderer.shadowMap.needsUpdate = true` before
+       the forward pass and WebGLShadowMap then walks the whole scene
+       once per light. The far cascade is the expensive one — it is
+       fitted to a sphere tens of metres across and so sweeps in every
+       building, tree and prop inside it.
+
+       And it re-rendered for nothing. The fit is TEXEL-SNAPPED (see
+       the snap in placeCascade below), which is the whole reason the
+       far shadows do not crawl when the camera turns: the ortho box
+       only ever moves in whole shadow texels. Its contents therefore
+       only change when the camera has moved a texel, or when
+       something inside it moved — and from ~17 m out to `far`, inside
+       the haze and inside the fadeFrac band, nothing in it moves fast
+       enough to read at 60 Hz.
+
+       So the far cascade renders on a cadence: `farCadence` frames
+       between renders, and on the frames in between IT IS NOT
+       RE-FITTED EITHER. That second half is the part that is easy to
+       get wrong. three writes `shadow.matrix` inside the shadow
+       render (vendor/three.module.js, WebGLShadowMap.render ->
+       shadow.updateMatrices), so the matrix the fragment shader
+       samples with is the one from the LAST RENDER. Move the light
+       without re-rendering and the shadow coordinates address a map
+       drawn from somewhere else, which is a whole-screen shadow
+       smear, not a saving.
+
+       `farPad` is what makes the skip safe rather than lucky: a
+       cadenced cascade is fitted to a sphere `1 + farPad` times the
+       one it needs, so a few frames of camera motion still land
+       inside the box that was actually rendered. And it is CHECKED
+       rather than assumed — update() re-renders immediately, cadence
+       or not, the moment the live sub-frustum sphere stops being
+       contained in the rendered one, or the sun turns. A cascade can
+       therefore never be sampled outside the box it was drawn for, so
+       the failure this could have caused — a band of missing far
+       shadow while the camera runs — cannot happen; the worst it can
+       do is spend a frame it meant to save.
+
+       farCadence = 1 is the rule this replaced, exactly, and
+       `WALLY.debug.shadowCadence(1)` / `(3)` switches between them on
+       one page load. A single-cascade tier ignores it: on `low` the
+       only cascade there is is the near one, and that one carries
+       Wally. */
+    farCadence: opts.farCadence ?? 3,
+    farPad: opts.farPad ?? 0.04,
   };
 
   const group = new T.Group();
@@ -102,12 +153,40 @@ export function createCSM(ctx, opts = {}) {
     l.shadow.bias = -0.0004;
     l.shadow.normalBias = 0.06;
     l.shadow.intensity = 1.0;
+    /* PER-LIGHT GATE. WebGLShadowMap skips a light whose shadow has
+       `autoUpdate === false && needsUpdate === false` (vendor bundle,
+       the `continue` inside its render loop). Every cascade is opted
+       out here so update() below decides, per cascade, per frame; the
+       near cascades simply get `needsUpdate = true` every frame, which
+       is byte-for-byte the behaviour they had. */
+    l.shadow.autoUpdate = false;
+    l.shadow.needsUpdate = true;
     l.matrixAutoUpdate = true;
     l.name = `csm-cascade-${i}`;
     group.add(l);
     group.add(l.target);
     lights.push(l);
   }
+
+  /* Where each cascade's shadow map was last RENDERED from — the
+     snapped centre, the padded radius the ortho box was built at, and
+     the sun direction it was drawn under. A skipped cascade must not
+     be re-fitted, so this is the fit that is still on screen. */
+  const fits = [];
+  for (let i = 0; i < cfg.cascades; i++) {
+    fits.push({ center: new T.Vector3(), radius: 0, sun: new T.Vector3(), frame: -1e9, valid: false });
+  }
+  const _live = new T.Vector3();
+  /* frameNo IS THE CADENCE'S OWN CLOCK AND stats() MUST NOT RESET IT.
+     It did, in the first cut of this: zeroing frameNo while fits[i].frame
+     kept its old absolute value made `frameNo - f.frame` hugely negative,
+     the beat could never come due again, and the far cascade then
+     re-rendered only when the containment test fired. The measurement
+     had switched the thing it was measuring off. The window counters
+     below are separate for exactly that reason. */
+  let frameNo = 0;
+  let renders = 0, skips = 0;   // cascade shadow renders taken / avoided
+  let winFrames = 0, byBeat = 0, byDrift = 0, bySun = 0;
 
   /* Uniforms the material layer binds by reference. */
   const uniforms = {
@@ -207,9 +286,13 @@ ${sel}
     uniforms.uCsmFade.value.set(far * cfg.fadeFrac, far);
   }
 
-  function fitCascade(camera, i, zNear, zFar) {
-    const light = lights[i];
-
+  /* The sub-frustum's bounding SPHERE in world space — rotation
+     invariant, so the fit does not change when the camera turns.
+     Writes the centre into `out` and returns the radius. Reads
+     nothing that a shadow render writes, so it is safe to call on a
+     frame whose cascade will be skipped: this is what the containment
+     test below compares the rendered fit against. */
+  function subSphere(camera, zNear, zFar, out) {
     /* Sub-frustum corners in world space: unproject the full frustum
        once, then lerp each near->far edge to the split distances. */
     _invProjView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
@@ -228,13 +311,23 @@ ${sel}
       f.set(fx, fy, fz);
     }
 
-    _center.set(0, 0, 0);
-    for (let c = 0; c < 8; c++) _center.add(_corners[c]);
-    _center.multiplyScalar(1 / 8);
+    out.set(0, 0, 0);
+    for (let c = 0; c < 8; c++) out.add(_corners[c]);
+    out.multiplyScalar(1 / 8);
 
     let radius = 0;
-    for (let c = 0; c < 8; c++) radius = Math.max(radius, _center.distanceTo(_corners[c]));
-    radius = Math.ceil(radius * 16) / 16;    // quantise so it does not breathe
+    for (let c = 0; c < 8; c++) radius = Math.max(radius, out.distanceTo(_corners[c]));
+    return Math.ceil(radius * 16) / 16;      // quantise so it does not breathe
+  }
+
+  /* Point cascade `i` at a sphere and rebuild its ortho box. THIS IS
+     THE ONLY THING THAT MOVES A CASCADE LIGHT, and it is called only
+     on a frame whose shadow map is about to be re-rendered — see the
+     cadence block at the top of this file for why the two cannot be
+     separated. Records the fit it delivered in fits[i]. */
+  function placeCascade(i, center, radius) {
+    const light = lights[i];
+    _center.copy(center);
 
     /* light basis (depends only on sunDir, so snapping is safe) */
     const up = Math.abs(sunDir.y) > 0.985 ? _upAlt : _up;
@@ -284,6 +377,59 @@ ${sel}
     const maxUV = 11.0 / cfg.mapSize;
     const comp = ['x', 'y', 'z', 'w'][i];
     uniforms.uCsmBlur.value[comp] = Math.min(maxUV, Math.max(minUV, blurUV));
+
+    const f = fits[i];
+    f.center.copy(_center);
+    f.radius = radius;
+    f.sun.copy(sunDir);
+    f.frame = frameNo;
+    f.valid = true;
+  }
+
+  /* How many frames this cascade may go between renders. Only the
+     LAST cascade is cadenced, and only when there is more than one —
+     the near cascades carry everything the eye is actually on. */
+  const cadenceOf = (i) =>
+    (cfg.cascades >= 2 && i === cfg.cascades - 1) ? Math.max(1, cfg.farCadence | 0) : 1;
+
+  /* Is the fit currently on screen still good enough to sample? The
+     ortho box is +-f.radius in the light's XY and (much) deeper than
+     that along the light axis, so sphere containment is the
+     conservative test for the box as well. */
+  /* Anything that changes what a cascade's map MEANS — its size, the
+     distance it covers, the cadence itself — throws the recorded fits
+     away, so the next update() re-renders every cascade rather than
+     sampling a map drawn under the old rule. */
+  function invalidate() { for (const f of fits) f.valid = false; }
+
+  /* The sun turning re-projects the whole map. SUN_EPS is 1.3 degrees:
+     the shadow direction may lag the light by that much between two
+     renders of the same cascade, which at the far cascade's own texel
+     (2*radius / mapSize — 0.055 m at radius 49, mapSize 1792) is under
+     one texel for anything up to about 2.4 m tall standing on the
+     ground. Tighter than this and an ordinary day cycle re-renders the
+     cascade every frame all by itself, which is the cadence switched
+     off without saying so — the first cut of this file used 0.6 deg
+     and did exactly that. */
+  const SUN_EPS = Math.cos(1.3 * Math.PI / 180);
+
+  /* WHY this cascade must be re-rendered this frame, or null for "the
+     map on screen is still the right map". Named rather than boolean
+     because the three reasons mean completely different things about
+     whether the cadence is doing anything: 'beat' is the cadence
+     working, 'drift' says farPad is too small for how fast the camera
+     is moving, and 'sun' says the day cycle is turning faster than
+     SUN_EPS allows. stats() counts them apart, so "the cadence saved
+     nothing here" can never be read as "the cadence is on". */
+  function dueReason(f, center, radius, cadence) {
+    if (cadence <= 1 || !f.valid) return 'beat';
+    if (f.sun.dot(sunDir) <= SUN_EPS) return 'sun';
+    /* The ortho box is +-f.radius in the light's XY and much deeper
+       than that along the light axis, so sphere containment is the
+       conservative test for the box as well. */
+    if (f.center.distanceTo(center) + radius > f.radius) return 'drift';
+    if ((frameNo - f.frame) >= cadence) return 'beat';
+    return null;
   }
 
   const api = {
@@ -312,7 +458,7 @@ ${sel}
       }
     },
 
-    setFar(far) { cfg.far = far; },
+    setFar(far) { cfg.far = far; invalidate(); },
 
     setMapSize(size) {
       cfg.mapSize = size;
@@ -320,13 +466,66 @@ ${sel}
         l.shadow.mapSize.set(size, size);
         if (l.shadow.map) { l.shadow.map.dispose(); l.shadow.map = null; }
       }
+      invalidate();
+    },
+
+    /* THE A/B, ON ONE PAGE LOAD. 1 is the rule this replaced — every
+       cascade re-rendered every frame — and the shipping default is
+       cfg.farCadence. Returns the cadence now in force. Driven from
+       WALLY.debug.shadowCadence() in renderer.js. */
+    setFarCadence(n) {
+      const want = Math.max(1, Math.min(60, n | 0));
+      if (want !== cfg.farCadence) { cfg.farCadence = want; invalidate(); }
+      return cfg.farCadence;
+    },
+
+    /* Load-independent evidence: how many cascade shadow renders were
+       taken and how many were skipped, since the last reset. A frame
+       count is not enough — the cadence also renders early whenever
+       the containment test fires, and that is the number that says
+       whether it is really saving anything where the camera moves. */
+    stats(reset) {
+      const s = {
+        cascades: cfg.cascades,
+        farCadence: cfg.farCadence,
+        farPad: cfg.farPad,
+        frames: winFrames,
+        renders,
+        skips,
+        /* which of the three things brought a cadenced cascade back
+           early, or on time — see dueReason() */
+        beat: byBeat, drift: byDrift, sun: bySun,
+        perFrame: winFrames ? +(renders / winFrames).toFixed(4) : 0,
+      };
+      /* frameNo is deliberately NOT reset — see its declaration. */
+      if (reset) { renders = 0; skips = 0; winFrames = 0; byBeat = 0; byDrift = 0; bySun = 0; }
+      return s;
     },
 
     update(camera) {
+      frameNo++; winFrames++;
       computeSplits(camera);
       camera.updateMatrixWorld();
       camera.updateProjectionMatrix();
-      for (let i = 0; i < cfg.cascades; i++) fitCascade(camera, i, splits[i], splits[i + 1]);
+      for (let i = 0; i < cfg.cascades; i++) {
+        const cadence = cadenceOf(i);
+        const f = fits[i];
+        /* Cheap and unconditional: we have to know where the cascade
+           WANTS to be before we can say the fit on screen still covers
+           it. This is matrix arithmetic on eight points, not a draw. */
+        const r = subSphere(camera, splits[i], splits[i + 1], _live);
+        const why = dueReason(f, _live, r, cadence);
+        if (why) {
+          placeCascade(i, _live, cadence > 1 ? Math.ceil(r * (1 + cfg.farPad) * 16) / 16 : r);
+          renders++;
+          if (cadence > 1) {
+            if (why === 'sun') bySun++; else if (why === 'drift') byDrift++; else byBeat++;
+          }
+        } else {
+          skips++;
+        }
+        lights[i].shadow.needsUpdate = !!why;
+      }
       group.updateMatrixWorld(true);
     },
 

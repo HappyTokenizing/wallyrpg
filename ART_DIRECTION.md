@@ -157,6 +157,30 @@ a hard step), plus:
   stays ~1.6 px on screen, colour = object albedo darkened 55 % and hue-rotated toward
   blue. **Never pure black outlines.**
 
+**THE OUTLINE IS A SIGNATURE, NOT A QUOTA — decided deliberately, at 200 m, with the
+frames side by side.** `toon.js`'s hull budget retires the shell on anything whose whole
+bounding sphere is under `minPx` 9 across, and after the prop merge it reaches ~210 more
+objects from the air than it used to. The *share* of hulls drawn therefore fell (0.86 →
+0.66 at 200 m) while the *stroke count* barely moved (≈439 → 415-420). The call is that
+the share is not the quantity this section is about, for three reasons that are all
+measurements:
+
+- **The retired strokes are not visible.** At 200 m, 209 of the 215 retired hulls fail
+  the *size* test and none fails the distance test; their bounding spheres are a median
+  **4.8 px** across (p90 8.2). A 1.6 px stroke on a 4.8 px object is not an outline, it
+  is a third of the object. Paired inside one page load with the camera held, the wind
+  pinned and the sea hidden, the budget on and off differ by **99 px in 1.44 M (0.007 %)**
+  — a fifth of the frame-to-frame spread of the *same* arm.
+- **The share was never the standard.** At head height, where the game is actually
+  played, the same ratio is **0.40-0.56** across five locations. A 0.7 floor demanded of
+  the aerial frame asks it to be inked more completely than any walking frame ever is.
+- **What "an inked balloon over an un-inked island is the wrong way round" actually
+  means** is that the island must be inked *more* from up there, not less. It is:
+  394-423 strokes at 80-260 m against 249-352 on the ground, and 0.63-0.67 against
+  0.40-0.56. That is the property to assert, and `tools/test-balloon.mjs` B11 now
+  asserts it, on absolute strokes and on the ground-versus-air comparison, instead of on
+  a fraction whose denominator another module owns.
+
 ### 2.3 Wind — the signature
 Wind is a **global uniform** every shader reads: `uWindDir`, `uWindStrength`,
 `uTime`. It must visibly move:
@@ -206,6 +230,51 @@ generous normal bias. Shadow colour is tinted, never black (see §2.1).
 
 **Performance target: locked 60 fps at 1920×1080 on integrated graphics.** Every
 feature above must have an automatic quality-tier fallback.
+
+### What that fallback actually costs — read `QUALITY_TIERS` in `src/core/contracts.js`
+
+The list above is the **ultra/high** frame. The last sentence is the whole trade, and
+contracts.js has already priced it, tier by tier; this section is not a description of
+what every player sees. Cross-referenced against `QUALITY_TIERS` and `renderer.js`:
+
+- **Item 1 is not a geometry prepass on any tier.** `renderer.js`'s `geoPrepass` is
+  `false` by default: `main.nd` is one full-screen un-projection of the main pass's own
+  depth texture, and the geometry prepass survives only as a fallback and as the A/B
+  switch `WALLY.debug.prepass(true)`. Paired A/B inside one page load, arms alternated
+  three times, boot camera, 1600×900 at dpr 1, tier `high`, wind pinned:
+  **499 draw calls off, 883 on** — and 499 is what the boot frame draws, so the boot
+  frame is the off path. On `low` the buffer is not built at all: `needND` is
+  `ssao || dof`, and `low` has both `false`.
+
+  **A MEDIAN, BECAUSE THE FRAME IS BIMODAL — and this is the trap that produced the
+  two wrong numbers this paragraph used to carry.** `csm.js`'s `farCadence` is 3, so
+  two frames in three draw one cascade and the third draws both. The off path reads
+  499 / 499 / 654 and the on path 883 / 883 / 1040, over and over. Attributed rather
+  than guessed: `WALLY.debug.shadowCadence(1)` flattens the off path to **651 every
+  frame** and `shadowCadence(3)` puts the pattern straight back, alternated on one page
+  load. A *mean* over the cadence is 551 / 940, which is where a "549 / 942" reading of
+  this same tree comes from — same frames, different statistic. Quote the median and
+  say which frame you mean. The figures this replaced, **802 / 1272**, were measured
+  before the prop merge and the cascade cadence landed and are simply gone.
+- **Item 4 (SSAO)** is off on `low`. **Item 6 (DOF, "always on")** is off on `low` and
+  `med` — i.e. on every phone and every integrated part.
+- **"4-cascade CSM, 2048 per cascade" ships on no tier**: `ultra` 3×2048, `high` 2×1792,
+  `med` 2×1280, `low` 1×1024 — and even those are the *populations*, not the per-frame
+  cost. `csm.js` cadences the LAST cascade of any tier that has more than one
+  (`farCadence` 3), so the typical `ultra`, `high` and `med` frame renders one cascade
+  fewer than its number and pays for the last one every third frame.
+- **The 60 fps figure is not held at 1920×1080's 2.07 Mpx — and it is not held at 1.44
+  either.** `high`'s `pixelBudget` is **2.30 Mpx**, `pixelRatioMax` 1.5, and
+  `renderer.js`'s `pixelRatioCeiling` takes `min(pixelRatioMax, devicePixelRatio,
+  sqrt(budget / cssPixels))`. In a 1600×900 CSS box that is ratio 1 on a dpr-1 panel —
+  1.44 Mpx, which is the *headless capture rig's* number and the only place the old
+  "1.44" was true — and ratio 1.264 on anything with dpr ≥ 1.264, i.e. the full 2.30 Mpx,
+  which is **above** 1920×1080, not below it. The margin `high` holds against its
+  16.67 ms promise is spent partly on that budget and partly on `msaa: 2`. Integrated
+  graphics is the tier contracts.js calls `low`, whose `pixelBudget` is 0.75 Mpx.
+
+Treat §3 as the authored ceiling and `QUALITY_TIERS` as the shipped floor. If you need
+to know what a frame contains, read the tier — not this list.
 
 ---
 

@@ -638,6 +638,16 @@ export async function init(ctx) {
   let latchYaw = 0;                 // the azimuth they started driving on
   let stallT = 0;                   // seconds of held stick going nowhere
   let stallReady = false;
+  /* WHO WROTE boomYaw LAST FRAME, and how far it still has to go.
+     Reported by api.state() so a test can assert the MECHANISM ("the
+     auto-orbit is the thing driving the boom, and it is converging")
+     instead of the residual ("the boom moved N degrees"). The residual
+     is not a property of the orbit: it is the error that happened to be
+     left when the stick came up, and a healthy orbit that has already
+     arrived moves zero. See tools/drifttest.mjs case B. */
+  let yawOwner = 'orbit';           // steer | relief | latch | orbit | vista
+  let orbitErr = 0;                 // radians from boomYaw to the orbit target
+  let orbitLam = 0;                 // the lambda that error is being damped at
   const stallPos = new THREE.Vector3();   // where he was when it started
   let vistaT = 0;                   // seconds of vista left, Infinity = held
   let vistaPoint = null;            // optional world point to face
@@ -1421,14 +1431,20 @@ export async function init(ctx) {
     if (unhold > 0) unhold = Math.max(0, unhold - dt / RIG.unholdTime);
     if (holdPending && !moving) { holdPending = false; holdYaw = pickPortraitYaw(); }
 
-    if (steerT > 0) steerT -= dt;
-    else if (wedgeT > 0.7) { /* relief owns the yaw this frame */ }
-    else if (driving) {
+    if (steerT > 0) { steerT -= dt; yawOwner = 'steer'; orbitErr = 0; orbitLam = 0; }
+    else if (wedgeT > 0.7) {
+      /* relief owns the yaw this frame */
+      yawOwner = 'relief'; orbitLam = 2.0;
+      orbitErr = reliefYaw === null ? 0 : wrapPi(reliefYaw - boomYaw);
+    } else if (driving) {
       /* LATCHED. The player owns "forward" while they are holding a
          direction, so the boom keeps the azimuth it had when they
          pressed it and the orbit does not run. It is back the frame
          they let go — see the note in RIG for why orbiting here could
          never have improved the shot in the first place. */
+      yawOwner = 'latch';
+      orbitErr = wrapPi((moving ? Math.atan2(subj.vel.x, subj.vel.z) : subj.yaw) - boomYaw);
+      orbitLam = 0;
     } else {
       const want = moving ? Math.atan2(subj.vel.x, subj.vel.z)
         : (holdYaw ?? subj.yaw);
@@ -1436,6 +1452,7 @@ export async function init(ctx) {
         ? RIG.orbitHold
         : RIG.orbitIdle + RIG.orbitRun * subj.gait * subj.gait
           + RIG.unholdBoost * unhold;
+      yawOwner = 'orbit'; orbitErr = wrapPi(want - boomYaw); orbitLam = lam;
       boomYaw = dampAngle(boomYaw, want, lam, dt);
     }
 
@@ -1450,6 +1467,7 @@ export async function init(ctx) {
       /* Ease the boom round to look at the vista, weighted by the blend
          so entering and leaving are one continuous move. */
       const want = Math.atan2(vistaPoint.x - anchor.x, vistaPoint.z - anchor.z);
+      yawOwner = 'vista'; orbitErr = wrapPi(want - boomYaw); orbitLam = 1.4 * vb;
       boomYaw = dampAngle(boomYaw, want, 1.4 * vb, dt);
     }
 
@@ -2200,8 +2218,22 @@ export async function init(ctx) {
            straight ahead), `latchYaw` the azimuth it was pressed on. */
         latched,
         stick: +(subj.stick > 0 ? subj.stickYaw / DEG : 0).toFixed(1),
+        stickMag: +subj.stick.toFixed(3),
         latchYaw: +(latchYaw / DEG).toFixed(1),
         stall: +stallT.toFixed(2),
+        /* WHO OWNS THE BOOM AZIMUTH, and the error it is closing.
+           `yawOwner` names the branch that wrote boomYaw last frame;
+           `orbitErr` is the signed degrees still to travel toward that
+           branch's target and `orbitLam` the damping lambda. A test
+           asking "did the orbit resume?" must read these: the boom
+           MOVING is a consequence of there being error left, not of the
+           orbit being alive. */
+        yawOwner,
+        orbitErr: +(orbitErr / DEG).toFixed(2),
+        orbitLam: +orbitLam.toFixed(2),
+        holdYaw: holdYaw === null ? null : +(holdYaw / DEG).toFixed(1),
+        idleT: +idleT.toFixed(2),
+        wedgeT: +wedgeT.toFixed(2),
       };
     },
 

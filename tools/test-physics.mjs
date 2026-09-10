@@ -980,6 +980,141 @@ console.log('\n\x1b[1mphysics\x1b[0m');
     near(phys.groundAt(0, 0).y, 0, 1e-6, 'pinned plane answers again');
   });
 
+  /* ----------------------------------------------------------------
+     SLOT RECYCLING — the leak this test was written red for.
+
+     remove() cleared alive[] and pruned the grid but never handed the
+     triangle SLOTS back: every mount/dismount of a streamed body burned
+     its span for the rest of the session (terrain chunks, rock chunks,
+     every OBB proxy a prop or a vehicle registers).
+
+     Bill it honestly. Dead slots cost nothing per query — queryAABB and
+     raycast skip them on `!this.alive[t]` and the grid no longer lists
+     them at all — so this is NOT desktop stutter. It is a BACKING-ARRAY
+     CEILING: 36 B/slot in `tri`, plus nrm 12, body 4, stamp 4, alive 1,
+     edge 1 = 58 B a slot, and `_grow` only ever doubles. On the mobile
+     path that ceiling is the whole budget.
+
+     Three spans, because churn comes in exactly three sizes: 12 (an
+     AABB / OBB proxy), 180 (a rock collider), 2048 (a terrain chunk).
+     One warm-up cycle is allowed to allocate; after that the slot
+     high-water and the capacity must not move, and the geometry must
+     still be exactly as collidable as it was on the first cycle —
+     a span handed back non-contiguously, or a slot still listed in a
+     grid cell, shows up in the groundAt() calls inside the cycle.
+     ---------------------------------------------------------------- */
+  await test('remove() gives triangle slots back: churn does not grow the arrays', async () => {
+    const { phys } = await makePhys();
+    phys.addAABB(box(-50, -2, -50, 50, 0, 50));              // permanent ground, top y = 0
+
+    /* cols x rows quads of `cell` metres, flat at y -> 2*cols*rows tris. */
+    const plate = (cols, rows, x0, y, z0, cell = 0.5) => {
+      const p = [];
+      for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) {
+        const xa = x0 + i * cell, xb = xa + cell;
+        const za = z0 + j * cell, zb = za + cell;
+        p.push(xa, y, za, xa, y, zb, xb, y, zb);
+        p.push(xa, y, za, xb, y, zb, xb, y, za);
+      }
+      return p;
+    };
+    const P180 = plate(9, 10, 100, 4, 100);                  // 180 triangles
+    const P2048 = plate(32, 32, 200, 6, 200);                // 2048 triangles
+    ok(P180.length === 180 * 9 && P2048.length === 2048 * 9, 'payload sizes');
+
+    /* Each cycle parks its bodies 40 m from where the last one did. That is
+       the whole point: cycle n writes into the slots cycle n-1 freed, so if
+       a single grid cell still named one of those slots, the new triangle
+       would answer at the OLD spot. Same-place churn cannot see that bug. */
+    const M = new THREE.Matrix4();
+    const gone = (x, z, y) => {
+      const g = phys.groundAt(x, z);
+      ok(g.hit === false || Math.abs(g.y - y) > 1e-6, `nothing may answer at ${x},${z} (got y=${g.y}, hit=${g.hit})`);
+    };
+    const cycle = (k) => {
+      const dx = (k % 2) ? 40 : 0, ox = (k % 2) ? 0 : 40;   /* 40 m clears the widest body (16 m) */
+      M.makeTranslation(dx, 0, 0);
+      const ids = [
+        phys.addAABB(box(dx, 0, 0, dx + 2, 1.5, 2), { name: 'churn.proxy' }),   //   12
+        phys.addTriangles(P180, null, { matrix: M, name: 'churn.rock' }),       //  180
+        phys.addTriangles(P2048, null, { matrix: M, name: 'churn.chunk' }),     // 2048
+      ];
+      near(phys.groundAt(dx + 1, 1).y, 1.5, 1e-6, 'proxy is collidable');
+      near(phys.groundAt(dx + 101, 101).y, 4, 1e-6, 'rock chunk is collidable');
+      near(phys.groundAt(dx + 201, 201).y, 6, 1e-6, 'terrain chunk is collidable');
+      near(phys.groundAt(ox + 1, 1).y, 0, 1e-6, 'the last cycle left no proxy behind');
+      gone(ox + 101, 101, 4);                                // stale rock slot
+      gone(ox + 201, 201, 6);                                // stale chunk slot
+      for (const id of ids) ok(phys.remove(id), 'removed');
+      near(phys.groundAt(dx + 1, 1).y, 0, 1e-6, 'proxy gone, ground answers');
+      gone(dx + 101, 101, 4);
+      gone(dx + 201, 201, 6);
+    };
+
+    cycle(0);                                                // warm-up: allowed to allocate
+    /* world.count is the raw slot high-water and means the same thing on
+       both sides of this fix — which is what makes it the number to
+       assert against. */
+    const slots0 = phys.world.count;
+    const cap0 = phys.world.capacity;
+    for (let i = 1; i <= 5; i++) cycle(i);
+    ok(phys.world.count === slots0,
+      `five more mount/dismount cycles must reuse the freed spans (${slots0} -> ${phys.world.count} slots, +${phys.world.count - slots0})`);
+    ok(phys.world.capacity === cap0,
+      `the backing arrays must not double (capacity ${cap0} -> ${phys.world.capacity})`);
+    ok(phys.stats.triangles === 12,
+      `stats.triangles must count ALIVE triangles, here the ground slab alone (${phys.stats.triangles})`);
+    ok(phys.stats.triangleSlots === slots0,
+      `stats.triangleSlots is that high-water (${phys.stats.triangleSlots} vs ${slots0})`);
+    ok(phys.stats.freeSlots === 12 + 180 + 2048,
+      `and every freed span is parked whole, ready for the next mount (${phys.stats.freeSlots})`);
+
+    /* Structural invariants, because the queries above cannot see a span
+       handed back ONE SLOT OFF: the narrowphase reads real coordinates, so
+       a misaligned span keeps answering correctly right up until the day
+       two bodies share a slot or a span runs past `count` (where no query
+       will ever look). Named branch: collision.js remove() ->
+       _giveSpan(rec.start, rec.span) and addTriangles -> _takeSpan(nTri).
+       This reaches into world._free on purpose — this file is the physics
+       store's own test and that list is the thing under test. */
+    const w = phys.world;
+    const spans = [];
+    for (const [, rec] of w.bodies) spans.push([rec.start, rec.span, 'body']);
+    for (const [n, bucket] of w._free) for (const s of bucket) spans.push([s, n, 'free']);
+    spans.sort((p, q) => p[0] - q[0]);
+    for (const [s, n, kind] of spans) {
+      ok(s >= 0 && s + n <= w.count, `${kind} span ${s}+${n} must lie inside [0, ${w.count})`);
+    }
+    for (let i = 1; i < spans.length; i++) {
+      ok(spans[i - 1][0] + spans[i - 1][1] <= spans[i][0],
+        `spans must not overlap: ${JSON.stringify(spans[i - 1])} then ${JSON.stringify(spans[i])}`);
+    }
+    for (const [n, bucket] of w._free) for (const s of bucket) for (let i = s; i < s + n; i++) {
+      ok(!w.alive[i], `parked span ${s}+${n} must be entirely dead (slot ${i} is live)`);
+    }
+    let aliveSum = 0;
+    for (let i = 0; i < w.count; i++) aliveSum += w.alive[i];
+    ok(aliveSum === phys.stats.triangles,
+      `alive[] must sum to stats.triangles (${aliveSum} vs ${phys.stats.triangles})`);
+  });
+
+  await test('clearStatics() drops the free list too, and the world rebuilds', async () => {
+    const { phys } = await makePhys();
+    phys.addAABB(box(-10, 0, -10, 10, 2, 10));
+    const b = phys.addAABB(box(-2, 0, -2, 2, 6, 2));
+    ok(phys.remove(b), 'removed');
+    ok(phys.stats.freeSlots === 12, `a 12-slot span is parked (${phys.stats.freeSlots})`);
+    phys.clearStatics();
+    ok(phys.stats.freeSlots === 0 && phys.stats.triangleSlots === 0 && phys.stats.triangles === 0,
+      `clear() drops the slots, the live count AND the free list (${JSON.stringify(phys.stats)})`);
+    /* A span that survived the clear would be handed out at an index above
+       count — and queryAABB/raycast early-out on count, so the body would
+       register, answer nothing, and read as a physics blackout. */
+    phys.addAABB(box(-5, 0, -5, 5, 3, 5));
+    near(phys.groundAt(0, 0).y, 3, 1e-6, 'the rebuilt world answers');
+    ok(phys.stats.triangles === 12, `and holds exactly the new body (${phys.stats.triangles})`);
+  });
+
   await test('world:collision bus event registers late geometry', async () => {
     const { phys, ctx } = await makePhys();
     ok(phys.stats.triangles === 0, 'starts empty');

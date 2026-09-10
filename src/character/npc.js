@@ -658,6 +658,19 @@ export async function init(ctx) {
    * bank, the one on the bench. They also cost a fraction of a wanderer
    * (no steering, no path following, and they are nearly always outside
    * the animation budget), so this is where the density belongs.
+   *
+   * "900 m" IS A HOUSE FIGURE, NOT A MEASUREMENT, AND IT IS DELIBERATE.
+   * The shoreline is an ellipse — WORLD.islandRadiusX 485 by
+   * islandRadiusZ 380 in game/data.js, so 970 m east-west by 760 m
+   * north-south — and 900 is the one round number this project uses for
+   * that span, in this file and in seven others (camera.js, ui.js,
+   * wally.js, world.js, ground.js, game.js, data.js). Leave it. It is
+   * also the SAFE side for the argument above: read as a circle 900 m
+   * across it is 636k m2 against the ellipse's real 579k, so the house
+   * figure overstates the ground a crowd has to fill by about a tenth.
+   * Replacing it with 970 makes the island bigger still and strengthens
+   * the case for residents rather than weakening it — the density
+   * objection to this number runs backwards.
    */
   /* Locations that stand on open ground rather than on a forecourt. A
      door-hugging 8 m search leaves the plaza between the buildings

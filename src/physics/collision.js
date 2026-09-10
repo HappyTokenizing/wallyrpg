@@ -248,11 +248,32 @@ export class CollisionWorld {
     /* Per triangle, 3 bits: edge AB / BC / CA is a triangulation seam
        (shared with a coplanar neighbour) rather than a real crease. */
     this.edge = new Uint8Array(this.capacity);
-    this.count = 0;
+    this.count = 0;                 // SLOT high-water, never the live count
 
     this.grid = new Map();          // packed cell key -> Int32Array-backed list
     this.bodies = new Map();        // id -> record
     this._nextId = 1;
+
+    /* ---- freed triangle spans ------------------------------------
+       remove() used to clear alive[] and prune the grid and stop there,
+       so every mount/dismount of a streamed body burned its slots for
+       the rest of the session. Nothing got slower — a dead slot is
+       skipped on `!alive[t]` and the grid no longer names it — but the
+       backing arrays only ever double: 58 B a slot (tri 36, nrm 12,
+       body 4, stamp 4, alive 1, edge 1). That ceiling is the whole
+       budget on the mobile path, and it is why this list exists.
+
+       Bucketed by span LENGTH, each entry the start index of a
+       CONTIGUOUS run of dead slots. Contiguity is not an implementation
+       detail: remove() walks [start, start+count) and _markInternalEdges
+       walks [start, start+count), so a per-slot free list would silently
+       break both. Exact size only — no splitting, no coalescing. Churn
+       comes in a handful of fixed sizes (12 for a box proxy, one size
+       per streamed chunk), so exact fits recycle all of it, and a split
+       span leaves ragged sizes that never match anything again. */
+    this._free = new Map();         // span length -> [startIndex, ...]
+    this._freeSlots = 0;            // dead slots parked in _free
+    this._live = 0;                 // ALIVE triangles
 
     /* Per-ray/query dedupe stamps so a triangle spanning many cells is
        only narrowphased once. */
@@ -275,7 +296,33 @@ export class CollisionWorld {
     this._tmpB = new THREE.Vector3();
   }
 
-  get triangleCount() { return this.count; }
+  /** ALIVE triangles. Not `count`: the moment anything has been removed
+      the two differ, and every reader that printed `count` as "triangles"
+      was quoting the slot high-water. */
+  get triangleCount() { return this._live; }
+  /** Slots ever handed out — the number the backing arrays are sized to. */
+  get slotCount() { return this.count; }
+  /** Dead slots parked in the free list, waiting for a same-size body. */
+  get freeSlotCount() { return this._freeSlots; }
+
+  /** A contiguous run of `n` dead slots, or -1 if none is parked. */
+  _takeSpan(n) {
+    const bucket = this._free.get(n);
+    if (bucket === undefined || bucket.length === 0) return -1;
+    const start = bucket.pop();
+    this._freeSlots -= n;
+    return start;
+  }
+
+  /** Park a contiguous run of `n` slots that are all dead. */
+  _giveSpan(start, n) {
+    if (!(n > 0)) return;
+    let bucket = this._free.get(n);
+    if (bucket === undefined) this._free.set(n, bucket = []);
+    bucket.push(start);
+    this._freeSlots += n;
+  }
+
   /** True when the flat fallback plane is currently in effect. */
   get planeActive() {
     if (this.groundPlane === null) return false;
@@ -331,9 +378,14 @@ export class CollisionWorld {
     const m = opts.matrix ?? null;
     const nTri = indices ? indices.length / 3 : positions.length / 9;
     const id = this._nextId++;
-    this._grow(this.count + nTri);
+    /* Take back a span of exactly this size before growing the arrays.
+       `w` is the write cursor either way, so the triangles land in one
+       contiguous run and everything downstream keeps its assumption. */
+    const reused = this._takeSpan(nTri);
+    if (reused < 0) this._grow(this.count + nTri);
+    let w = reused < 0 ? this.count : reused;
 
-    const rec = { id, start: this.count, count: 0, cells: [], opts, aabb: new THREE.Box3() };
+    const rec = { id, start: w, count: 0, span: nTri, cells: [], opts, aabb: new THREE.Box3() };
     const a = this._tmpA, b = this._tmpB, c = new THREE.Vector3();
     const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
 
@@ -352,7 +404,7 @@ export class CollisionWorld {
       if (len < 1e-12) continue;                    // degenerate — drop it
       n.divideScalar(len);
 
-      const idx = this.count++;
+      const idx = w++;
       const o = idx * 9;
       this.tri[o] = a.x; this.tri[o + 1] = a.y; this.tri[o + 2] = a.z;
       this.tri[o + 3] = b.x; this.tri[o + 4] = b.y; this.tri[o + 5] = b.z;
@@ -371,6 +423,13 @@ export class CollisionWorld {
       this.bounds.min.set(Math.min(this.bounds.min.x, minx), Math.min(this.bounds.min.y, miny), Math.min(this.bounds.min.z, minz));
       this.bounds.max.set(Math.max(this.bounds.max.x, maxx), Math.max(this.bounds.max.y, maxy), Math.max(this.bounds.max.z, maxz));
     }
+
+    /* Degenerate triangles are dropped, so a bump-allocated span can end
+       short: rewind rather than park a ragged size that would never match
+       another body. A reused span keeps its bucket size so it goes back
+       into the same bucket on the next remove(). */
+    if (reused < 0) { this.count = w; rec.span = rec.count; }
+    this._live += rec.count;
 
     this._markInternalEdges(rec.start, rec.count);
     this.bodies.set(id, rec);
@@ -466,6 +525,13 @@ export class CollisionWorld {
       if (kept.length) this.grid.set(key, kept); else this.grid.delete(key);
     }
     this.bodies.delete(id);
+    this._live -= rec.count;
+    /* Hand the SLOTS back, not just the alive flags. This is safe exactly
+       because of the loop above: rec.cells names every cell any of these
+       indices was inserted into, and each of those lists was just rebuilt
+       without them, so no grid list anywhere can still name a dead slot.
+       The next body of this size writes over them. */
+    this._giveSpan(rec.start, rec.span ?? rec.count);
     return true;
   }
 
@@ -474,6 +540,13 @@ export class CollisionWorld {
     this.grid.clear();
     this.bodies.clear();
     this.alive.fill(0);
+    /* The free list indexes slots that no longer exist — parking them
+       across a clear() would hand out live indices above a count of 0,
+       and queryAABB would early-out on that count while the grid held
+       geometry. Drop it with everything else. */
+    this._free.clear();
+    this._freeSlots = 0;
+    this._live = 0;
     this.bounds.min.set(Infinity, Infinity, Infinity);
     this.bounds.max.set(-Infinity, -Infinity, -Infinity);
   }

@@ -2,7 +2,8 @@
    menus.js — every panel that is not the phone.
 
      pause          resume / phone / desk / settings / save / load
-     settings       audio, quality, accessibility, persistence
+     settings       sound + mute, quality (restarts the page),
+                    comfort, accessibility, save/load/export
      travel         the fare board for a destination
      place          "what you can do here" + the people standing there
      desk           orders, arrivals, tokenizing, office, team
@@ -15,7 +16,7 @@
    ============================================================ */
 
 import { BRAND, CATEGORY, BUILD, SEA, LAND, css } from '../core/palette.js';
-import { QUALITY_TIERS, clamp } from '../core/contracts.js';
+import { clamp, tierName, qualityPin, pinQuality } from '../core/contracts.js';
 import {
   h, clear, icon, money, money2, pad2, portrait, glyphAvatar, wallyMark, rgba, mix, C,
   tickerTag, ticketLine,
@@ -860,16 +861,120 @@ export function createMenus(ctx, ui) {
       if (ctx.audio) ctx.audio.sfxVolume = v;
       ui.sfx('ui.click');
     }));
+    /* ------------------------------------------------------------
+       MUTE — the only control in this game that actually makes it
+       silent, and until now there was none.
 
-    /* ---- picture ---- */
+       BOTH SLIDERS AT ZERO IS NOT SILENCE. sfx.js and music.js each
+       run a PRE-FADER reverb send: the send is tapped off the voice,
+       not off the bus, so it feeds reverb.js and the wet return lands
+       on `duck`, which sits DOWNSTREAM of musicGain and sfxGain.
+       Pulling both faders to 0 measured peak 0.451 against a nominal
+       0.892 — half the loudness, on a control the player has every
+       reason to read as off.
+
+       audio.mute() closes the master gain, which is downstream of the
+       return, and measures 0.00000. It has existed for as long as the
+       reverb has and nothing in the UI called it.
+
+       It persists on its own (audio.js writes vol to localStorage on
+       every mix change), so it survives a reload and, unlike the two
+       sliders, it is NOT in the save — a player who muted the game on
+       the train does not want it back the moment he loads.
+       ------------------------------------------------------------ */
+    body.append(toggle('Mute all sound', !!ctx.audio?.muted, (on) => {
+      try { ctx.audio?.mute(on); } catch (e) { /* nullAudio, already silent */ }
+      /* Said AFTER the unmute so it can be heard, and skipped on the
+         way in so a mute is not answered with a noise. */
+      if (!on) { ui.sfx('ui.select'); ui.toast('Sound on', 'info'); }
+    }));
+
+    /* ------------------------------------------------------------
+       PICTURE — and why this row RESTARTS the game.
+
+       IT USED TO BE A TOAST. The chip called ctx.render.setQuality(),
+       which reaches the renderer's own state — cascade far plane, map
+       size, the post flags, the pixel-ratio ladder — and NOTHING
+       ELSE. Every other thing a tier buys is built once, at init, in
+       a module that never hears about the change: the grass field and
+       its draw distance, the crowd, the cloud octaves, the cloth
+       count, the MSAA sample count baked into the render target, the
+       bloom pyramid's mip count. Picking LOW from the menu delivered
+       9.3 % of the triangles a LOW boot actually drops. The player
+       who picks LOW is BY DEFINITION the player whose machine is
+       struggling, and what he got was a notification.
+
+       A live re-init would have to fan out across seven
+       frame-writing modules at once. The reload is one line, is
+       exact — it is the same path ?quality= has always taken — and
+       costs a boot.
+
+       So the tap ARMS, and a second, explicit tap spends it. The
+       game saves first (an autosave only lands every 45 s of played
+       time, so "restart" without one can cost real progress), the
+       tier is pinned per device (contracts.js qualityPin), and the
+       reload carries ?quality= so the choice applies even where
+       storage is refused. If the save FAILS, the button says so and
+       has to be pressed again — losing the session to a picture
+       setting is not a thing to do quietly.
+
+       AUTO is the way back out. Without it a pin is a one-way door:
+       a player who pinned ULTRA on a machine that cannot boot it has
+       to find the query string to escape.
+       ------------------------------------------------------------ */
     body.append(label('Picture'));
-    const tiers = ['low', 'med', 'high', 'ultra'];
-    body.append(chips('Quality', tiers, tierName(ctx.quality?.name), (v) => {
-      try {
-        ctx.render?.setQuality(QUALITY_TIERS[v]);
-        ui.toast('Quality: ' + v, 'info');
-      } catch (e) { ui.toast('Could not change quality', 'bad'); }
-    }, tiers.map((t) => t.toUpperCase())));
+    const tiers = ['auto', 'low', 'med', 'high', 'ultra'];
+    const running = tierName(ctx.quality?.name);
+    const pinned = qualityPin();
+    /* What the CHIP should show as chosen: the pin if there is one,
+       otherwise whatever the address bar forced, otherwise AUTO. A
+       session booted with ?quality=low must not sit here claiming the
+       probe picked it. */
+    const urlQ = new URLSearchParams(location.search).get('quality');
+    const base = pinned || (tiers.includes(urlQ) && urlQ !== 'auto' ? urlQ : 'auto');
+    let want = base;
+    let qArmed = false;
+
+    const qNote = h('div.sub');
+    const qBtn = h('button.w-btn.sm.prim.w-pe', {
+      type: 'button',
+      style: { width: '100%', marginTop: '6px' },
+      onclick: () => {
+        const ok = g().save();
+        if (!ok && !qArmed) {
+          qArmed = true;
+          clear(qBtn);
+          qBtn.append(icon('info', 15), 'Could not save · restart anyway');
+          ui.sfx('ui.error');
+          return;
+        }
+        pinQuality(want === 'auto' ? null : want);
+        const u = new URL(location.href);
+        if (want === 'auto') u.searchParams.delete('quality');
+        else u.searchParams.set('quality', want);
+        ui.toast('Restarting on ' + want.toUpperCase(), 'info');
+        location.replace(u.href);
+      },
+    }, icon('save', 15), 'Save and restart');
+
+    const paintQ = () => {
+      const same = want === base;
+      qNote.textContent = same
+        ? 'Running ' + running.toUpperCase()
+          + (ctx.quality?.name && ctx.quality.name !== running ? ' · ' + ctx.quality.name : '')
+          + (pinned ? ' · pinned on this device'
+            : base === 'auto' ? ' · chosen for this machine' : ' · from the address bar')
+        : (want === 'auto'
+          ? 'AUTO lets the game choose again. It takes a restart.'
+          : want.toUpperCase() + ' takes a restart — the picture is built at boot.');
+      qBtn.style.display = same ? 'none' : '';
+      if (same) { qArmed = false; clear(qBtn); qBtn.append(icon('save', 15), 'Save and restart'); }
+    };
+
+    body.append(chips('Quality', tiers, want, (v) => { want = v; paintQ(); },
+      tiers.map((t) => t.toUpperCase())));
+    body.append(h('div', { style: { margin: '-6px 0 12px' } }, qNote, qBtn));
+    paintQ();
 
     /* ---- comfort ---- */
     body.append(label('Comfort'));
@@ -1040,12 +1145,6 @@ export function createMenus(ctx, ui) {
       style: { textAlign: 'center', opacity: '.4', fontSize: '10px', marginTop: '16px', letterSpacing: '.1em' },
       text: 'WALLY RPG · save v' + g().data.config.version,
     }));
-  }
-
-  function tierName(n) {
-    if (!n) return 'high';
-    const s = String(n).replace(/\(.*\)/, '');
-    return QUALITY_TIERS[s] ? s : 'high';
   }
 
   function slider(name, value, onInput) {

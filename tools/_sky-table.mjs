@@ -67,7 +67,7 @@ page.on('console', m => { if (m.type() === 'error') logs.push(`[error] ${m.text(
 
 const t0 = Date.now();
 await page.goto(`http://127.0.0.1:${PORT}/index.html?shot=1`, { waitUntil: 'load', timeout: 60000 });
-await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 90000 });
+await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 90000 });
 const loadS = (Date.now() - t0) / 1000;
 
 /* ---- WHAT THIS RUN IS ACTUALLY RUNNING ON. Measured here, at the

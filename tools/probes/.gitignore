@@ -1,0 +1,11 @@
+# ---------------------------------------------------------------
+# Agent probe scratch. See BUILD_BRIEF.md, "Where your probes live".
+#
+# Git ignores everything in this directory except this file. A probe
+# written here therefore CANNOT be committed and cannot grow tools/
+# back the way it did after 89ec7c5 — 319 files deleted, 245 again in
+# sixteen days. This file is the whole enforcement mechanism; if you
+# delete it the directory stops being ignored. Leave it.
+# ---------------------------------------------------------------
+*
+!.gitignore

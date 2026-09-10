@@ -525,6 +525,12 @@ const TRUNK_BASE = -0.9;
    that turns foot IK off for the ride ("his feet are on a deck") — and
    that is the whole wiring. On foot the collision world is byte for
    byte what it was before this pass; aloft, every crown is solid.
+
+   AND ALOFT IT IS THE CROWNS AROUND HER, not the crowns on the island.
+   The sentence above used to be true of all 757 at once and it cost
+   the worst frame in the game to say so; the window that replaced it
+   is at setCanopies() below, and it changes which crowns are live and
+   nothing else about any one of them.
    ------------------------------------------------------------------ */
 const CANOPY_BASE = 2.90;
 /* below this a crown box is not worth a body: the clamp has eaten it */
@@ -743,7 +749,10 @@ export function createTrees(ctx, env) {
     t.solid = sh.hi.solid || null;
     t.crown = sh.hi.crown || null;
     trees.push(t);
-    if (physWired) { addTrunkCollider(t); if (canopiesOn) addCanopyCollider(t); }
+    /* A tree planted mid-flight gets its crown from the window on the
+       next frame, not here — see streamCanopies. 'island' keeps the
+       old behaviour so the revert really is the old rule. */
+    if (physWired) { addTrunkCollider(t); if (canopiesOn && canopyMode === 'island') addCanopyCollider(t); }
     const k = skey(x, z);
     let a = cell.get(k);
     if (!a) cell.set(k, a = []);
@@ -810,9 +819,14 @@ export function createTrees(ctx, env) {
   }
   function addCanopyCollider(t) {
     const c = t.crown;
-    if (!c || t.dead || t.crownId != null || !ctx.phys?.addOBB) return;
+    if (!c || t.dead || t.crownId != null || t.crownNo || !ctx.phys?.addOBB) return;
     const base = crownFloor(t);
-    if (base == null) return;
+    /* REMEMBERED, not recomputed. crownFloor() depends on t.m and
+       t.crown and neither moves after placement, so a crown the clamps
+       have eaten is eaten for the life of the session — and the stream
+       below would otherwise re-derive four transformed corners for
+       every one of them on every frame of every flight. */
+    if (base == null) { t.crownNo = 1; return; }
     const h = c.top - base;
     _colM.copy(t.m).multiply(_colT.makeTranslation(c.cx, base + h * 0.5, c.cz));
     t.crownId = ctx.phys.addOBB(c.rx * 2, h, c.rz * 2, _colM,
@@ -825,23 +839,121 @@ export function createTrees(ctx, env) {
     t.colId = null;
   }
 
-  /* THE SWITCH, and it is a revert switch, not a debug hook: on is
+  /* ------------------------------------------------------------------
+     THE SWITCH, and it is a revert switch, not a debug hook: on is
      what a balloon meets, off is the island exactly as it was before
      canopies existed, and the two run on one page load so the A/B is a
      measurement rather than a number quoted from a dead build. The
      game drives it from 'wally:fly' below and never calls it directly;
-     a test drives it to hold the island still on either side. */
+     a test drives it to hold the island still on either side.
+
+     AND THE ISLAND IS NO LONGER REGISTERED IN ONE GO — THAT WAS THE
+     WORST FRAME IN THE GAME. 'island' is the rule this replaced, kept
+     runnable beside the shipping one for exactly the reason above, and
+     what was wrong with it is a frame: every live crown on the island
+     went into the collision world inside a single setCanopies(true) —
+     757 addOBB calls, 9 084 triangles hashed into the broadphase grid
+     — on the frame the balloon boards, which is flyPhase 'boarding'
+     and has no cut over it to hide behind. The matching removals land
+     on the landing, where the player is watching the basket touch
+     down. Both ends of a flight paid for a world-sized edit to answer
+     a question about the fifty metres around one machine.
+
+     terrain.js already answers this for rocks — updateRockCollision(),
+     a window around the player at ROCK_IN 62 / ROCK_OUT 82, a couple
+     of bodies a frame, hysteresis so walking a boundary cannot thrash
+     one — and a canopy is the same shape of problem with the BALLOON
+     at the centre. Same radii, deliberately: they were chosen so a solid is
+     live long before anything can reach it, and a balloon's drift
+     ceiling (RIDE_TUNE.balloon, 9.0 m/s) is slower than a run.
+
+     WHAT THIS DOES NOT CHANGE, because all three were paid for:
+       · the gate. Crowns still exist only while something that can
+         reach them is in the air — see CANOPY_BASE's header for the
+         0.94 m ankles and the 7.92 m lens that buys;
+       · the floor. Nothing is registered below 2.90 m of world height
+         in either mode: the window decides WHICH crowns, crownFloor()
+         still decides where each one starts;
+       · what a balloon meets. Inside CANOPY_IN the collision world is
+         body for body what 'island' builds.
+     ------------------------------------------------------------------ */
+  const CANOPY_IN = 62, CANOPY_OUT = 82;   // terrain.js's rock window, verbatim
+  const CANOPY_BUDGET = 4;                 // crowns registered per frame
   let canopiesOn = false;
-  function setCanopies(on) {
+  let canopyMode = 'stream';               // 'stream' ships | 'island' is the prior rule
+  let canopyStreamed = 0;                  // adds made by the stream this session
+
+  /* WHERE THE WINDOW IS CENTRED, and it is the machine the crowns
+     exist for rather than the character: root carries the basket for
+     the whole of a flight (wally.js flyUpdate integrates the balloon
+     ON root and ctx.wally.position IS root.position), so the one
+     handle answers for both. Null before wally boots — the world stage
+     is earlier — and a null focus registers nothing rather than
+     guessing at an origin nobody is standing on. */
+  function canopyFocus() {
+    const p = ctx.wally?.position;
+    return p && Number.isFinite(p.x) && Number.isFinite(p.z) ? p : null;
+  }
+
+  /**
+   * One pass of the window: drop what has left it, add what has
+   * entered, at most `budget` additions. Horizontal distance, like the
+   * rock window — she may descend at any moment, so an altitude test
+   * would only take away the margin the radius is there to provide.
+   * @returns {number} crowns registered this pass
+   */
+  function streamCanopies(budget = CANOPY_BUDGET) {
+    if (!canopiesOn || canopyMode !== 'stream' || !physWired) return 0;
+    const f = canopyFocus();
+    if (!f) return 0;
+    const fx = f.x, fz = f.z;
+    for (const t of trees) {
+      if (t.crownId == null) continue;
+      if (!t.dead && Math.hypot(t.x - fx, t.z - fz) <= CANOPY_OUT) continue;
+      ctx.phys?.remove(t.crownId);
+      t.crownId = null;
+    }
+    let n = 0;
+    for (const t of trees) {
+      if (n >= budget) break;
+      if (t.dead || t.crownId != null || t.crownNo || !t.crown) continue;
+      if (Math.hypot(t.x - fx, t.z - fz) > CANOPY_IN) continue;
+      addCanopyCollider(t);
+      if (t.crownId != null) { n++; canopyStreamed++; }
+    }
+    return n;
+  }
+
+  /**
+   * @param {boolean} on
+   * @param {'stream'|'island'} [mode]  which rule to run. Naming the
+   *   mode with `on` unchanged re-runs the window unbudgeted, so a test
+   *   can switch rules mid-flight and measure both on one page load
+   *   without waiting for the stream to catch up.
+   */
+  function setCanopies(on, mode) {
+    const modeChanged = (mode === 'stream' || mode === 'island') && mode !== canopyMode;
+    if (mode === 'stream' || mode === 'island') canopyMode = mode;
     on = on !== false;
-    if (on === canopiesOn) return canopiesOn;
+    if (on === canopiesOn) {
+      if (on && physWired && modeChanged) {
+        if (canopyMode === 'island') { for (const t of trees) if (!t.dead) addCanopyCollider(t); }
+        else streamCanopies(1e9);
+      }
+      return canopiesOn;
+    }
     canopiesOn = on;
     if (!physWired) return canopiesOn;
-    for (const t of trees) {
-      if (t.dead) continue;
-      if (on) addCanopyCollider(t);
-      else if (t.crownId != null) { ctx.phys?.remove(t.crownId); t.crownId = null; }
+    if (!on) {
+      for (const t of trees) {
+        if (t.crownId == null) continue;
+        ctx.phys?.remove(t.crownId);
+        t.crownId = null;
+      }
+      return canopiesOn;
     }
+    if (canopyMode === 'island') { for (const t of trees) if (!t.dead) addCanopyCollider(t); }
+    else streamCanopies();
     return canopiesOn;
   }
   const offFly = ctx.bus?.on?.('wally:fly', (e) => setCanopies(!!e?.flying)) || null;
@@ -849,7 +961,8 @@ export function createTrees(ctx, env) {
   function wirePhysics() {
     if (physWired || !ctx.phys?.addOBB) return 0;
     physWired = true;
-    for (const t of trees) { addTrunkCollider(t); if (canopiesOn) addCanopyCollider(t); }
+    for (const t of trees) addTrunkCollider(t);
+    if (canopiesOn) { if (canopyMode === 'island') { for (const t of trees) if (!t.dead) addCanopyCollider(t); } else streamCanopies(1e9); }
     return trees.length;
   }
 
@@ -1083,10 +1196,33 @@ export function createTrees(ctx, env) {
     get solidCount() { let n = 0; for (const t of trees) if (t.colId != null) n++; return n; },
 
     /** The canopy switch. Driven by 'wally:fly'; exposed so a test can
-        run the island with crowns and without on one page load. */
+        run the island with crowns and without on one page load.
+        setCanopies(true, 'island') is the rule this round replaced —
+        every crown at once — and setCanopies(true, 'stream') is what
+        ships. Both run live, so the A/B is a measurement. */
     setCanopies,
     get canopiesOn() { return canopiesOn; },
+    get canopyMode() { return canopyMode; },
     get crownCount() { let n = 0; for (const t of trees) if (t.crownId != null) n++; return n; },
+    /** What the window is doing, for a rig that wants the shape of the
+        stream rather than a single frame of it. */
+    canopyStats() {
+      const f = canopyFocus();
+      let live = 0, eligible = 0, eaten = 0, inWindow = 0;
+      for (const t of trees) {
+        if (t.crownId != null) live++;
+        if (t.dead || !t.crown) continue;
+        if (t.crownNo) { eaten++; continue; }
+        eligible++;
+        if (f && Math.hypot(t.x - f.x, t.z - f.z) <= CANOPY_IN) inWindow++;
+      }
+      return {
+        mode: canopyMode, on: canopiesOn, live, eligible, eaten, inWindow,
+        streamed: canopyStreamed, budget: CANOPY_BUDGET,
+        radius: [CANOPY_IN, CANOPY_OUT],
+        focus: f ? [+f.x.toFixed(2), +f.y.toFixed(2), +f.z.toFixed(2)] : null,
+      };
+    },
     /** Every live crown box in world space — what a rig measures the
         fit of against the drawn canopy. */
     crownBoxes(limit = 1e9) {
@@ -1177,6 +1313,14 @@ export function createTrees(ctx, env) {
 
     update(dt) {
       acc += dt;
+      /* THE WINDOW, EVERY FRAME, AND ONLY WHILE SOMETHING IS FLYING.
+         It early-outs on `canopiesOn` before it touches the tree list,
+         so on foot — which is nearly all of the session — this line
+         costs one boolean. Aloft it is two passes over 782 trees and
+         at most CANOPY_BUDGET registrations. Not on the 8 Hz timer
+         with repack(): a crown that arrives an eighth of a second late
+         is a crown the balloon has already flown through. */
+      if (canopiesOn) streamCanopies();
       /* 8 Hz is plenty: a tree that pops into the frustum one frame
          late is invisible, and repacking 400 matrices every frame is
          not. Forced immediately after a plant() or clear(). */

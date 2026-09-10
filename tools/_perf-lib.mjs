@@ -35,7 +35,7 @@ export async function boot({ w = 1600, h = 900, dpr = 1, qs = '?shot=1', logs = 
   page.on('console', m => logs.push(`[${m.type()}] ${m.text()}`));
   page.on('pageerror', e => logs.push(`[PAGEERROR] ${e.message}`));
   await page.goto(`http://127.0.0.1:${port}/index.html${qs}`, { waitUntil: 'load', timeout: 60000 });
-  await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 60000 })
+  await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 60000 })
     .catch(() => logs.push('[warn] never ready'));
   return { browser, page, server, close: async () => { await browser.close(); server.close(); } };
 }

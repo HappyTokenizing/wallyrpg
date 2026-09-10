@@ -123,7 +123,7 @@ const ok = (cond, msg, detail) => {
 };
 
 await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 120000 });
-await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 120000 });
+await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 120000 });
 await page.waitForTimeout(3000);
 
 /* Clear the things that would make travel() legitimately refuse — the
@@ -823,7 +823,7 @@ console.log(`  before: route=${saved.route} arrow="${saved.arrow}" quote=${JSON.
 ok(saved.arrow === saved.want, `[walker/routed] the arrow named "${saved.want}" before the reload`, saved.arrow);
 
 await page.reload({ waitUntil: 'load', timeout: 120000 });
-await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 120000 });
+await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 120000 });
 await page.waitForTimeout(2500);
 await installHelpers();
 const reloaded = await page.evaluate(() => {

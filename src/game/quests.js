@@ -274,11 +274,25 @@ export function createQuests(env) {
       return l;
     }
     M().note('token', (air ? 'Spotted ' : 'Discovered ') + l.n);
+    /* THE GATE IS ITS OWN SENTENCE, BECAUSE IT STARTS WITH A NAME.
+       accessInfo().why is written to stand alone — 'Market Hall will
+       not deal with you yet — you need a reputation of 3.' — and
+       every other reader (game.js canEnter(), placeInfo(), the
+       'discover' event three lines down) renders it exactly as
+       written. This one clause used to splice it mid-sentence behind
+       'but ', so it ran it through a lowercaser, and a lowercaser
+       applied to a proper noun produces 'market Hall'. It fired at
+       all 24 locked places on a day-one save, which makes it the
+       first phone message a new player reads. Full stop, then the
+       sentence as it was written; the contrast 'but' was carrying is
+       carried by 'and no further', the same way game.js:1634 does it
+       for a batch. Nothing here lowercases anything now. */
+    const gate = acc.ok ? '' : ' It is on your map now, and no further. ' + acc.why;
     M().msg('City Guide', air
       ? 'You picked ' + l.n + ' out of ' + ZONES[l.z].n + ' from the basket, by its roof. '
-        + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why))
+        + l.desc + gate
       : 'You found ' + l.n + ' in ' + ZONES[l.z].n + ' by walking past it. '
-        + l.desc + (acc.ok ? '' : ' It is on your map, but ' + lower(acc.why)));
+        + l.desc + gate);
     /* THE SMALL REWARD. Its own sound and its own sting rather than
        the generic 'unlock' chime, so finding a place on foot does not
        sound like buying a wallet upgrade. The unlock event still goes
@@ -293,7 +307,6 @@ export function createQuests(env) {
     bus.emit('unlock', { key: 'location', location: l.id, zone: l.z, how, quiet: true });
     return l;
   }
-  const lower = (s) => (s ? s.charAt(0).toLowerCase() + s.slice(1) : s);
 
   /* ---------- objectives ---------- */
   const list = () => QUESTS;

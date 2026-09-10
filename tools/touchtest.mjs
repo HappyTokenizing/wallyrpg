@@ -20,6 +20,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { join, extname, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8' };
@@ -46,6 +47,125 @@ const ok = (cond, msg, extra = '') => {
   return cond;
 };
 
+/* ============================================================
+   THE MACHINE IS PART OF THE MEASUREMENT, AND IT HAS ALREADY COST
+   THIS PROJECT TWO CONCLUSIONS.
+
+   Everything in the IDLE and PAD blocks is wall-clock on both sides. A
+   dispatched double tap has to arrive inside touch.js's 300 ms TAP_GAP
+   or it is not a double tap; a read taken N ms after a press has to be
+   taken after the press has landed or it is a picture of a transition.
+   Neither is free on a loaded box, and on 2026-09-08 a judge running
+   this file alongside its own browser work produced 29 IDLE and 40 PAD
+   failures that were the box and not the build — enough noise to bury
+   the three real results in the same run, and it said so rather than
+   dressing it up.
+
+   A suite whose verdict depends on machine load is a suite nobody can
+   trust, so three things changed and each is marked at its site:
+
+     · WAIT ON THE FACT, NOT ON A STOPWATCH — test-balloon's phrase.
+       Where a fixed sleep was standing in for "the fade has happened"
+       or "the panel has opened", the fact itself is now polled, with a
+       generous bound, and HOW LONG IT TOOK is printed rather than
+       gated on. The claim survives: it faded, it opened. What no
+       longer survives is the accidental second claim that it did so
+       within 900 ms on this particular machine.
+
+     · A GESTURE IS VERIFIED AGAINST WHAT THE PAGE RECEIVED, not
+       against what we asked CDP to send. See doubleTap() below.
+
+     · WHAT CANNOT BE MADE LOAD-PROOF IS PRINTED WITH THE LOAD BESIDE
+       IT — rule 4 of HOW THIS PROJECT PROVES A FIX in contracts.js.
+       `6.5 ms (M1 Max, load1 2.1)` is a measurement; `6.5 ms` is a
+       rumour, and so is a red suite with no load beside it.
+
+   And a harness miss is not a product failure. Anything this file
+   cannot deliver to the page is counted separately and named
+   HARNESS-MISS in the output and in the exit line, so a contaminated
+   run reads as a contaminated run instead of as a regression in
+   whatever somebody happened to change that afternoon. That is rule 5
+   — a rig that cannot reach its subject must die, not shrug.
+
+   ------------------------------------------------------------
+   THE CONTROL, 2026-09-09, AND WHAT IT SETTLED.
+
+   The suite was red on PAD-3, PROMPT-2 and PROMPT-5 of 435, and only
+   PROMPT-2 was attributed. So a HEAD ARCHIVE was built — `git archive
+   HEAD` into a scratch tree with node_modules symlinked and THIS FILE
+   copied in, so the harness is byte-identical and only src/ differs —
+   and the two were run ALTERNATED (head, then tree) on a quiet box.
+
+       working tree   436/436, 0 harness miss   load1 9.6 -> 11.8, 849 s
+       HEAD archive   436/436, 0 harness miss   load1 9.9 -> 10.9, 851 s
+
+   Zero assertions disagree between the arms. PAD-3 1/1, PROMPT-2 4/4
+   and PROMPT-5 30/30 pass on BOTH. And the arms really are two
+   different builds, which is the check that stops this being two runs
+   of the same code: booted side by side, `WALLY.debug.keepOut` and
+   `doorReach` are functions on the working tree and undefined on the
+   HEAD archive, while promptAnchor is a function on both.
+
+   So none of the three was real. All three were the box. The run that
+   produced them was a run the judge itself said it had contaminated,
+   and the sleeps below were what let the contamination through.
+
+   The same file, hardened as described above, then went 436/436 on the
+   working tree in a single run whose load1 went from 192 AT BOOT to 10
+   at exit — an order of magnitude worse than the load that produced
+   the original red, with every fact it waited on arriving (0 NEVERs).
+   What the waits actually cost, measured across that run: a sheet
+   raised by a press arrives in 1-21 ms (median 2) where 700-900 ms was
+   being slept for it, and a `debug.arrive()` lands in 27-117 ms where
+   1600 ms was. The sleeps were two orders of magnitude longer than the
+   facts needed and STILL lost the race at load 131 — which is the
+   whole argument for waiting on the fact and not on the stopwatch.
+   ------------------------------------------------------------
+   ============================================================ */
+const load1 = () => {
+  try { return +execSync('uptime').toString().split('load averages:')[1].trim().split(/\s+/)[0]; }
+  catch { return NaN; }
+};
+let harnessMiss = 0;
+const miss = (msg, extra = '') => {
+  harnessMiss++;
+  console.log(`HARNESS-MISS  ${msg}${extra ? '   ' + extra : ''}   [load1 ${load1()}]`);
+};
+/* Returns whether the fact arrived, and never throws — the assertion
+   after it still reads the real state and still gets to fail. A `fact`
+   that times out is information, not an exception. */
+const fact = (pg, fn, arg = null, timeout = 9000) =>
+  pg.waitForFunction(fn, arg, { timeout }).then(() => true).catch(() => false);
+/* the same wait, with the elapsed time back, for the places that want
+   to PRINT how long the box took rather than assert on it */
+const factMs = async (pg, fn, arg = null, timeout = 9000) => {
+  const t0 = Date.now();
+  const got = await fact(pg, fn, arg, timeout);
+  return { got, ms: Date.now() - t0, load: load1() };
+};
+/* THE ARRIVAL IS A FACT TOO. `debug.arrive()` fades, warps and re-polls
+   the door ring; every caller below slept 1600 ms for that and then read
+   `ui.near`, and a null read there does not fail as "the arrival was
+   slow" — it fails as "standing in a doorway it no longer fades" or
+   "the door assertion had no door", which is a statement about the
+   build. Bounded, and the elapsed time is printed, never gated on. */
+/* NAMED, not merely non-null. `near != null` is already true if he was
+   standing at a door when arrive() was called, so a wait on it would
+   return on the OLD door before the warp had landed — the stale-read
+   the sleep it replaces was accidentally covering. The id is the fact. */
+const arrived = (pg, id = 'apartment', timeout = 9000) =>
+  factMs(pg, (want) => WALLY.ctx.ui.near?.id === want, id, timeout);
+/* THE PANEL IS A FACT, AND IT WAS BEING SLEPT FOR — see the long note
+   at THE PAD IS DRIVEN FROM POINTER EVENTS below, which is where this
+   was written. It lives up here because the presses that need it start
+   at IDLE-80, hundreds of lines above that block. */
+const panelUpOn = (pg, name, timeout = 5000) =>
+  factMs(pg, (n) => WALLY.ctx.ui.panels.includes(n), name, timeout);
+/* how long the sheet or the arrival took, for an assertion's extra */
+const upNote = (u) => `, sheet up ${u.got ? `+${u.ms} ms` : `NEVER in ${u.ms} ms`} (load1 ${u.load})`;
+const camNote = (u) => `, at the door ${u.got ? `+${u.ms} ms` : `NEVER in ${u.ms} ms`} (load1 ${u.load})`;
+console.log(`RIG  ${process.platform} · headless Chrome · load1 at boot ${load1()}`);
+
 /* ================= 1. the phone ================= */
 const ctxMobile = await browser.newContext({
   viewport: { width: 390, height: 844 },
@@ -67,6 +187,9 @@ await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'l
 await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 120000 });
 await page.waitForTimeout(3500);
 
+/* FRAMES, so "it held still" can be told from "nothing ran". Used by
+   padStill() below; the PROMPT block installs its own on its own page. */
+await page.evaluate(() => { window.__TF = 0; (function t() { window.__TF++; requestAnimationFrame(t); })(); });
 const cdp = await ctxMobile.newCDPSession(page);
 const P = (x, y) => [{ x, y, id: 1, radiusX: 14, radiusY: 14, force: 1 }];
 const touch = (type, x, y) =>
@@ -747,13 +870,136 @@ async function tapOnce(x, y, hold = 45) {
    gesture needs the delay: a 0 ms hold is a tap and a 0 ms gap is a
    double tap, and the tests that need a LONG gap or a FAR second tap
    (IDLE-11, IDLE-12) build them from tapOnce and their own waits. */
+/* AND IT IS NOW VERIFIED AGAINST WHAT THE PAGE RECEIVED.
+
+   The note above is right about why the sleeps went, and it is still
+   not enough: with the sleeps gone the gesture is four CDP round trips
+   long, and on a box at load 40 four round trips can exceed the 300 ms
+   gap the gesture has to fit inside. When that happens the page is
+   perfectly correct to refuse a wake — it was handed two separate taps
+   — and every assertion below reads a working feature as broken. That
+   is the shape of 29 of the failures this hardening comes from.
+
+   Two changes, and the second is the one that matters.
+
+   ONE BURST. The four messages go out without awaiting each other, so
+   three round trips come off the critical path. Ordering is preserved:
+   they are sent in order on one CDP session, which delivers them in
+   order. This shortens the gesture; it does not make it safe.
+
+   THEN ASK THE PAGE WHAT IT GOT. window.__tl records pointerdown and
+   pointerup at WINDOW CAPTURE — outside touch.js, which stops the wake
+   contact at document capture, so the ledger sees the raw arrival
+   whether or not the feature swallows it. The four events are then
+   measured against touch.js's OWN constants (TAP_MS 400, TAP_GAP 300,
+   TAP_DIST 44, quoted from src/ui/touch.js and not invented here). If
+   they do not satisfy them, no double tap was delivered and nothing
+   downstream is entitled to an opinion.
+
+   THE RETRY IS GUARDED BY THE WAKE COUNTER, which is what makes it
+   safe to retry at all. A second attempt is dispatched ONLY after
+   confirming `idle().wakes` did not move — i.e. the page really did
+   refuse the malformed pair — so a retry can never add a second wake
+   to a gesture that landed, and `wakes` stays exactly countable for
+   IDLE-15. Three attempts, then it dies out loud as a HARNESS-MISS
+   rather than shrugging into a false FAIL.
+
+   Returns the ledger verdict so callers can print it beside their
+   result: on a red run the reader can see whether the gesture was ever
+   a gesture. */
+const TAP_MS = 400, TAP_GAP = 300, TAP_DIST = 44;   // src/ui/touch.js
+const tapLedgerArm = () => page.evaluate(() => {
+  window.__tl = [];
+  if (!window.__tlOn) {
+    window.__tlOn = true;
+    for (const t of ['pointerdown', 'pointerup']) {
+      addEventListener(t, (e) => window.__tl.push(
+        { t: e.type, ts: e.timeStamp, x: e.clientX, y: e.clientY }), true);
+    }
+  }
+});
+const wellFormed = (g, MS, GAP, DIST) => {
+  const d = g.filter((e) => e.t === 'pointerdown'), u = g.filter((e) => e.t === 'pointerup');
+  if (d.length < 2 || u.length < 2) return { ok: false, why: `only ${d.length} down / ${u.length} up reached the page` };
+  const [d1, d2] = d.slice(-2), [u1, u2] = u.slice(-2);
+  const h1 = u1.ts - d1.ts, h2 = u2.ts - d2.ts, gap = d2.ts - u1.ts;
+  const dist = Math.hypot(d2.x - d1.x, d2.y - d1.y);
+  return {
+    ok: h1 <= MS && h2 <= MS && gap >= 0 && gap <= GAP && dist <= DIST,
+    why: `holds ${Math.round(h1)}/${Math.round(h2)} ms, gap ${Math.round(gap)} ms, ${Math.round(dist)} px apart`
+      + ` (gates ${MS}/${GAP}/${DIST})`,
+  };
+};
+/* THE FADE IS 0.42 s OF CSS AND THE SETTLE WAS 800 ms OF HOPE.
+
+   Every wake in this file reads the pad straight after doubleTap, and
+   `settle` was the only thing standing between the gesture and that
+   read. 800 ms is comfortably twice the transition on a quiet box and
+   is nothing at all on a busy one — the controls are then read
+   mid-cross-fade and `padThere`/`padGone` report a transition, which
+   is most of what 29 spurious IDLE failures were.
+
+   So the sleep STAYS (callers time other things against it, and one
+   passes 0 on purpose to read mid-fade) and the wait for the fade to
+   have FINISHED is added on top of it: the four control opacities,
+   already rounded to 2 dp by uiLayers(), read twice with at least two
+   RENDERED FRAMES in between. Two frames, because two reads 80 ms
+   apart agree for two reasons and only one of them is "it stopped
+   moving" — the other is that the page never got a frame, which is
+   precisely the condition this exists to survive. Bounded, and how
+   long it took is printed by stillNote() rather than gated on. */
+const padStill = async (bound = 4000) => {
+  let prev = null, waited = 0;
+  while (waited < bound) {
+    await page.waitForTimeout(80); waited += 80;
+    const s = await page.evaluate(() => {
+      const l = WALLY.debug.uiLayers();
+      return { o: `${l.stick.op},${l.acts.op},${l.act.op},${l.jump.op}`, F: window.__TF };
+    });
+    if (prev && s.F - prev.F >= 2 && s.o === prev.o) {
+      return { still: true, waited, frames: s.F - prev.F, op: s.o, load: load1() };
+    }
+    prev = s;
+  }
+  return { still: false, waited, op: prev && prev.o, load: load1() };
+};
+let lastStill = null;
+const stillNote = () => (lastStill
+  ? `[fade ${lastStill.still ? `settled +${lastStill.waited} ms` : `STILL MOVING after ${lastStill.waited} ms`} at op ${lastStill.op}, load1 ${lastStill.load}]`
+  : '');
+let lastTap = null;
 async function doubleTap(x, y, settle = 800) {
-  await touch('touchStart', x, y);
-  await touch('touchEnd', x, y);
-  await touch('touchStart', x, y);
-  await touch('touchEnd', x, y);
-  await page.waitForTimeout(settle);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const w0 = (await idleGet()).wakes;
+    await tapLedgerArm();
+    await Promise.all([
+      touch('touchStart', x, y), touch('touchEnd', x, y),
+      touch('touchStart', x, y), touch('touchEnd', x, y),
+    ]);
+    await page.waitForTimeout(settle);
+    /* additive only: the caller's settle is never shortened, and a
+       caller that passed 0 to read mid-fade still reads mid-fade */
+    lastStill = settle > 0 ? await padStill() : null;
+    /* A FADE THAT NEVER STOPS IS THE RIG, NOT THE BUILD. Surfaced here
+       rather than in twenty assertions: whichever one reads the pad
+       next would otherwise report a transition as a verdict. */
+    if (lastStill && !lastStill.still) {
+      miss(`the controls were still cross-fading ${lastStill.waited} ms after the double tap at ${Math.round(x)},${Math.round(y)}`,
+        `op ${lastStill.op} — whatever reads the pad next is reading a transition`);
+    }
+    lastTap = wellFormed(await page.evaluate(() => window.__tl), TAP_MS, TAP_GAP, TAP_DIST);
+    lastTap.attempt = attempt;
+    if (lastTap.ok) return lastTap;
+    /* it may have landed anyway — never tap a second time over a wake */
+    if ((await idleGet()).wakes !== w0) return lastTap;
+    if (attempt === 3) {
+      miss(`the double tap at ${Math.round(x)},${Math.round(y)} never reached the page as one, in 3 attempts`, lastTap.why);
+      return lastTap;
+    }
+  }
 }
+/* what the last dispatched double tap actually was, for the extra */
+const tapNote = () => (lastTap ? `[tap ${lastTap.ok ? 'well-formed' : 'DEFORMED'} on attempt ${lastTap.attempt}: ${lastTap.why}]` : '');
 /* a real one-finger camera drag: down, several moves, up */
 async function drag(x, y, dx, dy, steps = 8, step = 30) {
   await touch('touchStart', x, y);
@@ -765,11 +1011,41 @@ async function drag(x, y, dx, dy, steps = 8, step = 30) {
   await touch('touchEnd', x + dx, y + dy);
   await page.waitForTimeout(120);
 }
-/* stand still until the fade has certainly happened */
+/* THE WINDOW IS A DURATION; THE FADE IS A FACT — AND THEY WERE BOTH
+   BEING SLEPT.
+
+   `d * 1000 + 900` is two claims wearing one number. The first 1.4 s is
+   the idle window itself, which genuinely has to elapse and is still
+   slept. The trailing 900 ms was standing in for "and by now it has
+   faded", and on a loaded box it has not: `padGone` then reads a
+   control that is still on its way out, and IDLE-1, 17, 20 and 23 fail
+   for the machine. Those four preconditions gate most of the block, so
+   one slow fade takes twenty assertions with it — which is how a single
+   busy afternoon produced 29 IDLE failures against a build that was
+   fine.
+
+   So the fade is WAITED ON, generously bounded, and how long it took is
+   PRINTED rather than gated on. The surviving claim — it fades — is one
+   no machine can move. The claim that quietly rode along with it — it
+   fades within 900 ms on this rig — was never one this file meant to
+   make, and the shipping window itself is still asserted exactly, above,
+   by `ship.delay === 5`. If the fade never comes at all the wait falls
+   through and the assertion reads the truth and fails, which is the
+   difference between waiting on a fact and hoping. */
+let lastFade = null;
 async function goIdle(d) {
-  await page.waitForTimeout(d * 1000 + 900);
+  await page.waitForTimeout(d * 1000 + 250);
+  lastFade = await factMs(page, () => {
+    const l = WALLY.debug.uiLayers();
+    return !l.stick.hit && !l.acts.hit && !l.act.hit && !l.jump.hit;
+  }, null, 9000);
+  await page.waitForTimeout(120);                 // one settled frame after it
   return layers();
 }
+/* for the extra: how far past the window the box actually took */
+const fadeNote = () => (lastFade
+  ? `[faded ${lastFade.got ? `+${lastFade.ms} ms past the ${''}window` : `NOT AT ALL in ${lastFade.ms} ms`}, load1 ${lastFade.load}]`
+  : '');
 
 await toOpenGround();
 await page.waitForTimeout(1000);
@@ -791,7 +1067,7 @@ await idleSet(D);
 let st = await goIdle(D);
 ok(padGone(st),
   'IDLE-1 [counting->hidden]: after the idle window the thumbstick AND the whole action cluster are gone',
-  `stick op ${st.stick.op}/${st.stick.vis}, acts op ${st.acts.op}/${st.acts.vis}`);
+  `stick op ${st.stick.op}/${st.stick.vis}, acts op ${st.acts.op}/${st.acts.vis} ${fadeNote()}`);
 ok(st.barLeft.hit === false && st.barRight.hit === false,
   'IDLE-2 [stage one still holds]: the two top clusters are still gone too');
 
@@ -890,38 +1166,38 @@ ok(spin(qy0, await camYaw()) > 0.08,
 await doubleTap(195, 300);
 st = await layers();
 ok(padThere(st) && st.idle.wakes === 1,
-  'IDLE-15 [wake, over the world]: a double tap brings the thumbstick and the action cluster back',
-  `wakes ${st.idle.wakes}`);
+  'IDLE-15 [wake, over the world]: a double tap brings the thumbstick and the action cluster back' + ' ' + stillNote(),
+  `wakes ${st.idle.wakes} ${tapNote()}`);
 ok(st.seam.op < 0.05, 'IDLE-16 [the seam goes with them]', `seam op ${st.seam.op}`);
 
 /* --- BRANCH: wake from ON TOP of the hidden controls, and prove the
        waking tap did not drive the character. --- */
 st = await goIdle(D);
-ok(padGone(st), 'IDLE-17 [re-arm]: it fades again after a wake');
+ok(padGone(st), 'IDLE-17 [re-arm]: it fades again after a wake', `${fadeNote()} ${stillNote()}`);
 const wp0 = await wallyXZ();
 await doubleTap(rest.x, rest.y);
 const wp1 = await wallyXZ();
 st = await layers();
 ok(padThere(st),
   'IDLE-18 [wake, on the hidden thumbstick]: a double tap over the invisible stick still wakes',
-  `wakes ${st.idle.wakes}`);
+  `wakes ${st.idle.wakes} ${tapNote()}`);
 ok(moved(wp0, wp1) < 0.3,
   'IDLE-19 [wake fires no movement]: ...and it did not lurch him', `${moved(wp0, wp1).toFixed(2)} m`);
 
 /* --- BRANCH: wake from ON TOP of the hidden ENTER button, standing at
        a door — where a stray interact would be visible as a panel. --- */
 await page.evaluate(() => WALLY.debug.arrive('apartment', true));
-await page.waitForTimeout(1600);
+const arr20 = await arrived(page, 'apartment');
 const atDoor = await nearId();
 st = await goIdle(D);
 ok(atDoor !== null && padGone(st),
-  'IDLE-20 [re-arm at a door]: standing in a doorway it still fades', `ui.near ${atDoor}`);
+  'IDLE-20 [re-arm at a door]: standing in a doorway it still fades', `ui.near ${atDoor}${camNote(arr20)} ${fadeNote()}`);
 await doubleTap((pad.act.l + pad.act.r) / 2, (pad.act.t + pad.act.b) / 2);
 st = await layers();
 const panelsAfter = await page.evaluate(() => WALLY.ctx.ui.panels);
 ok(padThere(st),
   'IDLE-21 [wake, on the hidden ENTER]: a double tap over the invisible action button wakes',
-  `wakes ${st.idle.wakes}`);
+  `wakes ${st.idle.wakes} ${tapNote()}`);
 ok(panelsAfter.length === 0,
   'IDLE-22 [wake fires no interact]: ...and did NOT walk him through the door it was sitting on',
   JSON.stringify(panelsAfter));
@@ -970,7 +1246,7 @@ const probeRead = () => page.evaluate(() => window.__wprobe);
 await toOpenGround();
 await page.waitForTimeout(900);
 st = await goIdle(D);
-ok(padGone(st), 'IDLE-23 [re-arm in open ground]');
+ok(padGone(st), 'IDLE-23 [re-arm in open ground]', fadeNote());
 /* --- BRANCH: nothing live is under the finger. Six points spread over
        the screen, including both hidden controls, and every one of them
        hit-tests to the canvas. --- */
@@ -1285,11 +1561,11 @@ ok(doneIdle.live === true && doneEnter !== 'gl',
        door, centred on the hidden Enter. Tap three used to land on a
        live button at opacity 0.0-0.9 and walk him inside. --- */
 await page.evaluate(() => WALLY.debug.arrive('apartment', true));
-await page.waitForTimeout(1600);
+const arr58 = await arrived(page, 'apartment');
 const doorNear3 = await nearId();
 st = await goIdle(D);
 ok(doorNear3 !== null && padGone(st),
-  'IDLE-58 [re-arm at a door for the triple tap]', `ui.near ${doorNear3}`);
+  'IDLE-58 [re-arm at a door for the triple tap]', `ui.near ${doorNear3}${camNote(arr58)}`);
 await touch('touchStart', actP[0], actP[1]);
 await touch('touchEnd', actP[0], actP[1]);
 await touch('touchStart', actP[0], actP[1]);
@@ -1520,16 +1796,39 @@ await idleSet(3);                               // room to land three taps insid
 await doubleTap(195, 300);                      // t = 0 at the wake, +0.8 settle
 st = await layers();
 ok(padThere(st), 'IDLE-71 [visible, for the tap-does-not-reset call]', `t ${st.idle.t}`);
-await tapOnce(150, 300);                        // ~1.0 s into a 3 s window
-await page.waitForTimeout(400);
-await tapOnce(300, 500);                        // ~1.5 s
-await page.waitForTimeout(400);
-await tapOnce(150, 300);                        // ~2.0 s — a reset here means 5.0 s
-await page.waitForTimeout(1600);                // ~3.6 s total: past the window
+/* THE CLAIM IS "NO TAP RESET THE CLOCK", AND IT WAS BEING READ OFF A
+   STOPWATCH. Three taps, then 3.6 s of WALL time, then padGone — but
+   the idle clock is advanced by the frame loop with a BOUNDED dt (see
+   BACKGROUND TIME IS NOT IDLE TIME in touch.js), so on a box that is
+   dropping frames 3.6 s of wall time is not 3.6 s of idle time and the
+   pad is legitimately still up. padGone then reads false and IDLE-72
+   fails for the machine — the same shape as the 29 IDLE failures of
+   2026-09-08, and a SILENT one, because "it did not fade" is exactly
+   what a real reset would look like.
+
+   So the reset is measured where it would happen. The clock is read
+   IMMEDIATELY AFTER EACH TAP, and a tap that reset it drives `t` back
+   to ~0. Three readings that never go backwards ARE the claim, and no
+   amount of load can make them lie: a stalled frame loop leaves `t`
+   equal, never smaller. The fade is then waited on as a fact and how
+   long it took is PRINTED, exactly as goIdle does it. */
+const tapT = [];
+for (const [x, y] of [[150, 300], [300, 500], [150, 300]]) {
+  await tapOnce(x, y);
+  tapT.push((await idleGet()).t);
+  await page.waitForTimeout(400);
+}
+const noReset = tapT.every((t, i) => i === 0 || t >= tapT[i - 1] - 0.02);
+const fade72 = await factMs(page, () => {
+  const l = WALLY.debug.uiLayers();
+  return !l.stick.hit && !l.acts.hit && !l.act.hit && !l.jump.hit;
+}, null, 9000);
+await page.waitForTimeout(120);
 st = await layers();
-ok(padGone(st),
-  'IDLE-72 [a tap is not presence]: three taps across the window and it faded on time — only character movement resets the clock',
-  `t ${st.idle.t}`);
+ok(noReset && padGone(st),
+  'IDLE-72 [a tap is not presence]: three taps across the window and the clock never went back to zero — only character movement resets it',
+  `t after each tap ${JSON.stringify(tapT.map((t) => +t.toFixed(2)))}, monotone ${noReset}`
+  + `, faded ${fade72.got ? `+${fade72.ms} ms` : `NOT AT ALL in ${fade72.ms} ms`} (load1 ${fade72.load}), t ${st.idle.t}`);
 await idleSet(D);
 st = await goIdle(D);
 
@@ -1715,7 +2014,7 @@ await padProbe();
        precondition it actually got. --- */
 await toOpenGround();
 await page.evaluate(() => WALLY.debug.arrive('apartment', true));
-await page.waitForTimeout(1600);
+const arr74 = await arrived(page, 'apartment');
 const door74 = await nearId();
 for (const [n, delay, hold] of [[74, 150, 630], [75, 300, 300]]) {
   await page.evaluate(() => WALLY.ctx.ui.closeAll());
@@ -1734,7 +2033,7 @@ for (const [n, delay, hold] of [[74, 150, 630], [75, 300, 300]]) {
   ok(armed && door74 !== null && pr.nDown === 3 && pr.down && pr.down.live === false
     && pr.click && pr.click.inPad,
     `IDLE-${n}a [the case is really set up]: the MEASURED contact — the third pointerdown, after the wake tap's two — landed while live===false, and its click was retargeted INTO the pad`,
-    `${pr.nDown} pointerdowns, live at each ${JSON.stringify(pr.downs.map((d) => d.live))}, click ${pr.click?.target}, inPad ${pr.click?.inPad}`);
+    `${pr.nDown} pointerdowns, live at each ${JSON.stringify(pr.downs.map((d) => d.live))}, click ${pr.click?.target}, inPad ${pr.click?.inPad}, ui.near ${door74}${camNote(arr74)}`);
   ok(pr.act === 0 && pn.length === 0,
     `IDLE-${n} [a contact that outlives the fade presses nothing]: down ${delay} ms after the wake, held ${hold} ms, on the Enter at a door — the handler never ran and he is not inside`,
     `act handler entries ${pr.act}, panels ${JSON.stringify(pn)}`);
@@ -1822,7 +2121,7 @@ await page.waitForTimeout(700);
        that it opens the door. Both of these are at a door, on a pad
        that is LIVE, and both must go through. --- */
 await page.evaluate(() => WALLY.debug.arrive('apartment', true));
-await page.waitForTimeout(1600);
+const arr79 = await arrived(page, 'apartment');
 const door79 = await nearId();
 st = await goIdle(D);
 await padProbe();
@@ -1830,12 +2129,13 @@ await doubleTap(actP[0], actP[1], 0);
 await page.waitForTimeout(900);                 // the fade is long over
 const live79 = (await idleGet()).live;
 await press(actP[0], actP[1], 60);
-await page.waitForTimeout(900);
+const up79 = await panelUpOn(page, 'place');
+await page.waitForTimeout(200);
 const pr79 = await padRead();
 const pn79 = await page.evaluate(() => WALLY.ctx.ui.panels.slice());
 ok(door79 !== null && live79 === true && pr79.act === 1 && pn79.includes('place'),
   'IDLE-79 [and Enter still works]: a normal press once the fade has finished runs the handler and opens the door',
-  `live ${live79}, act entries ${pr79.act}, panels ${JSON.stringify(pn79)}`);
+  `live ${live79}, act entries ${pr79.act}, panels ${JSON.stringify(pn79)}${camNote(arr79)}${upNote(up79)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(700);
 
@@ -1858,12 +2158,13 @@ await padProbe();
 await doubleTap(actP[0], actP[1], 0);
 await page.waitForTimeout(900);
 await press(actP[0], actP[1], 250);
-await page.waitForTimeout(900);
+const up80 = await panelUpOn(page, 'place');
+await page.waitForTimeout(200);
 const pr80 = await padRead();
 const pn80 = await page.evaluate(() => WALLY.ctx.ui.panels.slice());
 ok(pr80.act === 1 && pn80.includes('place'),
   'IDLE-80 [a slow press that began live still presses]: 250 ms on Enter, well past TAP_MS, opens the door',
-  `act entries ${pr80.act}, panels ${JSON.stringify(pn80)}`);
+  `act entries ${pr80.act}, panels ${JSON.stringify(pn80)}${upNote(up80)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await toOpenGround();
 await page.waitForTimeout(900);
@@ -1920,6 +2221,46 @@ const shortBox = (i) => page.evaluate((k) => {
 const deskB = await shortBox(2);
 const phoneB = await shortBox(0);
 const panelsNow = () => page.evaluate(() => WALLY.ctx.ui.panels.slice());
+/* THE PANEL IS A FACT, AND IT WAS BEING SLEPT FOR.
+
+   Every door assertion in this block presses Enter, sleeps a few
+   hundred ms and then reads `ui.panels`. The sleep is standing in for
+   "and by now the sheet is up" — and on a loaded box it is not, so the
+   read lands between the verb running and the panel appearing and the
+   assertion says the game's main verb did nothing. That is the shape of
+   40 PAD failures in one contaminated run.
+
+   Measured while writing this: PAD-3's exact dispatch, twelve times on
+   one page load at load1 39-45, opened the door 12/12 under both the
+   shipping timings and this wait — so the sequence is sound and what
+   was fragile was only the moment the answer was read.
+
+   RE-MEASURED 2026-09-09, PAIRED. PAD-3's dispatch (a finger parked on
+   the canvas, Enter under the second) and PAD-1's (one finger, nothing
+   parked) run ALTERNATED inside one page load, eight rounds each, with
+   the order of the two arms flipped every round: 8/8 and 8/8, act 1 and
+   panels ['place'] every time, load1 14.7 to 20.9. The idle clock read
+   t 0.00 at the door in all sixteen, so the fade is not in this. What
+   the isolated rig CANNOT reproduce is the state PAD-3 inherits from
+   the forty scenarios above it, which is the only place left for it to
+   live and the reason the whole file is the unit of the control.
+
+   `panelUp` waits for the sheet the press is supposed to raise, bounded,
+   and hands back whether it arrived so the caller can print it. It is
+   only ever used where the assertion EXPECTS a panel: waiting on a fact
+   you are about to assert the absence of would be waiting for the test
+   to pass, so the negative branches (PAD-2b, PAD-6, PAD-12) keep their
+   own fixed settle and are untouched.
+
+   EVERY POSITIVE PANEL ASSERTION IN THIS FILE GOES THROUGH IT NOW, not
+   the four it started with. PAD-8, 9, 10, 11, 13, 16b, 17, 23b, 26,
+   30c and IDLE-80 each pressed something, slept 700-900 ms and read
+   `ui.panels`; that is eleven more assertions whose verdict was a bet
+   on the box, and IDLE-80 is not hypothetical — it failed with `act
+   entries 0, panels []` at load1 131 on 2026-09-09 while the build was
+   fine. `up` is printed in the extra of each so a slow arrival still
+   reads as a slow arrival. */
+const panelUp = (name, timeout = 5000) => panelUpOn(page, name, timeout);
 /* THE ARRIVAL IS POLLED, NOT SLEPT. A fixed wait is a bet on how long a
    city stream takes on a loaded machine, and losing that bet lands here
    as ui.near null, which reads as "Enter did nothing" — the one thing
@@ -1953,7 +2294,9 @@ const toDoor = async () => {
   const arrivalCard = await cardUp();
   if (arrivalCard) {
     await page.evaluate(() => WALLY.ctx.ui.hide('dialogue'));
-    await page.waitForTimeout(300);
+    /* WAIT ON THE FACT: the card being GONE, not 300 ms of hoping it is.
+       This is the precondition every door assertion below stands on. */
+    await fact(page, () => WALLY.ctx.ui.dialogueOpen === false, null, 4000);
   }
   /* READ AGAIN UNCONDITIONALLY, and not just when one was seen a moment
      ago. The state that matters is the one the press below is about to
@@ -1986,12 +2329,14 @@ const focusAct = () => page.evaluate(() => {
 const doorPad = await toDoor();
 await padProbe();
 await press(actP[0], actP[1], 60);
-await page.waitForTimeout(900);
+const up1 = await panelUp('place');
+await page.waitForTimeout(200);
 const p1 = await padRead();
 const pn1 = await panelsNow();
 ok(doorPad !== null && p1.act === 1 && pn1.includes('place'),
   'PAD-1 [one finger, pointerdown->pointerup]: a plain tap on Enter at a door runs the verb and opens the door',
-  `ui.near ${doorPad}, act entries ${p1.act}, panels ${JSON.stringify(pn1)}, toasts ${JSON.stringify(p1.toasts)}`);
+  `ui.near ${doorPad}, act entries ${p1.act}, panels ${JSON.stringify(pn1)}, toasts ${JSON.stringify(p1.toasts)}`
+  + `, sheet up +${up1.ms} ms (load1 ${up1.load})`);
 ok(p1.click && p1.click.detail >= 1 && !p1.click.inPad,
   'PAD-1b [and its own trailing click was dispatched somewhere else entirely and swallowed]',
   `click -> ${p1.click?.target} detail ${p1.click?.detail}, inPad ${p1.click?.inPad}`);
@@ -2045,7 +2390,8 @@ const walking = at2.speed;
 await multi('touchStart', [pt2(1, rest.x, rest.y + 70), pt2(2, actP[0], actP[1])]);
 await page.waitForTimeout(70);
 await multi('touchEnd', [pt2(2, actP[0], actP[1])]);
-await page.waitForTimeout(500);
+const up2 = await panelUp('place');
+await page.waitForTimeout(150);
 const p2 = await padRead();
 const pn2 = await panelsNow();
 await multi('touchEnd', [pt2(1, rest.x, rest.y + 70)]);
@@ -2055,7 +2401,8 @@ ok(door2 !== null && at2.near !== null && walking > 0.4,
   `${walking} m/s, stick t ${at2.t}, ${at2.moved} m from the door, ui.near ${at2.near}`);
 ok(walking > 0.4 && p2.act === 1 && pn2.includes('place'),
   'PAD-2 [second contact, walking]: a thumb on the stick and Enter under the other thumb — the game\'s main verb runs AND the door opens',
-  `${walking} m/s at the tap, act entries ${p2.act}, panels ${JSON.stringify(pn2)}, toasts ${JSON.stringify(p2.toasts)}`);
+  `${walking} m/s at the tap, act entries ${p2.act}, panels ${JSON.stringify(pn2)}, toasts ${JSON.stringify(p2.toasts)}`
+  + `, sheet up +${up2.ms} ms (load1 ${up2.load})`);
 ok(!p2.clicks.some((c) => c.inPad),
   'PAD-2b [...and no compatibility click ever reached the pad, which is exactly why click could not have delivered it]',
   JSON.stringify(p2.clicks));
@@ -2073,12 +2420,14 @@ await page.waitForTimeout(70);
 await multi('touchEnd', [pt2(2, actP[0], actP[1])]);
 await page.waitForTimeout(400);
 await multi('touchEnd', [pt2(1, 195, 300)]);
-await page.waitForTimeout(800);
+const up3 = await panelUp('place');
+await page.waitForTimeout(200);
 const p3 = await padRead();
 const pn3 = await panelsNow();
 ok(door3 !== null && p3.act === 1 && pn3.includes('place'),
   'PAD-3 [second contact, parked]: a finger resting anywhere on the screen no longer disables Enter — it opens the door',
-  `act entries ${p3.act}, panels ${JSON.stringify(pn3)}, toasts ${JSON.stringify(p3.toasts)}`);
+  `ui.near ${door3}, act entries ${p3.act}, panels ${JSON.stringify(pn3)}, toasts ${JSON.stringify(p3.toasts)}`
+  + `, sheet up +${up3.ms} ms (load1 ${up3.load})`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2093,7 +2442,8 @@ await page.waitForTimeout(70);
 await multi('touchEnd', [pt2(2, deskB.x, deskB.y)]);
 await page.waitForTimeout(400);
 await multi('touchEnd', [pt2(1, 195, 300)]);
-await page.waitForTimeout(800);
+const up4 = await panelUp('desk');
+await page.waitForTimeout(200);
 const p4 = await padRead();
 const pn4 = await panelsNow();
 ok(p4.sc === 1 && pn4.includes('desk'),
@@ -2216,7 +2566,8 @@ await touch('touchEnd', 195, 200);              // ...its click lands on the CAN
 await page.waitForTimeout(90);
 const focused8 = await focusAct();
 await page.keyboard.press('Enter');
-await page.waitForTimeout(900);
+const up8 = await panelUp('place');
+await page.waitForTimeout(200);
 const p8 = await padRead();
 const pn8 = await panelsNow();
 ok(armed8 && door8 !== null && live8 === false && focused8,
@@ -2224,7 +2575,7 @@ ok(armed8 && door8 !== null && live8 === false && focused8,
   `armed ${armed8}, live at the contact ${live8}, focused ${focused8}`);
 ok(p8.act === 1 && pn8.includes('place'),
   'PAD-8 [a keypress after an inert-born contact is delivered]: a hybrid tablet or a screen reader is not silenced by a finger that touched the screen half a second ago',
-  `act entries ${p8.act}, panels ${JSON.stringify(pn8)}, toasts ${JSON.stringify(p8.toasts)}`);
+  `act entries ${p8.act}, panels ${JSON.stringify(pn8)}, toasts ${JSON.stringify(p8.toasts)}${upNote(up8)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2243,12 +2594,13 @@ await drag(260, 200, -70, 0, 5, 22);
 await page.waitForTimeout(90);
 const focused9 = await focusAct();
 await page.keyboard.press('Enter');
-await page.waitForTimeout(900);
+const up9 = await panelUp('place');
+await page.waitForTimeout(200);
 const p9 = await padRead();
 const pn9 = await panelsNow();
 ok(armed9 && focused9 && p9.act === 1 && pn9.includes('place'),
   'PAD-9 [and after a camera drag]: the same keypress after a 70 px drag that began mid-fade still opens the door',
-  `act entries ${p9.act}, panels ${JSON.stringify(pn9)}, toasts ${JSON.stringify(p9.toasts)}`);
+  `act entries ${p9.act}, panels ${JSON.stringify(pn9)}, toasts ${JSON.stringify(p9.toasts)}${upNote(up9)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2283,7 +2635,8 @@ for (const gap of [80, 250]) {
   const wokeX = await idleGet();
   await page.waitForTimeout(gap);
   await press(phoneB.x, phoneB.y, 60);
-  await page.waitForTimeout(900);
+  const upX = await panelUp('phone');
+  await page.waitForTimeout(200);
   const pX = await padRead();
   const pnX = await panelsNow();
   ok(armedX && wokeX.hidden === false && wokeX.live === true,
@@ -2291,7 +2644,7 @@ for (const gap of [80, 250]) {
     `hidden ${wokeX.hidden}, live ${wokeX.live}, wakes ${wokeX.wakes}`);
   ok(pX.sc === 1 && pnX.includes('phone'),
     `PAD-${gap === 80 ? 10 : 11} [the commit swallow does not outlive its own gesture]: Phone pressed ${gap} ms after a two-finger wake opens the phone`,
-    `shortcut entries ${pX.sc}, panels ${JSON.stringify(pnX)}`);
+    `shortcut entries ${pX.sc}, panels ${JSON.stringify(pnX)}${upNote(upX)}`);
   await page.evaluate(() => WALLY.ctx.ui.closeAll());
   await page.waitForTimeout(700);
 }
@@ -2340,12 +2693,13 @@ await page.waitForTimeout(900);                 // the fade is long over
 const live13 = (await idleGet()).live;
 await padProbe();
 await press(actP[0], actP[1], 60);
-await page.waitForTimeout(900);
+const up13 = await panelUp('place');
+await page.waitForTimeout(200);
 const p13 = await padRead();
 const pn13 = await panelsNow();
 ok(live13 === true && p13.act === 1 && pn13.includes('place'),
   'PAD-13 [and Enter is unharmed the moment the pad is live again]: the same press one wake later opens the door',
-  `live ${live13}, act entries ${p13.act}, panels ${JSON.stringify(pn13)}, toasts ${JSON.stringify(p13.toasts)}`);
+  `live ${live13}, act entries ${p13.act}, panels ${JSON.stringify(pn13)}, toasts ${JSON.stringify(p13.toasts)}${upNote(up13)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await idleSet(D);
 await toOpenGround();
@@ -2512,12 +2866,13 @@ ok(p16.act === 0 && pn16.length === 0 && cls16 === false,
    a button left armed is refused by every later contact in silence */
 await padProbe();
 await press(actP[0], actP[1], 60);
-await page.waitForTimeout(900);
+const up16b = await panelUp('place');
+await page.waitForTimeout(200);
 const p16b = await padRead();
 const pn16b = await panelsNow();
 ok(p16b.act === 1 && pn16b.includes('place'),
   'PAD-16b [...and the button still works afterwards]: the very next press on the cancelled Enter opens the door',
-  `act entries ${p16b.act}, panels ${JSON.stringify(pn16b)}, toasts ${JSON.stringify(p16b.toasts)}`);
+  `act entries ${p16b.act}, panels ${JSON.stringify(pn16b)}, toasts ${JSON.stringify(p16b.toasts)}${upNote(up16b)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2539,7 +2894,8 @@ await page.waitForTimeout(80);
 await multi('touchEnd', [pt2(2, rightHalf[0], rightHalf[1])]);   // the gatecrasher lifts
 await page.waitForTimeout(150);
 await multi('touchEnd', [pt2(1, leftHalf[0], leftHalf[1])]);     // ...then the owner
-await page.waitForTimeout(900);
+const up17 = await panelUp('place');
+await page.waitForTimeout(200);
 const p17 = await padRead();
 const pn17 = await panelsNow();
 ok(door17 !== null && p17.nDown === 2 && p17.downs.every((d) => d.inPad),
@@ -2547,7 +2903,7 @@ ok(door17 !== null && p17.nDown === 2 && p17.downs.every((d) => d.inPad),
   `${p17.nDown} contacts at ${JSON.stringify(p17.downs.map((d) => d.target))}, ui.near ${door17}`);
 ok(p17.act === 1 && pn17.includes('place'),
   'PAD-17 [two thumbs on one button]: the second contact arms nothing and Enter fires exactly once, on the owner\'s release',
-  `act entries ${p17.act}, panels ${JSON.stringify(pn17)}, toasts ${JSON.stringify(p17.toasts)}`);
+  `act entries ${p17.act}, panels ${JSON.stringify(pn17)}, toasts ${JSON.stringify(p17.toasts)}${upNote(up17)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2707,12 +3063,13 @@ ok(p23.act === 0 && pn23.length === 0,
    silently stops working is the failure this ordering avoids. */
 await padProbe();
 await mousePress(actP[0], actP[1], 'left');
-await page.waitForTimeout(900);
+const up23b = await panelUp('place');
+await page.waitForTimeout(200);
 const p23b = await padRead();
 const pn23b = await panelsNow();
 ok(p23b.act === 1 && pn23b.includes('place'),
   'PAD-23b [...and the refusal let the button GO]: the very next primary press on Enter opens the door, so the guard declined to fire without leaving it armed',
-  `act entries ${p23b.act}, panels ${JSON.stringify(pn23b)}, toasts ${JSON.stringify(p23b.toasts)}`);
+  `act entries ${p23b.act}, panels ${JSON.stringify(pn23b)}, toasts ${JSON.stringify(p23b.toasts)}${upNote(up23b)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(600);
 
@@ -2792,7 +3149,8 @@ await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await page.waitForTimeout(400);
 await padProbe();
 await press(actP[0], actP[1], 60);
-await page.waitForTimeout(900);
+const up26 = await panelUp('place');
+await page.waitForTimeout(200);
 const p26 = await padRead();
 const pn26 = await panelsNow();
 const why26 = await page.evaluate(() => WALLY.debug.interact());
@@ -2801,7 +3159,7 @@ ok(door26 !== null && stacked26.length === 2 && stacked26.includes('phone') && s
   `ui.near ${door26}, stacked ${JSON.stringify(stacked26)}`);
 ok(p26.act === 1 && pn26.includes('place') && why26.ok === true,
   'PAD-26 [the stacked-panel sequence, with the reason visible]: Enter straight after a stacked pair closes runs the verb AND opens the door, and says which door it opened',
-  `act entries ${p26.act}, panels ${JSON.stringify(pn26)}, reason ${JSON.stringify(why26.why)}`);
+  `act entries ${p26.act}, panels ${JSON.stringify(pn26)}, reason ${JSON.stringify(why26.why)}${upNote(up26)}`);
 await page.evaluate(() => WALLY.ctx.ui.closeAll());
 await idleSet(D);
 await toOpenGround();
@@ -3024,12 +3382,13 @@ await page.waitForTimeout(600);
        stopped working entirely" passes every negative above. --- */
 await padProbe();
 await mousePress(phoneB.x, phoneB.y, 'left', 60);
-await page.waitForTimeout(700);
+const upPrim = await panelUp('phone');
+await page.waitForTimeout(200);
 const pPrim = await padRead();
 const pnPrim = await panelsNow();
 ok(pPrim.sc === 1 && pnPrim.includes('phone'),
   'PAD-30c [the primary button still presses, after all of that]: a left press on Phone opens the phone — the fix refuses a second button, it does not refuse a mouse',
-  `sc ${pPrim.sc}, panels ${JSON.stringify(pnPrim)}`);
+  `sc ${pPrim.sc}, panels ${JSON.stringify(pnPrim)}${upNote(upPrim)}`);
 await page.evaluate(() => { WALLY.ctx.ui.closeAll(); document.activeElement?.blur?.(); });
 await page.waitForTimeout(600);
 
@@ -3797,13 +4156,21 @@ await toOpenGround();
 await page.waitForTimeout(900);
 await page.evaluate(() => WALLY.debug.hideUI(true));
 await idleSet(1.6);
-await page.waitForTimeout(1000);                 // let the clock bank ~1.0 s of 1.6
+/* BANK IT ON THE PAD'S OWN CLOCK. 1000 ms of wall time is 1.0 s of
+   idle time only on a box that is giving the page frames — the clock
+   is advanced by the frame loop with a bounded dt — so on a busy one
+   the assertion below reads t < 0.5 and PAD-37-pre fails for the
+   machine. The claim is "with a second of a 1.6 s window banked", and
+   that is a fact about `t`, so `t` is what is waited on. Bounded; the
+   wall time it took is printed rather than gated on. */
+const banked = await factMs(page, () => WALLY.debug.idle().t >= 1.0, null, 9000);
 const idleBefore = await idleGet();
 const kbBefore = await padKb();
 ok(idleBefore.why === 'counting' && idleBefore.armed && !idleBefore.hidden
   && !kbBefore.padFocused,
   'PAD-37-pre [the case is really set up]: the idle clock is armed and actually COUNTING before any of this is measured — nothing modal, no dialogue and no movement holding it at zero — AND the keyboard is not already parked on the pad, because focusing what is already focused fires no focusin and there would be no edge to measure',
-  `why ${idleBefore.why}, armed ${idleBefore.armed}, t ${idleBefore.t}, padFocused ${kbBefore.padFocused}`);
+  `why ${idleBefore.why}, armed ${idleBefore.armed}, t ${idleBefore.t}, padFocused ${kbBefore.padFocused}`
+  + `, banked ${banked.got ? `in +${banked.ms} ms` : `NEVER in ${banked.ms} ms`} (load1 ${banked.load})`);
 /* focus(), not Tab, and on purpose: it is the shape a screen reader's
    own cursor movement arrives in, it fires the same focusin edge, and
    it costs no round trips — a Tab traversal here could itself outlast
@@ -3819,11 +4186,16 @@ ok(gotMenu.ok && !gotMenu.already && idleBefore.t > 0.5
 
 /* ...AND IT IS A RESET, NOT A SUSPENSION. This is the one that catches
    the design that disabled stage two outright. */
-await page.waitForTimeout(2600);                 // well past a full window
+/* AND THE SECOND FADE IS A FACT AS WELL. 2600 ms was "well past a full
+   window" measured on the wall; the window itself runs on the frame
+   loop. Waited on, bounded, elapsed printed. */
+const fade37 = await factMs(page, () => WALLY.debug.idle().hidden === true, null, 9000);
+await page.waitForTimeout(120);
 const idleLater = await idleGet();
 ok(idleLater.hidden === true,
   'PAD-37b [a reset, NOT a suspension]: the pad still fades a full window after the focus arrived — a focused button must not switch the comfort feature off for the rest of the session, which is exactly what suspending the clock here did',
-  `hidden ${idleLater.hidden}, why ${idleLater.why}, t ${idleLater.t}`);
+  `hidden ${idleLater.hidden}, why ${idleLater.why}, t ${idleLater.t}`
+  + `, faded ${fade37.got ? `+${fade37.ms} ms` : `NOT AT ALL in ${fade37.ms} ms`} (load1 ${fade37.load})`);
 
 /* ...AND THIS IS WHY THAT TRADE IS AFFORDABLE. The pad's four
    shortcuts are P / M / O / Esc and ui.js binds all four on `window`
@@ -5497,14 +5869,19 @@ ok(deskTalk.cap === true, 'desktop: and that one is still drawn AS a keycap too'
 await dpage.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.__TT.away(); });
 await dpage.waitForTimeout(700);
 await dpage.evaluate(() => { WALLY.ctx.ui.closeAll(); WALLY.debug.ui('dialogue'); });
-await dpage.waitForTimeout(3600);
+/* THE CARD BEING UP IS A FACT. 3.6 s was a guess at how long a
+   dialogue takes to open on this rig, and read early the row below is
+   empty and the assertion says the desktop lost its E keycap. */
+const cardUpD = await factMs(dpage, () => !!document.querySelector('.w-dlg-more .key'), null, 9000);
+await dpage.waitForTimeout(300);
 const deskMore = await dpage.evaluate(() => {
   const k = document.querySelector('.w-dlg-more .key');
   return { key: k?.textContent ?? null, shown: !!k && getComputedStyle(k).display !== 'none',
     row: document.querySelector('.w-dlg-more')?.textContent ?? '' };
 });
 ok(deskMore.key === 'E' && deskMore.shown,
-  'desktop: the dialogue card still offers the E keycap to continue', JSON.stringify(deskMore.row));
+  'desktop: the dialogue card still offers the E keycap to continue',
+  `${JSON.stringify(deskMore.row)}, card up ${cardUpD.got ? `+${cardUpD.ms} ms` : `NEVER in ${cardUpD.ms} ms`} (load1 ${cardUpD.load})`);
 await dpage.evaluate(() => { WALLY.ctx.ui.hide('dialogue'); WALLY.ctx.ui.closeAll(); });
 await dpage.waitForTimeout(500);
 
@@ -5571,6 +5948,10 @@ const PROMPT_RIG = () => {
   const W = window.WALLY, ctx = W.ctx;
   if (W.__PR) return true;
   const T = W.__PR = {};
+  /* FRAMES, so a reading that HELD STILL can be told from a reading
+     that never advanced. See SETTLED, NOT SLEPT below. */
+  W.__PRF = 0;
+  (function tick() { W.__PRF++; requestAnimationFrame(tick); })();
   const V3 = () => new ctx.THREE.Vector3();
   /* the point the prompt is generated from — hud.js's own door axis */
   T.doorPoint = (id) => {
@@ -5625,7 +6006,7 @@ const PROMPT_RIG = () => {
     return {
       gap: +Math.hypot(a.x - p.x, a.z - p.z).toFixed(1),
       near: ctx.ui.near ? ctx.ui.near.id : null,
-      row, name: a.n,
+      row, name: a.n, F: W.__PRF,
     };
   };
   return true;
@@ -5678,7 +6059,18 @@ const allLit = (rows) => rows.length > 0 && rows.every(lit);
    been up for metres and switches off as you reach the door. Measured
    on these three walks it is painted by the second sample every time,
    and on the phone's depot walk by the first. Allowing more than one
-   would start to allow the defect back in, so it is exactly one. */
+   would start to allow the defect back in, so it is exactly one.
+
+   AND THE PILL KEEP-OUT WAS PUT TO IT DIRECTLY, 2026-09-09. The same
+   walk-in, keepOut ON and OFF, ALTERNATED inside one page load with the
+   order of the two arms flipped between rounds, on both viewports:
+   four walks at 1600x900 (load1 261-269) and four at 390x844 (load1
+   151-188). PROMPT-2 held in all eight, and the only dark sample in
+   any of them was the fade-in step this rule already allows — resolved
+   opacity 0.00 and 0.45 at the first lit index, with `push` 0. So the
+   keep-out does not carry the chip out of the frame on the way in, and
+   a red PROMPT-2 in the full suite is inherited from whatever the walk
+   runs after rather than from the rule on its own. */
 const steady = (rows) => {
   const i = rows.findIndex(lit);
   return i >= 0 && i <= 1 && rows.slice(i).every(lit);
@@ -5732,9 +6124,19 @@ async function walkIn(pg, drive, id) {
     if (a.gap < 0.9) break;
   }
   await drive.stop();
-  await pg.waitForTimeout(2600);
-  const restRow = await pg.evaluate((i2) => WALLY.__PR.sample(i2), id);
-  return { rows, restRow };
+  /* THE BOOM'S OWN SOLVE IS A FACT TOO. 2600 ms was a guess at how long
+     the follow rig takes to swing onto its solved azimuth after the
+     controls let go — the frame the defect actually lived in. Wait for
+     the yaw to stop moving instead, then for the prompt to settle. */
+  const rested = await factMs(pg, () => {
+    const y = WALLY.ctx.cam.yaw;
+    const p = window.__PRy;
+    window.__PRy = { y, n: (p && Math.abs(Math.atan2(Math.sin(y - p.y), Math.cos(y - p.y))) < 0.004) ? p.n + 1 : 0 };
+    return window.__PRy.n >= 6;
+  }, null, 6000);
+  await pg.evaluate(() => { window.__PRy = null; });
+  const restRow = await settledSample(pg, id);
+  return { rows, restRow, rested };
 }
 
 /* ==================================================================
@@ -5791,6 +6193,20 @@ async function walkIn(pg, drive, id) {
    verdict on every cell; 0.15 is quoted because it is inside that
    empty band, not because anything sits near it.
 
+   AND THAT CENSUS WAS TAKEN BEFORE THE PILL KEEP-OUT EXISTED, so on
+   2026-09-09 it was re-measured under both arms of the new switch —
+   the same thirty cells (2 viewports x 3 doors x 5 azimuths), keepOut
+   ON and OFF alternated per cell inside ONE page load, headless Chrome
+   at load1 31-45. Every cell settled, both arms agreed on PROMPT-5 in
+   all thirty, and the t values reproduced the 2026-09-06 table:
+   behind 0.00-0.005 everywhere, the other four 0.80-1.00. The keep-out
+   does move the chip on the LINTEL arm — pushes of 39 to 185 px in 22
+   of the 30 cells — but it never changed whether that arm painted, so
+   the biconditional is measuring the anchor rule and not the keep-out.
+   Both arms are read with the keep-out in the SAME state, which is
+   what makes this a control; what would not be a control is one arm
+   under each.
+
    The real t is PRINTED in every row rather than frozen into a table:
    it depends on the building's height and on the viewport, and a
    hard-coded per-azimuth constant would be the same mistake one level
@@ -5803,6 +6219,69 @@ const SLIDE_EPS = 0.15;
    resting value for this frame and not the tail of the previous rung's
    ease-down (hud.js eases t DOWN at lambda 6 and raises it instantly,
    so a carried-over value can only ever read too high). */
+/* ==================================================================
+   SETTLED, NOT SLEPT — and this is the same 600 ms twice over.
+
+   Both readers below stood him somewhere, warped the boom and then
+   slept 600 ms before asking what was painted. The arithmetic in the
+   note under `ladder` is correct — 600 ms IS four time constants of a
+   lambda-12 damp and two door polls — and it is arithmetic about a
+   page that is being given frames. On a box at load 40 the tab is not:
+   the damp is dt-correct but the DOOR POLL and the boom's own solve
+   only advance on frames that actually run, and a rung read mid-solve
+   reads dark, or reads a `t` that is still easing. That turns
+   PROMPT-4's `allLit` and PROMPT-5's biconditional into statements
+   about the machine — and PROMPT-5 is a biconditional, so a single
+   unsettled cell flips it in EITHER direction, which is the worst
+   possible failure mode: it can go green as easily as red.
+
+   So the wait is now on the reading itself holding still. Two samples
+   120 ms apart that agree on opacity to 0.01 and on `t` to 0.005 is a
+   settled frame by the prompt's own measure, and it is reached in
+   360-720 ms on a quiet box — the same budget the 600 was buying — and
+   simply takes longer when the box is busy instead of lying. Bounded,
+   because a rig that cannot reach its subject must die rather than
+   spin: `settled` comes back false and every caller prints it.
+
+   Measured while writing this, on the working tree at load 41-61:
+   thirty far-rung cells (2 viewports x 3 doors x 5 azimuths) all
+   settled inside 720 ms and reproduced the 2026-09-06 census to two
+   decimals — behind t = 0.00, the other four 0.82-0.94.
+   ================================================================== */
+const SETTLE_FRAMES = 2;
+async function settledSample(pg, id, bound = 5000) {
+  let prev = null, waited = 0;
+  while (waited < bound) {
+    await pg.waitForTimeout(120); waited += 120;
+    const s = await pg.evaluate((i) => WALLY.__PR.sample(i), id);
+    /* TWO SAMPLES AGREE FOR TWO REASONS, AND ONLY ONE OF THEM IS
+       "IT CAME TO REST". The other is that no frame ran between them,
+       and then they agree about a value that is still easing — hud.js
+       eases `t` DOWN at lambda 6, so a pair caught mid-ease reads a t
+       that is too HIGH, and PROMPT-5 is a biconditional that a single
+       such cell flips in either direction. 120 ms of wall clock is not
+       a frame; the page's own rAF count is. Measured writing this, on
+       the working tree at load1 22-24, running the close-in ladder
+       first so `t` had the full 1 -> 0 ease to fall through: 3 frames
+       between the agreeing pair at CPU throttle 1x and 2 at 20x, and
+       the settle read t = 0.004 and 0.002 against a true resting 0.000
+       both times. So this gate costs nothing today and closes the case
+       where the box is slower still. */
+    if (prev && (s.F - prev.F) >= SETTLE_FRAMES
+      && ((!prev.row && !s.row)
+        || (prev.row && s.row && Math.abs(prev.row.op - s.row.op) < 0.01
+          && Math.abs(prev.row.t - s.row.t) < 0.005))) {
+      return { ...s, settled: true, waited, frames: s.F - prev.F };
+    }
+    prev = s;
+  }
+  /* prev is null only if `bound` was under one poll; a spread of null
+     is `{}` and `mark()` would then throw on an undefined gap, turning
+     a slow box into a crashed suite. Take one real reading either way. */
+  const last = prev || await pg.evaluate((i) => WALLY.__PR.sample(i), id);
+  return { ...last, settled: false, waited };
+}
+
 async function restingAnchor(pg, id, az) {
   const edge = await pg.evaluate((i) => WALLY.__PR.reachEdge(i), id);
   const d = Math.max(0.5, edge - 0.3);
@@ -5810,8 +6289,7 @@ async function restingAnchor(pg, id, az) {
     await pg.evaluate((m) => WALLY.debug.promptAnchor(m), mode);
     await pg.evaluate(([i, dd]) => WALLY.__PR.stand(i, dd), [id, d]);
     await pg.evaluate(([i, a]) => WALLY.__PR.az(i, a), [id, az]);
-    await pg.waitForTimeout(600);
-    return pg.evaluate((i) => WALLY.__PR.sample(i), id);
+    return settledSample(pg, id);
   };
   const slide = await at('slide');
   const lintel = await at('lintel');
@@ -5830,8 +6308,7 @@ async function ladder(pg, id, az) {
   for (const d of rungs) {
     await pg.evaluate(([i, dd]) => WALLY.__PR.stand(i, dd), [id, d]);
     await pg.evaluate(([i, a]) => WALLY.__PR.az(i, a), [id, az]);
-    await pg.waitForTimeout(600);
-    out.push(await pg.evaluate((i) => WALLY.__PR.sample(i), id));
+    out.push(await settledSample(pg, id));
   }
   return out;
 }
@@ -5868,19 +6345,37 @@ for (const [pg, drive, who] of [[dpage, keyDrive(dpage), 'desktop'], [wpage, sti
   for (const id of LADDER_DOORS) {
     for (const az of AZ) {
       const rows = await ladder(pg, id, az);
-      ok(allLit(rows), `PROMPT-4 ${who} [${id}/${az}]: painted at every range in this azimuth`,
-        rows.map(mark).join(' '));
+      /* AN UNSETTLED CELL IS A HARNESS MISS, NOT A VERDICT. A rung read
+         while the solve is still easing says nothing about the rule,
+         and PROMPT-5 is a biconditional that one such cell flips in
+         EITHER direction — it can go green as easily as red, which is
+         the worst way for a rig to fail. Rule 5: a rig that cannot
+         reach its subject must die, not shrug. */
+      const unsettled = rows.filter((r) => !r.settled).length;
+      if (unsettled) {
+        miss(`PROMPT-4 ${who} [${id}/${az}]: ${unsettled}/${rows.length} rungs never settled`,
+          rows.map((r) => `${mark(r)}${r.settled ? '' : `!${r.waited}ms`}`).join(' '));
+      } else {
+        ok(allLit(rows), `PROMPT-4 ${who} [${id}/${az}]: painted at every range in this azimuth`,
+          rows.map(mark).join(' '));
+      }
       /* PROMPT-5 — IN EVERY AZIMUTH, not just the one it holds in. See
          THE ANCHOR SLIDES ONLY AS FAR AS THE FRAME MAKES IT above. */
       const r5 = await restingAnchor(pg, id, az);
       const t = r5.slide.row ? r5.slide.row.t : null;
       const slid = t === null ? null : t > SLIDE_EPS;
       const oldPaints = lit(r5.lintel);
-      ok(lit(r5.slide) && slid !== null && slid === !oldPaints,
-        `PROMPT-5 ${who} [${id}/${az}]: at range the anchor sits at the SMALLEST t the frame allows — it leaves the lintel only where the lintel cannot be painted`,
-        `t=${t === null ? 'n/a' : t.toFixed(2)} at ${r5.slide.gap} m — ${slid ? 'slid' : 'still on its own lintel'}`
+      const note5 = `t=${t === null ? 'n/a' : t.toFixed(2)} at ${r5.slide.gap} m — ${slid ? 'slid' : 'still on its own lintel'}`
         + `, and the old rule ${oldPaints ? 'still paints' : 'goes dark on'} the same rung`
-        + ` [slide ${mark(r5.slide)} | lintel ${mark(r5.lintel)}]`);
+        + ` [slide ${mark(r5.slide)} +${r5.slide.frames ?? '?'}f/${r5.slide.waited}ms`
+        + ` | lintel ${mark(r5.lintel)} +${r5.lintel.frames ?? '?'}f/${r5.lintel.waited}ms]`;
+      if (!r5.slide.settled || !r5.lintel.settled) {
+        miss(`PROMPT-5 ${who} [${id}/${az}]: an arm never settled — this cell decides nothing`, note5);
+      } else {
+        ok(lit(r5.slide) && slid !== null && slid === !oldPaints,
+          `PROMPT-5 ${who} [${id}/${az}]: at range the anchor sits at the SMALLEST t the frame allows — it leaves the lintel only where the lintel cannot be painted`,
+          note5);
+      }
     }
   }
 }
@@ -5918,5 +6413,14 @@ await ctxWalk.close();
 
 await browser.close();
 server.close();
-console.log(fails ? `\nFAIL — ${fails} check(s) failed` : '\nPASS — touch controls move the elephant, desktop untouched');
+/* A CONTAMINATED RUN READS AS A CONTAMINATED RUN. The load is on the
+   exit line because that is the line people quote, and because a red
+   suite with no rig beside it is the rumour rule 4 is about. A harness
+   miss is reported separately from a failure and does not silently
+   become one: it means this file could not deliver a gesture to the
+   page, which is a statement about the box, not about the build. */
+console.log(`\nRIG  load1 at exit ${load1()}${harnessMiss ? `   ${harnessMiss} HARNESS-MISS — gestures this run could not deliver; those results are about the machine` : ''}`);
+console.log(fails
+  ? `\nFAIL — ${fails} check(s) failed${harnessMiss ? ` (and ${harnessMiss} harness miss(es) — re-run on a quieter box before believing this)` : ''}`
+  : '\nPASS — touch controls move the elephant, desktop untouched');
 process.exit(fails ? 1 : 0);

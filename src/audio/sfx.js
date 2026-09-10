@@ -153,18 +153,52 @@ export function createSfx({ actx, dest, reverb = null, rng = Math.random, seed =
     return g;
   }
 
-  /* An inharmonic struck-metal voice: bells, chimes, triangles. */
+  /* An inharmonic struck-metal voice: bells, chimes, triangles.
+
+     THE NYQUIST GUARD, and why a bell needs one. Every voice here is
+     `hz` times a partial as high as 8.93, and every caller may scale
+     `hz` again by the event's own pitch (o.p, which the UI and the
+     coin stack push past 1). 'chime' asks for 2093 x 8.93 = 18.7 kHz
+     before any pitch at all, and 'ui.toast' asks for 2640 x 8.93 =
+     23.6 kHz — ABOVE NYQUIST on a 44.1 kHz device, which is what most
+     Windows and Android hardware runs at.
+
+     MEASURED, rather than assumed: the whole bank played at three
+     pitches on one page, HEAD's sfx.js and this one side by side over
+     the same OfflineAudioContext (852 oscillators either way). At
+     44.1 kHz, HEAD asks for NINE partials at or above Nyquist; at
+     48 kHz, four. They do not go silent — AudioParam CLAMPS
+     frequency to sampleRate/2 — so the partial is pinned at Nyquist,
+     several distinct partials of one strike collapse onto that same
+     frequency, and WHICH of them collapse depends on the device's
+     sample rate. The same bell is a different bell on two machines,
+     which is the part no mix can compensate for. With the guard: nine
+     and four become zero.
+
+     The cut is 0.95 x Nyquist (20.9 kHz at 44.1, 22.8 at 48): above
+     that a partial is beyond hearing and is only spending a voice.
+     `i` still drives the amplitude and decay of every partial that
+     survives, so the timbre of what remains is byte-identical to
+     before — this only removes the ones that were never a partial.
+     And the tracked voice is the first SURVIVING oscillator rather
+     than partial 0, which may itself now be gone: voiceCount() has to
+     see something or the mixer's own accounting drifts. */
+  const NYQ = (actx.sampleRate || 48000) * 0.5;
   function metal(when, dur, peak, dst, hz, partials = [1, 2.76, 5.4, 8.93]) {
     const g = hit(when, dur, peak, dst, 0.002);
+    let voiced = 0;
     for (let i = 0; i < partials.length; i++) {
+      const f = hz * partials[i];
+      if (!(f > 0) || f > NYQ * 0.95) continue;
       const o = actx.createOscillator();
-      o.type = 'sine'; o.frequency.value = hz * partials[i];
+      o.type = 'sine'; o.frequency.value = f;
       const pg = actx.createGain();
       pg.gain.setValueAtTime(1 / (1 + i * 1.6), when);
       pg.gain.exponentialRampToValueAtTime(0.0001, when + dur * Math.pow(0.72, i));
       o.connect(pg); pg.connect(g);
       o.start(when); o.stop(when + dur + 0.06);
-      if (i === 0) track(o, when + dur + 0.06);
+      if (voiced === 0) track(o, when + dur + 0.06);
+      voiced++;
     }
     return g;
   }

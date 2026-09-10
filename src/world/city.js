@@ -25,7 +25,7 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { BUILD, LAND, BRAND, SEA, SKY, SHADOW } from '../core/palette.js';
-import { clamp, lerp, damp, smoothstep } from '../core/contracts.js';
+import { clamp, lerp, damp, smoothstep, tierName } from '../core/contracts.js';
 import { ZONES, LOCATIONS, LOC_BY_ID, WORLD } from '../game/data.js';
 import {
   createKitLib, kitFor, Kit, makeAO, boxRound, cyl, sphereG, TRS, mixHex, shadeHex,
@@ -971,12 +971,23 @@ export async function init(ctx) {
 
     /* --- collision --- */
     for (const b of meta.collide) {
-      /* The apartment's shell is thrown away and rebuilt per home tier
-         (4b), and a doorstep is the one collider whose position is a
-         property of the DOOR rather than of the plot — leaving the
-         generic one baked into the merged body would stand a phantom
-         kerb wherever this building's door used to be. */
-      if (b.step && loc.id === 'apartment') continue;
+      /* THE WHOLE HOME PLOT STAYS OUT OF THE MERGED CITY BODY — not
+         just its doorstep, which is what this line used to say.
+
+         The apartment's shell is thrown away and rebuilt per home
+         tier (4b), so its collision has to travel with it. Baking
+         tier 0's boxes into the static mesh froze the collider of the
+         one building in the game that changes shape: by the top tier
+         the drawn penthouse stood 20.61 m proud of the volume that
+         stops him, against an island whose next worst overhang is
+         4.05 m (Market Hall) and 3.70 (the bank). The balloon is the
+         only thing that can get up there, and it is the PLAYER'S OWN
+         HOUSE — twenty metres of wall you fly straight through.
+
+         wireHomeBerm() registers the standing tier's boxes as OBBs
+         instead, the way the doorstep already was, and re-registers
+         them on every move-in. */
+      if (loc.id === 'apartment') continue;
       collideQueue.push({ box: b, matrix: group.matrixWorld.clone() });
     }
     for (const s of bermSurfaces) {
@@ -2279,8 +2290,14 @@ export async function init(ctx) {
        island is one every other building — raise the ceiling so the
        awnings, banners, buntings and washing lines the forms now emit
        actually reach the screen. */
-    const MAX = ctx.quality.name === 'low' ? 16
-      : ctx.quality.name === 'med' ? 40 : 56;
+    /* THROUGH tierName(), NOT THE RAW NAME. The software-rasteriser
+       tier is called 'med(sw)', so `=== 'med'` was false on it and a
+       machine rendering every pixel on the CPU fell into the ELSE arm
+       and got 56 cloths — the count written for the fastest hardware
+       in the table, and 16 more than the `med` it actually is. Each
+       cloth is a verlet sim stepped every frame. */
+    const qt = tierName(ctx.quality?.name);
+    const MAX = qt === 'low' ? 16 : qt === 'med' ? 40 : 56;
     let n = 0;
     for (const c of clothQueue) {
       if (n >= MAX) break;
@@ -2290,7 +2307,8 @@ export async function init(ctx) {
       `${propCols}/${props.colliders.length} prop colliders ` +
       `(${props.colliders.length - propCols} vetoed at doorways), ` +
       `${bermQueue.length} berms (${bermTris} tris), ${footTris} footway tris, ` +
-      `${signCols}/${signs.length} sign boards, ${cloths.length} cloths`);
+      `${signCols}/${signs.length} sign boards, ${cloths.length} cloths ` +
+      `(tier ${qt}), ${homeColIds.length} home OBBs`);
   }
 
   /* ONE CLOTH. Lifted out of wirePhysics because the player's home is
@@ -2455,7 +2473,7 @@ export async function init(ctx) {
      used to be here happened to put one. */
   let homeBermIds = [];
   let homeBermStrips = [];
-  let homeStepIds = [];
+  let homeColIds = [];
   let homeEntry = null;
   const _UPY = new THREE.Vector3(0, 1, 0);
   const _sM = new THREE.Matrix4(), _sQ = new THREE.Quaternion();
@@ -2474,19 +2492,30 @@ export async function init(ctx) {
         } catch (e) { console.warn('[city] home berm collision failed', e); }
       }
     }
-    /* ...and the tier's own doorstep. The generic apartment's step went
-       into the merged city body with the rest of the 28; this tier's
-       door is somewhere else, on a building that no longer exists, so
-       the step travels with it. See doorway() in buildings.js. */
-    for (const id of homeStepIds) ctx.phys.remove(id);
-    homeStepIds = [];
+    /* ...and THIS TIER'S OWN SOLIDS — every box the standing home
+       declares, not only its doorstep.
+
+       The generic apartment's boxes used to go into the merged city
+       body with the rest of the 28 and stay there for the life of the
+       session, so a player who moved up to the penthouse got tier 0's
+       silhouette to bump into and 20.61 m of drawn building with
+       nothing behind it. The plot is now excluded from that merge
+       (see the note in the collision loop of section 3) and lives
+       here instead: one OBB per box, torn down and rebuilt on every
+       move-in, exactly the way the step already was. The step keeps
+       its own name and walkable flag — it is a surface to stand on,
+       the rest are walls. */
+    for (const id of homeColIds) ctx.phys.remove(id);
+    homeColIds = [];
     for (const b of homeEntry?.meta?.collide || []) {
-      if (!b.step) continue;
       _sP.set(b.x || 0, b.y || 0, b.z || 0).applyMatrix4(homeRec.group.matrixWorld);
       _sQ.setFromAxisAngle(_UPY, (b.ry || 0) + homeRec.loc.yaw);
       _sM.compose(_sP, _sQ, _sOne);
-      try { homeStepIds.push(ctx.phys.addOBB(b.w, b.h, b.d, _sM, { name: 'city.step', walkable: true })); }
-      catch (e) { console.warn('[city] home step collision failed', e); }
+      try {
+        homeColIds.push(ctx.phys.addOBB(b.w, b.h, b.d, _sM, {
+          name: b.step ? 'city.step' : 'city.home', walkable: !!b.step,
+        }));
+      } catch (e) { console.warn('[city] home collision failed', e); }
     }
   }
 

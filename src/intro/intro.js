@@ -857,6 +857,25 @@ export async function init(ctx) {
 
   function finish(reason) {
     if (finished || outro) return;
+    /* NO CARD, NOTHING TO END. api.skip() and WALLY.debug.skipIntro()
+       are reachable on a boot where the opener never armed — ?shot and
+       ?skipIntro, which is EVERY rig in tools/, because main.js calls
+       play() only when neither flag is set (see the note at the foot of
+       this file) — and again after dispose(), which nulls `card`. Both
+       fell into the dip below and threw
+         TypeError: Cannot read properties of null (reading 'setVeil')
+       which shot.mjs counts as a PAGEERROR and exits 1 on, failing a
+       whole capture for a rig that only wanted to be sure the cinematic
+       was out of the way. Skipping an opener that is not running is a
+       no-op, not a page error.
+       It deliberately does NOT emit intro:done: nothing started, so
+       nothing ended, and audio.js's listener (setContext('explore'))
+       must not be fired by a cinematic that never played. */
+    if (!card || !running) {
+      finished = true;
+      detachSkip();
+      return;
+    }
     if (reason === 'skip') {
       outro = { phase: 'dip', t: 0, reason };
       card.setVeil(1, 0.22);
@@ -1114,7 +1133,7 @@ export async function init(ctx) {
     dbg.playIntro = () => { play({ force: true }); return api.state(); };
     dbg.introShot = (n = 0) => seek(n);
     dbg.titleCard = () => seek(7);
-    dbg.skipIntro = () => { finish('skip'); return 'skipping'; };
+    dbg.skipIntro = () => { const was = running; finish('skip'); return was ? 'skipping' : 'intro not running'; };
     dbg.introState = () => api.state();
     dbg.introMarks = () => MARKS.map((m) => `${m.n}  ${m.t.toFixed(2)}s  ${m.label}`);
     dbg.intro = api;

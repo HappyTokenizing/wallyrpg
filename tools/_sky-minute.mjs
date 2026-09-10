@@ -269,7 +269,7 @@ try {
      before a single shot is taken, and an unknown one is fatal. */
   const QUAL = arg('quality', null);
   await page.goto(`http://127.0.0.1:${PORT}/index.html?shot=1${QUAL ? `&quality=${QUAL}` : ''}`, { waitUntil: 'load', timeout: 60000 });
-  await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 90000 });
+  await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 90000 });
   loadS = (Date.now() - t0) / 1000;
 
   /* rule 4: state the rig beside the number, measured at the moment

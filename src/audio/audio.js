@@ -49,7 +49,7 @@
      env                          the live environment the beds ride
    ============================================================ */
 
-import { clamp, damp, lerp, smoothstep } from '../core/contracts.js';
+import { clamp, damp, lerp, smoothstep, tierName } from '../core/contracts.js';
 import { createReverb, SPACES } from './reverb.js';
 import { createMusic, SCORES, CONTEXT_NAMES } from './music.js';
 import { createSfx, SURFACES } from './sfx.js';
@@ -303,7 +303,13 @@ export async function init(ctx) {
     zoneDwell: 0,   // seconds the candidate has been held
   };
 
-  const detailFor = (q) => (q === 'low' || q === 'med' ? 0.45 : 1);
+  /* MUSIC DETAIL BY TIER — through tierName(), not the raw string.
+     `q.name === 'med'` is false on the software-rasteriser tier, whose
+     name is 'med(sw)', so this line used to hand a machine with no GPU
+     at all the FULL score: every layer, every voice. It is the one
+     tier in the table pinned to pixelRatio 1 because it has nothing
+     but cost, and it was the one getting the most expensive mix. */
+  const detailFor = (q) => (tierName(q) === 'low' || tierName(q) === 'med' ? 0.45 : 1);
 
   function build() {
     if (built || failed) return built;

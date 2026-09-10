@@ -980,6 +980,22 @@ export async function init(ctx) {
   function land(locId, p) {
     const w = ctx.wally;
     if (!w) return false;
+    /* GET OUT OF THE BASKET BEFORE THE TELEPORT.
+       warpTo() moves the character controller, and the balloon is
+       parented to `root` while he is aboard — so warping a flying
+       Wally carried the whole machine across the island with him,
+       still inflated, still burning, camera still in flight override,
+       controller still disabled. He arrived at the bank in the air.
+       setBike(false, {instant:true}) is the character layer's own
+       door out (wally.js setFly -> flyEnd): it stows the envelope,
+       hands the controller and the camera back, and snaps him to the
+       ground. Doing it HERE and not in arrive() means it happens
+       behind the curtain, in the same frame as the warp, rather than
+       three hundred milliseconds earlier in full view. */
+    if (w.flying) {
+      try { w.setBike(false, { instant: true }); }
+      catch (e) { console.warn('[ui] could not put the balloon away', e); }
+    }
     let ok = false;
     try {
       if (typeof w.warpTo === 'function') {
@@ -1078,8 +1094,15 @@ export async function init(ctx) {
     const p = arrivalPoint(locId);
     if (!p) return false;
 
+    /* HE DID NOT WALK HERE IF HE IS TWO HUNDRED METRES OVER IT. This
+       test exists so an arrival at a door he is already standing at
+       does not fade — but it only measures x/z, so a balloon directly
+       above the destination passed it, returned early, and never
+       reached land(). state.loc said he had arrived and the player
+       was still aloft. Flying takes the full arrival. */
     const w = ctx.wally.position;
-    if (Math.hypot(w.x - p.x, w.z - p.z) <= ARRIVE_NEAR) return true;   // he walked here
+    if (!ctx.wally.flying
+        && Math.hypot(w.x - p.x, w.z - p.z) <= ARRIVE_NEAR) return true;   // he walked here
 
     flushArrival();                    // a different arrival mid-fade lands first
     if (o.instant || !canFade()) { land(locId, p); return true; }
@@ -1109,9 +1132,25 @@ export async function init(ctx) {
      double fade gets in. */
   const placeWally = (locId) => arrive(locId);
 
+  /* ---- NO TICKETS FROM UP HERE ----
+     M opens the phone whatever he is doing, and the Places app puts a
+     fare board on every pin. Buying a metro fare from a balloon ran
+     game.travel() -> jump(), which charges, advances the clock and
+     emits 'travel' with fast:true — and the arrival then warped him
+     across the island still inside the machine. The character layer
+     already publishes the one fact that settles it (wally.js:4415,
+     the same accessor game.js:3436 reads for altitude), so the fare
+     board simply refuses while it is true. Reading the map aloft is
+     still fine; it is the ticket that is refused, and it is refused
+     BEFORE the fare is paid rather than unwound afterwards. land()
+     carries the belt-and-braces for any route that gets past here. */
+  const airborne = () => !!(ctx.wally && ctx.wally.flying);
+  const AIRBORNE_WHY = 'Not from up here. Bring her down first.';
+
   function goto(locId, why) {
     const game = ctx.game;
     if (!game || !locId) return;
+    if (airborne()) { toast(AIRBORNE_WHY, 'bad'); return; }
     if (!game.known(locId)) { toast('You have not heard of that place yet', 'bad'); return; }
     if (game.state.loc === locId) { openPlace(locId); return; }
     game.quests.tip('map');
@@ -1490,13 +1529,24 @@ export async function init(ctx) {
     /** The Mayor's Dash: the start card, and quitting mid-race. */
     openRace: () => pushSheet(menus.raceCard(), 'race'),
     raceAbandon,
-    get racing() { return !!race; },
+    /* `racing` is NOT here. It was, and it was the block below's own
+       warning happening: Object.assign READS a getter and assigns the
+       value, so `get racing()` ran once at init with `race === null`
+       and ctx.ui.racing has been the frozen boolean false ever since —
+       through every race the game has ever run. Moved to the
+       defineProperties block. */
     /** A hunger or hours refusal, with the route out printed on it.
         Takes a gate() result: {kind:'hunger'|'hours', why, food|loc}. */
     showBlocked: (r) => menus.blocked(r),
     renderSettings: (el) => menus.renderSettings(el),
-    /** The fare board, so the phone and the map quote fares identically. */
-    renderTravelModes: (el, locId, onDone) => menus.travelModes(el, locId, onDone),
+    /** The fare board, so the phone and the map quote fares identically.
+        Refused while he is flying — see `airborne` above goto(). This
+        is the Places app's board (phone.js:391); menus.js draws two
+        more of its own from inside travelModes(). */
+    renderTravelModes: (el, locId, onDone) => {
+      if (airborne()) { el.append(h('div.w-empty', { text: AIRBORNE_WHY })); return; }
+      return menus.travelModes(el, locId, onDone);
+    },
     /** One ride, as a row. The garage, a shop counter and the fare
         board all render the same object from the same data table. */
     renderRide: (r, opts) => menus.rideRow(r, opts),
@@ -1582,6 +1632,8 @@ export async function init(ctx) {
     hideUI: { get: () => hideUI, enumerable: true },
     dialogueOpen: { get: () => dlg.isOpen, enumerable: true },
     panels: { get: () => stack.map((s) => s.name), enumerable: true },
+    /** Is the Mayor's Dash running? The only public read of `race`. */
+    racing: { get: () => !!race, enumerable: true },
   });
 
   /* ------------------------------------------------------------
@@ -1680,8 +1732,17 @@ export async function init(ctx) {
      the HUD's objective jump, game.enter() from a door in the world, and
      a bare ctx.game.travel() from anywhere at all. */
   on('travel', (t) => {
-    /* you cannot take the train round a footrace */
-    if (race) raceAbandon();
+    /* YOU CANNOT TAKE THE TRAIN ROUND A FOOTRACE — but running through
+       a door is not taking the train. 'travel' is emitted by BOTH ends
+       of game.js: jump() sends fast:true (metro, taxi — the fare you
+       paid to skip the journey) and enter() sends {fast:false,
+       onFoot:true} for a door he walked up to and pushed open. The
+       guard read neither, so the route's own checkpoints abandoned the
+       race: the door prompt lights ~9 m out, E entered the building,
+       'travel' fired, and the run ended with "You stopped running. He
+       did not." at the very corner it was meant to be scored at.
+       Abandon on the fare, never on the footstep. */
+    if (race && t && t.fast) raceAbandon();
     if (t && t.to) arrive(t.to);
   });
 
@@ -1759,7 +1820,46 @@ export async function init(ctx) {
     hud.refresh(true);
   });
   on('game:complete', (p) => { ending.open(p || {}); });
+  /* ============================================================
+     THE STATE OBJECT IS REPLACED, THE DOM IS NOT.
+
+     newGame(), load() and importSave() all call M.replace(st) and then
+     bootState(), which ends in this event (game.js:3118). Everything
+     ui.js painted from the OLD settings object is still painted: the
+     boot block below ran once, against a state that no longer exists.
+     So after New Game with high contrast on, the film grain and the
+     vignette stayed off and .w-hc stayed on the roots, while
+     settings.contrast read false — the Settings toggle said OFF for a
+     thing that was visibly ON, and the player had to flip it twice.
+     Same for Hide UI (the HUD stayed faded out) and text size.
+
+     Re-read the settings HERE rather than closing over `S`: `S` is the
+     stale object, and writing the new values into it would paint the
+     screen from a state nothing else in the game is reading. The four
+     setters are idempotent, so this is also correct on a cold boot,
+     where it simply re-applies what the boot block just applied.
+
+     Reduced motion is the one that was already half-safe — canFade()
+     re-reads state.settings.reduced live every arrival — but only the
+     ARRIVAL half; the .w-rm class that stops the CSS transitions is
+     written here and nowhere else, so it goes through the same door.
+
+     RACE, TOO. A new game with the Mayor's Dash running left `race`
+     holding the old route: the HUD box kept counting, raceTick kept
+     measuring his distance to a checkpoint belonging to a game that
+     had ended, and finishing it called race.finish() on a rules layer
+     that had never started one. raceStop() is the UI-only teardown —
+     raceAbandon() would report the quit to the NEW game.
+     ============================================================ */
   on('ready:game', () => {
+    raceStop();
+    const S2 = ctx.game?.state?.settings;
+    if (S2) {
+      setTextSize(S2.textSize || 1);
+      setReducedMotion(!!S2.reduced);
+      setHighContrast(!!S2.contrast);
+      setHideUI(!!S2.hideUI);
+    }
     hud.refresh(true);
     const st = ctx.game?.state;
     if (st && !st.flags.readMentor && !ctx.flags?.shot) {

@@ -73,6 +73,60 @@ export async function init(ctx) {
   let dirTarget = dirAngle;
   let dirTimer = 0;
 
+  /* ============================================================
+     THE PIN — the control every frame measurement in this project
+     did not have.
+
+     setStrength(0) DOES NOT BECALM THE AIR and never did. Three
+     independent writers move this field every frame:
+       1. weather.js:329 damps uWindStrength back toward 0.42*windMul
+          EVERY FRAME, so a base written to 0 is most of the way home
+          within a second and nominal within three;
+       2. the gust machine below writes uWindGust on its own clock,
+          and setStrength does not touch that term at all;
+       3. the direction wander re-aims uWindDir every 18-40 s.
+     Measured here: mean total wind after "becalming" 0.4477 against a
+     nominal 0.42 — indistinguishable from not calling it. In one
+     balloon A/B the BECALMED arm read |wind| 0.531 and the DRIFTING
+     arm 0.457: the two arms were the same condition with the labels
+     swapped.
+
+     pin() holds BOTH terms and the direction, refuses setStrength()
+     and setDirection() while held, and skips the whole state machine
+     in update(). uTime keeps advancing — every material in the world
+     shares it, and freezing it would freeze the frame, not the wind —
+     so what the pin makes constant is the AMPLITUDE:
+
+         wind.strength          exactly the pinned base + gust
+         wind.sample(x,z,ph)    that amplitude times a fixed wave
+         wind.vector(x,z)       fixed bearing, bounded magnitude
+
+     At pin(0) both terms are zero, so sample() and vector() are
+     IDENTICALLY ZERO at every point and every frame — an exact
+     becalm, not a mean. That is the arm an A/B wants.
+
+     HOW A LATER AGENT USES IT (replaces the setStrength(0) idiom in
+     every rig in tools/):
+         WALLY.ctx.wind.pin(0);       // becalm, exactly and durably
+         ... measure the frame ...
+         WALLY.ctx.wind.unpin();      // weather takes the field back
+     For a known wind on a known bearing, pin the whole state at once
+     rather than setStrength + setDirection — setDirection only EASES
+     toward its target over seconds, while pin snaps and holds:
+         WALLY.ctx.wind.pin({ strength: 1.0, gust: 0, dir: Math.atan2(dz, dx) });
+     pin() with no argument freezes whatever is blowing right now,
+     which is how you hold one arm's conditions across a switch.
+     wind.pinned reads back the held state, or null.
+     ============================================================ */
+  let pinned = null;          // null, or { strength, gust, dir }
+
+  function applyPin() {
+    uniforms.uWindStrength.value = pinned.strength;
+    uniforms.uWindGust.value     = pinned.gust;
+    dirAngle = dirTarget = pinned.dir;
+    uniforms.uWindDir.value.set(Math.cos(dirAngle), Math.sin(dirAngle));
+  }
+
   const api = {
     uniforms,
     glsl: WIND_GLSL,
@@ -116,11 +170,65 @@ export async function init(ctx) {
     },
 
     get strength() { return uniforms.uWindStrength.value + uniforms.uWindGust.value; },
-    setStrength(v) { uniforms.uWindStrength.value = v; },
-    setDirection(rad) { dirTarget = rad; },
+
+    /* Both setters REFUSE non-finite input and REFUSE to move a pinned
+       field, and both return the value now in force, so the no-argument
+       call reads instead of corrupting. weather.js calls setStrength
+       every frame; that call is the thing the pin has to block, and
+       this is the only line that can block it. */
+    setStrength(v) {
+      if (pinned || !Number.isFinite(v)) return uniforms.uWindStrength.value;
+      uniforms.uWindStrength.value = v;
+      return v;
+    },
+    setDirection(rad) {
+      if (pinned || !Number.isFinite(rad)) return dirTarget;
+      dirTarget = rad;
+      return rad;
+    },
+
+    /** Hold the delivered wind. See THE PIN above. Returns the held state. */
+    pin(v) {
+      const cur = {
+        strength: uniforms.uWindStrength.value,
+        gust:     uniforms.uWindGust.value,
+        dir:      dirAngle,
+      };
+      if (typeof v === 'number') {
+        pinned = Number.isFinite(v) ? { strength: v, gust: 0, dir: cur.dir } : cur;
+      } else if (v && typeof v === 'object') {
+        pinned = {
+          strength: Number.isFinite(v.strength) ? v.strength : cur.strength,
+          gust:     Number.isFinite(v.gust)     ? v.gust     : 0,
+          dir:      Number.isFinite(v.dir)      ? v.dir      : cur.dir,
+        };
+      } else {
+        pinned = cur;                       // pin() — hold what is blowing
+      }
+      applyPin();
+      return { ...pinned };
+    },
+
+    /** Release the field back to weather.js and the gust machine. */
+    unpin() {
+      const was = pinned;
+      pinned = null;
+      return was ? { ...was } : null;
+    },
+
+    /** The held state, or null. Print this beside any pinned number. */
+    get pinned() { return pinned ? { ...pinned } : null; },
 
     update(dt, elapsed) {
       uniforms.uTime.value = elapsed;
+
+      /* PINNED: no wander, no gust, and weather.js's write was refused
+         at the setter. uTime still advances — see THE PIN. */
+      if (pinned) {
+        applyPin();
+        ctx.bus.emit('wind', api);
+        return;
+      }
 
       // Direction wanders slowly — a new target every 18-40 s, eased in.
       dirTimer -= dt;

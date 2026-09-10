@@ -32,7 +32,7 @@ const page = await browser.newPage({ viewport: { width: 1400, height: 800 } });
 page.on('pageerror', e => console.log('PAGEERROR', e.message.split('\n')[0]));
 
 await page.goto(`http://127.0.0.1:${port}/index.html?skipIntro`, { waitUntil: 'load', timeout: 60000 });
-await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 60000 });
+await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 60000 });
 await page.waitForTimeout(3000);
 
 const probe = () => page.evaluate(() => {

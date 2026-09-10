@@ -241,7 +241,7 @@ for (const c of CASES) {
   const errs = [];
   pg.on('pageerror', e => errs.push(e.message));
   await pg.goto(`http://127.0.0.1:${PORT}/index.html?shot=1`, { waitUntil: 'load', timeout: 120000 });
-  await pg.waitForFunction('window.__WALLY_READY__===true', { timeout: 180000 });
+  await pg.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 180000 });
   await pg.waitForTimeout(6000);
   const nloc = await pg.evaluate(() => {
     const g = window.WALLY.ctx.game;

@@ -70,7 +70,8 @@
      setWaterLevel(fn|number|null)
      windAt(x, z, phase)    the shared wind as a world vector
      world                  the raw CollisionWorld if you need to go deeper
-     stats                  {triangles, controllers, chains, cloths, buoys, steps}
+     stats                  {triangles (ALIVE), triangleSlots (high-water),
+                            freeSlots, controllers, chains, cloths, buoys, steps}
 
    Bus events emitted
      'phys:land'    {position, impact, speed, normal, body}
@@ -375,7 +376,18 @@ export async function init(ctx = {}) {
      * registered it answers the flat fallback plane at y = 0.
      * @returns {y, normal, hit, plane, distance, body}  (reused unless `out`)
      */
-    groundAt(x, z, out = null) { return world.groundAt(x, z, out); },
+    /* fromY AND maxDist ARE FORWARDED, AND DROPPING THEM WAS A BUG.
+       collision.js:716 takes both; this wrapper took two arguments and
+       threw the rest away, so every caller that tried to cast from a
+       known height silently cast from the top of the world and got the
+       first solid on the way down. Measured at a sign.board: this
+       answered 72.17 m (the board) where the same query from street
+       level + 1 m answers 59.54 m — which is the "12.75 m snap" that
+       was blamed on fast travel and on a probe settling, and was
+       neither. */
+    groundAt(x, z, out = null, fromY = null, maxDist = null) {
+      return world.groundAt(x, z, out, fromY, maxDist);
+    },
     /** Just the height — terrain queries, prop placement, foot IK. */
     heightAt(x, z) { return world.groundAt(x, z).y; },
     /** Every contact for a capsule (a..b, r). Records are pooled. */
@@ -464,7 +476,16 @@ export async function init(ctx = {}) {
 
     get stats() {
       return {
+        /* ALIVE triangles. This used to be world.count, the slot
+           high-water, which is a different number the moment anything
+           has been removed — a streamed world reported hundreds of
+           thousands of "triangles" that no query ever touches.
+           `triangleSlots` is that high-water, kept because it is what
+           the backing arrays are sized against; `freeSlots` is how many
+           of them are parked for reuse. */
         triangles: world.triangleCount,
+        triangleSlots: world.slotCount,
+        freeSlots: world.freeSlotCount,
         bodies: world.bodies.size,
         controllers: controllers.length,
         chains: chains.length,
@@ -566,8 +587,13 @@ export async function init(ctx = {}) {
           if (l) local += l.length;
         }
       }
+      /* `tris` is ALIVE triangles (it used to be world.count, the slot
+         high-water — a rig reading it as a leak gauge should read
+         `slots`, which is that same high-water, and `freeSlots`, the
+         dead spans parked for reuse). */
       return {
-        tris: world.count, bodies: world.bodies.size, cells: g.size,
+        tris: world.triangleCount, slots: world.slotCount, freeSlots: world.freeSlotCount,
+        bodies: world.bodies.size, cells: g.size,
         meanList: +(total / Math.max(1, g.size)).toFixed(1), worstList: worst,
         capsuleCells: cells, capsuleTris: local, cellSize: world.cellSize,
       };

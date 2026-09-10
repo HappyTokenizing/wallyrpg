@@ -94,7 +94,7 @@ const game = await browser.newPage({ viewport: { width: W, height: H }, deviceSc
 const logs = [];
 game.on('pageerror', e => logs.push('PAGEERROR ' + e.message));
 await game.goto(`http://127.0.0.1:${PORT}/index.html?shot=1`, { waitUntil: 'load', timeout: 60000 });
-await game.waitForFunction('window.__WALLY_READY__ === true', { timeout: 45000 })
+await game.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 45000 })
   .catch(() => logs.push('never ready'));
 await game.evaluate(([p, c, t]) => {
   window.WALLY.debug.studio(p, c || undefined);

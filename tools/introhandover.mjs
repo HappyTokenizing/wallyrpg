@@ -217,7 +217,7 @@ async function run(label, opts = {}) {
   const errs = [];
   page.on('pageerror', (e) => errs.push(e.message.split('\n')[0]));
   await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'load', timeout: 90000 });
-  await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 90000 });
+  await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 90000 });
 
   /* ------------------------------------------------------------------
      ARM THE REVERT, BEFORE THE THING IT BREAKS HAPPENS.

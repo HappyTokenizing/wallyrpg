@@ -44,7 +44,7 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { BRAND, LAND } from '../core/palette.js';
-import { clamp, damp, lerp, smoothstep } from '../core/contracts.js';
+import { clamp, damp, lerp, smoothstep, tierName } from '../core/contracts.js';
 import { ZONES, LOCATIONS, LOC_BY_ID, WORLD } from '../game/data.js';
 import { createTerrain, TILE, CELL } from './terrain.js';
 import { createPaths } from './paths.js';
@@ -474,8 +474,12 @@ export async function init(ctx) {
      COUNT for each. A count is not a budget: three tile geometries in
      one frame is three unbounded geometry builds, and a profile caught
      one world frame at 9-10 ms doing exactly that. 1.2 ms matches the
-     foliage streamer's BUILD_MS, so the two streamers together cannot
-     claim more than a third of a 60 fps frame.
+     foliage streamer's BUILD_MS, but NEITHER IS A BOUND ON A FRAME —
+     `spent()` is read only AFTER an item has already run and each of
+     the three kinds gets one unconditionally (see update() below), so
+     what these budgets cap is how much work a frame may START, and
+     worldStream()'s own `worst` reads above 1.2 ms in both modes on
+     every run.
 
      'count' is the rule that shipped and 'budget' the new one; both
      live in update() and WALLY.debug.worldStreamMode() drives them on
@@ -573,7 +577,8 @@ export async function init(ctx) {
         terrain.updateCollision(f.x, f.z, 2);
         terrain.updateRockCollision(f.x, f.z, 4);
         terrain.updateLOD(ctx.camera);
-        terrain.processPending(ctx.quality.name === 'low' ? 1 : 3);
+        /* tierName: 'med(sw)' must not read as a fast tier here. */
+        terrain.processPending(tierName(ctx.quality.name) === 'low' ? 1 : 3);
       } else {
         /* ONE SHARED MILLISECOND BUDGET, spent in priority order.
            terrain.js owns these three queues and takes a COUNT, so the
@@ -604,7 +609,7 @@ export async function init(ctx) {
         if (!spent()) terrain.updateCollision(f.x, f.z, 1);
         for (let k = 0; k < 4; k++) { terrain.updateRockCollision(f.x, f.z, 1); if (spent()) break; }
         terrain.updateLOD(ctx.camera);
-        const maxGeo = ctx.quality.name === 'low' ? 1 : 3;
+        const maxGeo = tierName(ctx.quality.name) === 'low' ? 1 : 3;
         for (let k = 0; k < maxGeo; k++) { terrain.processPending(1); if (spent()) break; }
       }
       streamMs = performance.now() - tS;

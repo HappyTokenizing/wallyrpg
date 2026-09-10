@@ -461,7 +461,7 @@ async function boot({ block = false, mobile = false, query = '', settle = 1400 }
   /* NO ?shot and NO ?skipIntro unless a pass asks for them — this is
      how a player loads the game. */
   await page.goto(`http://127.0.0.1:${port}/index.html${query}`, { waitUntil: 'load', timeout: 120000 });
-  await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 120000 });
+  await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 120000 });
   /* Let openTheDoor()'s resume() probe finish its 400 ms race. */
   if (settle) await page.waitForTimeout(settle);
   return { browser, page, errors };
@@ -551,7 +551,7 @@ await attempt('PASS A', async () => {
   await page.keyboard.press('Space');
 
   const reached = await page
-    .waitForFunction('WALLY.ctx.audio && WALLY.ctx.audio.running === true', { timeout: 15000 })
+    .waitForFunction('WALLY.ctx.audio && WALLY.ctx.audio.running === true', null, { timeout: 15000 })
     .then(() => true).catch(() => false);
   ok(reached, 'the AudioContext reaches "running" on the gesture');
 
@@ -621,7 +621,7 @@ await attempt('PASS A', async () => {
   head('gameplay');
   await page.evaluate(() => WALLY.debug.skipIntro());
   const handed = await page
-    .waitForFunction('WALLY.ctx.intro.running === false', { timeout: 10000 })
+    .waitForFunction('WALLY.ctx.intro.running === false', null, { timeout: 10000 })
     .then(() => true).catch(() => false);
   ok(handed, 'the cinematic hands over to the player');
 
@@ -761,7 +761,7 @@ await attempt('PASS C', async () => {
   await page.touchscreen.tap(196, 425);
 
   const reached = await page
-    .waitForFunction('WALLY.ctx.audio && WALLY.ctx.audio.running === true', { timeout: 15000 })
+    .waitForFunction('WALLY.ctx.audio && WALLY.ctx.audio.running === true', null, { timeout: 15000 })
     .then(() => true).catch(() => false);
 
   const probe = await page.evaluate(() => ({

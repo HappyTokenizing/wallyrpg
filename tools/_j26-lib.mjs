@@ -119,7 +119,7 @@ export async function boot({
   page.on('console', m => { if (m.type() === 'error') logs.push(`[console.error] ${m.text()}`); });
   page.on('pageerror', e => logs.push(`[PAGEERROR] ${String(e.message).split('\n')[0]}`));
   await page.goto(`http://127.0.0.1:${port}/index.html${qs}`, { waitUntil: 'load', timeout: 120000 });
-  await page.waitForFunction('window.__WALLY_READY__===true', { timeout: 180000 })
+  await page.waitForFunction('window.__WALLY_READY__===true', null, { timeout: 180000 })
     .catch(() => logs.push('[warn] never ready'));
   return { browser, page, server, port,
     close: async () => { try { await browser.close(); } catch (e) {} server.close(); } };

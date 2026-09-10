@@ -4,7 +4,9 @@ You are building **WALLY RPG**: a Three.js, Wind-Waker-styled 3D action-RPG star
 Wally, a matte-clay elephant in black sunglasses. It is a 3D remake of a 2D browser
 RPG (`ref/original-wally.html`, `ref/original-README.md`).
 
-Project root: `/Users/herwig/Desktop/Claude files/wally-rpg`
+Project root: `/Users/herwig/Documents/GitHub/wallyrpg` — the git repo, and the **only**
+copy. `~/Desktop/Claude files/WALLY RPG August edition` is a frozen snapshot; never write
+there. (This line used to name a Desktop path that does not exist on this machine.)
 
 ## Read before you write
 
@@ -89,6 +91,22 @@ window.WALLY.debug.poseWally = (name) => { ... };
 window.WALLY.debug.setHour = (h) => { ... };
 window.WALLY.debug.camera = (preset) => { ... };
 ```
+
+## Where your probes live
+
+`tools/` is for rigs that outlive the round that wrote them, and **a one-off probe is
+not one of those.** Write throwaway probes to `tools/probes/`, which is gitignored, or
+to your session scratchpad — either is fine, and nothing else is. This is not tidiness.
+A file sitting in `tools/` reads as a durable suite to the next agent, so the directory
+fills with rigs nobody dares touch: it was mass-deleted once at `89ec7c5`, 319 files,
+and was back to 245 in sixteen days. Prefixing the name with an underscore does not give
+a probe a home; it only makes it look abandoned while still costing every future reader
+the question. If a probe turns out to be worth keeping, promote it on purpose — move it
+up into `tools/` under a real name, no leading underscore, and say so in your report.
+And a rig you cite by name from a comment in `src/` must be a promoted one: citing a
+path under `tools/probes/` writes a lie into the source the day the probe is swept,
+which is how `src/world/lighting.js` came to name a `tools/_wxmech.mjs` that no commit
+in this repo's history has ever contained.
 
 ## Comparison targets
 

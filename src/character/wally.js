@@ -1549,6 +1549,22 @@ export async function init(ctx) {
   const PARK_SIDE_X = -0.62;
   const PARK_CLEAR_M = 1.0;       // measured: the props are 0.60-0.72 m wide
   const PARK_STEP_M = 1.1;        // > PARK_CLEAR_M, or a rung blocks its neighbour
+  /* The park probe's ray. Start just above the machine so nothing over
+     its head can be mistaken for the ground under it, and go far enough
+     down to reach the terrain from the tallest roof in the city. See
+     the header on H() inside parkProp. PARK_STRUCT_M is the gap over
+     the terrain that means "this is a structure, not a kerb", and
+     PARK_STAND_M is how close the ray has to come to the rider's own
+     feet before it counts as the thing he is standing on — the
+     controller's own step offset is 0.35, so half a metre is a
+     comfortable pass for a man on a surface and a clear fail for a
+     bench beside him. */
+  const PARK_PROBE_UP = 2.0;
+  const PARK_PROBE_DOWN = 400;
+  const PARK_STRUCT_M = 1.2;
+  const PARK_STAND_M = 0.5;
+  const _parkOrigin = new THREE.Vector3();
+  const _parkDown = new THREE.Vector3(0, -1, 0);
   /* THE CLEARANCE IS THE MACHINE'S, NOT A CONSTANT, and the balloon is
      why. 1.0 m is the measured width of the widest thing on wheels; a
      moored balloon is a basket with five metres of cold envelope laid
@@ -1656,10 +1672,88 @@ export async function init(ctx) {
     const zr = ws.length > 1 ? contactZ(ws[1], g) : 0;
     const base = zf - zr;
 
-    const H = (x, z) => {
+    /* ----------------------------------------------------------------
+       WHAT THE MACHINE IS STANDING ON — and it is not always the hill.
+
+       ctx.world.heightAt() is the TERRAIN RASTER. It answers
+       everywhere, for every (x, z) on the island, and it always answers
+       about the ground — so solveParkPose could never fail, never once
+       took its fallback, and the pose it solved was always a pose on
+       the hillside. Park on a ROOF and that is a machine parked inside
+       the building. MEASURED, on the penthouse: roof 86.74, terrain
+       under it 56.99, and HEAD parks the balloon at 56.99 — 29.75 m
+       below the roof he is standing on — then game.js writes that into
+       state.rides.parked and it survives the reload.
+
+       A DOWNWARD RAY FROM JUST ABOVE THE MACHINE finds what is really
+       under the wheels. IT IS CAST, NOT ASKED FOR THROUGH groundAt:
+       ctx.phys.groundAt is published as groundAt(x, z, out)
+       (physics.js's wrapper, `groundAt(x, z, out = null)`) and DROPS
+       the fromY and maxDist arguments the CollisionWorld's own
+       `groundAt(x, z, out, fromY, maxDist)` accepts (cite the two
+       signatures rather than line numbers — they move every round). So
+       it always starts above the sky and answers the first solid on
+       the way down, which would park a bicycle on whatever it happened
+       to be standing under. See the
+       note on the flight floor clamp in flyUpdate for what that costs
+       when it is left in: a 9.91 m snap onto a shop sign.
+
+       AND IT ONLY OVERRIDES THE RASTER WHEN HE IS ACTUALLY STANDING ON
+       A STRUCTURE. The question is asked of THE RIDER'S OWN FEET, once,
+       and the answer drives every sample, so the chord can never be
+       drawn between a roof and a hill:
+
+         · the ray under him comes back within PARK_STAND_M of his own
+           y — he is standing ON the thing it found, not beside it;
+         · and that thing is more than PARK_STRUCT_M above the raster.
+
+       BOTH HALVES ARE LOAD-BEARING, and the first one is the one that
+       is easy to leave out. Asking only "is there something solid over
+       the terrain at the park spot" makes street furniture into ground:
+       measured on this island, the highest collider top over its own
+       terrain is 3.04 m for prop.lamp, with prop.bollard at 2.07 and
+       prop.bench at 1.70 — and 6 of 56 door-side park spots have a
+       stoop 1.24 m up. There is no empty band between that and a
+       roofline (the lowest of the named buildings is 6.96 m over its
+       own street, and prop.container reaches 7.91), so no threshold on
+       its own can separate them. His feet can: he is on the street, so
+       the raster answers and the solve is byte for byte the one HEAD
+       ran. Stand him on the stoop and the ray comes back at his feet
+       and the machine stands on the stoop with him.
+
+       THE EDGE CASE IT DOES NOT SOLVE: parked 0.62 m to his side, a
+       machine can have its spot past a parapet, and then the ray under
+       THAT spot is the street thirty metres down. solveParkPose's pitch
+       clamp and fallbackY are what catch it, as they did before; the
+       balloon has no wheelbase to pitch, so it simply parks low. The
+       landing footprint probe (flyFootprint) already leans her onto the
+       supported side before she touches, which is why this has to be
+       wrong by less than a basket to happen at all.
+       ---------------------------------------------------------------- */
+    const standX = at ? at.x : _pv.x, standZ = at ? at.z : _pv.z;
+    const standY = at ? at.y : _pv.y;
+    const startY = standY + PARK_PROBE_UP;
+    const rasterAt = (x, z) => {
       try { const h = ctx.world?.heightAt?.(x, z); if (Number.isFinite(h)) return h; } catch (e) {}
       return NaN;
     };
+    const rayAt = (x, z) => {
+      const p = ctx.phys;
+      if (!p || !p.raycast) return NaN;
+      try {
+        _parkOrigin.set(x, startY, z);
+        const h = p.raycast(_parkOrigin, _parkDown, PARK_PROBE_DOWN);
+        if (h && Number.isFinite(h.point.y)) return h.point.y;
+      } catch (e) { /* no collision world: the raster answers */ }
+      return NaN;
+    };
+    const _r0 = rayAt(standX, standZ), _h0 = rasterAt(standX, standZ);
+    const onStructure = Number.isFinite(_r0)
+      && Math.abs(_r0 - standY) <= PARK_STAND_M
+      && (!Number.isFinite(_h0) || _r0 - _h0 > PARK_STRUCT_M);
+    const H = onStructure
+      ? (x, z) => { const r = rayAt(x, z); return Number.isFinite(r) ? r : rasterAt(x, z); }
+      : rasterAt;
     const sol = solveParkPose(H, {
       x: px, z: pz, yaw, zf, zr,
       lean: bike.parkLean,
@@ -1681,6 +1775,13 @@ export async function init(ctx) {
          a 24-degree grade half a millimetre of position is 0.2 mm of
          height — twice the threshold the same tool then applies. */
       at: [+px.toFixed(6), +pz.toFixed(6)], offsetX: +ox.toFixed(4),
+      /* WHICH SURFACE THE SOLVE WAS RUN AGAINST, named rather than
+         inferred: `onStructure` false is the terrain raster and the
+         pose HEAD would have produced, true is the collision ray. A
+         probe that cannot say which branch it took cannot say what it
+         measured. */
+      onStructure, rayY: Number.isFinite(_r0) ? +_r0.toFixed(3) : null,
+      rasterY: Number.isFinite(_h0) ? +_h0.toFixed(3) : null,
       base: +base.toFixed(3),
       gradientDeg: base > 0.05 ? +(sol.rawPitch * 180 / Math.PI).toFixed(2) : null,
       clamped: base > 0.05 && sol.clamped,
@@ -2461,15 +2562,32 @@ export async function init(ctx) {
      against this city's collision set: 0.048 ms, which is 0.3% of a
      16.7 ms frame. There was never a reason to be stingy here.
 
-     TREES ARE STILL GHOSTS ABOVE 1.72 m, and that is not this file's
-     to fix. world/trees.js gives a trunk a box capped at props.js's
-     SOLID_TOP because nothing above a walking elephant's crown can be
-     touched by one — correct for the character and wrong for a machine
-     that meets the canopy and never the trunk. Measured: 0 of 24
-     sampled trees answer a ray at 3 m or above, 23 of 24 answer below
-     2 m. The handover is written in this round's report; the ladder
-     above meets a canopy collider the moment one exists, and
-     test-balloon B5f proves that by registering one itself.
+     TREES ARE SOLID NOW, AND ONLY WHILE SHE IS UP. This paragraph
+     used to read "TREES ARE STILL GHOSTS ABOVE 1.72 m" and describe a
+     handover; the handover shipped, and leaving the old text here was
+     the more expensive half of the mistake — a sentence that outlives
+     the code it describes reads like evidence for ever. What is true
+     now: world/trees.js caps a TRUNK box at props.js's SOLID_TOP,
+     which is still right (nothing above a walking elephant's crown can
+     be touched by one), and gives the CROWN its own box on top of that
+     — never below 2.90 m of world height, and only while 'wally:fly'
+     says something that can reach it is in the air. A skeptic put a
+     700-point A/B through it: on foot the collision world is what it
+     always was, and aloft the ladder above meets a canopy. The prior
+     measurement this paragraph carried — 0 of 24 sampled trees
+     answering a ray at 3 m — is what the world answers WITH THE
+     CROWNS OFF, which is now a mode (trees.js setCanopies(false)) and
+     not the world. test-balloon B5f still registers its own canopy,
+     deliberately: a test that flies at a body it built itself is
+     testing this file, not that one.
+
+     AND THE CROWNS ARE STREAMED, so "solid" means solid inside
+     trees.js's CANOPY_IN of the basket, not island-wide. She cannot
+     outrun it — 62 m of margin against a 9.0 m/s drift ceiling — but
+     a rig that teleports her with debug.balloon({at}) and reads the
+     collision world on the SAME frame will find the crowns still
+     arriving at a few a frame. Give it a dozen frames, or ask for
+     ctx.foliage.trees.setCanopies(true, 'island').
 
      WHAT IT MUST NOT DO. Not a stop — a balloon that halts dead at a
      roofline has no mass. Not a bounce — canvas has no restitution and
@@ -3903,13 +4021,47 @@ export async function init(ctx) {
           flyFloored = true;
         }
       }
+      /* ---- THE FLOOR, AND WHAT IT WILL PUT HER ON ----
+
+         IT IS A LIFT, NOT A LIMIT: `<=` with an assignment, so anything
+         that raises deckY teleports the basket UP to it inside one
+         frame. deckY is flyGround + DECK and flyGround comes from
+         flySolidUnder, which asks ctx.phys.groundAt — and groundAt as
+         PUBLISHED — physics.js's wrapper is `groundAt(x, z, out = null)`
+         — silently drops the fromY and maxDist arguments the
+         CollisionWorld's own `groundAt(x, z, out, fromY, maxDist)` takes.
+         flySolidUnder passes `(fromY ?? root.position.y) + 2` and 900
+         in good faith and neither survives the call. Every probe is
+         therefore cast FROM THE TOP OF THE WORLD and answers the first
+         solid on the way down — so any permanent collider over her head
+         is "the ground", and this line lifts her onto it.
+
+         MEASURED ON THIS BUILD, not inferred. The tallest sign.board
+         over its own street stands 25.18 m up (15.68 m over terrain at
+         9.51). Put the balloon 8 m under it at y 15.53 and read the
+         next frame: y 25.44, flyGround 25.18, alt 0.00, vy 0 — a
+         9.91 m upward snap onto a hanging shop sign, reported as a
+         landing. Two frames later she has drifted 30 cm off the board,
+         the ray finds the street again, flyGround 9.56, and she is
+         15.6 m up in clear air with the machine none the wiser.
+
+         THAT IS THE WHOLE OF THE REPORTED "12.75 m SNAP ON FAST
+         TRAVEL". It is not a warp transient and it is not a probe
+         settling: it is a permanent body — sign.board, 28 of them,
+         the highest topping out at 72.26 m of world height — being
+         found by a ray that starts above the sky. Fixing it means
+         making the ray honour its own fromY, which is a change to
+         physics.js's published signature and belongs to whoever owns
+         that file; the handover is in this round's report. Until then
+         nothing in here may treat flyGround as "the ground".
+
+         DOWN IS NOT OUT. Touching the ground is not getting out — he
+         can burn again from here and go straight back up, which is
+         what makes "land on that roof and have a look" a thing you
+         are allowed to do. Only an explicit dismount ends a flight. */
       if (root.position.y <= deckY) {
         root.position.y = deckY;
         if (flyState.vy < 0) flyState.vy = 0;
-        /* DOWN IS NOT OUT. Touching the ground is not getting out — he
-           can burn again from here and go straight back up, which is
-           what makes "land on that roof and have a look" a thing you
-           are allowed to do. Only an explicit dismount ends a flight. */
         if (flyLandWanted) { flyPhase = 'landing'; flyT = 0; flyLandWanted = false; }
       }
     } else if (flyPhase === 'landing') {
@@ -3940,13 +4092,22 @@ export async function init(ctx) {
         flyCam.seeded = false;
         prop.setBurner(false, 0, 1);
         bike = prop;
-        parkProp();
         ctx.cam?.releaseOverride?.();
         /* SAME ORDERING AS flyEnd, and this path is the worse-shaped
            one: maxDrop 3 will happily find a crown top under his head,
            so he would be snapped onto canopy the emit is about to
-           remove. Crowns down first, then snap onto what is left. */
+           remove. Crowns down first, then snap onto what is left.
+
+           AND parkProp() IS INSIDE THAT RULE NOW, not above it. Its
+           probe is a downward ray from just over the machine (see H in
+           parkProp) rather than the terrain raster, and a balloon that
+           has just come down on a beech is standing on a crown box —
+           so parking before the emit would solve the pose against a
+           body that is deleted three lines later and moor the machine
+           in mid-air, in a spot that then persists through
+           state.rides.parked. One order satisfies both readers. */
         ctx.bus?.emit('wally:fly', { flying: false, phase: 'off', ride: 'balloon' });
+        parkProp();
         if (controller) {
           controller.snapToGround(3);
           root.position.copy(controller.position);
@@ -6008,6 +6169,9 @@ export async function init(ctx) {
       /* parkProp's own raw pitch, at parkProp's own position, from
          parkProp's own pair of contact samples */
       gradientDeg: L.gradientDeg ?? null,
+      /* WHICH SURFACE, so a roof park can be told from a hill park
+         without inferring it from the numbers. See H() in parkProp. */
+      onStructure: L.onStructure ?? null, rayY: L.rayY ?? null, rasterY: L.rasterY ?? null,
       wheelbase: L.base ?? null,
       pitchDeg: +(p.group.rotation.x * 180 / Math.PI).toFixed(2),
       clampDeg: +(PARK_PITCH_MAX * 180 / Math.PI).toFixed(1),
@@ -6833,8 +6997,99 @@ export async function init(ctx) {
   }
   update(1 / 60, 0);
 
+  /* ================================================================
+     THE MACHINES ARE BUILT NOW, NOT ON THE FRAME HE GETS ON ONE.
+
+     `props = {}` and buildProp()'s `if (props[key]) return` made every
+     ride lazy, which is the right instinct and the wrong frame: the
+     work does not go away, it lands on the first equip — and for the
+     balloon the first equip is flyPhase 'boarding', the one transition
+     in the game with no cut over it. Two costs land there together:
+     the machine's own construction (geometry, canvas textures,
+     materials — one-time JS), and, the first time it is DRAWN, the
+     GLSL compile and link of its programs.
+
+     Both are one-time, so the only question is which frame pays. Here
+     it is behind the boot bar, in a stage that already reports its own
+     milliseconds, on a screen nobody is playing yet.
+
+     THE SCOPE IS DELIBERATE, AND THE WIDER VERSION WAS TRIED AND
+     REJECTED WITH EVIDENCE: a blanket renderer.compile() warm pass
+     over the whole scene built 49 programs in 79.3 ms and city.gold
+     and sky.godrays still compiled in play anyway, because their
+     in-play draws carry different cacheKeys. This compiles the ride
+     props and nothing else, against the real scene, and the count it
+     returns is published so a rig can see whether it took.
+
+     compile(object, camera, targetScene) is r180's own targeted form,
+     and its two traversals are NOT symmetric: the first argument is
+     walked with plain traverse(), so a hidden prop group is reachable,
+     while the third is walked with traverseVisible() for lights and
+     supplies the environment — which is why the scene goes there and
+     the group goes first. Read both in vendor/three.module.js before
+     changing either argument; that asymmetry is the whole reason this
+     works on a prop that is visible:false.
+
+     AND THE ONE-PIXEL RENDER TARGET IS THE POINT OF THE WHOLE BLOCK.
+     Warming without it builds programs that are never used. Measured,
+     on this build: compile straight to the canvas produced a
+     balloon.envelope whose cacheKey differed from the one the first
+     board used at EXACTLY ONE of 67 tokens — 'srgb' where the drawn
+     frame wants 'srgb-linear' — so all seven programs compiled again
+     on the lift-off frame anyway, which is precisely the failure the
+     rejected scene-wide warm pass hit and could not explain. The
+     token is three.module.js:6979: a material's outputColorSpace is
+     renderer.outputColorSpace when there is NO render target bound and
+     LinearSRGBColorSpace when there is, and everything in this game is
+     drawn into the post chain's linear target. Binding any target for
+     the length of the compile is therefore the difference between a
+     warm pass and a waste of 90 ms.
+
+     DO NOT REACH FOR renderer.outputColorSpace INSTEAD. It was tried:
+     it moves that token AND a second one (a map's colour space is
+     resolved against the output space), so the key misses in a new
+     way and the programs compile in play regardless.
+
+     WHAT IT STILL DOES NOT CATCH, measured the same way:
+     balloon.envelope.depth. That is toon.js's userData.depthMaterial,
+     hung on the mesh as customDepthMaterial, and compile() only ever
+     looks at object.material — so it is built the first time the
+     shadow pass draws the envelope. One program instead of seven.
+     ================================================================ */
+  api.stats.rideWarm = (() => {
+    const t = performance.now();
+    let built = 0, programs = 0;
+    try {
+      for (const key of Object.keys(RIDE_BUILD)) { buildProp(key); built++; }
+      const r = ctx.renderer, cam = ctx.camera, scene = ctx.scene;
+      if (r && cam && scene && typeof r.compile === 'function') {
+        const before = r.info?.programs?.length ?? 0;
+        const wasRT = r.getRenderTarget();
+        const rt = new THREE.WebGLRenderTarget(1, 1);
+        try {
+          r.setRenderTarget(rt);
+          for (const key of Object.keys(props)) r.compile(props[key].group, cam, scene);
+        } finally {
+          r.setRenderTarget(wasRT);
+          rt.dispose();
+        }
+        programs = (r.info?.programs?.length ?? 0) - before;
+      }
+    } catch (e) {
+      /* A ride that will not build at boot must not take the character
+         down with it — buildProp is still lazy and still works. */
+      console.warn('[wally] ride warm failed:', e && e.message);
+    }
+    return { built, programs, ms: +(performance.now() - t).toFixed(1) };
+  })();
+
   api.stats.buildMs = +(performance.now() - t0).toFixed(1);
   console.log(`[wally] cell=${bodyGeo.userData.cell} tier=${tier} ${api.stats.triangles} tris, ${api.stats.vertices} verts, ${nb} bones, ${api.stats.buildMs} ms`);
+  /* THE WARM IS PRINTED, so it cannot quietly stop working. `programs 0`
+     with `built 4` means the compile found nothing new to build and the
+     lift-off frame is about to pay for it again — which is exactly the
+     state this block existed to leave behind. */
+  console.log(`[wally] rides warm: ${api.stats.rideWarm.built} built, ${api.stats.rideWarm.programs} programs, ${api.stats.rideWarm.ms} ms`);
 
   return api;
 }

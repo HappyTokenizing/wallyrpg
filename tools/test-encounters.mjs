@@ -41,7 +41,7 @@ import { dirname, join } from 'node:path';
 
 import DATA, {
   DAY_EVENTS, DAY_EVENT_BY_ID, ENCOUNTERS, ENCOUNTER_BY_ID,
-  TIPSTERS, AIRVIEW, EVENT_TUNING, NEWS_POOL, VENUE_LOC,
+  TIPSTERS, TIP_VOICE, AIRVIEW, EVENT_TUNING, NEWS_POOL, VENUE_LOC,
   LOC_BY_ID, CLIENT_BY_ID, ASSET_BY_ID, LOCATIONS,
 } from '../src/game/data.js';
 import { WX_NAMES } from '../src/game/events.js';
@@ -150,11 +150,22 @@ for (const e of ENCOUNTERS) {
 for (const id of Object.keys(TIPSTERS)) {
   ok(!!CLIENT_BY_ID[id], 'tipster ' + id + ' is a real person');
   ok(TIPSTERS[id] > 0 && TIPSTERS[id] < 1, 'tipster ' + id + ' is neither an oracle nor a liar', TIPSTERS[id]);
+  /* …AND HAS A MOUTH OF THEIR OWN. data.js tipVoice() falls back —
+     `V.verdict[who] || V.verdict.dot` and `V.pr[who] || 'their'` — so
+     a tipster added without a voice does not throw, it silently
+     speaks Dot's two lines in Dot's idiom while wearing somebody
+     else's name and portrait. Nothing else looks at this.
+     BRANCH: data.js tipVoice(), the `||` on both of those lines. */
+  ok(!!TIP_VOICE.pr[id], 'tipster ' + id + ' has a pronoun of their own');
+  const v = TIP_VOICE.verdict[id];
+  ok(!!v && Array.isArray(v.up) && v.up.length >= 2 && Array.isArray(v.down) && v.down.length >= 2,
+    'tipster ' + id + ' has their own verdicts, two each way — not Dot borrowed',
+    v ? v.up.length + ' up / ' + v.down.length + ' down' : 'no verdict entry');
 }
 ok(Object.values(TIPSTERS).some((v) => v > 0.7) && Object.values(TIPSTERS).some((v) => v < 0.45),
   'some people are worth listening to and some are not — otherwise the ledger says nothing');
 
-/* THE TWO SITING RULES, stated in data.js and enforced here. */
+/* THE THREE SITING RULES, stated in data.js and enforced here. */
 T('siting');
 {
   const storm = DAY_EVENT_BY_ID.storm;
@@ -174,6 +185,62 @@ T('siting');
   g.state.day = 12;
   force(g, 'strike');
   for (const l of strike.shut) eq(g.isOpen(l), false, 'the strike really does shut ' + l);
+}
+
+/* ---------------------------------------------------------------
+   RULE 3 — A TIP SITE WITHOUT A TIPSTER IN ITS ZONE IS A DEAD SITE.
+
+   The two rules above are about shutters and storm.shut, and data.js
+   claimed they covered the siting of encounters generally. They did
+   not: 'stadium' sat in wire.at while no TIPSTERS key was homed in
+   `stampede`, and that site could not fire once in any play-through.
+   Nothing failed, because a tip site is not a card the location hands
+   out — the location only opens the question.
+
+   THE BRANCH THIS EXERCISES, by line. events.js candidates():
+     `if (e.kind === 'tip' && !tipster(locId, st)) return false;`
+   and inside tipster(), the filter that makes it return null:
+     `if (c.home !== l.z) return false;`
+   So the reachability of a tip site is decided by CLIENTS.home
+   against LOCATIONS.z, in a file that never mentions either.
+
+   Asserted twice on purpose: once on the data, which says WHY when
+   it breaks, and once through the production path with every client
+   met and a legal day on the clock, which is the thing that is
+   actually true or false.
+   --------------------------------------------------------------- */
+{
+  const { g } = fresh(0x7195e);
+  g.state.day = 14;
+  g.state.time = 11 * 60;
+  for (const c of DATA.clients) g.clients.meet(c.id);
+  for (const e of ENCOUNTERS.filter((x) => x.kind === 'tip')) {
+    for (const locId of e.at || []) {
+      const l = LOC_BY_ID[locId];
+      const zone = l ? l.z : null;
+      const homed = Object.keys(TIPSTERS).filter((id) => CLIENT_BY_ID[id] && CLIENT_BY_ID[id].home === zone);
+      ok(homed.length > 0,
+        e.id + ': somebody who deals in rumours lives in ' + locId + "'s zone — " + zone,
+        homed.length ? homed.join(', ') : 'NOBODY is homed in ' + zone + ', so this site can never fire');
+      ok(g.events.tipster(locId) != null,
+        e.id + ': …and tipster() actually returns one at ' + locId,
+        g.events.tipster(locId));
+      ok(g.events.candidates(locId).some((x) => x.id === e.id),
+        e.id + ': …so it survives candidates() at ' + locId);
+    }
+  }
+  /* THE NEGATIVE BRANCH: the same call at a location in a zone that
+     has no tipster returns null, so the assertions above are passing
+     because of the homing and not because tipster() says yes to
+     everything. 'goldenheights' is the zone that has none — and it
+     has no tip site either, which is the correct pairing. */
+  const bare = LOCATIONS.find((l) => !Object.keys(TIPSTERS).some((id) => CLIENT_BY_ID[id] && CLIENT_BY_ID[id].home === l.z));
+  if (bare) {
+    eq(g.events.tipster(bare.id), null,
+      'tipster() returns null in a zone nobody deals in — ' + bare.id + ' / ' + bare.z);
+    ok(!(ENCOUNTER_BY_ID.wire.at || []).includes(bare.id),
+      'and no tip is sited there — ' + bare.id);
+  }
 }
 
 /* =====================================================================

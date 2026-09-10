@@ -1297,8 +1297,7 @@ async function browserHalf() {
          one bearing made 1.96 m/s and never got there, which is a
          green assertion about nothing. B5d is the test that WANTS the
          wind, and it sets it itself. */
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       WALLY.debug.balloon({ alt: 1, at: [o.x, world.heightAt(o.x, o.z) + 0.3, o.z] });
       WALLY.debug.balloon({ alt: o.alt });
       WALLY.debug.balloonStick(0, 0);
@@ -1365,7 +1364,7 @@ async function browserHalf() {
       }
       WALLY.debug.balloonStick(null, null);
       WALLY.debug.balloonHull('canvas');
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       return { deepest: +deepest.toFixed(2), deepestY, through, frames,
         minGap: +minGap.toFixed(2), deepVy, deepAlt,
         maxDrift: +maxDrift.toFixed(2), travel: +travel.toFixed(2),
@@ -1702,7 +1701,6 @@ async function browserHalf() {
       const FIT = WALLY.debug.balloonInfo().fit;
       const mkHit = () => ({ point: new T3.Vector3(), normal: new T3.Vector3(), distance: 0, tri: -1, body: 0, plane: false });
       const hit = mkHit();
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
       const run = async (x, z, ms) => {
         WALLY.debug.balloon({ alt: 1, at: [x, world.heightAt(x, z) + 0.3, z] });
         WALLY.debug.balloon({ alt: o.alt });
@@ -1766,7 +1764,7 @@ async function browserHalf() {
          with no building in reach. Without it "she did not reach the
          wall" is also true of a becalmed machine. */
       const openRun = open ? await run(open.x, open.z, 9000) : null;
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       return { at, open: openRun, openAt: open && { x: +open.x.toFixed(1), z: +open.z.toFixed(1), tries: open.tries } };
     }, {
       x: faces[0].startX, z: faces[0].startZ, dx: faces[0].dx, dz: faces[0].dz,
@@ -1871,8 +1869,7 @@ async function browserHalf() {
          the gusts move her twenty. Base wind at zero, and a hand on
          the stick holding station over the mark — horizontal only, so
          nothing here touches the sink rate or the flare. */
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       let site = null;
       for (let i = 0; i < 3000 && !site; i++) {
         const a = i * 2.399963, rr = 14 + (i % 46);
@@ -1888,7 +1885,7 @@ async function browserHalf() {
         }
         if (clear) site = { x, z, gy: world.heightAt(x, z), tries: i };
       }
-      if (!site) { WALLY.ctx.wind.setStrength(windWas); return { sampled, solidHigh, solidLow, site: null }; }
+      if (!site) { WALLY.ctx.wind.unpin(); return { sampled, solidHigh, solidLow, site: null }; }
       const CB = 2.60, CT = 7.20, CR = 2.10;         // crown base, top, radius
       const mat = new T3.Matrix4().makeTranslation(site.x, site.gy + (CB + CT) / 2, site.z);
       const id = phys.addOBB(CR * 2, CT - CB, CR * 2, mat, { name: 'test.canopy', prop: true });
@@ -1936,7 +1933,7 @@ async function browserHalf() {
       const withCanopy = await descend(11000);
       phys.remove(id);
       const without = await descend(11000);
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       return { sampled, solidHigh, solidLow, reach,
         topMax: tops.length ? Math.max(...tops) : null,
         topMed: tops.length ? tops.slice().sort((a, b) => a - b)[tops.length >> 1] : null,
@@ -2022,8 +2019,7 @@ async function browserHalf() {
       const T3 = WALLY.THREE, w = WALLY.ctx.wally, world = WALLY.ctx.world, phys = WALLY.ctx.phys;
       const FIT = WALLY.debug.balloonInfo().fit;
       const hit = { point: new T3.Vector3(), normal: new T3.Vector3(), distance: 0, tri: -1, body: 0, plane: false };
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       /* open ground near where B5 left her, so nothing new streams in
          — see B5e's header for what happened the time it did */
       let site = null;
@@ -2041,7 +2037,7 @@ async function browserHalf() {
         }
         if (clear) site = { x, z, gy: world.heightAt(x, z), tries: i };
       }
-      if (!site) { WALLY.ctx.wind.setStrength(windWas); return { site: null }; }
+      if (!site) { WALLY.ctx.wind.unpin(); return { site: null }; }
       const W = 0.8, PB = 7.0, PT = 18.0, OFF = 1.7, ALT = 4.0;
       const mat = new T3.Matrix4().makeTranslation(site.x, site.gy + (PB + PT) / 2, site.z);
       const id = phys.addOBB(W, PT - PB, W, mat, { name: 'test.mast', prop: true });
@@ -2166,7 +2162,7 @@ async function browserHalf() {
       const gone = phys.raycast(new T3.Vector3(site.x - 6, site.gy + (PB + PT) / 2, site.z),
         new T3.Vector3(1, 0, 0), 12, hit);
       const without = await pass(7000, 'canvas');
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       return { site: { x: +site.x.toFixed(1), z: +site.z.toFixed(1), gy: +site.gy.toFixed(2), tries: site.tries },
         W, PB, PT, OFF, ALT, reach, goneAfterRemove: !gone, canvas, ladder, without,
         hCanvas, hLadder, hWithout: await hover(8000, 'canvas') };
@@ -2255,8 +2251,7 @@ async function browserHalf() {
          was read. This does not becalm the air (the gust machine runs
          on its own), which is why the site is clear over a
          neighbourhood and not just at a point. */
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       WALLY.debug.balloon({ alt: 20, at: [S.x, S.y + 2, S.z] });
       await new Promise((r) => setTimeout(r, 200));
       const from = [w.position.x, w.position.z];
@@ -2287,7 +2282,7 @@ async function browserHalf() {
         if (s.phase === 'off') break;
       }
       WALLY.debug.balloonStick(null);
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       const st = w.rideState;
       const spot = WALLY.ctx.game.actions.parkSpot('balloon');
       const p = WALLY.ctx.wally.rideProps.balloon;
@@ -2558,10 +2553,9 @@ async function browserHalf() {
          finishes on real ground, and the air's own effect is claimed by
          the replay below, at full strength, where it belongs. */
       const flown = await descend(true, start);
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       const drifted = await descend(false, openStart);
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       const air = await driftWindow(12);
       return { name: l.n, h: l.size.h, size: l.size, terrain: +terrain.toFixed(2),
         ground: flown.settled ? flown.settled.ground : null,
@@ -2761,8 +2755,7 @@ async function browserHalf() {
       /* AND HOLD THE AIR STILL. This assertion is about the park
          solve, not about drift; §2.3's wind is asserted elsewhere and
          restored below. */
-      const windWas = WALLY.ctx.wind.strength;
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       WALLY.ctx.game.actions.grantRide('balloon');
       const gy = world.heightAt(best.x, best.z);
       WALLY.debug.balloon({ alt: 4, at: [best.x, gy + 4, best.z] });
@@ -2784,7 +2777,7 @@ async function browserHalf() {
             vy: s.vy, ref: s.refusing, lw: s.landWanted, burn: s.burner, g: s.ground });
         }
       }
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       const p = WALLY.ctx.wally.rideProps.balloon;
       p.group.updateMatrixWorld(true);
       const res = [];
@@ -2997,10 +2990,9 @@ async function browserHalf() {
       await page.waitForTimeout(7000);
       const pre = await page.evaluate((S) => {
         WALLY.debug.balloonStick(0, 0);
-        const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
-        WALLY.ctx.wind.setStrength(0);
+        WALLY.ctx.wind.pin(0);
         WALLY.debug.balloon({ alt: 20, at: [S.x, S.y + 2, S.z] });
-        return { windWas, shore: Math.round(WALLY.ctx.world.shoreDistAt(S.x, S.z)),
+        return { shore: Math.round(WALLY.ctx.world.shoreDistAt(S.x, S.z)),
           water: WALLY.ctx.world.isWater(S.x, S.z) };
       }, site);
       ok(!pre.water && pre.shore >= site.radius + 160,
@@ -3023,7 +3015,7 @@ async function browserHalf() {
       const done = await page.waitForFunction("WALLY.debug.balloonInfo().phase === 'off'", null, { timeout: 60000 })
         .then(() => true).catch(() => false);
       await page.waitForTimeout(700);         // a few follow frames after the hand-back
-      await page.evaluate((v) => WALLY.ctx.wind.setStrength(v), pre.windWas);
+      await page.evaluate(() => WALLY.ctx.wind.unpin());
       const T3 = await page.evaluate(() => { const t = window.__S; window.__S = null; return t; });
       ok(done, 'the landing completed rather than hanging aloft — she had somewhere to come down',
         `${T3.length} frames tracked`);
@@ -3113,10 +3105,50 @@ async function browserHalf() {
        two things that were tuned against the closed haze have to open
        with it. Both are asserted AT BOTH ALTITUDES, because a number
        that is only ever read at 200 m will agree with itself.
-       REVERT CHECK: take the hazeK multiplier out of toon.js's
-       cullHulls and the drawn count at 200 m goes back to 89 of 517;
+       REVERT CHECK, AND THE INK HALF OF IT IS DRIVEN RATHER THAN
+       QUOTED. The multiplier's entire effect on toon.js's budget is
+       cullFarNow = cullFar * hazeK, so setOutline({cullFar: 185/hazeK})
+       IS "no hazeK in cullHulls", switchable live. Driven at 200 m,
+       hazeK 4.6, three alternated pairs on one page load: shipping
+       420, 420, 420 of 630 against pre-fix 84, 84, 84 of 630. The
+       assertions below drive it. (The sea half is still a citation:
        take flySea() out of wally.js's lateUpdate and uWaveFade at
-       altitude is the authored 520/1400 again.
+       altitude is the authored 520/1400 again.)
+
+       ----------------------------------------------------------------
+       WHY THIS NO LONGER ASSERTS A *SHARE* OF THE HULLS. It used to
+       read `hullsDrawn > hulls * 0.7`, and that threshold was a fact
+       about the hull POPULATION, not about the picture. city.js's prop
+       merge converted ~95 always-drawn instanced hulls into
+       budget-tested plain ones, so the denominator went 508 -> 630
+       while the numerator went 439 -> 415-420, and a green assertion
+       turned red without one stroke moving that anybody can see.
+
+       The share is the wrong quantity, and there are three
+       measurements saying so (they are written up in full in
+       ART_DIRECTION §2.2 and src/render/toon.js's HULL BUDGET):
+
+         · of the 215 hulls retired at 200 m, 209 fail the SIZE test
+           and NONE fails the distance test; their bounding spheres are
+           a median 4.8 px across, p90 8.2. A 1.6 px stroke on a 4.8 px
+           object is a third of the object.
+         · budget on against budget off, paired in one page load with
+           the camera held, the wind pinned and the sea hidden, differ
+           by 99 px in 1.44 M — 0.007 % of the frame, and a fifth of
+           the frame-to-frame spread of the SAME arm.
+         · the same share at HEAD HEIGHT, where the game is played, is
+           0.40-0.56 over five locations. A 0.7 floor on the aerial
+           frame demands it be inked more completely than any walking
+           frame ever is, which is not a standard anybody set.
+
+       So what is asserted instead is (a) the ABSOLUTE stroke count,
+       the quantity that barely moved and the one a collapse actually
+       shows up in — the pre-fix arm draws 84 — and (b) the property
+       §2.2's sentence "an inked balloon over an un-inked island is
+       exactly the wrong way round" actually names: MORE of the island
+       must be inked from up there than from down here, in strokes and
+       in share. Measured: 394-423 strokes at 80-260 m against 249-352
+       on the ground, 0.63-0.67 against 0.40-0.56.
        ================================================================ */
     T('the frame at altitude');
     const alt = await page.evaluate(async () => {
@@ -3146,7 +3178,24 @@ async function browserHalf() {
       const AT = [w.x, w.y, w.z];
       for (let i = 0; i < 150; i++) { WALLY.debug.balloon({ at: AT }); await new Promise((r) => requestAnimationFrame(r)); }
       const air = snap();
-      return { ground, air };
+      /* THE REVERT, DRIVEN, HERE, AT ALTITUDE, ON THIS PAGE LOAD.
+         cullFarNow = cullFar * hazeK is the multiplier's whole effect
+         on the budget, so pinning cullFarNow back to the authored 185
+         is exactly the pre-fix cullHulls. Arms alternated so neither
+         is the one that happened to be measured last, and the shipping
+         value restored before anything else in this suite runs. */
+      const hold = async (n) => { for (let i = 0; i < n; i++) { WALLY.debug.balloon({ at: AT }); await new Promise((r) => requestAnimationFrame(r)); } };
+      const K = WALLY.ctx.mat.setOutline({}).hazeK;
+      const revert = [];
+      for (const armPre of [true, false, true]) {
+        WALLY.ctx.mat.setOutline({ cullFar: armPre ? 185 / K : 185 });
+        await hold(8);
+        const o = WALLY.ctx.mat.setOutline({});
+        revert.push({ pre: armPre, drawn: o.hullsDrawn, hulls: o.hulls, cullFarNow: o.cullFarNow });
+      }
+      WALLY.ctx.mat.setOutline({ cullFar: 185 });
+      await hold(8);
+      return { ground, air, revert, K };
     });
     near(alt.ground.out.hazeK, 1, 1e-6,
       'on the ground the haze multiplier is exactly one, so every outline number in toon.js is the number it was',
@@ -3155,9 +3204,28 @@ async function browserHalf() {
     ok(alt.air.out.hazeK > 3,
       'at 200 m the fog has been opened several times over', `${alt.air.out.hazeK}x, fog ${JSON.stringify(alt.air.fog)}`);
     ok(alt.air.out.cullFarNow > 600, 'so the ink reaches the far side of the island', `${alt.air.out.cullFarNow} m`);
-    ok(alt.air.out.hullsDrawn > alt.air.out.hulls * 0.7,
-      'and most of the island is inked from the air instead of a seventh of it',
-      `${alt.air.out.hullsDrawn} of ${alt.air.out.hulls} hulls`);
+    /* THE ABSOLUTE STROKE COUNT, not a share of a hull population that
+       city.js owns and re-partitions. 380 is a floor under a measured
+       394-423 across 80-260 m, and the arm this is guarding against —
+       the haze multiplier gone — draws 84. See the header. */
+    ok(alt.air.out.hullsDrawn > 380,
+      'and the island is inked from the air — in STROKES, the quantity a collapse actually shows up in',
+      `${alt.air.out.hullsDrawn} of ${alt.air.out.hulls} hulls, against 84 with the multiplier taken out and 394-423 measured over 80-260 m`);
+    /* AND THE COMPARISON THAT IS THE ACTUAL ART STANDARD: §2.2's "an
+       inked balloon over an un-inked island is exactly the wrong way
+       round" is a claim about ALTITUDE AGAINST GROUND, and it is
+       true of both the count and the share or it is not true at all.
+       Both sides come from the same page load and the same lens. */
+    ok(alt.air.out.hullsDrawn > alt.ground.out.hullsDrawn * 1.05
+       && (alt.air.out.hullsDrawn / alt.air.out.hulls) > (alt.ground.out.hullsDrawn / alt.ground.out.hulls),
+      'and MORE of it is inked from up there than from head height — in strokes AND in share, which is what "an inked balloon over an un-inked island" actually forbids',
+      `air ${alt.air.out.hullsDrawn}/${alt.air.out.hulls} = ${(alt.air.out.hullsDrawn / alt.air.out.hulls).toFixed(3)} against ground ${alt.ground.out.hullsDrawn}/${alt.ground.out.hulls} = ${(alt.ground.out.hullsDrawn / alt.ground.out.hulls).toFixed(3)}`);
+    /* THE REVERT, RUN RATHER THAN CITED. Both arms, alternated, at
+       altitude, on this page load. */
+    ok(alt.revert.filter((r) => r.pre).every((r) => r.drawn < 150)
+       && alt.revert.filter((r) => !r.pre).every((r) => r.drawn > 380),
+      'and it is the haze multiplier that does it: pin cullFarNow back to the authored 185 and the ink collapses, release it and it comes back — alternated, same lens, same frame budget',
+      alt.revert.map((r) => `${r.pre ? 'pre-fix' : 'shipping'} ${r.drawn}/${r.hulls} at cullFarNow ${r.cullFarNow}`).join(' · ') + ` (hazeK ${alt.K})`);
     /* the counter-case for the budget: minPx still throws away the
        things that are too small to carry a stroke */
     ok(alt.air.out.hullsDrawn < alt.air.out.hulls,
@@ -3276,11 +3344,10 @@ async function browserHalf() {
     const WRAPDRIVE = `(async (o) => {
       const w = WALLY.ctx.wally;
       WALLY.debug.balloonMist(1);
-      const windWas = WALLY.ctx.wind.uniforms.uWindStrength.value;
       /* the base wind held down so what is being measured is the wrap
          and not whether the air let her reach the plane at all. B13 is
          not a test about the wind; A2 is. */
-      WALLY.ctx.wind.setStrength(0);
+      WALLY.ctx.wind.pin(0);
       WALLY.debug.balloon(false);
       await new Promise((r) => requestAnimationFrame(r));
       WALLY.debug.balloonWrap({ k: o.k, dir: o.dir, alt: o.alt });
@@ -3298,15 +3365,18 @@ async function browserHalf() {
          can break. Two seconds of frames, watching the altitude over
          whatever surface is now under her. */
       const after = [];
+      /* THE TILE COUNT IS A TAPE, NOT AN INSTANT. See the assertion
+         below for what reading it once cost. */
+      const tiles = [];
       const t1 = performance.now();
       while (performance.now() - t1 < 2000) {
         await new Promise((r) => requestAnimationFrame(r));
         const f = w.flightState;
         after.push([+f.at[1].toFixed(2), +f.ground.toFixed(2), f.alt]);
+        tiles.push(WALLY.debug.worldStats().colliderTiles);
       }
-      const tiles = WALLY.debug.worldStats().colliderTiles;
       WALLY.debug.balloonStick(null, null);
-      WALLY.ctx.wind.setStrength(windWas);
+      WALLY.ctx.wind.unpin();
       return { wrapped: w.flightState.wraps > w0, frames, rec, after, tiles,
         endK: w.flightState.wrapK, mist: w.flightState.mistK, fog: w.flightState.fog };
     })`;
@@ -3352,9 +3422,69 @@ async function browserHalf() {
     ok(wraps.every((r) => r.after.every((f) => f[0] > f[1] + 1.0)),
       'and she is still flying two seconds later, above whatever is under her every frame of it — the streamer cannot drop her through the sea floor because she is never asked to stand on it',
       wraps.map((r) => `${r.name}: lowest ${Math.min(...r.after.map((f) => f[0])).toFixed(2)} m over a floor of ${r.after[0][1]}`).join(' · '));
-    ok(wraps.every((r) => r.tiles >= 9),
-      'and the collision window has refilled behind her — world.js finishes what the wrap forced one tile of, from the same centre, because she is now standing on it',
-      wraps.map((r) => `${r.name}: ${r.tiles} tiles`).join(' · '));
+    /* ================================================================
+       THE COLLISION WINDOW — AND WHY THIS IS A TAPE.
+
+       THE BUG THIS REPLACES WAS IN THE TEST, NOT IN THE STREAMER. The
+       old line read WALLY.debug.worldStats().colliderTiles ONCE, at a
+       wall-clock 2000 ms into a flight that is still moving at 5.3-5.7
+       m/s, and asserted >= 9. It read 9/8/9/9/9 and named a streaming
+       regression that is not there.
+
+       WHAT IS ACTUALLY HAPPENING, sampled every frame instead of once,
+       five bearings, three of them re-run for nine seconds each:
+
+         · the wrap's forced tile lands, then world.js refills the 3x3
+           window ONE TILE PER FRAME — 2,3,4,5,6,7,8,9 over SEVEN frames,
+           105-125 ms. That is exactly what wally.js's flyWrap header
+           says it does. It is finished 1.9 SECONDS before the old line
+           looked.
+         · then she keeps flying, and every time the focus crosses a
+           64 m tile boundary terrain.js re-centres: three tiles are
+           evicted in one frame and rebuilt one per frame, so the count
+           goes 9 -> 7 -> 8 -> 9 and nothing else. Watched for 9 s:
+           east re-centred at 2132 ms, west at 2146 ms, north at
+           6146 ms — 9 frames below 9 out of 541.
+         · the read at 2000 ms sits 130 ms in front of the east and
+           west crossings. Land the frames 6 % differently — a busier
+           box, a different viewport — and the single sample falls on
+           the 7 or the 8. One bearing in five, at random, for ever.
+
+       Neither named candidate is involved: worldStream() reports p50
+       0.1 ms, p95 0.1-0.3, worst 3.7-10.8 across all five, so the
+       budget is never starved, and trees.js's canopy streamer does not
+       touch colliderTiles at all.
+
+       SO ASSERT THE PROPERTY AND NOT THE INSTANT. The claim this test
+       is entitled to make is that the window CONVERGES behind her and
+       then stays converged except while it is legitimately re-centring
+       under a player who is still moving. Both halves, off the tape.
+       ================================================================ */
+    const fillFrame = (r) => r.tiles.indexOf(9);
+    ok(wraps.every((r) => fillFrame(r) >= 0 && fillFrame(r) <= 15),
+      'and the collision window refills behind her — world.js finishes what the wrap forced one tile of, from the same centre, because she is now standing on it, one tile a frame',
+      wraps.map((r) => `${r.name}: full after ${fillFrame(r) + 1} frames (${r.tiles.slice(0, 10).join(',')}...)`).join(' · '));
+    /* THE SECOND HALF IS A RECOVERY LENGTH, NOT A FLOOR ON THE COUNT,
+       and the difference is a step across a tile CORNER. A one-axis
+       step leaves 6 of the 9 in the keep-set and terrain.js builds one
+       in the same call, so the frame ends at 7 and the tape reads
+       9,7,8,9 — measured, on three bearings. A diagonal step that
+       crosses both boundaries on one frame leaves 4, so it reads
+       9,5,6,7,8,9. Asserting `min >= 7` would therefore have been a
+       fourth assertion that only holds on the bearings that happen not
+       to corner. What must never happen is that the window falls
+       behind and STAYS behind, so that is what is asserted: every dip
+       is over inside eight frames. */
+    const longestDip = (t) => { let m = 0, n = 0;
+      for (const v of t) { n = v < 9 ? n + 1 : 0; if (n > m) m = n; } return m; };
+    ok(wraps.every((r) => {
+      const t = r.tiles.slice(fillFrame(r));
+      return t.length > 30 && longestDip(t) <= 8
+        && t.filter((n) => n === 9).length >= t.length * 0.9;
+    }),
+      'and it STAYS full for the rest of the flight — the only dips are a window re-centring under a player who is still moving, each one over inside eight frames, never a window that fell behind and stayed behind',
+      wraps.map((r) => { const t = r.tiles.slice(fillFrame(r));
+        return `${r.name}: ${t.filter((n) => n === 9).length}/${t.length} frames at 9, longest dip ${longestDip(t)}, min ${Math.min(...t)}`; }).join(' · '));
     ok(true, 'REPORTED, not asserted: what forcing the arrival tile costs on the swap frame. It is a real hitch and it is machine- and load-dependent, so it is a number and not a gate',
       wraps.map((r) => `${r.name} ${r.rec.streamMs} ms`).join(' · ') + ` — one tile; nine cost 39.2 to 59.6 ms on the same rig, which is why it is one`);
 
@@ -3446,7 +3576,7 @@ async function browserHalf() {
     for (const [name, dir] of BEARINGS) {
       for (const alt of [22, 45, 140]) {
         await page.evaluate(`(async () => {
-          WALLY.ctx.wind.setStrength(0);
+          WALLY.ctx.wind.pin(0);
           WALLY.debug.balloonMist(1);
           WALLY.debug.balloonWrap({ k: 0.999, dir: ${JSON.stringify(dir)}, alt: ${alt}, drive: false });
           WALLY.debug.balloonStick(0, 0);
@@ -3473,7 +3603,7 @@ async function browserHalf() {
     const sightOff = [];
     for (const [name, dir] of BEARINGS) {
       await page.evaluate(`(async () => {
-        WALLY.ctx.wind.setStrength(0);
+        WALLY.ctx.wind.pin(0);
         WALLY.debug.balloonMist(0);
         WALLY.debug.balloonWrap({ k: 0.999, dir: ${JSON.stringify(dir)}, alt: 45, drive: false });
         WALLY.debug.balloonStick(0, 0);
@@ -3529,7 +3659,7 @@ async function browserHalf() {
     const step = () => page.evaluate('new Promise((r)=>requestAnimationFrame(()=>requestAnimationFrame(r)))');
     const seeIsland = async (mistOn, shotPath) => {
       await page.evaluate(`(async () => {
-        WALLY.ctx.wind.setStrength(0);
+        WALLY.ctx.wind.pin(0);
         WALLY.debug.balloonMist(${mistOn ? 1 : 0});
         WALLY.debug.balloonWrap({ k: 0.999, dir: [1, 0], alt: 45, drive: false });
         WALLY.debug.balloonStick(0, 0);

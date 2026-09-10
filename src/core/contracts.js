@@ -190,8 +190,11 @@ export function createBus() {
       field in the game.
 
    Every expensive feature still checks ctx.quality before switching
-   itself on. Tier is chosen at boot from a GPU probe and may be
-   forced with ?quality=low|med|high|ultra.
+   itself on. Tier is chosen at boot from a GPU probe, may be forced
+   with ?quality=low|med|high|ultra, and may be pinned per device from
+   the Settings menu — which RELOADS, because almost nothing in this
+   table can be re-applied to a world that is already built (see
+   qualityPin below, and the note over the Quality row in menus.js).
    ============================================================ */
 /* ============================================================
    THE PIXEL RATIO IS NOT A CONSTANT ANY MORE — AND WHY IT WAS ONE.
@@ -689,6 +692,69 @@ export const QUALITY_TIERS = {
   },
 };
 
+/* THE NAME OF A TIER, WITHOUT ITS PARENTHESIS — and why this is not a
+   convenience.
+
+   pickQuality labels the software-rasteriser tier 'med(sw)': a real
+   `med` in everything but its pixel ratio, which is pinned to 1. So
+   `q.name === 'med'` is FALSE on it, and every test written that way
+   drops it into the ELSE branch — which is the branch written for the
+   fastest hardware in the table. Both of the sites this file could
+   reach were doing exactly that: city.js handed a software rasteriser
+   56 cloths (the `high` count, against med's 40) and audio.js gave it
+   full music detail. Eight modules had each written their own private
+   copy of this one line; this is the copy they now share.
+
+   An unrecognised name collapses to 'high' rather than throwing,
+   because every caller uses the result as a table key and a missing
+   key must never be the thing that stops a frame. */
+export function tierName(n) {
+  const s = String(n ?? '').replace(/\(.*$/, '').trim();
+  return Object.hasOwn(QUALITY_TIERS, s) ? s : 'high';
+}
+
+/* ------------------------------------------------------------
+   THE SETTINGS MENU'S TIER PIN.
+
+   A tier cannot be re-applied live — cascades, grass, crowd, clouds,
+   cloth, MSAA and bloom are all built at init, across seven modules —
+   so the menu reloads the page with ?quality=<tier> (see menus.js).
+   The URL carries the choice across that one reload; this carries it
+   across the NEXT one, when the player opens the game again from a
+   bookmark with no query on it.
+
+   IT IS NOT IN THE SAVE, and that is not laziness: pickQuality runs
+   inside createContext, before game/save.js has read a byte, and
+   save.js deletes any settings key that is not in DEFAULT_SETTINGS.
+   Per-device is also the right scope — the tier is a fact about the
+   machine, not about the playthrough.
+
+   `?shot` runs ignore the pin outright. A capture rig must render the
+   tier the probe or the query string names, never one a human left
+   behind in that browser profile.
+   ------------------------------------------------------------ */
+const PIN_KEY = 'wally.quality.v1';
+
+/** The pinned tier name, or null when the player has not pinned one. */
+export function qualityPin(env) {
+  const g = env || (typeof globalThis !== 'undefined' ? globalThis : {});
+  let v = null;
+  try { v = g.localStorage?.getItem(PIN_KEY) || null; }
+  catch (e) { return null; }            // private mode, or file:// with storage off
+  return v && Object.hasOwn(QUALITY_TIERS, v) ? v : null;
+}
+
+/** Pin a tier for this device, or clear the pin with null. Returns it. */
+export function pinQuality(tier, env) {
+  const g = env || (typeof globalThis !== 'undefined' ? globalThis : {});
+  const ok = tier && Object.hasOwn(QUALITY_TIERS, tier) ? tier : null;
+  try {
+    if (ok) g.localStorage?.setItem(PIN_KEY, ok);
+    else g.localStorage?.removeItem(PIN_KEY);
+  } catch (e) { /* the reload's own ?quality= still carries this session */ }
+  return ok;
+}
+
 /* ============================================================
    WHAT KIND OF DEVICE IS THIS?
 
@@ -771,7 +837,52 @@ const OLD_MOBILE_GPU = /adreno\s*(\(tm\)\s*)?[1-5]\d\d\b|mali-t|powervr|videocor
    escape costs nothing on a real phone. Apple silicon is deliberately
    NOT here: an M-series part behind a touchscreen is an iPad, which is
    the exact string coincidence this is fixing. */
-const DESKTOP_DISCRETE = /geforce|\brtx\b|\bgtx\b|quadro|radeon (rx|pro)|\barc a\d/i;
+const DESKTOP_DISCRETE = /geforce|\brtx\b|\bgtx\b|quadro|radeon (rx|pro)|\barc\b/i;
+
+/* THE PARTS THAT ARE ACTUALLY FAST — the `high` promise, which is a
+   frame time, so this list is FAMILIES WITH A GENERATION NUMBER and
+   never a bare vendor word.
+
+   THE BUG IT REPLACES: a GTX 1650 (matched by `geforce gtx 1[6-9]`)
+   got `high`, and a Radeon RX 7900 XTX — some fifteen times its
+   throughput, and the fastest consumer card AMD sells — got `med`,
+   because no AMD consumer string was on the list at all. Every
+   Radeon that was not a `radeon pro` workstation part fell off the
+   end of the desktop branch, and so did every GeForce older than the
+   16 series, GTX 1080 included.
+
+   DESKTOP_DISCRETE IS DELIBERATELY NOT REUSED HERE. It exists to
+   answer a different question — "is this touchscreen thing really a
+   desktop?" — and it answers it with `/geforce/`, `/\bgtx\b/` and
+   `/radeon rx/`, which are true of a GT 710 and an RX 550. Promoting
+   on that list would hand `high` to parts that cannot hold 30 fps.
+
+   The four families, and what each one's slowest member is:
+     geforce rtx / rtx      RTX 3050, ~GTX 1660 Super
+     geforce gtx 1[6-9]xx   GTX 1650              (already here)
+     gtx 10[6-8]0           GTX 1060, faster than the 1650
+     radeon rx 6-9 xxx      RX 6400, ~GTX 1650    (RDNA2 and newer)
+     arc a/b xxx            Arc A380, ~GTX 1650
+     apple m[1-9]           M1                    (already here)
+
+   The Arc entry has to come BEFORE the `/intel|uhd|iris/` demotion
+   below or it never fires: an Arc reports as
+   "Intel(R) Arc(TM) A770 Graphics", the vendor test matches on
+   'intel', and the fastest GPU Intel makes lands on `low` next to a
+   UHD 620. It also has to tolerate the "(TM)" that sits between the
+   family and the model number — `\barc a\d` does not, which is why
+   DESKTOP_DISCRETE never promoted an Arc tablet either (fixed above).
+   `arc\s*(\(tm\)\s*)?[ab]\d{3}` requires the model number, so the
+   Meteor Lake / Lunar Lake integrated parts branded plain "Intel Arc
+   Graphics" and "Intel Arc 140V" do NOT match and keep `low`. */
+const FAST_GPU = new RegExp([
+  'apple m[1-9]',
+  'radeon pro',
+  'geforce rtx', 'rtx',
+  'geforce gtx 1[6-9]', 'gtx 10[6-8]0',
+  'radeon\\s+rx\\s*[6-9]\\d{3}', '\\brx\\s*[6-9]\\d{3}\\b',
+  'arc\\s*(\\(tm\\)\\s*)?[ab]\\d{3}',
+].join('|'), 'i');
 
 /* Probe the device and the GPU and pick a starting tier.
 
@@ -780,8 +891,9 @@ const DESKTOP_DISCRETE = /geforce|\brtx\b|\bgtx\b|quadro|radeon (rx|pro)|\barc a
    the player never sees the frame rate the game was designed at and
    has no reason to suspect a setting is responsible. The fast-GPU
    branch now returns 'high' — retuned above until it genuinely held
-   60 fps in the heaviest scene — and 'ultra' is reachable only
-   through ?quality=ultra.
+   60 fps in the heaviest scene — and 'ultra' is never PROBED for: it
+   is reachable only by asking for it, through ?quality=ultra or the
+   Quality row in Settings, which pins a tier and reloads.
 
    Headless SwiftShader reports as a software renderer and gets 'med':
    the old code gave it 'high' for "correct visuals", but every visual
@@ -791,11 +903,21 @@ const DESKTOP_DISCRETE = /geforce|\brtx\b|\bgtx\b|quadro|radeon (rx|pro)|\barc a
    pinned to pixelRatio 1: a software rasteriser is nothing but pixel
    cost, so the governor has nothing to find there.
 
-   ORDER MATTERS, and it is: forced -> software -> handheld -> desktop.
-   The software check stays first because a software rasteriser is the
-   binding constraint no matter what shape the window is; the handheld
-   checks come before the GPU-name list because that list is a list of
-   DESKTOP parts and a phone reaching it at all was the bug. */
+   ITS NAME IS 'med(sw)', AND THAT PARENTHESIS IS A TRAP FOR EVERY
+   CONSUMER OF ctx.quality.name. `name === 'med'` is false on it, so a
+   two-armed test hands the slowest renderer in the project the arm
+   written for the fastest. Compare through tierName(q.name), never
+   against the raw string.
+
+   ORDER MATTERS, and it is:
+   forced -> pinned -> software -> handheld -> desktop.
+   The software check stays first of the probes because a software
+   rasteriser is the binding constraint no matter what shape the
+   window is; the handheld checks come before the GPU-name list
+   because that list is a list of DESKTOP parts and a phone reaching
+   it at all was the bug. The player's own pin outranks every probe
+   and is outranked only by the query string — a rig must always be
+   able to name the tier it is capturing. */
 export function pickQuality(renderer, env) {
   const g = env || (typeof globalThis !== 'undefined' ? globalThis : {});
   const qs = new URLSearchParams((g.location && g.location.search) || '');
@@ -805,8 +927,25 @@ export function pickQuality(renderer, env) {
   const msaaOverride = qs.has('msaa') ? Math.max(0, Math.min(8, +qs.get('msaa') | 0)) : null;
   const withMsaa = (t) => (msaaOverride == null ? t : { ...t, msaa: msaaOverride });
 
+  /* Object.hasOwn, NOT a truthiness test on the lookup. `?quality=
+     constructor` (or toString, or valueOf, or __proto__) found a
+     PROTOTYPE member, spread a function into the tier, and returned an
+     object with no `name`, no `pixelRatio` and no `shadowSize`.
+     renderer.js then threw inside init, so ctx.render stayed null —
+     while main.js went on to publish __WALLY_READY__ true and the HUD
+     drew over an empty frame. Player-unreachable, but it is exactly
+     the shape of failure a harness reports as a passing boot. */
   const forced = qs.get('quality');
-  if (forced && QUALITY_TIERS[forced]) return withMsaa({ ...QUALITY_TIERS[forced] });
+  if (forced && Object.hasOwn(QUALITY_TIERS, forced)) {
+    return withMsaa({ ...QUALITY_TIERS[forced] });
+  }
+
+  /* The Settings menu's pin (see qualityPin above). Never on a `?shot`
+     run: a capture must render the tier its command line asked for. */
+  if (!qs.has('shot')) {
+    const pinned = qualityPin(g);
+    if (pinned) return withMsaa({ ...QUALITY_TIERS[pinned] });
+  }
 
   const gl = renderer.getContext();
   const dbg = gl.getExtension('WEBGL_debug_renderer_info');
@@ -819,8 +958,14 @@ export function pickQuality(renderer, env) {
   if (cls === 'phone' || cls === 'tablet') {
     if (OLD_MOBILE_GPU.test(name)) return withMsaa({ ...QUALITY_TIERS.low });
     /* A Windows tablet on integrated Intel is the same machine the
-       desktop branch already sends to `low`. */
-    if (/intel|uhd|iris/i.test(name)) return withMsaa({ ...QUALITY_TIERS.low });
+       desktop branch already sends to `low` — but the vendor word is
+       'Intel' on a discrete Arc too, and this test used to be the
+       reason the fastest GPU Intel makes landed on `low` next to a
+       UHD 620. The exemption is the fast list, not the word 'arc':
+       the integrated parts branded "Intel Arc Graphics" and "Intel
+       Arc 140V" carry no model number, fail FAST_GPU, and keep `low`
+       exactly as they did. */
+    if (/intel|uhd|iris/i.test(name) && !FAST_GPU.test(name)) return withMsaa({ ...QUALITY_TIERS.low });
     /* A touchscreen laptop with a real discrete GPU falls through to
        the desktop branch below, at any window size. Everything else
        handheld gets `med`, which is what a phone gets today — no
@@ -829,9 +974,7 @@ export function pickQuality(renderer, env) {
     if (!DESKTOP_DISCRETE.test(name)) return withMsaa({ ...QUALITY_TIERS.med });
   }
 
-  if (/apple m[1-9]|radeon pro|geforce rtx|geforce gtx 1[6-9]|rtx/i.test(name)) {
-    return withMsaa({ ...QUALITY_TIERS.high });
-  }
+  if (FAST_GPU.test(name)) return withMsaa({ ...QUALITY_TIERS.high });
   if (/intel|uhd|iris/i.test(name)) return withMsaa({ ...QUALITY_TIERS.low });
   return withMsaa({ ...QUALITY_TIERS.med });
 }

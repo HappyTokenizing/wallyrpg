@@ -401,7 +401,7 @@ page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
 
 await page.goto(pathToFileURL(OUT).href, { waitUntil: 'load', timeout: 60000 });
 const ready = await page
-  .waitForFunction('window.__WALLY_READY__ === true', { timeout: 45000 })
+  .waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 45000 })
   .then(() => true)
   .catch(() => false);
 await page.waitForTimeout(2500);
@@ -423,7 +423,7 @@ const perf = await page.evaluate(() => window.__WALLY_PERF__ || null).catch(() =
    tool in tools/ already uses. */
 if (ready) {
   await page.goto(pathToFileURL(OUT).href + '?shot=1', { waitUntil: 'load', timeout: 60000 });
-  await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 60000 }).catch(() => {});
+  await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 60000 }).catch(() => {});
   await page.waitForTimeout(1500);
 }
 const balloon = ready ? await page.evaluate(async () => {

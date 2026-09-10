@@ -1058,8 +1058,20 @@ export async function init(ctx) {
       return true;
     },
 
+    /* A DEBUG SETTER MUST NOT BE ABLE TO BREAK THE READER.
+       contracts.js's clamp is `v < a ? a : v > b ? b : v`, and both
+       comparisons are false for undefined, so clamp(undefined,0,3)
+       RETURNS undefined. foliageDensity() and foliageWind() called
+       with no argument therefore stored undefined into DENS.value /
+       uWindK.value, and stats()'s `+DENS.value.toFixed(2)` threw
+       TypeError for the rest of the session — an agent in the hunt
+       round quoted foliageStats() as evidence and got a dead reader
+       instead. Non-finite input is refused and the current value
+       returned, which is what a no-argument call obviously means. */
+
     /** Global density multiplier. Rebuilds the streamed field. */
     density(v) {
+      if (!Number.isFinite(v)) return DENS.value;
       DENS.value = clamp(v, 0, 3);
       for (const c of [...chunks.values()]) disposeChunk(c);
       warmUntil = performance.now() + WARM_FOR;
@@ -1068,6 +1080,7 @@ export async function init(ctx) {
 
     /** Global wind-response multiplier on every patched material. */
     windResponse(v) {
+      if (!Number.isFinite(v)) return uWindK.value;
       uWindK.value = clamp(v, 0, 3);
       trees.setWind(uWindK.value);
       return uWindK.value;

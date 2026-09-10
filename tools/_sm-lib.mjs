@@ -16,7 +16,39 @@
        cpu.*      every wrapped hook, summed within that frame
        outside    raw - sum(cpu) — everything that is not our JS:
                   present, vsync wait, compositor, GPU stall, browser
-       gpu        EXT_disjoint_timer_query_webgl2 over ctx.render.render
+       gpu        EXT_disjoint_timer_query_webgl2 over ctx.render.render.
+                  READ THE NEXT PARAGRAPH BEFORE YOU QUOTE THIS COLUMN.
+
+   `gpu` IS NOT GPU OCCUPANCY ON THIS RIG, AND THE NAME HAS BEEN LYING.
+   TIME_ELAPSED_EXT is *specified* as GPU time for the bracketed
+   commands. What ANGLE Metal hands back here is dominated by the
+   latency of getting the query resolved. Three runs, headless Chrome,
+   ANGLE Metal / Apple M1 Max, 1600x900, dpr 1, gpuMode 'frame',
+   deliberately taken at three different machine loads (2026-09-08):
+
+       1-min load     13      28      49
+       mean gpu     43.71   36.74   41.01  ms  <- barely moves
+       mean R.total  8.06   15.20   13.56  ms  <- the CPU span it wraps
+       mean raw     43.80  161.99   94.56  ms  <- the frame period
+       r(gpu,R.total) 0.29    0.11   -0.06
+       r(gpu,raw)             -0.15   -0.14
+
+   It sits near 40 ms whatever else happens; it correlates with the
+   render work it claims to time at |r| <= 0.29 and with the frame
+   period at |r| <= 0.15; and 40 ms of occupancy inside a frame this
+   project renders at 59.7 fps (16.7 ms, vsync-capped) is
+   arithmetically impossible. ~40 ms is two to three frames of pipeline
+   queueing, which is what it is.
+
+   SO: this column is a LATENCY. It is published under its right name
+   as `gpuQueryMs` and kept under the old name only because ten rigs in
+   tools/ read `r.gpu` and this file must not break them. Do not divide
+   pixels by it, do not call anything "GPU-bound" from it, do not
+   compare it between machines. read() carries the same warning as the
+   string `gpuMeaning` — print that beside any table showing the
+   column. The load-independent numbers in this record are `calls`,
+   `tris`, `dP/dG/dT`; the honest time numbers are the CPU spans
+   `R.gl0`, `R.post`, `R.shadowmap`.
 
    ORDERING. The recorder's rAF is registered AFTER main.js's, and each
    callback re-registers itself at its own top, so the batch order
@@ -233,11 +265,22 @@ export const INJECT = () => {
   P.stop = () => { P.on = false; drain(); return P.rec.length; };
   P.read = () => {
     drain();
-    const rec = P.rec.map(r => ({ ...r, gpu: P.gpu.has(r.f) ? +P.gpu.get(r.f).toFixed(3) : null }));
+    /* `gpuQueryMs` is the honest name; `gpu` is the same number under
+       the old one, kept because ten rigs in tools/ read r.gpu. See the
+       header — it is a query LATENCY, not occupancy. */
+    const rec = P.rec.map(r => {
+      const v = P.gpu.has(r.f) ? +P.gpu.get(r.f).toFixed(3) : null;
+      return { ...r, gpuQueryMs: v, gpu: v };
+    });
     const gp = {};
     for (const k in P.gpuPass) { const a = P.gpuPass[k].slice().sort((x, y) => x - y);
       gp[k] = { n: a.length, p50: +a[a.length >> 1].toFixed(3), p95: +a[Math.max(0, Math.ceil(a.length * 0.95) - 1)].toFixed(3), sum50: +a[a.length >> 1].toFixed(3) }; }
-    return { label: P.label, gpuMode: P.gpuMode, gpuPass: gp, gpuOK: P.gpuOK, gpuName: P.gpuName, long: P.long, rec,
+    return { label: P.label, gpuMode: P.gpuMode, gpuPass: gp, gpuOK: P.gpuOK, gpuName: P.gpuName,
+      gpuMeaning: 'gpu/gpuQueryMs = EXT_disjoint_timer_query TIME_ELAPSED, resolved LATENCY on ANGLE Metal, ' +
+        'NOT GPU occupancy: ~40 ms whatever the load, r(gpu,R.total) <= 0.29, r(gpu,raw) <= 0.15, ' +
+        'and larger than this project\'s 16.7 ms vsync frame. Do not divide pixels by it. ' +
+        'Use calls/tris and the CPU spans R.gl0/R.post/R.shadowmap.',
+      long: P.long, rec,
       quality: ctx.quality?.name, dpr: ctx.renderer.getPixelRatio(), size: [innerWidth, innerHeight] };
   };
   P.mark = (s) => { P.marks.push([performance.now(), s]); };

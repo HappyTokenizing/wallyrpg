@@ -481,10 +481,52 @@ export async function init(ctx) {
   let govSettle = GOV_BOOT;
   let govN = 0, govLate = 0, govLast = 0, govIgnored = 0, govFrame = -1;
   const govLog = [];
-  let prOverride = null;                 // debug / measurement pin
 
-  const glClamp = (pr, cssW, cssH) =>
-    Math.max(0.5, Math.min(pr, GL_LIMIT / Math.max(1, Math.max(cssW, cssH))));
+  /* ================================================================
+     ONE CLAMP, AND THE PIN IS STORED THROUGH IT.
+
+     THE BUG. There were two. The frame loop's clamp floored the ratio
+     at 0.5 and ceilinged it at GL_LIMIT / longest side; the debug pin
+     `WALLY.debug.pixelRatio(v)` floored at 0.25 and ceilinged at 8,
+     stored THAT in prOverride, and only then handed it to the first
+     clamp on its way to the renderer. So the number a measurement rig
+     set, the number governorState() reported back, and the number the
+     frame was drawn at were three things.
+
+     WHAT THAT COSTS. `pixelRatio(0.25)` and `pixelRatio(0.5)` are the
+     SAME CONDITION — both draw at 0.5 — while the pin, the log and
+     every table built off `governorState().override` say 0.25 and 0.5.
+     A two-arm A/B run at those ratios measures one arm twice and
+     reports the difference between two samples of the same frame as a
+     result. This project has already voided an experiment for exactly
+     that shape of mistake (the "becalmed" wind arm that measured
+     windier than the drifting one), and the fix is the same both
+     times: there must be nowhere left to set the value that does not
+     go through the clamp.
+
+     SO: PR_MIN / PR_MAX are the only bounds that exist, clampPR is the
+     only function that applies them, and prOverride can only be
+     assigned by setPin(), which stores what will actually be drawn.
+     `viewportState()` publishes the request beside it — `prPinWant`,
+     `prPin`, `prPinClamped` — so an arm that has collapsed into
+     another one says so in the same object a rig already reads. */
+  const PR_MIN = 0.5;                    // below this the frame is unreadable
+  const PR_MAX = 8;                      // and above it nothing can allocate
+  const clampPR = (pr, cssW, cssH) => Math.max(PR_MIN, Math.min(
+    Number.isFinite(+pr) ? +pr : 1, PR_MAX, GL_LIMIT / Math.max(1, Math.max(cssW, cssH))));
+
+  let prOverride = null;                 // debug / measurement pin, ALREADY CLAMPED
+  let prOverrideWant = null;             // ...and what was asked for
+
+  /* The one door into the pin. null / false hands the ratio back to
+     the governor. Returns the clamped value that will be drawn. */
+  function setPin(v) {
+    if (v == null || v === false) { prOverride = null; prOverrideWant = null; return null; }
+    const [cw, ch] = measure();
+    prOverrideWant = Number.isFinite(+v) ? +v : 1;
+    prOverride = clampPR(prOverrideWant, cw, ch);
+    return prOverride;
+  }
 
   /* The ceiling for THIS viewport. A megapixel budget, not a dpr
      constant: it is orientation-invariant and it self-limits on a big
@@ -495,15 +537,19 @@ export async function init(ctx) {
     const tierMax = Number.isFinite(q.pixelRatioMax) ? q.pixelRatioMax : (q.pixelRatio || 1);
     const budgetMpx = Number.isFinite(q.pixelBudget) ? q.pixelBudget : 1.6;
     const byBudget = Math.sqrt((budgetMpx * 1e6) / Math.max(1, cssW * cssH));
-    return glClamp(Math.max(1, Math.min(tierMax, dpr, byBudget)), cssW, cssH);
+    return clampPR(Math.max(1, Math.min(tierMax, dpr, byBudget)), cssW, cssH);
   }
   /* What the ladder asks for at step `i`, after the ceiling. */
   const stepRatio = (i, cssW, cssH) =>
     Math.min(PR_LADDER[Math.max(0, Math.min(PR_LADDER.length - 1, i))], pixelRatioCeiling(cssW, cssH));
 
   function maxPixelRatio(cssW, cssH) {
-    if (prOverride != null) return glClamp(prOverride, cssW, cssH);
-    return Math.max(0.5, stepRatio(govStep, cssW, cssH));
+    /* prOverride was clamped by setPin() against the viewport it was
+       set in; re-clamp here because the viewport can have changed
+       under it since (a rotation, a fullscreen flip). Same function,
+       so it is idempotent when nothing moved. */
+    if (prOverride != null) return clampPR(prOverride, cssW, cssH);
+    return clampPR(stepRatio(govStep, cssW, cssH), cssW, cssH);
   }
 
   function governorTick() {
@@ -647,6 +693,13 @@ export async function init(ctx) {
       pixelRatio: pr,
       /* what the tier would ALLOW here, vs what the ladder has earned */
       prCeiling: +pixelRatioCeiling(cw, ch).toFixed(3),
+      /* THE PIN, AS REQUESTED AND AS DRAWN. Two arms of an A/B whose
+         `prPin` matches are the same condition however different
+         their `prPinWant` looks. */
+      prPinWant: prOverrideWant,
+      prPin: prOverride,
+      prPinClamped: prOverrideWant != null && Math.abs(prOverrideWant - prOverride) > 1e-6,
+      prMin: PR_MIN, prMax: PR_MAX,
       prStep: PR_LADDER[govStep],
       prBudgetMpx: Number.isFinite(q.pixelBudget) ? q.pixelBudget : null,
       mpx: canvasEl ? +((canvasEl.width * canvasEl.height) / 1e6).toFixed(3) : null,
@@ -932,13 +985,19 @@ export async function init(ctx) {
     if (govOn) { govSettle = GOV_SETTLE; govN = 0; govLate = 0; govLast = 0; }
     return govOn;
   };
+  /* Returns the ratio the frame is ACTUALLY drawn at — which is not
+     always the one asked for, and a rig comparing two arms must
+     compare these and not its own inputs. viewportState() carries
+     prPinWant / prPin / prPinClamped for the same reason. */
   dbg.pixelRatio = (v) => {
-    prOverride = (v == null || v === false) ? null : Math.max(0.25, Math.min(8, +v || 1));
+    setPin(v);
     syncViewport(true);
     return renderer.getPixelRatio();
   };
   dbg.governorState = () => ({
-    on: govOn, override: prOverride,
+    on: govOn, override: prOverride, overrideWant: prOverrideWant,
+    overrideClamped: prOverrideWant != null && Math.abs(prOverrideWant - prOverride) > 1e-6,
+    prMin: PR_MIN, prMax: PR_MAX,
     step: govStep, ladder: PR_LADDER.slice(), cap: govCap,
     pixelRatio: renderer.getPixelRatio(),
     window: GOV_WINDOW, lateMs: GOV_LATE_MS, dropLate: GOV_DROP_LATE,
@@ -968,12 +1027,24 @@ export async function init(ctx) {
      event — which is the state the landscape bug was reported in. */
   dbg.viewportAuto = (on) => { vpAuto = on !== false; return vpAuto; };
   dbg.sun = (x, y, z) => csm.setSun(new THREE.Vector3(x, y, z).normalize());
+  /* ---- THE FAR CASCADE'S CADENCE, AND ITS A/B ----
+     `shadowCadence(1)` is the rule this replaced — every cascade
+     re-rendered every frame — and `shadowCadence(3)` is what ships;
+     both on one page load, same world, same clock, which is the
+     module-switch form contracts.js asks for rather than a quoted
+     before-number. `shadowStats(true)` reads and zeroes the counters,
+     so a window is `stats(true)` at the start, N frames, `stats(true)`
+     at the end. Counts, not milliseconds: renders and skips are
+     load-independent and the box is shared. See csm.js. */
+  dbg.shadowCadence = (n) => csm.setFarCadence(n);
+  dbg.shadowStats = (reset) => csm.stats(reset === true);
   dbg.renderInfo = () => ({
     calls: renderer.info.render.calls,
     tris: renderer.info.render.triangles,
     programs: renderer.info.programs?.length ?? 0,
     quality: q.name,
     cascades: csm.cfg.cascades,
+    farCadence: csm.cfg.farCadence,
   });
   if (window.WALLY) window.WALLY.debug = dbg;
 

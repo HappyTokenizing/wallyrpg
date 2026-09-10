@@ -28,7 +28,7 @@
 
 import * as THREE from '../../vendor/three.module.js';
 import { SEA, LAND } from '../core/palette.js';
-import { clamp } from '../core/contracts.js';
+import { clamp, tierName } from '../core/contracts.js';
 import { WORLD } from '../game/data.js';
 
 const MAX_DROPS = 220;
@@ -45,7 +45,7 @@ export function createFoam(ctx, shared) {
   /* ================================================================
      1. SHORE SKIRT
      ================================================================ */
-  const ANG = q.name === 'low' ? 192 : 384;   // angular samples round the island
+  const ANG = tierName(q.name) === 'low' ? 192 : 384;   // angular samples round the island
   const RAD = 7;                              // strips from sea to inland
   const INLAND = 7.5;                         // metres of wet sand painted
   const SEAWARD = 1.2;                        // metres past the crossing

@@ -805,6 +805,96 @@ export function createHud(ctx, ui) {
      page load. tools/touchtest.mjs drives it; nothing ships through it. */
   let anchorMode = 'slide';
 
+  /* ============================================================
+     THE PROMPT AND THE PILLS WANTED THE SAME BAND OF PIXELS.
+
+     projectPrompts() pins the chip's TOP EDGE at y = 12 (the box's
+     `top` is eh + 12 and the element is translate(-50%,-100%)), and
+     12 px is where .w-bar sits — `top:max(12px, safe-area)` — so the
+     chip's ceiling is the pill row's own line. Whenever the anchor
+     solve drives t up far enough to hit that ceiling under a cluster,
+     the chip lands ON the pills.
+
+     WHAT IT ACTUALLY COVERS — measured, not asserted. Standing at 28
+     doors and sweeping the boom through 16 azimuths at each,
+     WALLY.debug.keepOut('off'): 416 of the 447 samples that painted a
+     door chip put some of it over a .w-pills row. At the worst of
+     them (penthouse, boom warped to 270 deg, four metres off the
+     door) the chip covered 11,152 px2 of the rows, and inside that
+     the ENTIRE energy meter bar and an entire meter numeral — 100 %
+     of each element's own box. So the honest sentence is not "it
+     nudges the bars": at the top of the range it eats a whole pill.
+     Most samples are milder; the census counts overlap, not severity,
+     and the two are not the same claim.
+
+     The rule is a keep-out, not a smaller box. The box is solved in
+     clip space as five half-planes (see above) and a rectangle with a
+     hole in it is not a half-plane, so narrowing `top` globally would
+     push every prompt down, including the ones over empty sky in the
+     middle of the frame where no pill has ever been. Instead the
+     solve runs unchanged and the answer is nudged DOWN — and only
+     down, and only by prompts whose own width actually overlaps a
+     cluster's width. A chip displaced 40 px toward the player still
+     points at its door; a chip painted over the energy bar does not.
+
+     AND THE RECT IS THE WHOLE BAR, NOT THE PILL ROW. It was the pill
+     rows first, and the before/after pair said why that is not
+     enough: pushed 38 px, the chip cleared the pills and landed on
+     the OBJECTIVE STRIP directly beneath them — the one pointer this
+     file is allowed to have. Keeping out of a band and dropping the
+     chip onto the next band down is not a fix. So the rects are
+     .w-bar.left and .w-bar.right, which is exactly what
+     WALLY.debug.uiLayers() calls barLeft/barRight, read the way it
+     reads them: getBoundingClientRect plus a real visibility test.
+     They cover the pills, the objective strip and the lock strip
+     parked under it, and they grow and shrink with those on their
+     own. Hide-UI (opacity 0 + visibility hidden on .w-bar) and the
+     dialogue fade take the keep-out away with the bar, so a
+     screenshot with the HUD off gets the old framing back exactly.
+
+     Read at 8 Hz at the TOP of the frame, before this layer writes
+     anything, so it is one clean layout read per 125 ms and never a
+     write-then-read flush.
+     ============================================================ */
+  let keepOutMode = 'on';         // 'on' ships; 'off' is the pre-fix rule
+  const KEEP_PAD = 6;             // px of air under a row
+  const _keep = [];               // {x0,x1,y1} — the clusters to stay under
+  let keepT = 0;
+
+  const clusterShown = (el) => (typeof el.checkVisibility === 'function'
+    ? el.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+    : (() => {
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.display !== 'none' && +cs.opacity > 0.02;
+    })());
+
+  function measureKeepOut() {
+    _keep.length = 0;
+    if (keepOutMode !== 'on') return;
+    for (const el of [left, right]) {
+      if (!el || !clusterShown(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) continue;
+      _keep.push({ x0: r.left - KEEP_PAD, x1: r.right + KEEP_PAD, y1: r.bottom + KEEP_PAD });
+    }
+  }
+
+  /* The chip is translate(-50%,-100%) about (x, y), so its box is
+     [x - ew/2, x + ew/2] wide and its top edge is y - eh. Returns the
+     y that puts that top edge under every row it overlaps. */
+  function keepOutY(x, y, p) {
+    p.push = 0;
+    if (!_keep.length) return y;
+    const x0 = x - p.ew * 0.5, x1 = x + p.ew * 0.5, top = y - p.eh;
+    /* the widest cluster wins; a chip that overlaps both takes the lower */
+    for (const k of _keep) {
+      if (x1 <= k.x0 || x0 >= k.x1 || top >= k.y1) continue;
+      const d = k.y1 - top;
+      if (d > p.push) p.push = d;
+    }
+    return y + p.push;
+  }
+
   /* Just above his crown, and stable: position + height, not the head
      bone, which bobs with the walk cycle and would shake the label. */
   function playerAnchor(out) {
@@ -918,6 +1008,10 @@ export function createHud(ctx, ui) {
     const w = window.innerWidth, hgt = window.innerHeight;
     const B = anchorMode === 'slide' ? playerAnchor(_fall) : null;
     if (B) _mvp.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    /* the pill rows, before any of this frame's writes — one clean
+       layout read per 125 ms. See THE PROMPT AND THE PILLS above. */
+    keepT -= dt;
+    if (keepT <= 0) { keepT = 0.125; measureKeepOut(); }
     for (const [id, p] of prompts) {
       if (p.ttl !== Infinity) {
         p.ttl -= dt;
@@ -1007,12 +1101,55 @@ export function createHud(ctx, ui) {
       p.el.style.opacity = p.alpha.toFixed(3);
       if (p.alpha < 0.02) { p.el.style.visibility = 'hidden'; continue; }
       p.el.style.visibility = '';
-      p.el.style.left = Math.round(clamp(x, bx0, bx1)) + 'px';
-      p.el.style.top = Math.round(clamp(y, by0, by1)) + 'px';
+      /* the keep-out runs on the CLAMPED point — the one that is
+         actually painted — and can only move it down, never past the
+         bottom of the same box the solve was run against */
+      const fx = clamp(x, bx0, bx1);
+      const fy = Math.min(keepOutY(fx, clamp(y, by0, by1), p), by1);
+      p.el.style.left = Math.round(fx) + 'px';
+      p.el.style.top = Math.round(fy) + 'px';
       const s = 0.92 + 0.08 * p.alpha;
       p.el.style.transform = `translate(-50%,-100%) scale(${s.toFixed(3)})`;
     }
   }
+
+  /* ============================================================
+     A DOOR IS A PLACE ON THE GROUND, NOT A COLUMN OF AIR.
+
+     The reach test below was `Math.hypot(l.world.x - p.x, l.world.z -
+     p.z)` — two terms, no y — so "within 13 metres of the apartment"
+     was true of every point in an INFINITE VERTICAL CYLINDER over its
+     doorstep. Fly the balloon over the city and the prompt lights for
+     whatever is directly underneath; press it and enterDoor() ->
+     game.enter() succeeds, the place sheet opens, and the flight ends.
+     Measured on this build, one page load: balloon held at +60 m over
+     Dispatch, `ctx.ui.near` = 'trunkdepot', the chip painted, one E ->
+     interact `{path:'door', ok:true, why:'opened trunkdepot'}`, state
+     .loc 'trunkdepot', flying false, y 67.71 -> 7.97.
+
+     So the third term goes in, as a gate rather than inside the
+     hypot: horizontal reach decides WHICH building, and a vertical
+     band decides whether he is at its doorstep at all. Folding y into
+     the hypot instead would have let him in from 12 m up over a 12 m
+     apartment, which is the roof.
+
+     WHY 3 METRES. Everything a player can legitimately be standing on
+     at a door, measured on this build over all 28 locations:
+       · heightAt(door) - l.world.y = 0.00 for all 28, so l.world.y IS
+         the doorstep height and no extra height sample is needed here;
+       · terrain inside the reach ring is +0.60 m at its highest and
+         -0.32 m at its lowest, relative to that doorstep;
+       · a standing jump apexes 0.94 m;
+       · his feet sit ~0.25 m above the sampled ground.
+     Worst legitimate case 1.79 m; the band is 3.0 m either way. It is
+     geometry only — it does not ask whether he is flying — so nothing
+     here has to know about balloons, bikes or anything added later.
+
+     The fast-travel half of the same defect lives in ui.js and is not
+     this file's.
+     ============================================================ */
+  const DOOR_RISE = 3.0;           // metres above/below the doorstep
+  let doorReachMode = '3d';        // '3d' ships; 'flat' is the pre-fix rule
 
   /* ---- the automatic door prompt ---- */
   const DOOR = { id: null, loc: null };
@@ -1052,6 +1189,8 @@ export function createHud(ctx, ui) {
     let best = null, bestD = Infinity;
     for (const l of g.data.locations) {
       if (!g.known(l.id)) continue;
+      /* THE Y TERM — see A DOOR IS A PLACE ON THE GROUND above */
+      if (doorReachMode === '3d' && Math.abs(p.y - l.world.y) > DOOR_RISE) continue;
       const d = Math.hypot(l.world.x - p.x, l.world.z - p.z);
       const reach = Math.max(9, Math.hypot(l.size.w, l.size.d) * 0.5 + 5.5);
       if (d < reach && d < bestD) { bestD = d; best = l; }
@@ -1239,6 +1378,37 @@ export function createHud(ctx, ui) {
   }
 
   /* ============================================================
+     THE TWO REVERT SWITCHES FOR THIS ROUND, side by side with the
+     rules they replaced, drivable on ONE page load — contracts.js's
+     preferred form of proof, and the same shape as promptAnchor().
+
+       WALLY.debug.doorReach('flat')   the 2D cylinder, back
+       WALLY.debug.doorReach('3d')     shipping — the y term in
+       WALLY.debug.keepOut('off')      the chip ceiling back at y = 12
+       WALLY.debug.keepOut('on')       shipping — under the pill rows
+
+     Registered from THIS file rather than handed to ui.js to register,
+     because a switch whose only reader is a wrapper in a file this
+     round may not touch is a switch that ships dead. Both are also on
+     the returned object, so ui.js may wrap them later without either
+     side conflicting: the wrapper would install the same function.
+     Nothing ships through either name; both default to the fix.
+     ============================================================ */
+  function doorReach(mode) {
+    if (mode === '3d' || mode === 'flat') { doorReachMode = mode; updateDoor(); publishReach(); }
+    return doorReachMode;
+  }
+  function keepOut(mode) {
+    if (mode === 'on' || mode === 'off') { keepOutMode = mode; measureKeepOut(); }
+    return keepOutMode;
+  }
+  if (typeof window !== 'undefined' && window.WALLY) {
+    const d = window.WALLY.debug || (window.WALLY.debug = {});
+    d.doorReach = doorReach;
+    d.keepOut = keepOut;
+  }
+
+  /* ============================================================
      public
      ============================================================ */
   return {
@@ -1291,6 +1461,7 @@ export function createHud(ctx, ui) {
       }
       return anchorMode;
     },
+    doorReach, keepOut,
     /** WHAT THE BROWSER IS ACTUALLY PAINTING, per prompt: the chip's
         own box on screen, its computed opacity and visibility, and
         `t` — how far along lintel -> crown the anchor had to slide to
@@ -1312,6 +1483,9 @@ export function createHud(ctx, ui) {
           x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
           w: Math.round(r.width), h: Math.round(r.height),
           t: +p.t.toFixed(3), painted: on,
+          /* how far the pill keep-out had to move it down this frame;
+             0 means it never touched a row. THE PROMPT AND THE PILLS. */
+          push: Math.round(p.push || 0),
         });
       }
       return out;

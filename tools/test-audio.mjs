@@ -748,7 +748,7 @@ async function browserSuite() {
 
   try {
     await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'load', timeout: 45000 });
-    await page.waitForFunction('window.__WALLY_READY__ === true', { timeout: 30000 }).catch(() => {});
+    await page.waitForFunction('window.__WALLY_READY__ === true', null, { timeout: 30000 }).catch(() => {});
 
     const r = await page.evaluate(async () => {
       const a = window.WALLY?.ctx?.audio;
