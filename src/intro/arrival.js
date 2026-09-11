@@ -17,7 +17,7 @@
      bike        Second-hand Bicycle   speed 1     $180, rep 0
      scooter     Barnaby's Scooter     speed 1.5   quest q_side_scooter
      motorcycle  Thunderhead 900       speed 3     $3,300, rep 50
-     balloon     The Assessor          speed 2.2   $24,000, rep 75, 40 assets
+     balloon     The Happy Skies       speed 2.2   $24,000, rep 75, 40 assets
 
    The rung between the bicycle and the motorcycle is the SCOOTER. It
    is not for sale at any price — Barnaby signs it over — so a player
@@ -113,8 +113,8 @@ export const ARRIVAL = Object.freeze({
     id: 'balloon', clip: null, air: true,
     dist: 8.0, aimY: 1.15,
     /* 6.4 / 5.6, AND THE NUMBER WAS READ OFF THE FRAME. At the
-       bicycle's 1.45 / 1.55 a moored Assessor is 3.6 m from him and
-       about 10 m from the hero lens; balloon.js measures her at 3.2 m
+       bicycle's 1.45 / 1.55 the moored Happy Skies is 3.6 m from him
+       and about 10 m from the hero lens; balloon.js measures her at 3.2 m
        across and just under 4 tall, so she subtended nearly thirty
        degrees of a thirty-two degree lens and the envelope crossed the
        title lockup's own band. At 8.5 m from him she reads as a

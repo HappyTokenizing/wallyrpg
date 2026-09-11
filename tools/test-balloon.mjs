@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* ============================================================
-   tools/test-balloon.mjs — THE ASSESSOR, asserted.
+   tools/test-balloon.mjs — THE HAPPY SKIES, asserted.
 
        node tools/test-balloon.mjs            everything
        node tools/test-balloon.mjs --data     the node half only (fast)
@@ -276,6 +276,15 @@ const CLEAR_SITE = `((RADII) => {
 T('the ride table');
 ok(!!RIDES.balloon, 'RIDES.balloon exists');
 eq(RIDE_LIST.length, 4, 'four rides now');
+/* THE NAME, PINNED. Renamed from "The Assessor" by request from play.
+   The branch this exercises is RIDES.balloon.name / .n in
+   src/game/data.js. It is asserted rather than trusted because a
+   rename that reaches nine places out of ten reads as done and is
+   not — and every other line in this file now takes the name FROM
+   this row rather than spelling it, so this is the only copy of the
+   string left in the suite. */
+eq(RIDES.balloon.name, 'The Happy Skies', 'it is The Happy Skies (data.js RIDES.balloon.name)');
+eq(RIDES.balloon.n, RIDES.balloon.name, 'and the short form agrees with it');
 eq(RIDES.balloon.unlock.kind, 'buy', 'it is bought, not granted');
 eq(RIDES.balloon.price, RIDES.balloon.unlock.price, 'price mirrors unlock.price');
 
@@ -2883,12 +2892,27 @@ async function browserHalf() {
        All three come from the delivered camera, not from the rig's
        intentions.
 
-       BOTH BRANCHES, AND THAT IS THE POINT. flyCamera()'s corrective
-       damp only runs above 0.8 m/s of drift, so a boarding on a calm
-       day never reaches it and the SEED alone decides where the
-       camera spends the whole flight. The becalmed case is therefore
-       the one that can only be passed by a correct seed; the drifting
-       case is the one the drift could rescue. Asserted separately.
+       BOTH BRANCHES, AND THAT IS THE POINT. Under the rule that
+       shipped before this round, flyCamera()'s corrective damp only
+       ran above 0.8 m/s of drift, so a boarding on a calm day never
+       reached it and the SEED alone decided where the camera spent the
+       whole flight: the becalmed case could only be passed by a
+       correct seed and the drifting case was the one the drift could
+       rescue. THE SERVO IS GONE NOW (see THE BOOM HOLDS in wally.js
+       and B9d below), so every flight is the becalmed case and the
+       seed is the only thing that ever sets this rig's heading. Both
+       arms are kept: they are the same claim under both rules, and the
+       pair is what says the removal did not quietly rely on the air.
+
+       AND THE BECALMED ARM IS NOW ACTUALLY BECALMED. It called
+       wind.setStrength(0), which src/core/wind.js says in as many
+       words does not becalm anything — weather.js damps the base back
+       every frame and the gust term is never touched at all. So the
+       "BECALMED" label described nothing and the arm was a second
+       drifting boarding with a different number on it. It pins the
+       field instead, and both arms now fly a wind this file CHOSE
+       rather than one it happened to get; the measured |wind| is
+       printed beside each so the label can be checked against it.
 
        THE REVERT CHECK. Put the negations back in wally.js —
        `flyCam.yaw = Math.atan2( -_fv2.x, -_fv2.z )` — and BOTH
@@ -2923,7 +2947,10 @@ async function browserHalf() {
     async function boarding(windStrength, stick, label) {
       await page.evaluate(() => { try { WALLY.debug.balloon(false); } catch (e) {} WALLY.ctx.game.actions.equipRide(null); });
       await page.waitForTimeout(1200);
-      await page.evaluate((w) => WALLY.ctx.wind.setStrength(w), windStrength);
+      /* THE REAL PIN, not setStrength — see the header. `gust: 0`
+         matters as much as the strength: the gust term is the half
+         setStrength could never reach. */
+      await page.evaluate((w) => WALLY.ctx.wind.pin({ strength: w, gust: 0 }), windStrength);
       await page.waitForTimeout(2500);
       const wind = await page.evaluate(() => { const v = WALLY.ctx.wind.vector(0, 0); return +Math.hypot(v.x, v.z).toFixed(3); });
       await page.evaluate(TRACKER);
@@ -2965,6 +2992,146 @@ async function browserHalf() {
       ok(r.minBehind > -0.05,
         `${label}: and the lens never gets in FRONT of the subject, which is the seed's own signature`,
         `${r.minBehind.toFixed(3)} m behind at its worst`);
+    }
+
+    /* ================================================================
+       B9d. THE BOOM HOLDS — the player's report, and the rule that
+       answers it, driven against the rule it replaced ON ONE PAGE LOAD.
+
+       WHAT THE PLAYER SAID: "the camera seems to go crazy when I'm
+       flying it ... fix it to always be centered on him so it never
+       sways for any reason unless the user is purposefully changing
+       the camera angle."
+
+       WHAT IT WAS. wally.js's flyCamera() servoed the boom onto the
+       DRIFT heading, and the stick is read in the boom's own frame
+       (camRelative), so the boom chased a heading its own rotation
+       pushed away. A player holding one key got a camera that rotated
+       on its own until the boom and the WIND agreed. THE BRANCH THIS
+       EXERCISES is the `if (flyYawRule === 'drift')` block in
+       flyCamera(); WALLY.debug.flyCamRule('drift') restores it live.
+
+       WHY IT HAS TO BE THE KEYBOARD. WALLY.debug.balloonStick writes
+       the drift wish in WORLD space, downstream of camRelative — so a
+       stick-driven arm cannot close the loop and would report the
+       shipping number under both rules. This drives KeyW through the
+       page, which is the only input path with the camera basis in it.
+
+       ARMS ALTERNATED, hold/drift/hold, in one flight, so the pair is
+       not two runs an hour apart: this project called a regression
+       that did not exist doing exactly that. The fourth arm is the
+       counter-case, and without it the first three pass for a rig that
+       has been nailed down: the player steers 30 degrees and the boom
+       must deliver them. */
+    T('the boom holds');
+    {
+      const HOLD_S = 7000;
+      /* AND IT PUTS THE WORLD BACK. This block flies her half a minute
+         across the island and steers the camera thirty degrees, and
+         B11 two sections down measures how much of the ISLAND is inked
+         from a frame whose contents are a function of where she is and
+         which way the lens is pointing. Nothing downstream re-pins her,
+         so a test that wanders is a test that rewrites its neighbours'
+         inputs: adding this block moved B11's stroke count 394-423 ->
+         365 without a stroke of anybody's changing. Position, ride and
+         boom azimuth are recorded here and restored at the end. */
+      const home = await page.evaluate(() => {
+        const p = WALLY.ctx.wally.position;
+        return { at: [p.x, p.y, p.z], yaw: WALLY.ctx.cam.yaw };
+      });
+      await page.evaluate(() => {
+        try { WALLY.debug.balloon(false); } catch (e) {}
+        WALLY.ctx.game.actions.equipRide(null);
+        /* A WIND THE TEST CHOSE. The defect is a loop between the air
+           and the boom, so an arm flown in still air proves nothing —
+           and 'still' was never what setStrength meant anyway. */
+        WALLY.ctx.wind.pin({ strength: 1.0, gust: 0, dir: 0.9 });
+      });
+      await page.waitForTimeout(2200);
+      await page.evaluate(() => {
+        const g = WALLY.ctx.game; g.actions.grantRide('balloon'); g.actions.equipRide('balloon');
+      });
+      await page.waitForTimeout(9000);            // through the inflation, into cruise
+      const wind = await page.evaluate(() => { const v = WALLY.ctx.wind.vector(0, 0); return +Math.hypot(v.x, v.z).toFixed(3); });
+      /* a player's hands: the canvas has the focus and W is held on it */
+      await page.click('canvas', { position: { x: 400, y: 320 } }).catch(() => {});
+      await page.keyboard.down('KeyW');
+
+      const arms = [];
+      for (const [rule, steerDeg] of [['hold', 0], ['drift', 0], ['hold', 0], ['hold', 30]]) {
+        const a = await page.evaluate((r) => {
+          WALLY.debug.flyCamRule(r);
+          const c = WALLY.debug.balloonCam();
+          return { travel: c.travelDeg, steer: c.steerDeg, rule: c.yawRule };
+        }, rule);
+        if (steerDeg) {
+          /* the player, purposefully changing the camera angle — the
+             same public call ui/touch.js's drag and camera.js's Q/E
+             both land on */
+          for (let i = 0; i < 10; i++) {
+            await page.evaluate((d) => WALLY.ctx.cam.steer(d * Math.PI / 180), steerDeg / 10);
+            await page.waitForTimeout(HOLD_S / 10);
+          }
+        } else await page.waitForTimeout(HOLD_S);
+        const b = await page.evaluate(() => {
+          const c = WALLY.debug.balloonCam();
+          return { travel: c.travelDeg, steer: c.steerDeg, alt: WALLY.ctx.wally.flightState.alt, drift: WALLY.ctx.wally.flightState.drift };
+        });
+        arms.push({ rule, asked: steerDeg, travel: +(b.travel - a.travel).toFixed(2),
+          steered: +(b.steer - a.steer).toFixed(2), alt: +(b.alt || 0).toFixed(1),
+          drift: +(b.drift || 0).toFixed(3) });
+      }
+      await page.keyboard.up('KeyW');
+      await page.evaluate(() => { WALLY.debug.flyCamRule('hold'); WALLY.ctx.wind.unpin(); });
+      const line = arms.map((a) => `${a.rule}${a.asked ? '+steer' + a.asked : ''} ${a.travel} deg`).join(' · ');
+      const h1 = arms[0], dr = arms[1], h2 = arms[2], st = arms[3];
+
+      /* THE PRECONDITION, asserted rather than assumed: an arm flown
+         in dead air would show no sway under either rule and three of
+         the assertions below would pass for that reason.
+
+         AND IT IS THE DRIFT, NOT THE WIND. This read `wind > 0.4` for
+         one run and went red at 0.327 with the servo swinging the boom
+         76.15 degrees in the same arm — a precondition failing while
+         the thing it was guarding worked perfectly. wind.pin's
+         `strength` is an AMPLITUDE, not a speed at a point, so the
+         number it produces at (0, 0) is not the quantity this cares
+         about. The servo reads hypot(vx, vz) — the machine's own drift
+         — and fades in over 0.35 to 1.30 m/s of it, so that is what
+         has to be above the floor, and it is read off the machine. */
+      ok(dr.drift > 0.35 && dr.travel > 5,
+        'the drift arm was genuinely flown in drift the servo could chase — it fades in over 0.35 m/s, and under that an arm would show nothing under EITHER rule',
+        `${dr.drift} m/s of drift (|wind| ${wind}), ${dr.travel} deg of boom travel under the old rule`);
+      ok(h1.travel < 0.5 && h2.travel < 0.5,
+        'BOOM HOLDS: with the stick held and the camera untouched the boom does not move, in either hold arm',
+        `${h1.travel} deg and ${h2.travel} deg over ${HOLD_S / 1000} s each · ${line}`);
+      ok(dr.travel > h1.travel * 10 + 4,
+        'and the rule it replaced swung it, on the same flight, in the same air, between those two arms',
+        `drift ${dr.travel} deg vs hold ${h1.travel} / ${h2.travel} deg`);
+      ok(h1.steered < 0.5 && dr.steered < 0.5,
+        'neither arm was steered by the player — so the travel above is the rig moving itself, which is the whole complaint',
+        `${h1.steered} / ${dr.steered} deg asked for`);
+      near(st.travel, st.asked, 3.0,
+        'AND IT IS NOT NAILED DOWN: the player asks for 30 degrees through ctx.cam.steer and the boom delivers them — "unless the user is purposefully changing the camera angle"',
+        `asked ${st.asked}, steered ${st.steered}, boom travelled ${st.travel} deg`);
+
+      /* --- put it back. See the note at the top of this block. --- */
+      const back = await page.evaluate((h) => {
+        WALLY.debug.balloon(false);
+        WALLY.ctx.game.actions.equipRide(null);
+        WALLY.ctx.wally.setPosition(h.at[0], h.at[1], h.at[2]);
+        let d = h.yaw - WALLY.ctx.cam.yaw;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        WALLY.ctx.cam.steer(d);
+        const p = WALLY.ctx.wally.position;
+        return { off: +Math.hypot(p.x - h.at[0], p.z - h.at[2]).toFixed(2),
+          yawOff: +(((WALLY.ctx.cam.yaw - h.yaw) * 180 / Math.PI + 540) % 360 - 180).toFixed(1) };
+      }, home);
+      await page.waitForTimeout(1200);
+      ok(back.off < 2.0 && Math.abs(back.yawOff) < 2.0,
+        'and this block leaves the world where it found it, so the sections after it are measuring their own subject and not this one',
+        `${back.off} m from home, boom ${back.yawOff} deg off`);
     }
 
     /* --- and the other end of it ---
@@ -3723,7 +3890,7 @@ if (fails.length) {
   process.exit(1);
 }
 console.log(`PASS — ${pass} assertions green.   load ${LOAD}`);
-console.log(`  The Assessor · $${RIDES.balloon.price} · rep ${RIDES.balloon.unlock.rep} · `
+console.log(`  ${RIDES.balloon.name} · $${RIDES.balloon.price} · rep ${RIDES.balloon.unlock.rep} · `
   + `${RIDES.balloon.unlock.assets}/${CONFIG.totalAssets} assets · at the ${LOC_BY_ID.treasury.n}`);
 console.log(`  climb ${FLIGHT.vMaxUp} m/s · sink ${FLIGHT.vMaxDown} m/s · drift ${FLIGHT.reach} m/s `
   + `· tau ${(1 / FLIGHT.hLag).toFixed(1)} s · ${FIT.TOP} m tall`);

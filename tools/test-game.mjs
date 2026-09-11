@@ -1456,6 +1456,109 @@ T('the rides table');
     ok(!g.actions.buyRide('motorcycle').ok, 'you cannot buy a second one');
   }
 
+  /* ------------------------------------------------------------
+     THE HAPPY SKIES — and the two gates that are NOT money.
+
+     WHY THIS IS HERE AT ALL. A probe read `assetsHave: 0` and
+     `buyable: true` off actions.rideById('balloon') and reported the
+     forty-asset gate as decorative. It is not: `buyable` is a
+     CATEGORY (see game.js rideView) meaning "sold for money at all",
+     which is false for the scooter and true for every other row
+     regardless of whether he may have one today. The permission is
+     canBuyRide().ok, and buyRide() calls it before it takes a dollar.
+
+     WHICH LINE EACH ARM EXERCISES (rule 2). The assets arm is
+     game.js canBuyRide's `if (have < need)`; the rep arm is the
+     `if ((u.rep || 0) > st.rep)` above it. BOTH SIDES OF BOTH, at
+     the boundary and one short of it, because a test that only
+     checks the refusing side proves a gate that is stuck shut just
+     as happily as one that works.
+
+     THE CLOCK IS NOT DECORATION EITHER. The Treasury opens at 09:00
+     and a fresh game starts at 07:00, so `enter('treasury')` fails
+     on hours alone and every later assertion would then be passing
+     off the WRONG refusal. enter() is checked, not assumed.
+     ------------------------------------------------------------ */
+  {
+    const need = RIDES.balloon.unlock.assets;
+    const repNeed = RIDES.balloon.unlock.rep;
+    eq(need, 40, 'the balloon is gated on forty tokenized assets');
+    eq(repNeed, 75, 'and on reputation 75');
+    ok(need < CONFIG.totalAssets, 'which is less than the whole city', `${need}/${CONFIG.totalAssets}`);
+
+    /* one game, one page load, both arms driven on it in turn — no
+       comparing a number from one run against a number from another */
+    const g = createGame({ seed: 61, autosave: false });
+    g.state.money = RIDES.balloon.price * 2;
+    g.state.rep = repNeed;
+    g.state.time = 600;                 // 10:00, inside 09:00-15:00
+    g.state.known.treasury = true;
+    g.state.tokenized = {};
+    const ent = g.enter('treasury');
+    ok(ent.ok, 'standing in the City Treasury with the money', ent.why);
+    eq(g.state.loc, 'treasury', 'and that is really where he is');
+
+    const tokenizeTo = (n) => {
+      g.state.tokenized = {};
+      for (let i = 0; i < n; i++) g.state.tokenized[ASSETS[i].id] = true;
+      return Object.keys(g.state.tokenized).length;
+    };
+
+    /* --- THE ASSET ARM, both sides of the boundary --- */
+    eq(tokenizeTo(0), 0, 'nothing tokenized');
+    ok(!g.actions.canBuyRide('balloon').ok, 'at 0 assets he may not buy it');
+    ok(/tokenized/i.test(g.actions.canBuyRide('balloon').why), 'and it is the asset gate that says no',
+      g.actions.canBuyRide('balloon').why);
+    ok(g.actions.rideById('balloon').buyable,
+      'BUT the row is still `buyable`, because that word means "for sale at all" and not "yours"');
+    eq(g.actions.ridesFor('treasury').filter((r) => r.id === 'balloon').length, 1,
+      'so it stays on the Treasury shelf as a goal with a distance on it');
+    eq(g.actions.rideById('balloon').assetsHave, 0, 'and the row carries how far through the gate he is');
+
+    eq(tokenizeTo(need - 1), need - 1, 'thirty-nine tokenized — one short');
+    ok(!g.actions.canBuyRide('balloon').ok, 'at 39 assets he STILL may not buy it');
+    ok(/39/.test(g.actions.canBuyRide('balloon').why), 'and the refusal counts them for him',
+      g.actions.canBuyRide('balloon').why);
+    const moneyBefore = g.state.money;
+    const denied = g.actions.buyRide('balloon');
+    ok(!denied.ok, 'buyRide() refuses it too — the gate is not display-only');
+    ok(!g.state.rides.owned.balloon, 'nothing was bought');
+    eq(g.state.money, moneyBefore, 'and not a dollar moved');
+
+    /* --- THE REP ARM, both sides, at 40 assets so it is alone --- */
+    eq(tokenizeTo(need), need, 'forty tokenized — the asset gate is open');
+    g.state.rep = repNeed - 1;
+    ok(!g.actions.canBuyRide('balloon').ok, 'at reputation 74 he may not buy it');
+    ok(/reputation/i.test(g.actions.canBuyRide('balloon').why), 'and now it is reputation that says no',
+      g.actions.canBuyRide('balloon').why);
+    g.state.rep = repNeed;
+    ok(g.actions.canBuyRide('balloon').ok, 'at reputation 75, with forty assets, he may',
+      g.actions.canBuyRide('balloon').why);
+
+    /* --- and the place, which is the third gate --- */
+    g.enter('apartment');
+    ok(!g.actions.canBuyRide('balloon').ok, 'not from the flat, whatever he has tokenized');
+    ok(g.enter('treasury').ok, 'back to the Treasury');
+
+    /* --- THE PASSING SIDE. 40 assets, rep 75, at the counter ---
+       He is put on the Thunderhead first, because the one thing
+       RIDES.balloon's comment promises about `speed: 2.2` is that
+       buying the balloon must NOT take the motorcycle out from under
+       him: takeRide() only auto-equips what is faster than what he
+       is on. Asserting that with nothing in the shed proves nothing. */
+    ok(g.actions.grantRide('motorcycle').ok, 'put the Thunderhead under him first');
+    eq(g.state.rides.equipped, 'motorcycle', 'which is what he is riding');
+    const bought = g.actions.buyRide('balloon');
+    ok(bought.ok, 'and THAT is a sale', bought.why);
+    eq(moneyBefore - g.state.money, RIDES.balloon.price, 'it costs exactly $24,000');
+    ok(g.state.rides.owned.balloon, 'the balloon is his');
+    eq(g.state.rides.equipped, 'motorcycle',
+      'and at speed 2.2 it does NOT take the motorcycle out from under him');
+    ok(g.actions.equipRide('balloon').ok, 'it is a thing he chooses, not a thing that happens');
+    eq(g.state.rides.equipped, 'balloon', 'and then he is in the basket');
+    ok(!g.actions.buyRide('balloon').ok, 'and there is only ever one');
+  }
+
   /* ONE AT A TIME. */
   {
     const g = createGame({ seed: 53, autosave: false });
@@ -1608,6 +1711,70 @@ T('the taxi is Yoober, everywhere the player can see');
   const offenders = readdirSync(gameDir).filter((f) => f.endsWith('.js'))
     .filter((f) => /uber/i.test(readFileSync(join(gameDir, f), 'utf8')));
   eq(offenders.length, 0, 'and no file in src/game mentions Uber at all', offenders.join(', '));
+}
+
+/* ============================================================
+   THE BALLOON IS CALLED THE HAPPY SKIES.
+
+   It was "The Assessor" until today, in ten places across six files,
+   and a rename that lands in nine of them is worse than one that
+   lands in none: the shop row, the acquisition banner and the fare
+   board would each be naming a different machine.
+
+   THE NAMES ARE TYPED OUT HERE INDEPENDENTLY OF data.js, the way
+   Happy's ending is, so that this suite disagrees with the table
+   rather than agreeing with whatever the table currently says.
+
+   THIS IS A REVERT CHECK, not a citation: run against yesterday's
+   src/game/*.js the sweep below finds "The Assessor" and fails.
+   The old name survives on purpose in exactly one place, which is
+   the alias map in character/wally.js (`assessor: 'balloon'`), so
+   that a player or a rig that types the old word still gets the
+   balloon. That file is not in src/game and this sweep does not
+   reach it.
+   ============================================================ */
+T('the balloon is The Happy Skies, everywhere the player can see');
+{
+  eq(RIDES.balloon.name, 'The Happy Skies', 'the long name, character for character');
+  eq(RIDES.balloon.n, 'The Happy Skies', 'and the short alias agrees with it');
+  eq(RIDES.balloon.short, 'Balloon', "while `short` stays the noun — it is what the banner shouts and what the refusals say");
+  eq(RIDES.balloon.name, RIDES.balloon.n, 'name and n are the same string, as every other ride row has them');
+
+  /* THE JOKE IS THAT BOTH HALVES ARE TRUE: a machine painted THE
+     HAPPY SKIES that is also a retired government survey balloon.
+     Neither half may quietly fall out of the prose. */
+  ok(/Treasury/.test(RIDES.balloon.desc), 'the description still says whose it was');
+  ok(/survey balloon/.test(RIDES.balloon.desc), 'and what it was for');
+  ok(/THE HAPPY SKIES/.test(RIDES.balloon.desc), 'and that the name is paint on the side of it');
+  ok(/THE HAPPY SKIES/.test(RIDES.balloon.line), 'the acquisition line says so too, at the shed doors');
+  ok(/logbook/.test(RIDES.balloon.line), 'and still hands over the forty-year logbook');
+
+  /* no string anywhere in the content bundle carries the old name */
+  const strings = [];
+  (function walk(o, seen = new Set()) {
+    if (o == null) return;
+    if (typeof o === 'string') { strings.push(o); return; }
+    if (typeof o !== 'object' || seen.has(o)) return;
+    seen.add(o);
+    for (const k of Object.keys(o)) walk(o[k], seen);
+  })(DATA);
+  const stale = strings.filter((t) => /assessor/i.test(t));
+  eq(stale.length, 0, 'no string in the content tables still says Assessor', stale.slice(0, 3).join(' | '));
+  ok(strings.some((t) => /Happy Skies/.test(t)), 'and at least one says Happy Skies');
+
+  /* including the live ride view and the shop row the player reads */
+  const g = createGame({ seed: 69, autosave: false });
+  eq(g.actions.rideById('balloon').name, 'The Happy Skies', 'the ride view carries the new name');
+  eq(g.actions.rides().filter((r) => /assessor/i.test(r.name + r.n + r.desc + r.line)).length, 0,
+    'and no row in the table says Assessor');
+
+  /* and the source this agent owns, comments included — the sweep
+     that makes this a revert check rather than a restatement */
+  const gameDir2 = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'game');
+  const stillSays = readdirSync(gameDir2).filter((f) => f.endsWith('.js'))
+    .filter((f) => /The Assessor/.test(readFileSync(join(gameDir2, f), 'utf8')));
+  eq(stillSays.length, 0, 'and no file in src/game names The Assessor, in prose or in comment',
+    stillSays.join(', '));
 }
 
 T('a broke, exhausted player is never hard-locked');
@@ -2954,7 +3121,7 @@ T("Happy's ending is verbatim, and both URLs are links");
   /* THE LINE, TYPED OUT HERE INDEPENDENTLY OF data.js. If these two
      ever disagree, one of them was edited, and this is the test that
      has to say so. */
-  const VERBATIM = "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAFx.xyz";
+  const VERBATIM = "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAF.xyz";
 
   eq(DATA.happyEnding.text, VERBATIM, "Happy's speech is verbatim, character for character");
   eq(HAPPY_ENDING.text, VERBATIM, 'and the exported constant agrees');
@@ -2963,7 +3130,7 @@ T("Happy's ending is verbatim, and both URLs are links");
 
   /* the two URLs, present and countable */
   ok(HAPPY_ENDING.text.includes('RWAF.ai'), 'RWAF.ai survives in the text');
-  ok(HAPPY_ENDING.text.includes('RWAFx.xyz'), 'RWAFx.xyz survives in the text');
+  ok(HAPPY_ENDING.text.includes('RWAF.xyz'), 'RWAF.xyz survives in the text');
   eq(HAPPY_ENDING.links.length, 2, 'and both are declared as links, not prose');
   for (const l of HAPPY_ENDING.links) {
     ok(HAPPY_ENDING.text.includes(l.label), `link label "${l.label}" appears in the speech`);
@@ -2972,7 +3139,7 @@ T("Happy's ending is verbatim, and both URLs are links");
       `"${l.label}" appears exactly once, so a linkifier cannot mis-target it`);
   }
   eq(HAPPY_ENDING.links[0].label, 'RWAF.ai', 'the first link is RWAF.ai');
-  eq(HAPPY_ENDING.links[1].label, 'RWAFx.xyz', 'the second link is RWAFx.xyz');
+  eq(HAPPY_ENDING.links[1].label, 'RWAF.xyz', 'the second link is RWAF.xyz');
   ok(HAPPY_ENDING.links[0].url !== HAPPY_ENDING.links[1].url, 'and they point at different places');
 
   /* AND IT RIDES ON THE EVENT, so the UI never retypes it */
@@ -2984,7 +3151,7 @@ T("Happy's ending is verbatim, and both URLs are links");
   eq(payload.speaker, 'Happy', 'the payload names Happy as the speaker');
   eq(payload.text, VERBATIM, 'and carries the speech verbatim');
   eq(payload.links.length, 2, 'and both links');
-  eq(payload.links.map((l) => l.label).join('|'), 'RWAF.ai|RWAFx.xyz', 'in order, labelled');
+  eq(payload.links.map((l) => l.label).join('|'), 'RWAF.ai|RWAF.xyz', 'in order, labelled');
   num(payload.netWorth, 'plus a net worth for the card');
   eq(payload.main.total, QUESTS.length, 'and the main-chain tally');
   eq(payload.side.total, SIDE_QUESTS.length, 'and the side-quest tally');

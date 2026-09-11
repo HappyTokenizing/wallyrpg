@@ -177,6 +177,146 @@ export function createHud(ctx, ui) {
     lockD.textContent = sub;
   }
 
+  /* ---------------- THE BASKET STRIP ----------------
+     A player bought the most expensive machine in the game, arrived
+     in the air, and was told nothing. Their words: "the hot air
+     balloon did not load and it offered no instruction on how to fly
+     it properly." The balloon loads — tools/probes proved the equip
+     click on four arms of one page load — but NOTHING on screen ever
+     said so, and the machine sinks back to the ground inside half a
+     minute if the burner is never lit. Two failures that look
+     identical from the basket.
+
+     So while he is aloft there is one strip, under the objective,
+     and it carries the three things that are not discoverable:
+
+       · HOW HIGH HE IS. Everything about a balloon is the altitude
+         and the game had no altimeter.
+       · WHAT LIFTS HER. The burner and the vent, named for the input
+         in the player's hands — touch.js's action table, never a
+         literal key, because this build has a history of "press E"
+         on phones with no E. The vent has NO pad control (touch.js
+         reads it off the stick past 62% deflection), so under a
+         thumb it is described as the stick and not as a key.
+       · THE NINETY METRES. data.js AIRVIEW.min is 90 m and below it
+         the balloon buys nothing that standing in the road does not.
+         A player who never climbs past 40 m concludes the $24,000
+         machine is a slow bicycle. It is read from `data.airview`
+         rather than typed, so the number here and the number
+         events.js enforces cannot drift.
+
+     It is the lock strip's shape because the lock strip is already
+     this: one line, a sub-line, and a control on the right. Here the
+     control is the way OUT — wally.js setFly() turns an unequip in
+     the air into a request to land, which is the other thing nobody
+     could have guessed. style.js belongs to another agent, so it
+     borrows `.w-lock` and says nothing new in CSS.
+     ------------------------------------------------------------- */
+  const flyT = h('div.t', { text: '' });
+  /* THE ONE SENTENCE THAT MUST NOT BE TRUNCATED. `.w-lock .d` is
+     white-space:nowrap with an ellipsis, which is right for "opens at
+     09:00" and wrong for the only line in the game that says how to
+     fly — the first capture of this strip read "Hold Space to cl…".
+     style.js belongs to another agent, so the override is inline,
+     which outranks the class; this is the treatment touch.js's
+     CHIP_TOUCH already establishes for the same reason. */
+  const flyD = h('div.d', {
+    text: '',
+    style: { whiteSpace: 'normal', overflow: 'visible', textOverflow: 'clip', lineHeight: '1.35' },
+  });
+  const flyGo = h('span.go', { text: 'LAND' });
+  const flyStrip = h('button.w-lock.w-pe', {
+    type: 'button', style: { display: 'none' }, title: 'Ask her down',
+    onclick: () => { ui.click(); askToLand(); },
+  }, h('div.ic', null, h('span', { text: '🎈', style: { fontSize: '15px' } })),
+    h('div.w-grow', null, flyT, flyD), flyGo);
+  left.append(flyStrip);
+  let flyShown = { t: '', d: '', on: false };
+
+  /* Unequipping in the air is a REQUEST — wally.js setFly() vents,
+     descends, flares and dismounts on the ground. Going through the
+     rides table rather than the character module keeps the one-at-a-
+     time slot honest: the balloon has to stop being the equipped ride
+     or the next reconcile puts him back in it. */
+  function askToLand() {
+    const g = game();
+    if (!g) return;
+    try { g.actions.equipRide(null); } catch (e) { return; }
+    ui.toast('Venting. She comes down in her own time.', 'info');
+  }
+
+  /* THE BURNER IS THE ONLY CONTROL WORTH NAMING, and that is a
+     measurement rather than an economy. Equip her and touch nothing
+     and the heat bleeds off on its own: 7.4 m, 16.2, 14.8, 2.7, 0.0
+     — down inside twenty seconds, no vent required. So "hold it to
+     climb, let go to come down" is the whole machine, it is true on
+     a keyboard and under a thumb alike, and it needs no second
+     control name.
+
+     THE VENT IS DELIBERATELY UNNAMED. It exists (wally.js reads it
+     off `run`), but there is no honest label for it: touch.js's
+     action table has no entry, and on the pad it is not a button at
+     all — input() raises `run` from stick deflection past 62%, so a
+     thumb cannot vent without also drifting at full tilt. Writing
+     the keycap here would break this file's one law — no key name is
+     typed in hud.js, every one comes from the action table — and
+     would print a key at a player with no keys. It is a HANDOVER;
+     see the report. The fast way down is the LAND button beside this
+     sentence, which vents for him. */
+  function flyControls() {
+    return 'Hold ' + actionLabel('jump') + ' to climb · let go and she settles';
+  }
+
+  function updateFly() {
+    const w = ctx.wally;
+    const on = !!(w && w.flying);
+    if (!on) {
+      if (flyShown.on) { flyStrip.style.display = 'none'; flyShown = { t: '', d: '', on: false }; }
+      return;
+    }
+    let s = null;
+    try { s = w.flightState; } catch (e) { s = null; }
+    if (!s) return;
+    const g = game();
+    const min = (g && g.data && g.data.airview && g.data.airview.min) || 90;
+    const alt = Math.max(0, Math.round(s.alt));
+    let t, d;
+    if (s.phase === 'boarding') {
+      t = 'FILLING THE ENVELOPE';
+      d = 'She takes a moment. ' + flyControls();
+    } else if (s.phase === 'landing') {
+      t = 'COMING DOWN · ' + alt + ' M';
+      d = 'Stand by. The basket lands itself.';
+    } else if (s.landWanted) {
+      /* THE REQUEST IS NOT THE EVENT, and this line exists because
+         the strip did not say so. Asking her down at altitude sets
+         wally.js's flyLandWanted and leaves the phase 'aloft' the
+         whole way through the descent — it only turns 'landing' in
+         the last metre. Reading `phase` alone, the strip went on
+         saying "132 M · THE WHOLE ISLAND · hold to climb" after the
+         player had pressed LAND, which is a control that reports
+         nothing. Measured at 137 m on one page load. */
+      t = 'COMING DOWN · ' + alt + ' M';
+      d = 'Venting. She finds her own ground; hold the burner to change your mind.';
+    } else if (s.refusing) {
+      t = 'SHE WILL NOT PUT YOU DOWN THERE · ' + alt + ' M';
+      d = 'The burner is lit whether you like it or not. Find some flat ground.';
+    } else if (alt >= min) {
+      t = alt + ' M · THE WHOLE ISLAND';
+      d = 'Everything under you is going on the map. ' + flyControls();
+    } else {
+      t = alt + ' M · ' + min + ' M FOR THE WHOLE ISLAND';
+      d = 'Below ' + min + ' you can see what you could see from the road. ' + flyControls();
+    }
+    if (t === flyShown.t && d === flyShown.d && flyShown.on) return;
+    flyShown = { t, d, on: true };
+    flyStrip.style.display = '';
+    flyStrip.classList.toggle('bad', !!s.refusing);
+    flyGo.textContent = (s.phase === 'landing' || s.landWanted) ? 'DOWN' : 'LAND';
+    flyT.textContent = t;
+    flyD.textContent = d;
+  }
+
   /* ---------------- THE MAYOR'S DASH, live ----------------
      Top-centre, on screen only while the race is running. The clock,
      which corner is next, and the one thing that decides the race:
@@ -1322,6 +1462,9 @@ export function createHud(ctx, ui) {
     }
     for (const p of prompts.values()) paintPromptKey(p);
     ptrShown.sub = '';
+    /* the basket strip names two controls; clearing its cache makes
+       the next refresh repaint them for the input he just switched to */
+    flyShown = { t: '', d: '', on: flyShown.on };
   });
 
   /* ============================================================
@@ -1367,6 +1510,8 @@ export function createHud(ctx, ui) {
 
     /* the two refusals the engine enforces, said out loud */
     updateLock(d);
+    /* …and the one machine that has no ground under it */
+    updateFly();
 
     const unread = g.actions.unreadCount();
     msgBadge.textContent = unread > 9 ? '9+' : String(unread);

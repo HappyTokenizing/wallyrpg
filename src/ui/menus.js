@@ -1513,6 +1513,23 @@ export function createMenus(ctx, ui) {
         d: (on ? 'With you · ' : (parkedAt ? parkedAt + ' · ' : 'In the shed · ')) + speedLine(r),
       });
       row.classList.toggle('on', on);
+      /* THE LOGBOOK, FOR A MACHINE THAT IS NOT DRIVEN. A bicycle
+         needs no instructions and does not get a button: the row
+         asks ui.rideBriefing(id) and draws this only where there is
+         something to read, so the rides table stays the only place a
+         fifth machine has to be described. The player who paid
+         $24,000 for the balloon arrived in the air with nothing —
+         "it offered no instruction on how to fly it properly" — and
+         this is the door back to what the Treasury clerk handed
+         over with it. */
+      if (ui.rideBriefing && ui.rideBriefing(r.id)) {
+        row.append(h('button.w-btn.sm.ghost.w-pe', {
+          type: 'button', style: { marginLeft: '8px' },
+          title: 'The logbook — how she flies',
+          'aria-label': 'How ' + r.n + ' flies',
+          onclick: (e) => { e.stopPropagation(); ui.click(); ui.showRideBriefing(r.id); },
+        }, icon('book', 13, { fill: 'currentColor', w: 1 })));
+      }
       row.append(h('button.w-btn.sm.' + (on ? 'ghost' : 'prim') + '.w-pe', {
         type: 'button', style: { marginLeft: '8px' },
         onclick: (e) => {
@@ -1520,7 +1537,18 @@ export function createMenus(ctx, ui) {
           const res2 = game.actions.equipRide(on ? null : r.id);
           if (!res2.ok) { res(res2); return; }
           ui.sfx('ui.select');
-          ui.toast(on ? r.short + ' left behind' : r.short + ' with you', on ? 'info' : 'good');
+          /* WHAT ACTUALLY HAPPENS, NOT WHICH SLOT CHANGED. "Balloon
+             with you" would be true of a bicycle in a shed and is a
+             lie about ten metres of envelope that is already
+             inflating; and unequipping in the air is a REQUEST to
+             land (wally.js setFly), not an event, so the word for it
+             is not "left behind". A machine with a logbook brings
+             its own two lines; everything else keeps the old pair. */
+          const log = ui.rideBriefing?.(r.id) || null;
+          const line = on
+            ? (log && log.unequipLine) || r.short + ' left behind'
+            : (log && log.equipLine) || r.short + ' with you';
+          ui.toast(line, on ? 'info' : 'good');
           ui.refresh();
           redraw();
         },

@@ -770,7 +770,7 @@ export function createEvents(env) {
 
      game.sense() asks for the radius; at ground level it gets 0 and
      nothing changes. Above AIRVIEW.min the radius is the horizon,
-     which is the one thing the Assessor's own description has always
+     which is the one thing the Happy Skies' own description has always
      promised and never delivered. It puts places on the MAP and
      nothing else: quests.access() is untouched, so flying over a
      locked door does not open it.

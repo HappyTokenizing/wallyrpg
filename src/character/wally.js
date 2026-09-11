@@ -3482,12 +3482,52 @@ export async function init(ctx) {
      with a balloon in the corner of it, which is the shot this whole
      feature is for.
 
-     AND IT LOOKS ALONG THE DRIFT, NOT ALONG THE BASKET. The basket
-     rotates under the envelope (balloon.js FLIGHT.spin) because real
-     ones do; hanging the camera on that would swing the island round
-     the frame every forty seconds. The boom is on the velocity, so
-     the world holds still and the basket turns underneath it — which
-     is what the ride actually feels like from inside one.
+     AND IT LOOKS ALONG NEITHER THE DRIFT NOR THE BASKET.
+
+     The basket rotates under the envelope (balloon.js FLIGHT.spin)
+     because real ones do, and hanging the camera on that would swing
+     the island round the frame every forty seconds. That half was
+     always right. The other half was not: the boom used to be SERVOED
+     ONTO THE DRIFT HEADING, atan2(vx, vz), damped at 1.1 and capped at
+     22 deg/s — and that is the same feedback loop camera.js deleted
+     from the follow rig this round, one storey up.
+
+     THE LOOP, because it is not obvious and it cost three flights to
+     see. The stick is CAMERA-RELATIVE — camRelative() near the top of
+     this file, "the one place the camera basis is applied" — so the
+     drift the player is pushing for is expressed in the boom's own
+     frame. The boom then turns toward the drift. That rotates the
+     basis the stick is read in, which turns the drift, which turns the
+     boom. The only fixed points are the two headings parallel to the
+     WIND, so a player holding one key gets a camera that rotates, by
+     itself, until the air and the boom agree. Measured with W held
+     down for the whole flight and nothing else touched, three sites,
+     one build, 1280x720:
+
+       open grass, 45 s     97.7 deg of boom travel  (net  -97.4)
+       Market Hall, 30 s   225.6 deg                 (net  -71.3)
+       the Treasury, 32 s  163.4 deg                 (net +159.0)
+
+     The player's report is "the camera seems to go crazy when I'm
+     flying it", and the rule they gave with it — "never sways for any
+     reason unless the user is purposefully changing the camera angle"
+     — is the whole fix. THE BOOM HOLDS. It is seeded from the lens at
+     the hand-over and after that only the player moves it, which this
+     rig reads as the FRAME'S CHANGE IN ctx.cam.yaw: camera.js's
+     stepFollow does not run under an override, so while she is aloft
+     the only thing writing that rig's boomYaw is the player's own
+     drag / steer / fling, and adding its delta here is the whole of
+     "unless the user is purposefully changing the camera angle". A
+     becalmed balloon no longer spins its own camera hunting for a
+     heading, and a drifting one no longer spins it chasing one.
+
+     WHAT IT COSTS. Drift a long way sideways and you watch her from
+     the quarter rather than from behind, because nothing re-centres
+     the boom any more. That is the deal the follow rig made this round
+     in the same words, and the balloon is the case where it costs
+     least: she is a sphere, she has no front, and nothing she does is
+     aimed. WALLY.debug.flyCamRule('drift') is the prior rule, live, on
+     the same page load — tools/test-balloon.mjs B9d drives both.
      ---------------------------------------------------------------- */
   const flyCam = {
     pos: new THREE.Vector3(), aim: new THREE.Vector3(), fov: 52, yaw: 0, seeded: false,
@@ -3502,21 +3542,56 @@ export async function init(ctx) {
       inflation, so it is out by the time she leaves the grass. */
   const F_CAM_EASE = 3.2;
   /** rad/s the boom may swing while it comes round onto a new drift
-      heading. 0.38 = 22 deg/s: a deliberate pan, slower than anything
-      a player can ask the follow rig for. */
+      heading. 0.38 = 22 deg/s. LEGACY ONLY: the drift servo it rate-
+      limits runs under flyCamRule('drift'). See the block header. */
   const F_CAM_YAW_RATE = 0.38;
-  /* WHERE THIS RIG HANDS THE LENS BACK. camera.js's RIG, expressed in
-     the fly rig's own coordinates: its boom is 3.15 m behind and its
-     lens 0.90 m over his soles (RIG.distance / RIG.height), which is
-     0.45 m over this rig's chest anchor, and it is tilted 2.1 DEGREES
-     UP (RIG.pitch) rather than down. `ahead`/`down` are the aim point
-     that reproduces that tilt: the aim sits 8 m in front of the anchor
-     and ( 8 + 3.15 ) * tan( 2.1 ) + 0.45 = 0.86 m ABOVE it, hence a
-     NEGATIVE `down`. If camera.js ever re-solves its boom these three
-     numbers go stale — the dismount assertion in tools/test-balloon.mjs
-     is what catches that, because it measures the delivered look
-     change across the hand-back rather than these constants. */
-  const F_CAM_HAND = { dist: 3.15, high: 0.45, ahead: 8.0, down: -0.86 };
+  /* WHERE THIS RIG HANDS THE LENS BACK — camera.js's RIG, expressed in
+     the fly rig's own coordinates, AND READ FROM IT RATHER THAN COPIED.
+
+     This was four transcribed constants with a note under them saying
+     "if camera.js ever re-solves its boom these three numbers go
+     stale". It did, this round, in the same pass that took the orbit
+     out: distance 3.15 -> 4.05, height 0.90 -> 1.40, pitch +2.1 deg UP
+     -> 2.74 deg DOWN. So the note was right and the constants were
+     already wrong by 0.90 m of boom, 0.50 m of lens and 4.8 degrees of
+     tilt before anybody flew. A transcription with a warning on it is
+     still a transcription; ctx.cam.rig is published, so read it.
+
+     `ahead` is this rig's own choice — how far in front of the anchor
+     the aim sits — and `down` is then whatever reproduces the follow
+     rig's tilt from there: the aim is ( ahead + dist ) * tan(pitch)
+     above the lens height, so `down` (metres BELOW the anchor) is the
+     negation of that plus the lens's own height over the anchor.
+     CHEST is the anchor's offset above his soles, which is what RIG's
+     `height` is measured from. */
+  const F_CAM_AHEAD = 8.0;
+  /** 'hold' ships (the boom holds, the player steers it); 'drift' is
+      the servo that shipped before this round. The runtime revert. */
+  let flyYawRule = 'hold';
+  /** last frame's ctx.cam.yaw, so the PLAYER'S change to it can be
+      integrated without adopting the rig's absolute azimuth. null
+      until the first frame after a seed. */
+  let flyCamYawRef = null;
+  /** radians of boom yaw the PLAYER asked for this flight, and radians
+      the boom actually travelled. The pair is the whole assertion: the
+      second must not exceed the first by more than rounding. */
+  let flyCamSteer = 0, flyCamYawTravel = 0, flyCamYawLast = 0;
+  /** metres the ground floor added to the lens this frame, measured.
+      See the block at the clamp: it is published rather than fixed. */
+  let flyCamLift = 0;
+  const _fhand = { dist: 4.05, high: 0.95, ahead: F_CAM_AHEAD, down: -0.37 };
+  function flyCamHand() {
+    const R = ctx.cam && ctx.cam.rig;
+    const chest = BALLOON_FIT.WALL * 0.5;
+    const dist = R && Number.isFinite(R.distance) ? R.distance : 4.05;
+    const high = (R && Number.isFinite(R.height) ? R.height : 1.40) - chest;
+    const pitch = R && Number.isFinite(R.pitch) ? R.pitch : 0;   // rad, + is UP
+    _fhand.dist = dist;
+    _fhand.high = high;
+    _fhand.ahead = F_CAM_AHEAD;
+    _fhand.down = -((F_CAM_AHEAD + dist) * Math.tan(pitch) + high);
+    return _fhand;
+  }
   const _fcp = new THREE.Vector3(), _fca = new THREE.Vector3();
   /** b, moved by whole turns onto the side of a it is nearest. */
   function wrapNear(a, b) {
@@ -3534,8 +3609,10 @@ export async function init(ctx) {
     let ahead = lerp(2.0, 30.0, k);
     /* HOW FAR BELOW THE BASKET THE AIM SITS. 2.6 m was wrong at ground
        level and the take-off filmstrip is why: the override is seeded
-       from the follow rig, which is 4.3 m behind him at chest height,
-       so on the first frame of a boarding the lens is 1.3 m off the
+       from the follow rig, which is a few metres behind him at about
+       chest height (ctx.cam.rig, and it moves — do not write the
+       number down here again), so on the first frame of a boarding the
+       lens is a metre or so off the
        grass — and an aim 2.6 m BELOW the basket from there points it
        into the ground. The first second of every launch was a
        close-up of the underside of the basket and its own shadow.
@@ -3560,10 +3637,13 @@ export async function init(ctx) {
          wrongness in one character each. `yaw` is consumed as
          ( fx, fz ) = ( sin yaw, cos yaw ) = THE DIRECTION OF TRAVEL:
          the boom goes to ax - fx*dist (behind the subject) and the aim
-         to ax + fx*ahead (in front of it). The update twelve lines
-         below sets it from atan2( vx, vz ), the drift heading — so the
-         seed has to be measured the same way round, and the negated
-         one was 180 degrees out of phase with its own update. The boom
+         to ax + fx*ahead (in front of it). The servo that used to run
+         below set it from atan2( vx, vz ), the drift heading, so the
+         seed had to be measured the same way round and the negated one
+         was 180 degrees out of phase with its own update. THAT SERVO
+         IS GONE (see THE BOOM HOLDS) and the sign matters more now,
+         not less: the seed is the ONLY thing that sets this heading,
+         and nothing downstream will ever correct it. The boom
          target then landed 20 m in FRONT of the subject along the view
          direction: the lens flew forward over Wally's head while the
          aim retreated behind him, and the two crossed. Measured on the
@@ -3573,17 +3653,24 @@ export async function init(ctx) {
          same rig, load 22.30: 55.5 deg/s worst, pitch -18.4, and the
          lens never once gets in front.
 
-         IT HAS TO BE RIGHT ON ITS OWN. The corrective damp below only
-         runs above 0.8 m/s of drift, so a balloon boarded on a calm
-         day never reaches it and holds whatever the seed said for as
-         long as the flight lasts — which is why tools/test-balloon.mjs
-         asserts the becalmed boarding as well as the drifting one. */
+         IT HAS TO BE RIGHT ON ITS OWN, AND NOW THAT IS THE WHOLE RULE
+         RATHER THAN AN EDGE OF IT. The corrective damp used to run
+         above 0.8 m/s of drift, so only a balloon boarded on a calm
+         day held whatever the seed said for the length of the flight;
+         with the servo gone, every flight does. tools/test-balloon.mjs
+         still asserts both boardings — they are the same claim under
+         the shipping rule, and the pair is what says so. */
       flyCam.pos.copy(ctx.camera.position);
       ctx.camera.getWorldDirection(_fv2);
       flyCam.aim.copy(ctx.camera.position).addScaledVector(_fv2, 12);
       flyCam.fov = ctx.camera.fov;
       flyCam.yaw = Math.atan2(_fv2.x, _fv2.z);
       flyCam.seeded = true;
+      /* the steer integrator starts from nothing, not from whatever
+         boomYaw happened to be a re-seed ago — see THE BOOM HOLDS */
+      flyCamYawRef = null;
+      flyCamYawLast = flyCam.yaw;
+      flyCamSteer = 0; flyCamYawTravel = 0;
       /* AND SEED THE TARGET TOO, WHICH THE STATE ALONE DOES NOT DO.
          Seeding only the state leaves the rig damping toward a boom
          sixteen metres further back and four metres higher from the
@@ -3654,47 +3741,95 @@ export async function init(ctx) {
        There is nothing to fix in camera.js. The fix is to ARRIVE in
        the follow rig's geometry rather than to be taken out of a
        flying one: over the 3.2 s of the deflation the boom walks from
-       20 m back and 6 m up in to camera.js's own RIG (3.15 m back,
-       0.90 m over his soles, tilted 2.1 degrees UP), so by the time
-       releaseOverride() runs the two rigs are looking at the same
-       thing from the same place and adopt() has nothing left to move.
-       It is also the better shot: the envelope comes down and the
-       camera comes back to him with it. */
+       20 m back and 6 m up in to camera.js's own RIG — whatever that
+       rig currently is, solved from ctx.cam.rig by flyCamHand() rather
+       than copied — so by the time releaseOverride() runs the two rigs
+       are looking at the same thing from the same place and adopt()
+       has nothing left to move. It is also the better shot: the
+       envelope comes down and the camera comes back to him with it. */
     if (flyPhase === 'landing') {
       /* arrive early — the state damps toward this target and has to
          be given time to actually reach it before the hand-back */
+      const H = flyCamHand();
       const lt = smoothstepLocal(0, 1, clamp(flyT / (F_ANIM.land * 0.72), 0, 1));
-      dist = lerp(dist, F_CAM_HAND.dist, lt);
-      high = lerp(high, F_CAM_HAND.high, lt);
-      ahead = lerp(ahead, F_CAM_HAND.ahead, lt);
-      down = lerp(down, F_CAM_HAND.down, lt);
+      dist = lerp(dist, H.dist, lt);
+      high = lerp(high, H.high, lt);
+      ahead = lerp(ahead, H.ahead, lt);
+      down = lerp(down, H.down, lt);
       landLam = lerp(1, 3.4, lt);
     }
 
-    /* the boom sits behind the DRIFT; with no drift it holds the last
-       heading, so a becalmed balloon does not spin its own camera
-       hunting for one.
+    /* ---- THE BOOM HOLDS, AND THE PLAYER IS THE ONLY THING THAT MOVES
+       IT. See the block header for the loop this replaced and the three
+       flights that measured it.
 
-       THE FADE AND THE CAP ARE BOTH THERE FOR THE BOARDING. `if (sp >
+       WHY A DELTA AND NOT ctx.cam.yaw ITSELF. The seed is taken from
+       the LIVE LENS's own forward (see the seed block), which is not
+       camera.js's boomYaw — the two differ by whatever lateral framing
+       that rig had on the hand-over frame. Adopting boomYaw outright
+       would throw that difference away as a step on the first frame of
+       every boarding, which is the one thing the whole seam is built
+       to avoid. The DIFFERENCE between consecutive boomYaws is the
+       player's steer and nothing else, because stepFollow — the only
+       other writer — returns before it runs while mode is 'override'
+       (camera.js's update(), the `if (mode === 'override')` branch).
+       So: seed the reference with the yaw, then integrate its changes.
+
+       AND IT SURVIVES A RE-SEED. flyCam.seeded is cleared by the wrap
+       debug hooks and by every boarding; `flyCamYawRef = null` there
+       means the first frame after one contributes no delta rather than
+       a half-turn of stale difference.
+
+       THE ONE OTHER THING THAT WRITES boomYaw IS A CUT, AND IT IS MEANT
+       TO ARRIVE HERE. ui.js's land() calls ctx.cam.warp({yaw}) on a
+       fast-travel arrival, and ui.js's own note says a flying player
+       takes the full arrival — so the boom swings with it, in one
+       frame, behind the 180/260 ms fade that cut is already hidden
+       under. That is a scripted camera move and the player asked for
+       it by travelling; it is not a sway, and it is not filtered out.
+       Do not add a per-frame cap to "protect" against it: a drag flick
+       is 0.0055 rad per pixel and a hundred-pixel flick is half a
+       radian in one frame, so any cap tight enough to catch a cut
+       clips the player's own hand. */
+    const camYawNow = (cam && Number.isFinite(cam.yaw)) ? cam.yaw : null;
+    if (camYawNow !== null) {
+      if (flyCamYawRef !== null) {
+        let d = camYawNow - flyCamYawRef;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        flyCam.yaw += d;
+        flyCamSteer += Math.abs(d);
+      }
+      flyCamYawRef = camYawNow;
+    }
+
+    /* ---- LEGACY ONLY — the drift servo, kept live so the rule can be
+       driven against its predecessor on one page load rather than
+       quoted at. WALLY.debug.flyCamRule('drift').
+
+       THE FADE AND THE CAP WERE BOTH THERE FOR THE BOARDING. `if (sp >
        0.8)` is a cliff: on the frame the drift crosses it a damp at
        1.1 opens on whatever angle happens to lie between the lens and
        the new heading, and on a boarding into a following wind that
        angle is most of a half-turn. Measured on the drifting boarding
        before this, load 24.61: 2.59 degrees in one 17 ms frame,
        154 deg/s, on the frame of the crossing and nowhere else.
-       Fading the authority in over 0.35-1.30 m/s removes the cliff;
-       capping the rate keeps the swing a pan rather than a whip when
-       the heading really does have to come half way round. After the
-       first seconds the exponential is slower than the cap and
-       neither term does anything, so cruise is untouched. */
-    const sp = Math.hypot(flyState.vx, flyState.vz);
-    const align = smoothstepLocal(0.35, 1.30, sp);
-    if (align > 0) {
-      const want = wrapNear(flyCam.yaw, Math.atan2(flyState.vx, flyState.vz));
-      const step = damp(flyCam.yaw, want, 1.1 * align, dt) - flyCam.yaw;
-      const cap = F_CAM_YAW_RATE * dt;
-      flyCam.yaw += clamp(step, -cap, cap);
+       Fading the authority in over 0.35-1.30 m/s removed the cliff;
+       capping the rate kept the swing a pan rather than a whip. Both
+       are true and neither was the problem — the problem was that the
+       servo existed at all. */
+    if (flyYawRule === 'drift') {
+      const sp = Math.hypot(flyState.vx, flyState.vz);
+      const align = smoothstepLocal(0.35, 1.30, sp);
+      if (align > 0) {
+        const want = wrapNear(flyCam.yaw, Math.atan2(flyState.vx, flyState.vz));
+        const step = damp(flyCam.yaw, want, 1.1 * align, dt) - flyCam.yaw;
+        const cap = F_CAM_YAW_RATE * dt;
+        flyCam.yaw += clamp(step, -cap, cap);
+      }
     }
+    flyCamYawTravel += Math.abs(flyCam.yaw - flyCamYawLast);
+    flyCamYawLast = flyCam.yaw;
     const fx = Math.sin(flyCam.yaw), fz = Math.cos(flyCam.yaw);
 
     /* DURING THE INFLATION THE SUBJECT IS THE ENVELOPE, not the ground
@@ -3741,7 +3876,37 @@ export async function init(ctx) {
     const floor = flyCam.ease < 1
       ? lerp(Math.min(flyCam.sFloor, 1.5), 1.5, smoothstepLocal(0, 1, flyCam.ease))
       : 1.5;
-    if (flyCam.pos.y < gy + floor) flyCam.pos.y = gy + floor;
+    /* ---- MEASURED, PUBLISHED, AND NOT FIXED — the second thing the
+       player's "goes crazy" could be, written down with its numbers
+       rather than quietly left for somebody to rediscover.
+
+       This clamp is a hard set on the DAMPED STATE, so a roof passing
+       under the boom does not push the lens, it teleports it, and the
+       spring then has to damp back down from the roof rather than from
+       its own solve. Flown for real over the Market Hall quarter —
+       boarded from the phone, W held, 1651 frames — 68 frames came
+       back clamped and one roof edge moved the lens 4.67 m in a single
+       frame for 10.40 degrees of look. Dropped into the Exchange plaza
+       at 8 m, where the towers are 86 m: 7.46 m of lift, an 8.41 m
+       lens step and 26.89 degrees in one frame.
+
+       IT WAS NOT FIXED THIS ROUND, and the reason is worth the lines.
+       Lifting the PUBLISHED lens instead of the spring was written and
+       measured and it does not help: the jump is on the frame the roof
+       arrives, and that frame is the same either way. The only thing
+       that removes it is giving the floor a LOOK-AHEAD — the highest
+       ground under the whole boom rather than under the lens point, so
+       the target has risen seconds before the lens gets there — and
+       that reframes every low flight over a city, which is a design
+       change and not a bug fix. `lift` is published on
+       WALLY.debug.balloonCam() so whoever takes it can drive it.
+
+       AND THE CAST IS PART OF THE SAME PROBLEM. It starts 4 m over the
+       LENS, so a tower the lens is already inside of is invisible to
+       it: this clamp keeps the lens off roofs it is above and does
+       nothing at all about walls it is in. */
+    flyCamLift = Math.max(0, (gy + floor) - flyCam.pos.y);
+    if (flyCamLift > 0) flyCam.pos.y = gy + floor;
     cam.override(flyCam.pos, flyCam.aim, flyCam.fov);
   }
 
@@ -6339,6 +6504,8 @@ export async function init(ctx) {
        WALLY.debug.balloonCost()            what the machine costs,
                                             differenced across frames
        WALLY.debug.balloonPose(t)           freeze the inflation at t
+       WALLY.debug.balloonCam()             the fly rig's own numbers
+       WALLY.debug.flyCamRule('drift')      the boom's PRIOR rule, live
      ================================================================ */
   dbg.balloon = (o = {}) => {
     if (o === false || o === 'off' || o === null) {
@@ -6469,9 +6636,31 @@ export async function init(ctx) {
       when the aim point walks THROUGH the lens the look direction is
       undefined and the frame whips — which is exactly what the
       seed's sign error used to do on every boarding. */
+  /** THE RUNTIME REVERT FOR THE FLY CAMERA, both rules, live, on one
+      page load — the form src/core/contracts.js prefers over a quoted
+      before-number.
+        'hold'   ships — the boom holds and the player steers it
+        'drift'  the servo onto atan2(vx, vz) that shipped before
+      Returns the rule actually in force, never the one asked for. */
+  dbg.flyCamRule = (o) => {
+    const y = typeof o === 'string' ? o : (o && o.yaw);
+    if (y === 'hold' || y === 'drift') flyYawRule = y;
+    return { yaw: flyYawRule };
+  };
   dbg.balloonCam = () => ({
     seeded: flyCam.seeded,
     yawDeg: +(flyCam.yaw * 180 / Math.PI).toFixed(2),
+    yawRule: flyYawRule,
+    /* degrees the PLAYER asked the boom for since the seed, and degrees
+       it actually travelled. Under the shipping rule the two are the
+       same number; under 'drift' the second runs away from the first,
+       which is the whole of the defect. */
+    steerDeg: +(flyCamSteer * 180 / Math.PI).toFixed(2),
+    travelDeg: +(flyCamYawTravel * 180 / Math.PI).toFixed(2),
+    /* metres the ground floor is adding to the lens right now, and the
+       geometry it is solved from */
+    lift: +flyCamLift.toFixed(3),
+    hand: (() => { const H = flyCamHand(); return { dist: +H.dist.toFixed(3), high: +H.high.toFixed(3), ahead: +H.ahead.toFixed(3), down: +H.down.toFixed(3) }; })(),
     pos: flyCam.pos.toArray().map((v) => +v.toFixed(3)),
     aim: flyCam.aim.toArray().map((v) => +v.toFixed(3)),
     aimDist: +flyCam.pos.distanceTo(flyCam.aim).toFixed(3),

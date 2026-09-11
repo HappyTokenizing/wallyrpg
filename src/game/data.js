@@ -1323,8 +1323,8 @@ export const RIDES = Object.freeze({
     line: 'It starts on the first press. Somewhere in Rusty Row, a window rattles in sympathy.',
   }),
   /* ============================================================
-     THE ASSESSOR — the City Treasury's survey balloon, and the last
-     rung. It is the only ride that is not a way of getting to work.
+     THE HAPPY SKIES — the City Treasury's survey balloon, and the
+     last rung. It is the only ride that is not a way of getting to work.
 
      WHOSE IS IT. The Treasury valued the island from the air once a
      year — you cannot rate land you have not seen the shape of — and
@@ -1332,8 +1332,13 @@ export const RIDES = Object.freeze({
      photographs instead. It has been in the shed behind the Treasury
      ever since. Selling it to the one person in Bull Bear City who is
      turning the whole island into tokens is the joke and the point:
-     he is doing the Assessor's job, and now he can do it from the
-     Assessor's altitude.
+     he is doing the assessor's job, and now he can do it from the
+     assessor's altitude.
+
+     THE NAME IS PAINT, NOT PAPERWORK. On the ledger it is a survey
+     asset with an inventory number. THE HAPPY SKIES is what somebody
+     in the shed painted down the side of it, and nobody senior ever
+     came out far enough to have it painted off again.
 
      THE PRICE IS $24,000, AND HERE IS THE ARITHMETIC.
 
@@ -1387,7 +1392,7 @@ export const RIDES = Object.freeze({
      ============================================================ */
   balloon: Object.freeze({
     id: 'balloon',
-    name: 'The Assessor', n: 'The Assessor', short: 'Balloon',
+    name: 'The Happy Skies', n: 'The Happy Skies', short: 'Balloon',
     ico: '🎈',
     speed: 2.2,
     effort: 0.04,
@@ -1402,8 +1407,8 @@ export const RIDES = Object.freeze({
        optional override the row uses instead, so a fifth machine that
        is a normal machine still needs no UI code at all. */
     pitch: 'It goes over the top of everything · slower than the motorcycle and it does not care',
-    desc: 'The Treasury’s survey balloon, retired the year somebody sold them photographs. Slower than the motorcycle and it does not care: it goes over the top of everything, and you can see the whole island at once.',
-    line: 'The shed doors fold back and it is enormous, and orange, and folded like a sleeping animal. The clerk hands you a logbook with forty years of the island’s shape in it.',
+    desc: 'The Treasury’s survey balloon, retired the year somebody sold them photographs. Somebody in the shed painted THE HAPPY SKIES down the side of it and nobody senior ever came out to argue. Slower than the motorcycle and it does not care: it goes over the top of everything, and you can see the whole island at once.',
+    line: 'The shed doors fold back and it is enormous, and orange, and folded like a sleeping animal, with THE HAPPY SKIES painted along one flank in a hand nobody ever owned up to. The clerk hands you a logbook with forty years of the island’s shape in it.',
   }),
 });
 export const RIDE_LIST = Object.freeze(Object.values(RIDES));
@@ -1951,10 +1956,10 @@ export const MILESTONES = [
 export const HAPPY_ENDING = Object.freeze({
   speaker: 'Happy',
   role: 'Your oldest friend',
-  text: "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAFx.xyz",
+  text: "Congratulations, Wally! You've brought Bull Bear City to its max potential using tokenization and your belief in RWAs. Try more games at RWAF.ai or learn more about the RWA Foundation at RWAF.xyz",
   links: Object.freeze([
     Object.freeze({ label: 'RWAF.ai',    url: 'https://rwaf.ai' }),
-    Object.freeze({ label: 'RWAFx.xyz', url: 'https://rwafx.xyz' }),
+    Object.freeze({ label: 'RWAF.xyz',  url: 'https://rwaf.xyz' }),
   ]),
 });
 
@@ -2445,7 +2450,7 @@ export function tipVoice(who, news, asset, rec, rng = Math.random) {
 /* ------------------------------------------------------------
    THE VIEW FROM THE BASKET — the one encounter that is not a card.
 
-   The Assessor's own description promises "you can see the whole
+   The Happy Skies' own description promises "you can see the whole
    island at once", the Treasury clerk hands over a logbook with
    forty years of the island's shape in it, and until now the
    balloon's altitude bought exactly nothing that standing in the

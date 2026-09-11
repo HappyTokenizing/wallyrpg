@@ -13,7 +13,7 @@
    THE TEXT IS THE USER'S, VERBATIM. It is rendered as one string,
    split ONLY where a link label sits inside it, so the rendered
    textContent is character-for-character the payload's `text`.
-   RWAF.ai and RWAFx.xyz become real anchors — target=_blank,
+   RWAF.ai and RWAF.xyz become real anchors — target=_blank,
    rel=noopener — underlined in token gold inside the sentence, and
    repeated underneath as two large buttons so nobody has to notice
    that a word in a paragraph was clickable. Verify with
@@ -50,7 +50,7 @@ const MOTES = [
    host, so a link added to data.js later still gets a caption. */
 const LINK_NOTE = {
   'RWAF.ai': 'More games to play',
-  'RWAFx.xyz': 'The RWA Foundation',
+  'RWAF.xyz': 'The RWA Foundation',
 };
 
 export function createEnding(ctx, ui) {

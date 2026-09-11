@@ -260,7 +260,7 @@ export function createQuests(env) {
     const acc = accessInfo(l.id);
     /* HOW YOU FOUND IT IS PART OF FINDING IT. 'by walking past it' is
        the only sentence this ever said, and from a balloon at two
-       hundred metres it was simply untrue — the Assessor's whole
+       hundred metres it was simply untrue — the Happy Skies' whole
        point is that you have not walked anywhere. See AIRVIEW in
        data.js and game.sense(). */
     const air = how === 'air';

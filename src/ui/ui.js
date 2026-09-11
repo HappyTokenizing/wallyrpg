@@ -53,7 +53,7 @@ import { createMenus } from './menus.js';
    something — 'press E' with a keyboard, 'tap Enter' under a thumb.
    Nothing in this file names a key directly; see the input-mode header
    in touch.js for why that is one mechanism and not seven literals. */
-import { createTouch, shouldEnable, actionPhrase } from './touch.js';
+import { createTouch, shouldEnable, actionPhrase, actionLabel, touchUI } from './touch.js';
 import { createOrient } from './orient.js';
 import { createNotify } from './notify.js';
 import { createEnding } from './ending.js';
@@ -1552,6 +1552,17 @@ export async function init(ctx) {
     renderRide: (r, opts) => menus.rideRow(r, opts),
     /** Every ride, fastest first — the phone's garage. */
     renderRides: (el, opts) => { for (const row of menus.rideList(opts)) el.append(row); },
+    /** Is there a logbook for this machine? menus.js's row builder
+        asks before it draws the button, so a ride with no briefing
+        needs no code in the row. Returns the card spec, or null. */
+    rideBriefing,
+    /** Open it. Safe to call for a ride that has none. */
+    showRideBriefing(id) {
+      const spec = rideBriefing(id);
+      if (!spec) return false;
+      api.dialogue(spec);
+      return true;
+    },
     /** The map at full size. */
     openMap: (locId) => pushSheet(menus.bigMap(locId), 'map'),
 
@@ -1688,6 +1699,102 @@ export async function init(ctx) {
   on('banner', (b) => banner(b.title, b.sub));
   on('msg', (m) => toast('Message from ' + m.from, 'token'));
   on('tip', (t) => api.dialogue({ speaker: t.title, role: 'A note for you', text: t.text, portrait: 'wally' }));
+
+  /* ============================================================
+     THE LOGBOOK — how a ride is flown, for the one ride that is not
+     driven.
+
+     A player bought the $24,000 machine, arrived in the air, and
+     said: "it offered no instruction on how to fly it properly."
+     They were right, and the consequence is measurable — equip the
+     balloon and touch nothing and she reaches 16 m, sinks, and is
+     back on the grass 21 seconds later with the whole interface
+     still pointing at an errand across town (tools/probes, one page
+     load, altitudes 7.4 / 16.2 / 14.8 / 2.7 / 0.0). Hold the burner
+     on the same page load and she climbs at 4.53 m/s to 88.9 m. The
+     machine was never broken. The silence was.
+
+     IT IS NOT A TUTORIAL, IT IS THE THING THE CLERK HANDS YOU.
+     data.js already wrote it: "The clerk hands you a logbook with
+     forty years of the island's shape in it." So the instructions
+     live in the logbook, the logbook is a dialogue card, and it can
+     be opened again from the ride's row for as long as he owns her.
+
+     KEYED BY RIDE, NOT BY AN `if`. menus.js's row builder asks
+     ui.rideBriefing(id) and shows the button when the answer is not
+     null, which keeps the promise the rides table was built on: a
+     fifth machine that is a normal machine still costs the UI
+     nothing. The copy belongs in data.js with the rest of the
+     content and is here only because this agent does not own that
+     file — see the report.
+
+     NO KEY NAME IS TYPED. touch.js's action table answers for the
+     burner on both inputs. The VENT has no control of its own on the
+     pad — touch.js input() reads it off the stick past 62% of full
+     deflection — so under a thumb it is described rather than named,
+     which is the honest sentence and also a handover.
+     ============================================================ */
+  const RIDE_BRIEFING = {
+    balloon: () => {
+      /* ONE CONTROL, NAMED THROUGH THE ACTION TABLE. The burner is
+         touch.js's `jump` on both inputs — wally.js flyUpdate() reads
+         `jumpHeld` for it — and it is the only thing that has to be
+         named, because letting go IS the way down: heat bleeds off on
+         its own and she is back on the grass inside twenty seconds
+         (measured, one page load: 7.4 m, 16.2, 14.8, 2.7, 0.0).
+         The vent is real but has no honest label — no entry in the
+         action table, and on the pad it is not a button at all — so
+         it is not named here. See the report. */
+      const climb = 'Hold ' + actionLabel('jump');
+      /* the drift wish is read where the controller would read it, so
+         it is whatever walks him — no keycap either way */
+      const lean = touchUI() ? 'the stick' : 'the keys you walk with';
+      return {
+        speaker: 'The logbook',
+        role: "Forty years of the island's shape",
+        text: [
+          'Forty years of somebody’s handwriting, and only the first page is instructions. The rest is weather.',
+          climb + ' and she climbs. Let go and she settles, all on her own, rather sooner than you expect. You can lean her with ' + lean + ', but the wind has the casting vote.',
+          'Ninety metres is the number in the margin, underlined twice. Below it you see what you would see from the road. Above it you see the island — and the island goes on your map.',
+          'Nobody steps out of a basket at a hundred metres. Ask her down, and she comes down in her own time.',
+        ],
+        dismiss: 'Close the logbook',
+        /* The two lines the ride row toasts instead of "Balloon with
+           you" / "Balloon left behind", which describe a bicycle in a
+           shed and not this. They ride with the briefing so the row
+           stays machine-agnostic. */
+        equipLine: 'Filling the envelope. Hold the burner or she will set you back down.',
+        unequipLine: 'Venting. She comes down in her own time.',
+      };
+    },
+  };
+
+  /** The briefing card for a ride, or null if that machine drives
+      itself the way every other machine on the island does. */
+  function rideBriefing(id) {
+    const make = RIDE_BRIEFING[id];
+    return make ? make() : null;
+  }
+
+  /* ONCE, AND THEN ONLY UNTIL HE HAS DONE IT. The card opens itself
+     the first time he is airborne in a session, and stops opening
+     itself for good once `flags.sawIsland` is set — which events.js
+     sets the first time he crosses AIRVIEW.min with places still to
+     find, i.e. the first time the machine has actually paid. A
+     player who has seen the island does not need the page about the
+     island. Read-only on game state; the row keeps the card
+     reachable forever either way. */
+  let briefedThisLoad = false;
+  on('wally:fly', (e) => {
+    if (!e || !e.flying) return;
+    const spec = rideBriefing(e.ride || 'balloon');
+    if (!spec) return;
+    if (briefedThisLoad) return;
+    briefedThisLoad = true;
+    if (ctx.game?.state?.flags?.sawIsland) return;
+    if (dlg.isOpen) return;
+    api.dialogue(spec);
+  });
 
   /* QUESTS ARE THE ACHIEVEMENT TIER.
      quests.js fires a plain note AND a 'quest' event for one act, so

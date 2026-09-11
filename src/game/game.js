@@ -928,6 +928,23 @@ export function createGame(opts = {}) {
          row can be a goal with a distance on it rather than a "no" */
       assets: u.assets || 0,
       assetsHave: Object.keys(S().tokenized || {}).length,
+      /* `buyable` IS A CATEGORY, NOT A PERMISSION, and it has been
+         misread as one at least twice — a probe read `assetsHave: 0`
+         and `buyable: true` off this object and reported the asset
+         gate as decorative. It is not. `buyable` means only "this row
+         is sold for money at all", which is false for exactly one ride
+         (the scooter, which is a favour returned). It is what
+         ridesFor() filters the shop list on, so a locked balloon still
+         appears at the Treasury as a goal with a distance on it rather
+         than vanishing until the day it is affordable.
+
+         THE PERMISSION IS actions.canBuyRide(id).ok, which is where
+         rep, the asset count, the place, the opening hours, the heat
+         gate and the money all live, and it is what buyRide() calls
+         before it takes a dollar. ui/menus.js:1532 does the same.
+         Paired proof at 39/40 assets and rep 74/75, both arms, in
+         tools/test-game.mjs — "the balloon's two gates are enforced,
+         not decorative". */
       buyable: u.kind === 'buy',
       owned: !!rs.owned[r.id],
       equipped: rs.equipped === r.id,
@@ -1645,8 +1662,8 @@ export function createGame(opts = {}) {
      exactly as it did on foot. Above it the radius stops being the
      width of a doorway and becomes the horizon — 2.6 m of island per
      metre of altitude, capped at 560 — which is the one thing the
-     Assessor's own description has always promised, "you can see the
-     whole island at once", and never once delivered.
+     Happy Skies' own description has always promised, "you can see
+     the whole island at once", and never once delivered.
 
      IT PUTS PLACES ON THE MAP AND NOTHING ELSE. quests.discover()
      sets known/found; quests.access() is untouched, so flying over
